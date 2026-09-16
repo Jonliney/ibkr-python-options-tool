@@ -1,0 +1,104 @@
+{
+  "title": "Choose the read-only planner’s visual world",
+  "question": "Pick the operational language for the desktop preview, or keep the code-first recommendation and continue.",
+  "options": [
+    {
+      "id": "assigned",
+      "label": "Passage Plan",
+      "kicker": "THE ROLL",
+      "lineage": "maritime bridge passage plans",
+      "thesis": "The option exit becomes a plotted route whose checkpoints must all clear before departure.",
+      "palette": ["#071a2b", "#eef4f5", "#d34174", "#7fc8c8"],
+      "materials": ["coated plotting sheet", "engraved instrument rail"],
+      "viewport": "A permanent safety strip crowns a chart-like workspace: evidence and inputs at left, the price route and validation log at right.",
+      "risk": "The chart-room metaphor could slow scanning if labels become nautical rather than literal.",
+      "raised": [
+        {"from": "Modular identity", "raise": "Every region locks to one strong operational grid."},
+        {"from": "Game Boy field", "raise": "Focus and selection use unmistakable inversion, not decoration."},
+        {"from": "Drum machine", "raise": "Target and stop pairs read as one unbroken sequenced rail."}
+      ],
+      "wireframe": {"cols": 12, "rows": 10, "regions": [
+        {"label": "safety strip", "x": 0, "y": 0, "w": 12, "h": 1, "accent": true},
+        {"label": "evidence", "x": 0, "y": 1, "w": 4, "h": 3},
+        {"label": "plan controls", "x": 0, "y": 4, "w": 4, "h": 6},
+        {"label": "price route", "x": 4, "y": 1, "w": 8, "h": 6, "accent": true},
+        {"label": "validation log", "x": 4, "y": 7, "w": 8, "h": 3}
+      ]},
+      "comp": ".impeccable/mocks/decision/assigned.webp"
+    },
+    {
+      "id": "model-pick",
+      "label": "Dispatch Release",
+      "kicker": "IMPECCABLE’S PICK",
+      "lineage": "flight operations dispatch paperwork",
+      "thesis": "One dense release sheet turns broker evidence, calculations, and blockers into a signed-off sequence.",
+      "palette": ["#f1f0e8", "#17243a", "#dc5b2a", "#6d7a82"],
+      "materials": ["carbon-copy stock", "rubber status stamp"],
+      "viewport": "A tall operational form flows from connection to position to request to order pairs, with a fixed status margin.",
+      "risk": "The most familiar safety form here, but it can feel bureaucratic when density is not paced.",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [
+        {"label": "release header", "x": 0, "y": 0, "w": 12, "h": 1, "accent": true},
+        {"label": "status margin", "x": 0, "y": 1, "w": 2, "h": 9},
+        {"label": "evidence rows", "x": 2, "y": 1, "w": 10, "h": 2},
+        {"label": "request form", "x": 2, "y": 3, "w": 4, "h": 7},
+        {"label": "release table", "x": 6, "y": 3, "w": 6, "h": 7}
+      ]},
+      "comp": ".impeccable/mocks/decision/model-pick.webp"
+    },
+    {
+      "id": "challenger-emission",
+      "label": "Calibrated Price Rail",
+      "verdict": "wins",
+      "lineage": "spectrograph calibration plates",
+      "thesis": "Basis, quote, stop, and every target register as precise marks on one calibrated rail.",
+      "palette": ["#15191c", "#e9e5d8", "#7dcfff", "#f2c14e", "#ec6a5f"],
+      "materials": ["graphite instrument panel", "hairline emission marks"],
+      "viewport": "A dominant horizontal price rail carries the live state and order graph; compact evidence and controls hang from its calibrated ticks.",
+      "case": "It best identifies with price-driven work and makes the planner’s unique order graph immediately legible.",
+      "risk": "A dark panel can resemble a generic trading terminal unless glow and chrome remain rigorously restrained.",
+      "hero": "https://impeccable.style/worlds/cards/operate-c-emission-line-rail-hero.webp",
+      "board": "https://impeccable.style/worlds/cards/operate-c-emission-line-rail.webp",
+      "wireframe": {"cols": 12, "rows": 10, "regions": [
+        {"label": "read-only banner", "x": 0, "y": 0, "w": 12, "h": 1, "accent": true},
+        {"label": "connection evidence", "x": 0, "y": 1, "w": 12, "h": 1},
+        {"label": "request controls", "x": 0, "y": 2, "w": 3, "h": 8},
+        {"label": "calibrated price rail", "x": 3, "y": 2, "w": 9, "h": 5, "accent": true},
+        {"label": "validation register", "x": 3, "y": 7, "w": 9, "h": 3}
+      ]},
+      "comp": ".impeccable/mocks/decision/challenger-emission.webp"
+    },
+    {
+      "id": "challenger-modular",
+      "label": "Modular Signal Blocks",
+      "verdict": "declined",
+      "lineage": "Dutch modular identity systems",
+      "thesis": "Broker state snaps into bright blocks that reorganize around the selected position.",
+      "palette": ["#f4f5f2", "#23272a", "#1db4c5", "#e94b63", "#f1cb3d"],
+      "materials": ["flat vector bars", "cool grey work surface"],
+      "viewport": "Large color bands separate evidence, request, graph, and validation into one strict grid.",
+      "case": "It has strong structure but identifies less clearly with careful trading work and makes status too color-dependent.",
+      "kept": "Total grid commitment and responsive restacking.",
+      "risk": "The saturated blocks compete with warning and validity states.",
+      "hero": "https://impeccable.style/worlds/cards/studio-dumbar-identity-hero.webp",
+      "board": "https://impeccable.style/worlds/cards/studio-dumbar-identity.webp"
+    }
+  ],
+  "reroll": {"registers": ["safer", "bolder"]},
+  "buildPath": {"value": "code", "toggle": true},
+  "canon": true,
+  "canonCard": {
+    "label": "Conventional trading utility",
+    "thesis": "A familiar desktop form with a sidebar, grouped inputs, and a preview table.",
+    "palette": ["#101820", "#e9eef2", "#22a06b"],
+    "materials": ["standard desktop chrome", "tabular data grid"],
+    "viewport": "Connection status above a two-column form-and-table workspace.",
+    "risk": "Immediately familiar, but visually indistinguishable from other trading dashboards.",
+    "wireframe": {"cols": 12, "rows": 10, "regions": [
+      {"label": "toolbar", "x": 0, "y": 0, "w": 12, "h": 1},
+      {"label": "sidebar", "x": 0, "y": 1, "w": 3, "h": 9},
+      {"label": "preview table", "x": 3, "y": 1, "w": 9, "h": 9, "accent": true}
+    ]},
+    "comp": ".impeccable/mocks/decision/canon.webp"
+  },
+  "steer": true
+}

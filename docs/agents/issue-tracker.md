@@ -1,0 +1,15 @@
+# Issue tracker: Local Markdown
+
+Issues and PRDs for this repository live as Markdown files in `.scratch/`.
+
+## Conventions
+
+- One feature per directory: `.scratch/<feature-slug>/`.
+- The PRD is `.scratch/<feature-slug>/PRD.md`.
+- Implementation issues are
+  `.scratch/<feature-slug>/issues/<NN>-<slug>.md`, numbered from `01`.
+- Triage state is a `Status:` line near the top of each issue file.
+- Comments append under a `## Comments` heading.
+
+When a skill publishes to the issue tracker, it creates or updates the relevant
+file under `.scratch/`. When it fetches a ticket, it reads the referenced file.

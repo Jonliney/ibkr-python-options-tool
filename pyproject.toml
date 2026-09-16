@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=80,<81"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ibkr-options-manager"
+version = "0.1.0"
+description = "Read-only planning tools for long option exits in IBKR TWS"
+requires-python = ">=3.12"
+dependencies = [
+  "PySide6>=6.10,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "hypothesis>=6,<7",
+  "mypy>=1,<2",
+  "pytest>=8,<10",
+  "ruff>=0.13,<1",
+]
+
+[project.scripts]
+ibkr-options-manager = "ibkr_options_manager.cli:main"
+ibkr-options-manager-gui = "ibkr_options_manager.app.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["ibkr_options_manager"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["ibapi.*"]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

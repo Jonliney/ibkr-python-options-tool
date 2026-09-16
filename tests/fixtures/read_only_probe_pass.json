@@ -1,0 +1,22 @@
+{
+  "blockers": [],
+  "blocking_errors": [],
+  "connected": true,
+  "contract_details_count": 1,
+  "localhost_only": true,
+  "managed_accounts": [
+    "***6111"
+  ],
+  "market_rule_received": true,
+  "observed_order_perm_ids": [
+    900000001
+  ],
+  "open_orders_complete": true,
+  "option_con_id": 917864414,
+  "positions_complete": true,
+  "quote_received": true,
+  "read_only_api": true,
+  "server_time_received": true,
+  "server_version": 223,
+  "status": "PASS"
+}
