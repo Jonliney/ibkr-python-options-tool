@@ -58,6 +58,12 @@ from .components.ui.dialog import (
     DialogTitle,
     DialogTrigger,
 )
+from .components.ui.dropdown_menu import (
+    DropdownMenu,
+    DropdownMenuContent,
+    DropdownMenuItem,
+    DropdownMenuTrigger,
+)
 from .components.ui.input import Input
 from .components.ui.label import Label
 from .components.ui.scroll_area import ScrollArea
@@ -158,8 +164,10 @@ class StarUIWorkbench:
                 elif action.startswith("remove-layer:"):
                     _, _, layer_index = action.partition(":")
                     self._remove_layer_locked(_positive_int(layer_index, 0))
-                elif action == "equal-split":
-                    self._equal_split_locked()
+                elif action in {"equal-split", "equal-split-available"}:
+                    self._equal_split_locked(use_available_quantity=True)
+                elif action == "equal-split-assigned":
+                    self._equal_split_locked(use_available_quantity=False)
                 elif action == "preview":
                     self._preview_locked()
             return self._page()
@@ -315,15 +323,20 @@ class StarUIWorkbench:
         del layers[index - 1]
         self._drafts[con_id] = tuple(layers)
 
-    def _equal_split_locked(self) -> None:
+    def _equal_split_locked(self, *, use_available_quantity: bool) -> None:
         layers = self._current_layers()
         con_id = self._selected_con_id
         if not layers or con_id is None:
             return
+        total_quantity = (
+            self._state.available_quantity
+            if use_available_quantity
+            else sum(_int_or_zero(layer.quantity) for layer in layers)
+        )
         self._drafts[con_id] = tuple(
             replace(layer, quantity=str(quantity))
             for layer, quantity in zip(
-                layers, _split_quantity(self._state.available_quantity, len(layers)), strict=True
+                layers, _split_quantity(total_quantity, len(layers)), strict=True
             )
         )
 
@@ -550,13 +563,28 @@ class StarUIWorkbench:
                     ),
                     CardAction(
                         Div(
-                            Button(
-                                "Equal split",
-                                variant="outline",
-                                size="sm",
-                                type="submit",
-                                name="action",
-                                value="equal-split",
+                            DropdownMenu(
+                                DropdownMenuTrigger(
+                                    "Equal split",
+                                    Icon("lucide:chevron-down", cls="size-4"),
+                                    variant="outline",
+                                    size="sm",
+                                ),
+                                DropdownMenuContent(
+                                    DropdownMenuItem(
+                                        "All available contracts",
+                                        type="submit",
+                                        name="action",
+                                        value="equal-split-available",
+                                    ),
+                                    DropdownMenuItem(
+                                        "Already assigned contracts",
+                                        type="submit",
+                                        name="action",
+                                        value="equal-split-assigned",
+                                    ),
+                                    align="end",
+                                ),
                             ),
                             Button(
                                 "Add layer",
@@ -598,7 +626,6 @@ class StarUIWorkbench:
                 ),
             ),
             self._outcome_projection(layers),
-            HTMLInput(type="hidden", name="action", value="save-draft"),
             HTMLInput(type="hidden", name="target_presets", value=self._target_presets),
             HTMLInput(type="hidden", name="stop_presets", value=self._stop_presets),
             action=f"/{self.session_token}/action",

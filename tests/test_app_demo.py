@@ -123,7 +123,11 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     )[0]
     assert 'data-slot="card-action"' in draft
     assert "Equal split" in draft
+    assert 'data-slot="dropdown-menu"' in draft
+    assert "All available contracts" in draft
+    assert "Already assigned contracts" in draft
     assert "Add layer" in draft
+    assert 'name="action" value="save-draft"' not in draft
     assert "font-mono" not in draft
     assert "+$280.00 gain" in draft
     assert "-$340.00 max loss" in draft
@@ -161,6 +165,42 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert response.status_code == 200
     assert [layer.quantity for layer in workbench._current_layers()] == ["3", "2"]
     assert workbench._current_layers()[0].tif == "DAY"
+
+    response = client.post(
+        workbench.path + "action",
+        data={
+            "action": "equal-split-assigned",
+            "target_presets": "20, 40, 60, 100",
+            "stop_presets": "25",
+            "target_1": "20",
+            "stop_1": "25",
+            "quantity_1": "1",
+            "target_2": "40",
+            "stop_2": "25",
+            "quantity_2": "2",
+        },
+    )
+
+    assert response.status_code == 200
+    assert [layer.quantity for layer in workbench._current_layers()] == ["2", "1"]
+
+    response = client.post(
+        workbench.path + "action",
+        data={
+            "action": "equal-split-available",
+            "target_presets": "20, 40, 60, 100",
+            "stop_presets": "25",
+            "target_1": "20",
+            "stop_1": "25",
+            "quantity_1": "2",
+            "target_2": "40",
+            "stop_2": "25",
+            "quantity_2": "1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert [layer.quantity for layer in workbench._current_layers()] == ["3", "2"]
 
     response = client.post(
         workbench.path + "action",
