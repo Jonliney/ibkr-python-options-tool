@@ -136,9 +136,12 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert 'id="quantity_1"' in draft
     assert 'for="tif_1"' in draft
     assert 'id="tif_1"' in draft
-    assert "mx-auto w-fit min-w-[41rem]" in draft
+    assert "w-full min-w-[41rem]" in draft
     assert "items-start gap-3" in draft
-    assert "grid-cols-[5rem_10rem_10rem_5rem_5rem_2.25rem]" in draft
+    assert (
+        "grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem]"
+        in draft
+    )
     assert 'aria-label="Draft layer rows"' in draft
     assert "mt-5" in draft
 

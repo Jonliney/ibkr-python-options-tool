@@ -587,7 +587,7 @@ class StarUIWorkbench:
                                     ),
                                     cls="mt-5 flex justify-end",
                                 ),
-                                cls="mx-auto w-fit min-w-[41rem]",
+                                cls="w-full min-w-[41rem]",
                             ),
                             aria_label="Draft layer rows",
                             orientation="both",
@@ -693,7 +693,7 @@ class StarUIWorkbench:
                 aria_label=f"Remove layer {index}",
                 cls="mt-5",
             ),
-            cls="grid grid-cols-[5rem_10rem_10rem_5rem_5rem_2.25rem] items-start gap-3 border-t border-border py-4 first:border-t-0",
+            cls="grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4 first:border-t-0",
         )
 
     def _layer_projection(self, layer: DraftLayerForm) -> tuple[str, str]:
