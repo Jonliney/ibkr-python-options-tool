@@ -26,6 +26,7 @@ from starhtml import (
     Input as HTMLInput,
 )
 from starhtml.icons import resolver
+from starhtml.plugins import position as position_plugin
 from starlette.requests import Request
 
 from ...domain import preview_reference_prices
@@ -58,12 +59,6 @@ from .components.ui.dialog import (
     DialogTitle,
     DialogTrigger,
 )
-from .components.ui.dropdown_menu import (
-    DropdownMenu,
-    DropdownMenuContent,
-    DropdownMenuItem,
-    DropdownMenuTrigger,
-)
 from .components.ui.input import Input
 from .components.ui.label import Label
 from .components.ui.scroll_area import ScrollArea
@@ -79,9 +74,6 @@ from .components.ui.tabs import Tabs, TabsContent, TabsList, TabsTrigger
 
 _STATIC_DIR = Path(__file__).with_name("static")
 _ASSETS_DIR = Path(__file__).with_name("assets")
-_DEFAULT_HELP = "Each layer creates one SELL LMT + SELL STP OCA pair."
-
-
 class StarUIWorkbench:
     """Server-owned StarUI view over the existing, write-free planner seam."""
 
@@ -115,6 +107,7 @@ class StarUIWorkbench:
             htmlkw={"lang": "en", "data_theme": "dark"},
             bodykw={"cls": "min-h-screen bg-background text-foreground"},
         )
+        self.app.register(position_plugin)
         route(f"/{self.session_token}/")(self._home)
         route(f"/{self.session_token}/action", methods=["POST"])(self._action)
 
@@ -532,7 +525,12 @@ class StarUIWorkbench:
                     variant="line",
                 ),
                 TabsContent(
-                    self._draft_panel(),
+                    ScrollArea(
+                        self._draft_panel(),
+                        aria_label="Layer draft workspace",
+                        orientation="vertical",
+                        cls="h-full",
+                    ),
                     id="draft",
                     cls="mt-5 min-h-0 flex-1",
                     style="overflow: hidden",
@@ -559,32 +557,24 @@ class StarUIWorkbench:
                 CardHeader(
                     Div(
                         CardTitle("Layered OCA draft"),
-                        CardDescription(_DEFAULT_HELP, cls="mt-1"),
                     ),
                     CardAction(
                         Div(
-                            DropdownMenu(
-                                DropdownMenuTrigger(
-                                    "Equal split",
-                                    Icon("lucide:chevron-down", cls="size-4"),
-                                    variant="outline",
-                                    size="sm",
-                                ),
-                                DropdownMenuContent(
-                                    DropdownMenuItem(
-                                        "All available contracts",
-                                        type="submit",
-                                        name="action",
-                                        value="equal-split-available",
-                                    ),
-                                    DropdownMenuItem(
-                                        "Already assigned contracts",
-                                        type="submit",
-                                        name="action",
-                                        value="equal-split-assigned",
-                                    ),
-                                    align="end",
-                                ),
+                            Button(
+                                "Split all available",
+                                variant="outline",
+                                size="sm",
+                                type="submit",
+                                name="action",
+                                value="equal-split-available",
+                            ),
+                            Button(
+                                "Split assigned",
+                                variant="outline",
+                                size="sm",
+                                type="submit",
+                                name="action",
+                                value="equal-split-assigned",
                             ),
                             Button(
                                 "Add layer",
@@ -595,7 +585,7 @@ class StarUIWorkbench:
                                 value="add-layer",
                                 disabled=len(layers) >= self._state.available_quantity,
                             ),
-                            cls="flex items-center gap-2",
+                            cls="flex flex-wrap items-center justify-end gap-2",
                         ),
                     ),
                 ),
@@ -618,8 +608,8 @@ class StarUIWorkbench:
                                 cls="w-full min-w-[41rem]",
                             ),
                             aria_label="Draft layer rows",
-                            orientation="both",
-                            cls="max-h-[25rem] w-full",
+                            orientation="horizontal",
+                            cls="w-full",
                         ),
                         cls="min-w-0",
                     ),
@@ -754,7 +744,12 @@ class StarUIWorkbench:
         return Card(
             CardHeader(CardTitle("Outcome projection"), CardDescription("Based on the current cost basis and planned layer prices."), cls="gap-1"),
             CardContent(
-                Div(_metric("Expected gain", _money(gain), "text-emerald-400"), _metric("Max loss", _money(loss), "text-rose-400"), _metric("Breakeven after", _breakeven(outcomes), "text-amber-300"), cls="grid grid-cols-3 gap-8"),
+                Div(
+                    _metric("Expected gain", _money(gain), "text-emerald-400"),
+                    _metric("Max loss", _money(loss), "text-rose-400"),
+                    _metric("Breakeven after", _breakeven(outcomes), "text-amber-300"),
+                    cls="flex flex-wrap items-start gap-x-16 gap-y-5",
+                ),
             ),
             cls="mt-5",
         )
@@ -831,7 +826,7 @@ def _percentage_price_field(
     return Div(
         Div(
             Label(label, fr=input_id, cls="text-xs font-medium text-muted-foreground"),
-            Span(f"${price}", cls=f"text-xs font-semibold {tone}"),
+            Span(f"${price}", cls="text-xs font-semibold text-foreground"),
             cls="flex items-center justify-between gap-2",
         ),
         Div(

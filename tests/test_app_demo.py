@@ -105,6 +105,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     page = client.get(workbench.path)
     assert page.status_code == 200
     assert "Layered OCA draft" in page.text
+    assert "Each layer creates one SELL LMT + SELL STP OCA pair." not in page.text
     assert "Transmission locked" in page.text
     assert "Preview only" not in page.text
     assert "SELL LMT" in page.text
@@ -114,21 +115,23 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert "<dialog" in page.text
     assert "h-screen overflow-hidden" in page.text
     assert 'aria-label="Draft layer rows"' in page.text
+    assert 'aria-label="Layer draft workspace"' in page.text
     assert 'aria-label="Planned order actions"' in page.text
     assert "cdn.jsdelivr.net" not in page.text
     assert "api.iconify.design" not in page.text
+    assert "@starhtml/plugins/position" in page.text
+    assert client.get("/_pkg/starhtml/plugins/position.js").status_code == 200
 
     draft = page.text.split("Layered OCA draft", maxsplit=1)[1].split(
         "Outcome projection", maxsplit=1
     )[0]
     assert 'data-slot="card-action"' in draft
-    assert "Equal split" in draft
-    assert 'data-slot="dropdown-menu"' in draft
-    assert "All available contracts" in draft
-    assert "Already assigned contracts" in draft
+    assert "Split all available" in draft
+    assert "Split assigned" in draft
     assert "Add layer" in draft
     assert 'name="action" value="save-draft"' not in draft
     assert "font-mono" not in draft
+    assert "text-xs font-semibold text-foreground" in draft
     assert "+$280.00 gain" in draft
     assert "-$340.00 max loss" in draft
     assert ">%</span>" in draft
@@ -147,6 +150,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
         in draft
     )
     assert 'aria-label="Draft layer rows"' in draft
+    assert 'overflow-x-auto overflow-y-hidden' in draft
     assert "mt-5" in draft
 
     response = client.post(
