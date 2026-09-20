@@ -6,8 +6,11 @@ Interactive Brokers Trader Workstation (TWS).
 
 The initial milestone is deliberately non-trading: connect to TWS in
 read-only mode, display exact positions and working orders, and preview a
-validated exit plan. Live order transmission is out of scope until the plan
-engine and paper-trading workflow have been independently verified.
+validated laddered OCA bracket plan for an open position. Any working order
+associated with that account and contract is inspected before planning: coherent
+closing orders reserve their quantity, while opening, malformed, or ambiguous
+orders block the preview. Live order transmission is out of scope until the
+plan engine and paper-trading workflow have been independently verified.
 
 See [docs/PROJECT_BRIEF.md](docs/PROJECT_BRIEF.md) for the current requirements
 and safety constraints. The reviewed architecture, safety gates, delivery
@@ -33,6 +36,16 @@ Slice 3 now has a runnable PySide6
 exact-position verification, plan controls, a plotted price route, target/stop
 pairs, and blocking validations. It remains structurally unable to send an
 order.
+
+To rehearse the desktop workbench without TWS or market data, start it with
+deterministic simulated positions:
+
+```sh
+.venv/bin/ibkr-options-manager-gui --demo-data
+```
+
+The simulated-data header is deliberately prominent and the process never
+opens a TWS connection or exposes order transmission.
 
 Local verification from the repository root:
 

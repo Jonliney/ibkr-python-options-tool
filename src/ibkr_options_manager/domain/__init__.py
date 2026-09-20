@@ -4,6 +4,7 @@ from .model import (
     BrokerSnapshot,
     ContractKey,
     ExitPair,
+    LayerRequest,
     MarketRule,
     ObservedPosition,
     OrderIntent,
@@ -12,18 +13,19 @@ from .model import (
     PlanStatus,
     PriceBand,
     Quote,
+    ReferencePricePreview,
     RemainderPolicy,
-    TriggerMethod,
     Validation,
     VerifiedOptionContract,
     WorkingOrder,
 )
-from .planner import build_exit_plan
+from .planner import build_exit_plan, preview_reference_prices
 
 __all__ = [
     "BrokerSnapshot",
     "ContractKey",
     "ExitPair",
+    "LayerRequest",
     "MarketRule",
     "ObservedPosition",
     "OrderIntent",
@@ -32,10 +34,11 @@ __all__ = [
     "PlanStatus",
     "PriceBand",
     "Quote",
+    "ReferencePricePreview",
     "RemainderPolicy",
-    "TriggerMethod",
     "Validation",
     "VerifiedOptionContract",
     "WorkingOrder",
     "build_exit_plan",
+    "preview_reference_prices",
 ]

@@ -145,9 +145,9 @@ Deep marine neutrals separate operator inputs from the plotting field, while the
 
 - **Instrument Ground:** The window ground, primary dark ink, and high-contrast anchor for the entire system.
 - **Risk Ground:** A slightly deeper footer field that keeps the execution warning visually persistent.
-- **Control Panel / Control Field:** Nested dark surfaces for the evidence-and-request column and its editable controls.
+- **Control Panel / Control Field:** Nested dark surfaces for collapsed connection settings and editable controls.
 - **Status Surface / Ready Surface:** Tonal status fields; the former is neutral or loading-adjacent, while the latter supports a verified ready state.
-- **Plotting Sheet / Table Paper:** Cool, low-chroma working surfaces for the route, table, quote facts, and validations.
+- **Plotting Sheet / Table Paper:** Cool, low-chroma working surfaces for the position inventory, action preview, and on-demand evidence.
 - **Structural Line / Light Rule:** One-pixel dividers on dark and light surfaces respectively.
 - **Dark Muted / Light Muted:** Secondary text for labels, descriptions, axes, and snapshot metadata.
 - **White:** High-emphasis text on saturated or dark surfaces.
@@ -156,7 +156,7 @@ Deep marine neutrals separate operator inputs from the plotting field, while the
 
 **The Chart-Ink Rule.** Accent colors encode observed, planned, stopped, blocked, or risky information; they are never ambient decoration.
 
-**The Two-Field Rule.** Configuration and evidence stay on dark marine surfaces; calculated routes and validation detail stay on the cool plotting sheet.
+**The Two-Field Rule.** Connection settings live on dark marine surfaces; selection, action, and preview live on the cool plotting sheet. Evidence is revealed only when the operator asks for it or a state blocks progress.
 
 ## Typography
 
@@ -182,13 +182,15 @@ Deep marine neutrals separate operator inputs from the plotting field, while the
 
 ## Layout
 
-The window opens at 1380 × 900px and has a hard minimum of 1120 × 820px. A full-width read-only strip and header sit above a two-pane horizontal workspace; a full-width execution-risk strip anchors the bottom. The splitter begins at 420px / 960px, expressing the four-column evidence-and-control rail beside an eight-column route field.
+The window opens at 1320 × 900px and has a hard minimum of 1080 × 760px. A full-width read-only strip and compact connection header sit above one vertically scrollable workspace; a full-width execution-risk strip anchors the bottom. The header holds status, the redacted account, Refresh, and a settings toggle. Connection inputs are initially available when needed, then fold away after a coherent refresh.
 
-The left rail is vertically scrollable, fixed between 380px and 480px wide, and uses 24px horizontal insets, 22px top inset, 28px bottom inset, and 14px section rhythm. Field rows use a 10px vertical gap. The route pane expands into remaining width with 28px horizontal and 22px vertical insets. Its vertical sequence is route heading, expanding price plot, three allocation totals, plan table, then a 1:2 quote/validation lower split.
+The workspace uses 28px horizontal insets, 24px top inset, 32px bottom inset, and 18px section rhythm. Its fixed order is open option positions, selected-position summary, OCA bracket configuration, then the action preview. The inventory preserves broker-received order and uses contract, open/total quantity, basis, P&L availability, and eligibility state. One selected position expands directly beneath its row to show every associated working order and its reservation context. The bracket workspace includes a compact price explorer: it presents the latest verified snapshot Bid, Ask, Mid, or Last (or an explicitly entered illustrative LMT reference), and tick-rounds an exploratory TP/SL calculation. It is not a market-data subscription, does not read TWS's unsent Order Entry value, and never changes the actual bracket inputs. The preview holds allocation and the table; full evidence, validation, and the price route remain collapsed until requested.
 
-This is a minimum-size desktop interface, not a breakpoint-driven responsive layout. At the supported minimum, the left rail scrolls while the route plot, allocation register, and table remain separate. The price plot has a 180px minimum height, the plan table a 125px minimum height, and the table's final OCA column absorbs remaining width.
+This is a minimum-size desktop interface, not a breakpoint-driven responsive layout. The inventory and OCA bracket configuration stay in the initial viewport; longer inspection detail scrolls below. The plan table is at least 125px tall, and its final logical-OCA column absorbs remaining width.
 
-**The Route Owns the Width Rule.** The control rail may scroll and is width-capped; the plotted route receives all remaining horizontal space.
+**The Position List Owns the First View Rule.** The user begins with an open option, not with connection plumbing or a chart. After refresh, the first received position is selected and expanded; selecting another row moves the single active-order register there. The action workspace adapts to that selection rather than competing with it.
+
+**The Reservation Rule.** The tool previews a new laddered OCA bracket without cancelling or modifying any existing order. Coherent closing SELL orders for the same account and contract reserve their remaining quantity; a new preview can use only the unreserved balance. An opening BUY order, an ambiguous OCA relationship, an invalid quantity, or an unsupported status blocks the preview.
 
 ## Elevation & Depth
 

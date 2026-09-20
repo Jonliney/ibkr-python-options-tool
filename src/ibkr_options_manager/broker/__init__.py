@@ -2,6 +2,7 @@
 
 from .ibkr import IbkrSnapshotBroker
 from .read_only import (
+    PORTFOLIO_COMPLETIONS,
     REQUIRED_COMPLETIONS,
     BrokerCapture,
     CapturedContract,
@@ -9,11 +10,14 @@ from .read_only import (
     CapturedOrder,
     CapturedPosition,
     CapturedQuote,
+    PortfolioBroker,
+    PortfolioRequest,
     ReadOnlyBroker,
     SnapshotRequest,
 )
 
 __all__ = [
+    "PORTFOLIO_COMPLETIONS",
     "REQUIRED_COMPLETIONS",
     "BrokerCapture",
     "CapturedContract",
@@ -22,6 +26,8 @@ __all__ = [
     "CapturedPosition",
     "CapturedQuote",
     "IbkrSnapshotBroker",
+    "PortfolioBroker",
+    "PortfolioRequest",
     "ReadOnlyBroker",
     "SnapshotRequest",
 ]

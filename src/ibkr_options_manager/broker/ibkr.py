@@ -21,6 +21,7 @@ from .read_only import (
     CapturedOrder,
     CapturedPosition,
     CapturedQuote,
+    PortfolioRequest,
     SnapshotRequest,
 )
 
@@ -57,12 +58,12 @@ class _OrderDraft:
 
 
 class IbkrSnapshotBroker:
-    """Official TWS adapter exposing one bounded read-only capture."""
+    """Official TWS adapter exposing bounded read-only captures."""
 
     def __init__(self) -> None:
         self._connection_epoch = 0
 
-    def capture(self, request: SnapshotRequest) -> BrokerCapture:
+    def capture(self, request: SnapshotRequest | PortfolioRequest) -> BrokerCapture:
         imports = _load_ibapi()
         self._connection_epoch += 1
         app = _build_capture_app(imports)
@@ -110,17 +111,18 @@ class IbkrSnapshotBroker:
                 "TWS configuration request timed out",
             )
 
-            contract = imports.Contract()
-            contract.conId = request.option_con_id
-            contract.secType = "OPT"
-            app.reqContractDetails(app.contract_request_id, contract)
-            _await(
-                app,
-                "contract_details",
-                deadline,
-                "contract-details request timed out",
-            )
-            _request_quote_and_rule(app, deadline)
+            if isinstance(request, SnapshotRequest):
+                contract = imports.Contract()
+                contract.conId = request.option_con_id
+                contract.secType = "OPT"
+                app.reqContractDetails(app.contract_request_id, contract)
+                _await(
+                    app,
+                    "contract_details",
+                    deadline,
+                    "contract-details request timed out",
+                )
+                _request_quote_and_rule(app, deadline)
             return _capture(app, self._connection_epoch, connected=app.connected)
         except (ConnectionError, OSError) as error:
             app.errors.append(f"connection failed: {error}")

@@ -22,6 +22,22 @@ The same entry point can be run without prefilling the selection:
 .venv/bin/python -m ibkr_options_manager.app
 ```
 
+### Simulated data
+
+For interface work or workflow rehearsal outside market hours, use the fully
+local deterministic data set:
+
+```sh
+.venv/bin/ibkr-options-manager-gui --demo-data
+```
+
+It automatically refreshes four illustrative long option positions. The first
+includes a simulated external sell limit for five contracts, so both the
+available-quantity and external-coverage states can be exercised. The header
+states `SIMULATED DATA · NO TWS`; this mode neither connects to TWS nor sends,
+modifies, or cancels an order. Optional `--con-id` values must be one of the
+contracts present in the simulated data.
+
 The account must use the project's `DU` paper-account allowlist convention.
 The exact ID is kept only in memory for the current process. The evidence view
 redacts it, and changing any connection-selection field immediately clears the

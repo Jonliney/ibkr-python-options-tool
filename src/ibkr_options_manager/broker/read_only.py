@@ -20,6 +20,59 @@ REQUIRED_COMPLETIONS = frozenset(
     }
 )
 
+PORTFOLIO_COMPLETIONS = frozenset(
+    {
+        "server_time",
+        "managed_accounts",
+        "positions",
+        "open_orders",
+        "configuration",
+    }
+)
+
+
+def _validate_connection_request(
+    host: str,
+    port: int,
+    client_id: int,
+    expected_account: str,
+    timeout_seconds: float,
+) -> None:
+    try:
+        address = ip_address(host)
+    except ValueError as error:
+        raise ValueError("host must be a literal loopback address") from error
+    if not address.is_loopback:
+        raise ValueError("host must be a literal loopback address")
+    if not 1 <= port <= 65535:
+        raise ValueError("port must be between 1 and 65535")
+    if client_id <= 0:
+        raise ValueError("client_id must be positive and nonzero")
+    if not expected_account.strip():
+        raise ValueError("expected_account is required")
+    if not expected_account.strip().upper().startswith("DU"):
+        raise ValueError("expected_account must be a paper account ID")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioRequest:
+    host: str
+    port: int
+    client_id: int
+    expected_account: str
+    timeout_seconds: float = 10.0
+
+    def __post_init__(self) -> None:
+        _validate_connection_request(
+            self.host,
+            self.port,
+            self.client_id,
+            self.expected_account,
+            self.timeout_seconds,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class SnapshotRequest:
@@ -31,24 +84,15 @@ class SnapshotRequest:
     timeout_seconds: float = 10.0
 
     def __post_init__(self) -> None:
-        try:
-            address = ip_address(self.host)
-        except ValueError as error:
-            raise ValueError("host must be a literal loopback address") from error
-        if not address.is_loopback:
-            raise ValueError("host must be a literal loopback address")
-        if not 1 <= self.port <= 65535:
-            raise ValueError("port must be between 1 and 65535")
-        if self.client_id <= 0:
-            raise ValueError("client_id must be positive and nonzero")
-        if not self.expected_account.strip():
-            raise ValueError("expected_account is required")
-        if not self.expected_account.strip().upper().startswith("DU"):
-            raise ValueError("expected_account must be a paper account ID")
+        _validate_connection_request(
+            self.host,
+            self.port,
+            self.client_id,
+            self.expected_account,
+            self.timeout_seconds,
+        )
         if self.option_con_id <= 0:
             raise ValueError("option_con_id must be positive")
-        if self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,3 +173,10 @@ class ReadOnlyBroker(Protocol):
 
     def capture(self, request: SnapshotRequest) -> BrokerCapture:
         """Return one bounded capture without retaining or mutating orders."""
+
+
+class PortfolioBroker(Protocol):
+    """Read-only transport seam for the account position inventory."""
+
+    def capture(self, request: PortfolioRequest) -> BrokerCapture:
+        """Return one bounded portfolio capture without broker mutations."""

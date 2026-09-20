@@ -8,6 +8,7 @@ from hypothesis import strategies as st
 from ibkr_options_manager.domain import (
     BrokerSnapshot,
     ContractKey,
+    LayerRequest,
     MarketRule,
     ObservedPosition,
     PlanRequest,
@@ -15,10 +16,10 @@ from ibkr_options_manager.domain import (
     PriceBand,
     Quote,
     RemainderPolicy,
-    TriggerMethod,
     VerifiedOptionContract,
     WorkingOrder,
     build_exit_plan,
+    preview_reference_prices,
 )
 
 
@@ -81,8 +82,75 @@ def canonical_request(
         stop_loss_percentage=Decimal("20"),
         remainder_policy=remainder_policy,
         tif="GTC",
-        trigger_method=TriggerMethod.DOUBLE_BID_ASK,
     )
+
+
+def test_reference_price_preview_tick_rounds_the_illustrative_prices() -> None:
+    preview = preview_reference_prices(
+        Decimal("1.03"),
+        Decimal("20"),
+        Decimal("20"),
+        (PriceBand(Decimal("0"), Decimal("0.05")),),
+    )
+
+    assert preview.reference_price == Decimal("1.03")
+    assert preview.target_price == Decimal("1.25")
+    assert preview.stop_price == Decimal("0.85")
+
+
+def test_explicit_layer_draft_preserves_individual_prices_and_quantities() -> None:
+    request = replace(
+        canonical_request(),
+        layers=(
+            LayerRequest(
+                quantity=3,
+                target_price=Decimal("1.20"),
+                stop_price=Decimal("0.80"),
+                tif="GTC",
+                target_percentage=Decimal("20"),
+            ),
+            LayerRequest(
+                quantity=2,
+                target_price=Decimal("1.50"),
+                stop_price=Decimal("0.75"),
+                tif="DAY",
+                target_percentage=Decimal("50"),
+                runner=True,
+            ),
+        ),
+    )
+
+    result = build_exit_plan(complete_snapshot(), request)
+
+    assert result.status is PlanStatus.VALID
+    assert [pair.quantity for pair in result.pairs] == [3, 2]
+    assert result.pairs[0].target.rounded_price == Decimal("1.20")
+    assert result.pairs[1].stop.tif == "DAY"
+    assert result.pairs[1].runner is True
+
+
+def test_open_buy_order_blocks_a_new_bracket() -> None:
+    selected = ContractKey("DU1234567", 917864414)
+    order = WorkingOrder(
+        41,
+        17,
+        101,
+        selected,
+        "BUY",
+        "LMT",
+        Decimal("2"),
+        "Submitted",
+    )
+
+    result = build_exit_plan(
+        complete_snapshot(working_orders=(order,)), canonical_request()
+    )
+
+    assert result.status is PlanStatus.BLOCKED
+    assert result.pairs == ()
+    assert "OPENING_ORDER_CONFLICT" in {
+        validation.code for validation in result.validations
+    }
 
 
 def test_builds_five_equal_target_stop_pairs_for_ten_contracts() -> None:
@@ -106,6 +174,51 @@ def test_builds_five_equal_target_stop_pairs_for_ten_contracts() -> None:
     assert first.target.logical_oca_group == first.stop.logical_oca_group
     assert first.target.account == first.stop.account == "DU1234567"
     assert first.target.con_id == first.stop.con_id == 917864414
+
+
+def test_target_entries_define_layers_and_leave_the_remainder_open() -> None:
+    request = replace(
+        canonical_request(),
+        tranche_size=3,
+        target_percentages=(Decimal("20"), Decimal("40")),
+    )
+
+    result = build_exit_plan(complete_snapshot(), request)
+
+    assert result.status is PlanStatus.VALID
+    assert result.available_quantity == 10
+    assert result.planned_quantity == 6
+    assert [pair.quantity for pair in result.pairs] == [3, 3]
+
+
+def test_existing_bracket_reserves_quantity_but_allows_a_new_available_layer() -> None:
+    selected = ContractKey("DU1234567", 917864414)
+    target = WorkingOrder(
+        41,
+        8,
+        101,
+        selected,
+        "SELL",
+        "LMT",
+        Decimal("6"),
+        "Submitted",
+        "existing-bracket",
+    )
+    stop = replace(target, perm_id=42, order_id=102, order_type="STP")
+    request = replace(
+        canonical_request(),
+        tranche_size=4,
+        target_percentages=(Decimal("20"),),
+    )
+
+    result = build_exit_plan(
+        complete_snapshot(working_orders=(target, stop)), request
+    )
+
+    assert result.status is PlanStatus.VALID
+    assert result.available_quantity == 4
+    assert result.planned_quantity == 4
+    assert [pair.quantity for pair in result.pairs] == [4]
 
 
 def test_blocks_an_unverified_or_incomplete_snapshot() -> None:
@@ -289,7 +402,7 @@ def test_zero_tranche_size_is_a_blocker_not_an_exception() -> None:
     ]
 
 
-def test_insufficient_target_rungs_blocks_the_plan() -> None:
+def test_target_entries_cap_the_number_of_planned_layers() -> None:
     request = replace(
         canonical_request(),
         target_percentages=(Decimal("20"), Decimal("40")),
@@ -297,10 +410,9 @@ def test_insufficient_target_rungs_blocks_the_plan() -> None:
 
     result = build_exit_plan(complete_snapshot(), request)
 
-    assert result.status is PlanStatus.BLOCKED
-    assert [validation.code for validation in result.validations] == [
-        "TARGET_RUNGS_INSUFFICIENT"
-    ]
+    assert result.status is PlanStatus.VALID
+    assert result.planned_quantity == 4
+    assert [pair.quantity for pair in result.pairs] == [2, 2]
 
 
 @pytest.mark.parametrize(
@@ -486,7 +598,6 @@ def test_invalid_price_policy_inputs_are_aggregated_as_blockers() -> None:
         ),
         stop_loss_percentage=Decimal("100"),
         tif="IOC",
-        trigger_method=TriggerMethod.DEFAULT,
     )
 
     result = build_exit_plan(complete_snapshot(), request)
@@ -496,7 +607,6 @@ def test_invalid_price_policy_inputs_are_aggregated_as_blockers() -> None:
         "TARGET_PERCENTAGES_INVALID",
         "STOP_LOSS_INVALID",
         "TIF_UNSUPPORTED",
-        "TRIGGER_METHOD_UNSUPPORTED",
     }
 
 
@@ -586,7 +696,6 @@ def test_every_valid_plan_preserves_quantity_and_pair_invariants(
         stop_loss_percentage=Decimal("20"),
         remainder_policy=remainder_policy,
         tif="GTC",
-        trigger_method=TriggerMethod.DOUBLE_BID_ASK,
     )
 
     result = build_exit_plan(snapshot, request)
@@ -650,7 +759,6 @@ def test_order_callback_sequence_and_unrelated_orders_do_not_change_fingerprint(
         "Submitted",
         "existing-pair",
     )
-    stop = replace(target, perm_id=12, order_id=102, order_type="STP")
     unrelated = replace(
         target,
         perm_id=13,
@@ -659,11 +767,9 @@ def test_order_callback_sequence_and_unrelated_orders_do_not_change_fingerprint(
         oca_group=None,
     )
 
-    first = build_exit_plan(
-        complete_snapshot(working_orders=(target, stop)), canonical_request()
-    )
+    first = build_exit_plan(complete_snapshot(), canonical_request())
     second = build_exit_plan(
-        complete_snapshot(working_orders=(unrelated, stop, target)),
+        complete_snapshot(working_orders=(unrelated,)),
         canonical_request(),
     )
 

@@ -7,13 +7,14 @@ from decimal import ROUND_CEILING, Decimal
 from .model import (
     BrokerSnapshot,
     ExitPair,
+    LayerRequest,
     OrderIntent,
     PlanRequest,
     PlanResult,
     PlanStatus,
     PriceBand,
+    ReferencePricePreview,
     RemainderPolicy,
-    TriggerMethod,
     Validation,
     WorkingOrder,
 )
@@ -22,36 +23,59 @@ from .model import (
 def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResult:
     """Build a deterministic preview; this module has no broker side effects."""
 
-    allocated, allocation_validations = _allocated_quantity(snapshot)
-    position_quantity = _positive_whole(snapshot.position.quantity) or 0
-    available = position_quantity - allocated
-    validations = (
+    state_validations = (
         *_validate_snapshot_state(snapshot),
         *_validate_contract_position(snapshot),
         *_validate_basis_and_quote(snapshot),
         *_validate_market_rule(snapshot),
+    )
+    if state_validations:
+        return _blocked(state_validations)
+    allocated, allocation_validations = _allocated_quantity(snapshot)
+    position_quantity = _positive_whole(snapshot.position.quantity) or 0
+    available = position_quantity - allocated
+    validations = (
         *allocation_validations,
-        *_validate_request(request, available),
+        *_validate_request(request, available, snapshot.market_rule.bands),
     )
     if validations:
         return _blocked(validations)
 
-    pair_quantities = _pair_quantities(
-        available, request.tranche_size, request.remainder_policy
+    pair_quantities = (
+        tuple(layer.quantity for layer in request.layers)
+        if request.layers
+        else _pair_quantities(
+            available,
+            request.tranche_size,
+            request.remainder_policy,
+            layer_limit=len(request.target_percentages),
+        )
     )
     fingerprint = _fingerprint(snapshot, request, allocated, pair_quantities)
-    stop_raw = snapshot.position.unit_basis * (
-        Decimal("1") - request.stop_loss_percentage / Decimal("100")
-    )
-    stop_rounded = _round_up(stop_raw, snapshot.market_rule.bands)
     pairs: list[ExitPair] = []
 
     for index, quantity in enumerate(pair_quantities):
-        percentage = request.target_percentages[index]
-        target_raw = snapshot.position.unit_basis * (
-            Decimal("1") + percentage / Decimal("100")
-        )
-        target_rounded = _round_up(target_raw, snapshot.market_rule.bands)
+        if request.layers:
+            layer = request.layers[index]
+            percentage = layer.target_percentage or _percentage_from_basis(
+                layer.target_price, snapshot.position.unit_basis
+            )
+            target_raw = layer.target_price
+            target_rounded = layer.target_price
+            stop_raw = layer.stop_price
+            stop_rounded = layer.stop_price
+            tif = layer.tif
+        else:
+            percentage = request.target_percentages[index]
+            target_raw = snapshot.position.unit_basis * (
+                Decimal("1") + percentage / Decimal("100")
+            )
+            target_rounded = _round_up(target_raw, snapshot.market_rule.bands)
+            stop_raw = snapshot.position.unit_basis * (
+                Decimal("1") - request.stop_loss_percentage / Decimal("100")
+            )
+            stop_rounded = _round_up(stop_raw, snapshot.market_rule.bands)
+            tif = request.tif
         group = f"{fingerprint[:12]}/tranche-{index + 1}"
         target = OrderIntent(
             account=snapshot.selected.account,
@@ -61,8 +85,7 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
             quantity=quantity,
             raw_price=target_raw,
             rounded_price=target_rounded,
-            tif=request.tif,
-            trigger_method=None,
+            tif=tif,
             logical_oca_group=group,
             oca_type=2,
         )
@@ -74,8 +97,7 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
             quantity=quantity,
             raw_price=stop_raw,
             rounded_price=stop_rounded,
-            tif=request.tif,
-            trigger_method=request.trigger_method,
+            tif=tif,
             logical_oca_group=group,
             oca_type=2,
         )
@@ -86,6 +108,7 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
                 quantity=quantity,
                 target=target,
                 stop=stop,
+                runner=request.layers[index].runner if request.layers else False,
             )
         )
 
@@ -97,6 +120,36 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
         planned_quantity=sum(pair_quantities),
         pairs=tuple(pairs),
         validations=(),
+    )
+
+
+def preview_reference_prices(
+    reference_price: Decimal,
+    target_percentage: Decimal,
+    stop_loss_percentage: Decimal,
+    bands: tuple[PriceBand, ...],
+) -> ReferencePricePreview:
+    """Calculate tick-rounded illustrative target and stop prices from a reference."""
+
+    if (
+        not reference_price.is_finite()
+        or reference_price <= 0
+        or not target_percentage.is_finite()
+        or target_percentage <= 0
+        or not stop_loss_percentage.is_finite()
+        or stop_loss_percentage <= 0
+        or stop_loss_percentage > 100
+        or not bands
+    ):
+        raise ValueError("reference-price inputs must be positive and complete")
+    target_raw = reference_price * (Decimal("1") + target_percentage / Decimal("100"))
+    stop_raw = reference_price * (Decimal("1") - stop_loss_percentage / Decimal("100"))
+    return ReferencePricePreview(
+        reference_price=reference_price,
+        target_percentage=target_percentage,
+        target_price=_round_up(target_raw, bands),
+        stop_loss_percentage=stop_loss_percentage,
+        stop_price=_round_up(stop_raw, bands),
     )
 
 
@@ -215,6 +268,8 @@ def _validate_contract_position(
 def _allocated_quantity(
     snapshot: BrokerSnapshot,
 ) -> tuple[int, tuple[Validation, ...]]:
+    """Return contracts reserved by coherent closing orders for this position."""
+
     failures: list[Validation] = []
     relevant_perm_ids = [
         order.perm_id
@@ -232,7 +287,22 @@ def _allocated_quantity(
     ungrouped = 0
     all_groups: dict[str, list[WorkingOrder]] = {}
     for order in snapshot.working_orders:
-        if order.key == snapshot.selected and order.action not in {"BUY", "SELL"}:
+        if order.key != snapshot.selected:
+            if order.oca_group:
+                all_groups.setdefault(order.oca_group, []).append(order)
+            continue
+        if order.action == "BUY":
+            failures.append(
+                Validation(
+                    "OPENING_ORDER_CONFLICT",
+                    (
+                        f"order {order.perm_id} may change the position; cancel or "
+                        "fill it in TWS, then refresh before planning exits"
+                    ),
+                    True,
+                )
+            )
+        elif order.action != "SELL":
             failures.append(
                 Validation(
                     "ORDER_ACTION_UNSUPPORTED",
@@ -240,7 +310,7 @@ def _allocated_quantity(
                     True,
                 )
             )
-        if order.key == snapshot.selected and order.action == "SELL":
+        if order.action == "SELL":
             remaining = _positive_whole(order.remaining)
             if remaining is None:
                 failures.append(
@@ -270,7 +340,7 @@ def _allocated_quantity(
                 )
         if order.oca_group:
             all_groups.setdefault(order.oca_group, []).append(order)
-        elif order.key == snapshot.selected and order.action == "SELL":
+        elif order.action == "SELL":
             ungrouped += _positive_whole(order.remaining) or 0
 
     grouped_allocated = 0
@@ -465,7 +535,13 @@ def _validate_basis_and_quote(
     return tuple(failures)
 
 
-def _validate_request(request: PlanRequest, available: int) -> tuple[Validation, ...]:
+def _validate_request(
+    request: PlanRequest,
+    available: int,
+    bands: tuple[PriceBand, ...],
+) -> tuple[Validation, ...]:
+    if request.layers:
+        return _validate_layers(request.layers, available, bands)
     if request.tranche_size <= 0:
         return (
             Validation(
@@ -486,14 +562,11 @@ def _validate_request(request: PlanRequest, available: int) -> tuple[Validation,
                 True,
             )
         )
-    required_rungs = len(
-        _pair_quantities(available, request.tranche_size, request.remainder_policy)
-    )
-    if len(request.target_percentages) < required_rungs:
+    if not request.target_percentages:
         failures.append(
             Validation(
-                "TARGET_RUNGS_INSUFFICIENT",
-                "target percentages do not cover every planned tranche",
+                "TARGET_PERCENTAGES_REQUIRED",
+                "provide at least one target percentage to create a bracket layer",
                 True,
             )
         )
@@ -535,11 +608,75 @@ def _validate_request(request: PlanRequest, available: int) -> tuple[Validation,
                 True,
             )
         )
-    if request.trigger_method is TriggerMethod.DEFAULT:
+    return tuple(failures)
+
+
+def _validate_layers(
+    layers: tuple[LayerRequest, ...],
+    available: int,
+    bands: tuple[PriceBand, ...],
+) -> tuple[Validation, ...]:
+    failures: list[Validation] = []
+    if not layers:
+        return (
+            Validation(
+                "LAYERS_REQUIRED",
+                "provide at least one explicitly priced OCA layer",
+                True,
+            ),
+        )
+    total = 0
+    for index, layer in enumerate(layers, start=1):
+        if layer.quantity <= 0:
+            failures.append(
+                Validation(
+                    "LAYER_QUANTITY_INVALID",
+                    f"layer {index} quantity must be a positive whole number",
+                    True,
+                )
+            )
+        total += layer.quantity
+        for label, price in (
+            ("target", layer.target_price),
+            ("stop", layer.stop_price),
+        ):
+            if not price.is_finite() or price <= 0:
+                failures.append(
+                    Validation(
+                        "LAYER_PRICE_INVALID",
+                        f"layer {index} {label} price must be finite and positive",
+                        True,
+                    )
+                )
+            elif _round_up(price, bands) != price:
+                failures.append(
+                    Validation(
+                        "LAYER_PRICE_INCREMENT_INVALID",
+                        f"layer {index} {label} price is not on the verified tick",
+                        True,
+                    )
+                )
+        if layer.tif not in {"DAY", "GTC"}:
+            failures.append(
+                Validation(
+                    "TIF_UNSUPPORTED",
+                    f"layer {index} time-in-force must be DAY or GTC",
+                    True,
+                )
+            )
+        if layer.stop_price >= layer.target_price:
+            failures.append(
+                Validation(
+                    "LAYER_PRICE_RELATION_INVALID",
+                    f"layer {index} stop price must be below its target price",
+                    True,
+                )
+            )
+    if total > available:
         failures.append(
             Validation(
-                "TRIGGER_METHOD_UNSUPPORTED",
-                "an explicit option stop trigger method is required",
+                "LAYER_QUANTITY_EXCEEDS_AVAILABLE",
+                "draft layers exceed the verified available quantity",
                 True,
             )
         )
@@ -562,10 +699,14 @@ def _pair_quantities(
     available: int,
     tranche_size: int,
     remainder_policy: RemainderPolicy,
+    *,
+    layer_limit: int | None = None,
 ) -> tuple[int, ...]:
     full, remainder = divmod(available, tranche_size)
-    quantities = [tranche_size] * full
-    if remainder:
+    full_limit = full if layer_limit is None else min(full, layer_limit)
+    quantities = [tranche_size] * full_limit
+    has_room_for_remainder = layer_limit is None or len(quantities) < layer_limit
+    if remainder and has_room_for_remainder:
         if remainder_policy is RemainderPolicy.ADD_TO_LAST and quantities:
             quantities[-1] += remainder
         else:
@@ -591,6 +732,10 @@ def _round_up(value: Decimal, bands: tuple[PriceBand, ...]) -> Decimal:
             return rounded
         candidate = rounded
     raise ValueError("market-rule rounding did not converge")
+
+
+def _percentage_from_basis(price: Decimal, basis: Decimal) -> Decimal:
+    return ((price / basis) - Decimal("1")) * Decimal("100")
 
 
 def _fingerprint(
@@ -624,7 +769,21 @@ def _fingerprint(
         "stop_loss_percentage": _decimal_text(request.stop_loss_percentage),
         "remainder_policy": request.remainder_policy.value,
         "tif": request.tif,
-        "trigger_method": request.trigger_method.value,
+        "layers": [
+            {
+                "quantity": layer.quantity,
+                "target_price": _decimal_text(layer.target_price),
+                "stop_price": _decimal_text(layer.stop_price),
+                "tif": layer.tif,
+                "target_percentage": (
+                    None
+                    if layer.target_percentage is None
+                    else _decimal_text(layer.target_percentage)
+                ),
+                "runner": layer.runner,
+            }
+            for layer in request.layers
+        ],
         "pair_quantities": pair_quantities,
         "working_orders": [
             {

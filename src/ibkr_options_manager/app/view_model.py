@@ -1,22 +1,24 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError, version
 from typing import Protocol
 
-from ..broker import SnapshotRequest
+from ..broker import PortfolioRequest, SnapshotRequest
 from ..domain import (
     BrokerSnapshot,
+    LayerRequest,
     PlanRequest,
     PlanStatus,
+    PriceBand,
     RemainderPolicy,
-    TriggerMethod,
     build_exit_plan,
 )
+from ..portfolio import PortfolioPosition, PortfolioResult, PortfolioStatus
 from ..snapshot import SnapshotResult, SnapshotStatus
 
 
@@ -43,13 +45,32 @@ class ConnectionSelection:
 
 
 @dataclass(frozen=True, slots=True)
+class ConnectionSettings:
+    account: str
+    port: int = 7497
+    client_id: int = 17
+    timeout_seconds: float = 20.0
+
+
+@dataclass(frozen=True, slots=True)
 class PlanForm:
     tranche_size: str = "2"
     target_percentages: str = "20, 40, 60, 80, 100"
     stop_loss_percentage: str = "20"
     remainder_policy: RemainderPolicy = RemainderPolicy.NEXT_RUNG
     tif: str = "GTC"
-    trigger_method: TriggerMethod = TriggerMethod.DOUBLE_BID_ASK
+    layers: tuple[DraftLayerForm, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DraftLayerForm:
+    quantity: str
+    target_price: str
+    stop_price: str
+    target_percentage: str
+    tif: str = "GTC"
+    runner: bool = False
+    stop_percentage: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,8 +90,8 @@ class PlanPairLine:
     stop_raw: Decimal
     stop_price: Decimal
     tif: str
-    trigger_method: str
     logical_group: str
+    runner: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +107,41 @@ class ValidationLine:
     code: str
     message: str
     blocking: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class PortfolioPositionLine:
+    con_id: int
+    local_symbol: str
+    quantity: str
+    unit_basis: str
+    working_order_count: int
+    eligible: bool
+    eligibility: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingOrderLine:
+    perm_id: int
+    action: str
+    order_type: str
+    remaining: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class QuoteCalculatorLine:
+    bid: Decimal | None
+    ask: Decimal | None
+    last: Decimal | None
+    market_data_type: str
+    fresh: bool
+    bands: tuple[PriceBand, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewRow:
+    values: tuple[str, str, str, str, str, str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,12 +161,35 @@ class ViewState:
     validations: tuple[ValidationLine, ...]
     fingerprint: str | None
     can_preview: bool
+    positions: tuple[PortfolioPositionLine, ...] = ()
+    selected_con_id: int | None = None
+    working_orders: tuple[WorkingOrderLine, ...] = ()
+    preview_headers: tuple[str, str, str, str, str, str] = (
+        "Pair",
+        "Qty",
+        "Target",
+        "Stop",
+        "TIF",
+        "Logical OCA",
+    )
+    preview_rows: tuple[PreviewRow, ...] = ()
+    bracket_form: PlanForm = PlanForm()
+    quote_calculator: QuoteCalculatorLine | None = None
+    available_quantity: int = 0
+    unit_basis: Decimal | None = None
+    multiplier: Decimal | None = None
 
 
 class SnapshotSource(Protocol):
     def refresh(self, request: SnapshotRequest) -> SnapshotResult: ...
 
     def current(self) -> SnapshotResult: ...
+
+
+class PortfolioSource(Protocol):
+    def refresh(self, request: PortfolioRequest) -> PortfolioResult: ...
+
+    def current(self) -> PortfolioResult: ...
 
 
 class PlannerViewModel:
@@ -121,14 +200,144 @@ class PlannerViewModel:
         snapshots: SnapshotSource,
         *,
         clock: Callable[[], Decimal],
+        portfolio: PortfolioSource | None = None,
     ) -> None:
         self._snapshots = snapshots
+        self._portfolio = portfolio
         self._clock = clock
         self._selection: ConnectionSelection | None = None
+        self._settings: ConnectionSettings | None = None
         self._account = ""
+        self._portfolio_positions: tuple[PortfolioPosition, ...] = ()
+        self._portfolio_lines: tuple[PortfolioPositionLine, ...] = ()
+        self._bracket_forms: dict[int, PlanForm] = {}
 
     def empty(self) -> ViewState:
         return _empty_state()
+
+    def refresh_portfolio(self, settings: ConnectionSettings) -> ViewState:
+        self._settings = settings
+        self._selection = None
+        self._account = settings.account
+        self._portfolio_positions = ()
+        self._portfolio_lines = ()
+        if self._portfolio is None:
+            return _portfolio_unavailable_state(
+                settings,
+                (ValidationLine("PORTFOLIO_UNAVAILABLE", "Portfolio source missing"),),
+            )
+        try:
+            result = self._portfolio.refresh(
+                PortfolioRequest(
+                    host="127.0.0.1",
+                    port=settings.port,
+                    client_id=settings.client_id,
+                    expected_account=settings.account,
+                    timeout_seconds=settings.timeout_seconds,
+                )
+            )
+        except Exception as error:  # the GUI boundary must fail closed
+            return _portfolio_unavailable_state(
+                settings,
+                (
+                    ValidationLine(
+                        "PORTFOLIO_REFRESH_FAILED", _redact(str(error), self._account)
+                    ),
+                ),
+            )
+        if result.status is not PortfolioStatus.READY or result.snapshot is None:
+            validations = tuple(
+                ValidationLine("PORTFOLIO_BLOCKED", _redact(message, self._account))
+                for message in result.errors
+            ) or (
+                ValidationLine("PORTFOLIO_BLOCKED", "No coherent portfolio is ready"),
+            )
+            return _portfolio_unavailable_state(settings, validations)
+
+        self._portfolio_positions = result.snapshot.positions
+        self._portfolio_lines = tuple(
+            _portfolio_line(position) for position in result.snapshot.positions
+        )
+        return _portfolio_ready_state(
+            result,
+            settings,
+            self._portfolio_lines,
+            now=self._clock(),
+        )
+
+    def select_position(
+        self,
+        con_id: int,
+        form: PlanForm | None = None,
+    ) -> ViewState:
+        settings = self._settings
+        if settings is None:
+            return _empty_state()
+        if con_id not in {
+            position.key.con_id for position in self._portfolio_positions
+        }:
+            return _portfolio_unavailable_state(
+                settings,
+                (
+                    ValidationLine(
+                        "POSITION_NOT_IN_PORTFOLIO", "Select a listed option position"
+                    ),
+                ),
+                positions=self._portfolio_lines,
+            )
+        self._selection = ConnectionSelection(
+            account=settings.account,
+            con_id=con_id,
+            port=settings.port,
+            client_id=settings.client_id,
+            timeout_seconds=settings.timeout_seconds,
+        )
+        chosen = self._bracket_forms.get(con_id, form or PlanForm())
+        try:
+            result = self._snapshots.refresh(
+                SnapshotRequest(
+                    host="127.0.0.1",
+                    port=settings.port,
+                    client_id=settings.client_id,
+                    expected_account=settings.account,
+                    option_con_id=con_id,
+                    timeout_seconds=settings.timeout_seconds,
+                )
+            )
+        except Exception as error:  # the GUI boundary must fail closed
+            state = _unavailable_state(
+                UiStatus.BLOCKED,
+                self._selection,
+                (
+                    ValidationLine(
+                        "POSITION_REFRESH_FAILED", _redact(str(error), self._account)
+                    ),
+                ),
+            )
+            return self._decorate(state, selected_con_id=con_id, form=chosen)
+        return self._present_selected(result, chosen)
+
+    def preview_action(self, form: PlanForm) -> ViewState:
+        if self._selection is None:
+            return _empty_state()
+        try:
+            result = self._snapshots.current()
+        except Exception as error:  # the GUI boundary must fail closed
+            state = _unavailable_state(
+                UiStatus.BLOCKED,
+                self._selection,
+                (
+                    ValidationLine(
+                        "SNAPSHOT_FAILED", _redact(str(error), self._account)
+                    ),
+                ),
+            )
+            return self._decorate(
+                state,
+                selected_con_id=self._selection.con_id,
+                form=form,
+            )
+        return self._present_selected(result, form)
 
     def refresh(
         self,
@@ -170,6 +379,71 @@ class PlannerViewModel:
             )
         return self._present(result, form)
 
+    def _present_selected(
+        self,
+        result: SnapshotResult,
+        form: PlanForm,
+    ) -> ViewState:
+        selection = self._selection
+        if selection is None:
+            return _empty_state()
+        if result.status is not SnapshotStatus.READY or result.snapshot is None:
+            status = (
+                UiStatus.STALE
+                if result.status is SnapshotStatus.STALE
+                else UiStatus.BLOCKED
+            )
+            validations = tuple(
+                ValidationLine("SNAPSHOT_BLOCKED", _redact(message, self._account))
+                for message in result.errors
+            ) or (ValidationLine("SNAPSHOT_BLOCKED", "No coherent snapshot is ready"),)
+            state = _unavailable_state(status, selection, validations)
+            return self._decorate(
+                state,
+                selected_con_id=selection.con_id,
+                form=form,
+            )
+
+        self._bracket_forms[selection.con_id] = form
+        state = _with_preview_rows(
+            _ready_state(result.snapshot, selection, form, now=self._clock()),
+            form,
+        )
+        return self._decorate(
+            state,
+            selected_con_id=selection.con_id,
+            form=form,
+            snapshot=result.snapshot,
+        )
+
+    def _decorate(
+        self,
+        state: ViewState,
+        *,
+        selected_con_id: int | None,
+        form: PlanForm,
+        snapshot: BrokerSnapshot | None = None,
+    ) -> ViewState:
+        orders = (
+            ()
+            if snapshot is None
+            else _working_order_lines(snapshot)
+        )
+        return replace(
+            state,
+            positions=self._portfolio_lines,
+            selected_con_id=selected_con_id,
+            working_orders=orders,
+            bracket_form=state.bracket_form
+            if state.bracket_form != PlanForm()
+            else form,
+            quote_calculator=(
+                None
+                if snapshot is None
+                else _quote_calculator_line(snapshot)
+            ),
+        )
+
     def _present(self, result: SnapshotResult, form: PlanForm) -> ViewState:
         selection = self._selection
         if selection is None:
@@ -185,11 +459,9 @@ class PlannerViewModel:
                 for message in result.errors
             ) or (ValidationLine("SNAPSHOT_BLOCKED", "No coherent snapshot is ready"),)
             return _unavailable_state(status, selection, validations)
-        return _ready_state(
-            result.snapshot,
-            selection,
+        return _with_preview_rows(
+            _ready_state(result.snapshot, selection, form, now=self._clock()),
             form,
-            now=self._clock(),
         )
 
 
@@ -266,8 +538,8 @@ def _ready_state(
             snapshot_age=_format_age(age),
             allocation=(
                 f"Position {_quantity(snapshot.position.quantity)}",
-                "Allocated —",
-                "Planned —",
+                "Reserved —",
+                "Bracketed —",
             ),
             pairs=(),
             route_marks=base_marks,
@@ -276,6 +548,7 @@ def _ready_state(
             ),
             fingerprint=None,
             can_preview=True,
+            quote_calculator=_quote_calculator_line(snapshot),
         )
 
     result = build_exit_plan(snapshot, request)
@@ -289,10 +562,8 @@ def _ready_state(
             stop_raw=pair.stop.raw_price,
             stop_price=pair.stop.rounded_price,
             tif=pair.target.tif,
-            trigger_method=pair.stop.trigger_method.value
-            if pair.stop.trigger_method is not None
-            else "—",
             logical_group=pair.target.logical_oca_group,
+            runner=pair.runner,
         )
         for pair in result.pairs
     )
@@ -320,7 +591,7 @@ def _ready_state(
                 f"S{pair.index}",
                 pair.stop_price,
                 "STOP",
-                f"{pair.quantity} contract(s) · {pair.trigger_method}",
+                f"{pair.quantity} contract(s)",
             )
             for pair in pairs
         ),
@@ -340,14 +611,160 @@ def _ready_state(
         snapshot_age=_format_age(age),
         allocation=(
             f"Position {_quantity(snapshot.position.quantity)}",
-            f"Allocated {result.allocated_quantity}",
-            f"Planned {result.planned_quantity}",
+            f"Reserved {result.allocated_quantity}",
+            (
+                f"Bracketed {result.planned_quantity} · Open "
+                f"{result.available_quantity - result.planned_quantity}"
+            ),
         ),
         pairs=pairs,
         route_marks=tuple(route_marks),
         validations=validations,
         fingerprint=result.fingerprint,
         can_preview=True,
+        quote_calculator=_quote_calculator_line(snapshot),
+        available_quantity=result.available_quantity,
+        unit_basis=snapshot.position.unit_basis,
+        multiplier=snapshot.contract.multiplier,
+    )
+
+
+def _with_preview_rows(state: ViewState, form: PlanForm) -> ViewState:
+    return replace(
+        state,
+        preview_rows=tuple(
+            PreviewRow(
+                (
+                    f"{pair.index:02d}",
+                    str(pair.quantity),
+                    f"{pair.target_price}  (+{pair.target_percentage}%)",
+                    str(pair.stop_price),
+                    pair.tif,
+                    pair.logical_group,
+                )
+            )
+            for pair in state.pairs
+        ),
+        bracket_form=form,
+    )
+
+
+def _quote_calculator_line(snapshot: BrokerSnapshot) -> QuoteCalculatorLine:
+    return QuoteCalculatorLine(
+        bid=snapshot.quote.bid,
+        ask=snapshot.quote.ask,
+        last=snapshot.quote.last,
+        market_data_type=snapshot.quote.market_data_type,
+        fresh=snapshot.quote.fresh,
+        bands=snapshot.market_rule.bands,
+    )
+
+
+def _portfolio_line(position: PortfolioPosition) -> PortfolioPositionLine:
+    return PortfolioPositionLine(
+        con_id=position.key.con_id,
+        local_symbol=position.contract.local_symbol or str(position.key.con_id),
+        quantity=_quantity(position.quantity),
+        unit_basis="—" if position.unit_basis is None else _money(position.unit_basis),
+        working_order_count=len(position.working_orders),
+        eligible=position.eligible,
+        eligibility=position.eligibility,
+    )
+
+
+def _portfolio_ready_state(
+    result: PortfolioResult,
+    settings: ConnectionSettings,
+    positions: tuple[PortfolioPositionLine, ...],
+    *,
+    now: Decimal,
+) -> ViewState:
+    snapshot = result.snapshot
+    if snapshot is None:
+        return _portfolio_unavailable_state(
+            settings,
+            (ValidationLine("PORTFOLIO_BLOCKED", "No coherent portfolio is ready"),),
+        )
+    age = max(Decimal("0"), now - snapshot.captured_at)
+    count = len(positions)
+    return ViewState(
+        status=UiStatus.READY,
+        status_message=(
+            f"{count} open option position{'s' if count != 1 else ''} · select one"
+            if count
+            else "No open option positions found"
+        ),
+        account=_redact_account(settings.account),
+        connection=(
+            Fact("Endpoint", f"127.0.0.1:{settings.port}", FactState.PASS),
+            Fact("Client ID", str(settings.client_id), FactState.PASS),
+            Fact(
+                "Server / API",
+                f"{snapshot.server_version or 'unknown'} / {_api_version()}",
+            ),
+            Fact("Server time", _server_time(snapshot.server_time)),
+            Fact("Read-only API", "verified", FactState.PASS),
+            Fact("Localhost only", "verified", FactState.PASS),
+            Fact("Paper account", _redact_account(settings.account), FactState.PASS),
+            Fact("Connection epoch", str(snapshot.connection_epoch)),
+            Fact("Snapshot age", _format_age(age), FactState.PASS),
+        ),
+        position_title="Select an open option position",
+        position=(),
+        quote=(),
+        market_rule=(),
+        snapshot_age=_format_age(age),
+        allocation=("Position —", "Reserved —", "Bracketed —"),
+        pairs=(),
+        route_marks=(),
+        validations=(),
+        fingerprint=None,
+        can_preview=False,
+        positions=positions,
+    )
+
+
+def _portfolio_unavailable_state(
+    settings: ConnectionSettings,
+    validations: tuple[ValidationLine, ...],
+    *,
+    positions: tuple[PortfolioPositionLine, ...] = (),
+) -> ViewState:
+    return ViewState(
+        status=UiStatus.BLOCKED,
+        status_message="Portfolio state is not ready",
+        account=_redact_account(settings.account),
+        connection=(
+            Fact("Endpoint", f"127.0.0.1:{settings.port}"),
+            Fact("Client ID", str(settings.client_id)),
+            Fact("Safety state", "not verified", FactState.BLOCKED),
+        ),
+        position_title="No verified position",
+        position=(),
+        quote=(),
+        market_rule=(),
+        snapshot_age="—",
+        allocation=("Position —", "Reserved —", "Bracketed —"),
+        pairs=(),
+        route_marks=(),
+        validations=validations,
+        fingerprint=None,
+        can_preview=False,
+        positions=positions,
+    )
+
+
+def _working_order_lines(snapshot: BrokerSnapshot) -> tuple[WorkingOrderLine, ...]:
+    return tuple(
+        WorkingOrderLine(
+            perm_id=order.perm_id,
+            action=order.action,
+            order_type=order.order_type,
+            remaining=_quantity(order.remaining),
+            status=order.status,
+        )
+        for order in snapshot.working_orders
+        if order.key == snapshot.selected
     )
 
 
@@ -374,7 +791,7 @@ def _unavailable_state(
         quote=(),
         market_rule=(),
         snapshot_age="—",
-        allocation=("Position —", "Allocated —", "Planned —"),
+        allocation=("Position —", "Reserved —", "Bracketed —"),
         pairs=(),
         route_marks=(),
         validations=validations,
@@ -394,7 +811,7 @@ def _empty_state() -> ViewState:
         quote=(),
         market_rule=(),
         snapshot_age="—",
-        allocation=("Position —", "Allocated —", "Planned —"),
+        allocation=("Position —", "Reserved —", "Bracketed —"),
         pairs=(),
         route_marks=(),
         validations=(),
@@ -407,6 +824,21 @@ def _parse_plan_form(
     form: PlanForm,
 ) -> tuple[PlanRequest | None, ValidationLine | None]:
     try:
+        layers = tuple(
+            LayerRequest(
+                quantity=int(layer.quantity.strip()),
+                target_price=Decimal(layer.target_price.strip()),
+                stop_price=Decimal(layer.stop_price.strip()),
+                tif=layer.tif.strip().upper(),
+                target_percentage=(
+                    None
+                    if not layer.target_percentage.strip()
+                    else Decimal(layer.target_percentage.strip())
+                ),
+                runner=layer.runner,
+            )
+            for layer in form.layers
+        )
         tranche_size = int(form.tranche_size.strip())
         targets = tuple(
             Decimal(part.strip())
@@ -426,7 +858,7 @@ def _parse_plan_form(
             stop_loss_percentage=stop,
             remainder_policy=form.remainder_policy,
             tif=form.tif.strip().upper(),
-            trigger_method=form.trigger_method,
+            layers=layers,
         ),
         None,
     )

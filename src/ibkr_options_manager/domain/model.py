@@ -15,16 +15,6 @@ class RemainderPolicy(StrEnum):
     ADD_TO_LAST = "ADD_TO_LAST"
 
 
-class TriggerMethod(StrEnum):
-    DEFAULT = "DEFAULT"
-    DOUBLE_BID_ASK = "DOUBLE_BID_ASK"
-    LAST = "LAST"
-    DOUBLE_LAST = "DOUBLE_LAST"
-    BID_ASK = "BID_ASK"
-    LAST_OR_BID_ASK = "LAST_OR_BID_ASK"
-    MIDPOINT = "MIDPOINT"
-
-
 @dataclass(frozen=True, slots=True)
 class ContractKey:
     account: str
@@ -120,7 +110,19 @@ class PlanRequest:
     stop_loss_percentage: Decimal
     remainder_policy: RemainderPolicy
     tif: str
-    trigger_method: TriggerMethod
+    layers: tuple[LayerRequest, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class LayerRequest:
+    """One explicitly priced, read-only OCA-layer draft."""
+
+    quantity: int
+    target_price: Decimal
+    stop_price: Decimal
+    tif: str
+    target_percentage: Decimal | None = None
+    runner: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +142,6 @@ class OrderIntent:
     raw_price: Decimal
     rounded_price: Decimal
     tif: str
-    trigger_method: TriggerMethod | None
     logical_oca_group: str
     oca_type: int
 
@@ -152,6 +153,7 @@ class ExitPair:
     quantity: int
     target: OrderIntent
     stop: OrderIntent
+    runner: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,3 +165,12 @@ class PlanResult:
     planned_quantity: int
     pairs: tuple[ExitPair, ...]
     validations: tuple[Validation, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ReferencePricePreview:
+    reference_price: Decimal
+    target_percentage: Decimal
+    target_price: Decimal
+    stop_loss_percentage: Decimal
+    stop_price: Decimal

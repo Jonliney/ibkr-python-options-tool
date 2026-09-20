@@ -118,11 +118,10 @@ without a broker session.
    than configured. Re-evaluate the market-rule band after rounding, since an
    increment can change at a price edge.
 
-9. **Stop trigger behavior must be explicit.** IBKR documents several trigger
-   methods and notes that US options default to double bid/ask while other
-   options default to last. The request and preview must include the selected
-   trigger method and explain it. Unsupported method/security-type pairs block
-   the plan.
+9. **Stop trigger behavior follows TWS defaults.** Trigger method is a property
+   of an individual simulated stop, not its OCA group. Milestone 1 does not
+   expose or override it; a later execution milestone must preserve the
+   broker's default behaviour and verify its execution semantics in paper TWS.
 
 10. **Milestone 1 cannot yet prove submission idempotency.** It can and should
     prove deterministic plan generation and assign a semantic plan fingerprint.
@@ -181,9 +180,9 @@ At minimum, use explicit immutable types for:
 - `MarketRule(exchange, bands, observed_at)`;
 - `BrokerSnapshot(completion_times, connection_epoch, errors, ...)`;
 - `PlanRequest(tranche_size, target_percentages, stop_loss_percentage,
-  remainder_policy, tif, trigger_method)`;
+  remainder_policy, tif)`;
 - `OrderIntent(action, order_type, quantity, raw_price, rounded_price, tif,
-  trigger_method, logical_oca_group)`;
+  logical_oca_group)`;
 - `PlanResult(status, fingerprint, allocated, available, pairs, validations)`.
 
 Never use display labels, symbols, or local symbols as identity. The selected
@@ -402,7 +401,6 @@ all(price is valid under the selected market rule)
 - [One-shot `reqAllOpenOrders` behavior](https://www.interactivebrokers.com/docs/tws-api/doc/order-management/requesting-currently-active-orders/all-submitted-orders)
 - [Position subscription behavior](https://www.interactivebrokers.com/docs/tws-api/doc/account-portfolio-data/positions/request-positions)
 - [Market-rule lookup](https://www.interactivebrokers.com/docs/tws-api/doc/orders/minimum-price-increment/request-market-rule)
-- [Stop trigger methods](https://www.interactivebrokers.com/docs/tws-api/doc/orders/trigger-methods)
 - [Paper-trading limitations](https://www.interactivebrokers.com/docs/tws-api/doc/notes-limitations/limitations/paper-trading)
 - [Official TWS API installation source](https://www.interactivebrokers.com/docs/tws-api/doc/download-the-tws-api/introduction)
 - [TWS API changelog](https://www.interactivebrokers.com/docs/tws-api/changelog)
