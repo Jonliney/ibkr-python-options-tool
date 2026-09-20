@@ -8,9 +8,10 @@ adaptive
 
 ## Stack
 
-Python 3.12 with PySide6 for the local desktop interface, backed by the
-existing transport-neutral snapshot coordinator and pure planner. The official
-IBKR Python API remains isolated behind the read-only broker seam.
+Python 3.12 with a PySide6 desktop shell and embedded, local-only
+StarHTML/StarUI workbench, backed by the existing transport-neutral snapshot
+coordinator and pure planner. The official IBKR Python API remains isolated
+behind the read-only broker seam.
 
 ## Users
 

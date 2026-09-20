@@ -31,10 +31,10 @@ Slice 2 is complete with an official-API
 [read-only coherent snapshot adapter](docs/SNAPSHOTS.md). Its deterministic
 offline suite and redacted paper-TWS smoke test pass.
 
-Slice 3 now has a runnable PySide6
-[read-only desktop preview](docs/DESKTOP_PREVIEW.md) with connection evidence,
-exact-position verification, plan controls, a plotted price route, target/stop
-pairs, and blocking validations. It remains structurally unable to send an
+Slice 3 now has a runnable PySide6 desktop shell containing a local
+StarHTML/StarUI [read-only desktop preview](docs/DESKTOP_PREVIEW.md). It
+provides position inventory, draft layer controls, outcome projection, and a
+chronological order review while remaining structurally unable to send an
 order.
 
 To rehearse the desktop workbench without TWS or market data, start it with

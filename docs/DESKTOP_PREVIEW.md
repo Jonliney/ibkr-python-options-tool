@@ -1,9 +1,12 @@
 # Read-only desktop preview
 
-Slice 3 provides one PySide6 window for refreshing a coherent paper-TWS
-snapshot and rebuilding the pure exit-plan preview. It has no arm, confirm,
+Slice 3 provides one PySide6 desktop shell containing a locally served,
+embedded StarHTML/StarUI workbench. It refreshes a coherent paper-TWS snapshot
+and rebuilds the pure exit-plan preview. The loopback web server exposes only
+the local workbench during the process lifetime; it has no arm, confirm,
 submit, modify, cancel, bind, exercise, or global-cancel control or transport
-path.
+path. The WebView also rejects every request whose destination is not its own
+`127.0.0.1` server.
 
 ## Launch
 
@@ -34,9 +37,9 @@ local deterministic data set:
 It automatically refreshes four illustrative long option positions. The first
 includes a simulated external sell limit for five contracts, so both the
 available-quantity and external-coverage states can be exercised. The header
-states `SIMULATED DATA · NO TWS`; this mode neither connects to TWS nor sends,
-modifies, or cancels an order. Optional `--con-id` values must be one of the
-contracts present in the simulated data.
+states `SIMULATED DATA`; this mode neither connects to TWS nor sends, modifies,
+or cancels an order. Optional `--con-id` values must be one of the contracts
+present in the simulated data.
 
 The account must use the project's `DU` paper-account allowlist convention.
 The exact ID is kept only in memory for the current process. The evidence view
@@ -46,26 +49,29 @@ visible plan and requires another refresh.
 ## Workflow
 
 1. Verify the literal loopback endpoint, paper port, nonzero client ID, and
-   exact paper account and option conId.
-2. Select **Refresh paper snapshot**. The previous snapshot and preview are
-   cleared before the background read begins.
-3. Inspect connection evidence, the exact verified option position, quote,
-   market rule, current allocation, and snapshot age.
-4. Adjust tranche size, ordered target percentages, stop loss, remainder
-   policy, TIF, or explicit stop-trigger method.
-5. Select **Rebuild preview**. This reruns only the pure planner against the
-   current snapshot and never refreshes or writes broker state.
-6. Inspect the plotted basis/quote/target/stop route, target-stop table,
-   logical OCA grouping, rounded prices, and every blocking validation.
+   exact paper account.
+2. Select **Refresh**, which invalidates the previous snapshot before the
+   read begins. The first returned option is selected by default.
+3. Choose an eligible position from the persistent long-position inventory.
+   Associated open orders are prominently called out; only the verified
+   unassociated quantity can be drafted.
+4. Use **Draft layers** to adjust each layer's target percentage, stop-loss
+   percentage, quantity, and TIF. Dollar prices are derived from cost basis
+   using the verified market rule. **Equal split** distributes every verified
+   available contract across the current rows.
+5. Review the expected gain, maximum loss, breakeven threshold, and the
+   chronological sell-limit/sell-stop action review.
+6. Select **Preview current draft**. It re-runs only the pure planner against
+   the current verified snapshot and never refreshes or writes broker state.
 
-The first quick-hack workflow selects one conId directly rather than exposing a
-browsable multi-position inventory. An ineligible or ambiguous selection stays
-visible as a blocked state with its reason. Expanding this into an all-position
-selector remains a follow-up within the desktop phase.
+**Active layers** is intentionally labelled as unavailable: management of
+submitted brackets belongs to a later, explicitly authorised transmission
+milestone. No UI control suggests it can modify an existing order.
 
 ## Safety behavior
 
-- The permanent banner states `READ-ONLY PREVIEW — ORDERS CANNOT BE SENT`.
+- The action review states that no order will be placed, modified, or
+  cancelled, and **Transmission locked** remains disabled.
 - Only loopback hosts and `DU` paper-account IDs pass request construction.
 - Unknown or false read-only, localhost-only, account, freshness, completion,
   contract-identity, quote, allocation, or market-rule state blocks a valid
@@ -85,10 +91,9 @@ selector remains a follow-up within the desktop phase.
 .venv/bin/python -m ruff check src tests
 ```
 
-Qt tests run offscreen and cover the permanent safety notice, the absence of
-order-action controls, blocked-refresh invalidation, connection-field
-invalidation, repeated preview behavior, table rendering, and keyboard focus
-flow. The production AST scan continues to reject forbidden IBKR order calls.
+The deterministic web-surface tests cover inventory rendering, draft-layer
+addition/removal, previewing, and the permanent transmission lock. The
+production AST scan continues to reject forbidden IBKR order calls.
 
 Paper behavior remains simulation evidence only and does not establish that
 live stop or complex-order execution will behave identically.

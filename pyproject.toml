@@ -9,6 +9,8 @@ description = "Read-only planning tools for long option exits in IBKR TWS"
 requires-python = ">=3.12"
 dependencies = [
   "PySide6>=6.10,<7",
+  "starhtml>=0.7,<0.8",
+  "starui==0.3.2",
 ]
 
 [project.optional-dependencies]
@@ -41,9 +43,22 @@ mypy_path = "src"
 module = ["ibapi.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["ibkr_options_manager.app.web.components.*"]
+ignore_errors = true
+
 [tool.ruff]
 line-length = 88
 src = ["src", "tests"]
+extend-exclude = ["src/ibkr_options_manager/app/web/components"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.starui]
+component_dir = "src/ibkr_options_manager/app/web/components/ui"
+css_output = "src/ibkr_options_manager/app/web/static/starui.css"
+css_dir = "."
+
+[tool.setuptools.package-data]
+"ibkr_options_manager.app.web" = ["assets/*.json", "static/*.css"]

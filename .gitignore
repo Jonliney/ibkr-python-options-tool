@@ -4,3 +4,13 @@ __pycache__/
 *.egg-info/
 .impeccable/questions/
 .impeccable/review/
+
+# StarUI generated files
+starui.css
+*.css.map
+!src/ibkr_options_manager/app/web/static/
+!src/ibkr_options_manager/app/web/static/starui.css
+
+# StarUI cache
+.starui/
+.sesskey

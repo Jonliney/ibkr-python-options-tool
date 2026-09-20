@@ -13,7 +13,7 @@ from ..portfolio import PortfolioCoordinator
 from ..snapshot import SnapshotCoordinator
 from .demo import DEMO_ACCOUNT, DEMO_CON_IDS, DemoReadOnlyBroker, DemoSnapshotSource
 from .view_model import PlannerViewModel
-from .window import PlannerWindow
+from .web_window import StarUIPlannerWindow
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,7 +67,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         clock=clock,
     )
     view_model = PlannerViewModel(coordinator, portfolio=portfolio, clock=clock)
-    window = PlannerWindow(
+    window = StarUIPlannerWindow(
         view_model,
         initial_account=initial_account,
         initial_con_id=args.con_id,

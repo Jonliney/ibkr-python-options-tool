@@ -3,12 +3,12 @@ from decimal import Decimal
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
+from starlette.testclient import TestClient
 
 from ibkr_options_manager.app.demo import DEMO_ACCOUNT, DEMO_CON_IDS, DemoReadOnlyBroker
 from ibkr_options_manager.app.main import build_parser, main
-from ibkr_options_manager.app.window import PlannerWindow
+from ibkr_options_manager.app.web import StarUIWorkbench
 from ibkr_options_manager.broker import PortfolioRequest, SnapshotRequest
 from ibkr_options_manager.portfolio import PortfolioCoordinator, PortfolioStatus
 from ibkr_options_manager.snapshot import SnapshotCoordinator, SnapshotStatus
@@ -68,36 +68,116 @@ def test_demo_broker_exercises_inventory_and_reserved_quantity_without_tws() -> 
     assert snapshot.snapshot.position.unit_basis == Decimal("2.74")
 
 
-def test_demo_launch_populates_the_first_contract_without_a_tws_refresh() -> None:
-    application = QApplication.instance() or QApplication([])
+def test_demo_launch_populates_the_starui_workbench_without_a_tws_refresh() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
 
-    assert main(["--demo-data"]) == 0
-    window = next(
-        widget
-        for widget in application.topLevelWidgets()
-        if isinstance(widget, PlannerWindow)
-    )
-
-    assert window.demo_indicator.isVisible()
-    assert len(window._state.positions) == 4
-    assert window._state.selected_con_id is not None
-    assert window._state.quote_calculator is not None
-    window.close()
+    assert len(workbench._state.positions) == 4
+    assert workbench._state.selected_con_id is not None
+    assert workbench._state.quote_calculator is not None
+    assert workbench._state.available_quantity == 5
 
 
 def test_demo_preview_does_not_expire_using_the_live_snapshot_age_setting() -> None:
-    application = QApplication.instance() or QApplication([])
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._preview_locked()
 
-    assert main(["--demo-data", "--max-age", "0.001"]) == 0
-    window = next(
-        widget
-        for widget in application.topLevelWidgets()
-        if isinstance(widget, PlannerWindow)
+    assert workbench._state.selected_con_id is not None
+    assert workbench._state.available_quantity == 5
+    assert workbench._state.quote_calculator is not None
+
+
+def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    client = TestClient(workbench.app)
+
+    page = client.get(workbench.path)
+    assert page.status_code == 200
+    assert "Layered OCA draft" in page.text
+    assert "Transmission locked" in page.text
+    assert "Connection &amp; layer defaults" in page.text
+    assert "<dialog" in page.text
+    assert "cdn.jsdelivr.net" not in page.text
+    assert "api.iconify.design" not in page.text
+
+    response = client.post(
+        workbench.path + "action",
+        data={
+            "action": "add-layer",
+            "target_presets": "20, 40, 60, 100",
+            "stop_presets": "25",
+            "target_1": "20",
+            "stop_1": "25",
+            "quantity_1": "5",
+            "tif_1": "DAY",
+        },
     )
-    QTest.qWait(20)
-    window._preview()
 
-    assert window._state.selected_con_id is not None
-    assert window._state.available_quantity == 5
-    assert window._state.quote_calculator is not None
-    window.close()
+    assert response.status_code == 200
+    assert [layer.quantity for layer in workbench._current_layers()] == ["3", "2"]
+    assert workbench._current_layers()[0].tif == "DAY"
+
+    response = client.post(
+        workbench.path + "action",
+        data={
+            "action": "remove-layer:1",
+            "target_presets": "20, 40, 60, 100",
+            "stop_presets": "25",
+            "target_1": "20",
+            "stop_1": "25",
+            "quantity_1": "3",
+            "target_2": "40",
+            "stop_2": "25",
+            "quantity_2": "2",
+        },
+    )
+
+    assert response.status_code == 200
+    assert [layer.quantity for layer in workbench._current_layers()] == ["2"]
+
+
+def test_main_builds_the_embedded_starui_window(monkeypatch: object) -> None:
+    QApplication.instance() or QApplication([])
+    created: list[_WindowStub] = []
+
+    def window_factory(*args: object, **kwargs: object) -> _WindowStub:
+        window = _WindowStub(*args, **kwargs)
+        created.append(window)
+        return window
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "ibkr_options_manager.app.main.StarUIPlannerWindow", window_factory
+    )
+
+    assert main(["--demo-data"]) == 0
+    assert len(created) == 1
+    assert created[0].demo_loaded is True
+
+
+def _demo_workbench() -> StarUIWorkbench:
+    def clock() -> Decimal:
+        return Decimal("100")
+
+    broker = DemoReadOnlyBroker(clock=clock)
+    snapshots = SnapshotCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock)
+    portfolio = PortfolioCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock)
+    from ibkr_options_manager.app.view_model import PlannerViewModel
+
+    return StarUIWorkbench(
+        PlannerViewModel(snapshots, portfolio=portfolio, clock=clock),
+        initial_account=DEMO_ACCOUNT,
+        demo_mode=True,
+    )
+
+
+class _WindowStub:
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        self.demo_loaded = False
+
+    def show(self) -> None:
+        pass
+
+    def load_demo_data(self) -> None:
+        self.demo_loaded = True
