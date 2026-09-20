@@ -106,9 +106,15 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert page.status_code == 200
     assert "Layered OCA draft" in page.text
     assert "Transmission locked" in page.text
+    assert "Preview only" not in page.text
+    assert "SELL LMT" in page.text
+    assert "SELL STP" in page.text
     assert "150 CALL · SEP 25 '26" in page.text
     assert "Connection &amp; layer defaults" in page.text
     assert "<dialog" in page.text
+    assert "h-screen overflow-hidden" in page.text
+    assert 'aria-label="Draft layers"' in page.text
+    assert 'aria-label="Planned order actions"' in page.text
     assert "cdn.jsdelivr.net" not in page.text
     assert "api.iconify.design" not in page.text
 

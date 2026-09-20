@@ -343,9 +343,9 @@ class StarUIWorkbench:
                 self._inventory(),
                 self._workspace(title),
                 self._review(),
-                cls="grid min-h-[calc(100vh-57px)] grid-cols-[16rem_minmax(0,1fr)_19rem] border-t border-border",
+                cls="grid h-[calc(100vh-3.5rem)] min-h-0 grid-cols-[16rem_minmax(0,1fr)_19rem] overflow-hidden border-t border-border",
             ),
-            cls="min-h-screen bg-background text-foreground selection:bg-primary selection:text-primary-foreground",
+            cls="h-screen overflow-hidden bg-background text-foreground selection:bg-primary selection:text-primary-foreground",
         )
 
     def _header(self, ready: bool) -> Any:
@@ -416,9 +416,9 @@ class StarUIWorkbench:
             ScrollArea(
                 *rows,
                 aria_label="Open option positions",
-                cls="h-[calc(100vh-3.5rem)]",
+                cls="min-h-0 flex-1",
             ),
-            cls="border-r border-border bg-card/30",
+            cls="flex min-h-0 flex-col overflow-hidden border-r border-border bg-card/30",
         )
 
     def _settings_dialog(self) -> Any:
@@ -512,14 +512,35 @@ class StarUIWorkbench:
             ),
             P(f"{self._state.available_quantity} contracts verified available to bracket", cls="mt-2 text-sm font-medium text-emerald-400"),
             Tabs(
-                TabsList(TabsTrigger("Draft layers", id="draft"), TabsTrigger("Active layers", id="active", disabled=True), variant="line"),
-                TabsContent(self._draft_panel(), id="draft", cls="mt-5"),
-                TabsContent(P("Active layer management arrives with the future transmission milestone."), id="active"),
+                TabsList(
+                    TabsTrigger("Draft layers", id="draft"),
+                    TabsTrigger("Active layers", id="active", disabled=True),
+                    variant="line",
+                ),
+                TabsContent(
+                    ScrollArea(
+                        self._draft_panel(),
+                        aria_label="Draft layers",
+                        orientation="both",
+                        cls="h-full",
+                    ),
+                    id="draft",
+                    cls="mt-5 min-h-0 flex-1",
+                    style="overflow: hidden",
+                ),
+                TabsContent(
+                    P(
+                        "Active layer management arrives with the future transmission milestone."
+                    ),
+                    id="active",
+                    cls="mt-5 min-h-0 flex-1",
+                    style="overflow: hidden",
+                ),
                 value="draft",
                 variant="line",
-                cls="mt-5",
+                cls="mt-5 flex min-h-0 flex-1 flex-col",
             ),
-            cls="min-w-0 px-8 py-6",
+            cls="flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6",
         )
 
     def _draft_panel(self) -> Any:
@@ -605,21 +626,45 @@ class StarUIWorkbench:
 
     def _review(self) -> Any:
         layers = self._current_layers()
-        actions: list[str] = []
-        for index, layer in enumerate(layers, start=1):
-            actions.extend((f"SELL LMT · {layer.quantity}", f"${layer.target_price} · {layer.tif} · OCA-{index}"))
-            actions.extend((f"SELL STP · {layer.quantity}", f"${layer.stop_price} · {layer.tif} · OCA-{index}"))
         action_rows = [
-            Div(P(action, cls="font-mono text-xs font-semibold"), P(detail, cls="mt-1 text-xs text-muted-foreground"), cls="border-b border-border py-3")
-            for action, detail in zip(actions[::2], actions[1::2], strict=True)
+            self._review_pair(index, layer)
+            for index, layer in enumerate(layers, start=1)
         ]
         return Div(
             Div(Span("ACTION REVIEW", cls="text-xs font-semibold tracking-wide text-muted-foreground"), Badge("DRAFT", variant="outline", cls="text-[10px]"), cls="flex items-center justify-between px-4 py-4"),
-            Alert(AlertTitle("Preview only"), AlertDescription("No order will be placed, modified, or cancelled."), cls="mx-4 border-emerald-500/40 bg-emerald-500/10 text-emerald-100"),
-            ScrollArea(*action_rows, aria_label="Planned order actions", cls="h-[calc(100vh-19rem)] px-4"),
+            ScrollArea(
+                *action_rows,
+                aria_label="Planned order actions",
+                cls="min-h-0 flex-1 px-4",
+            ),
             Form(Button("Preview current draft", variant="outline", type="submit", cls="w-full"), HTMLInput(type="hidden", name="action", value="preview"), action=f"/{self.session_token}/action", method="post", cls="border-t border-border p-4"),
             Button("Transmission locked", disabled=True, cls="mx-4 mb-4 w-[calc(100%-2rem)]"),
-            cls="border-l border-border bg-card/30",
+            cls="flex min-h-0 flex-col overflow-hidden border-l border-border bg-card/30",
+        )
+
+    def _review_pair(self, index: int, layer: DraftLayerForm) -> Any:
+        return Div(
+            Div(
+                P(f"OCA-{index}", cls="text-xs font-semibold"),
+                P(
+                    f"{layer.quantity} contracts · {layer.tif}",
+                    cls="mt-0.5 text-xs text-muted-foreground",
+                ),
+            ),
+            Div(
+                Div(
+                    Span("SELL LMT", cls="text-xs font-semibold text-emerald-400"),
+                    Span(f"${layer.target_price}", cls="text-sm font-semibold text-emerald-400"),
+                    cls="flex items-center justify-between gap-3",
+                ),
+                Div(
+                    Span("SELL STP", cls="text-xs font-semibold text-rose-400"),
+                    Span(f"${layer.stop_price}", cls="text-sm font-semibold text-rose-400"),
+                    cls="flex items-center justify-between gap-3",
+                ),
+                cls="mt-3 space-y-3 border-l-2 border-border pl-3",
+            ),
+            cls="border-b border-border py-4",
         )
 
 
