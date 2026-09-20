@@ -9,6 +9,7 @@ from starlette.testclient import TestClient
 from ibkr_options_manager.app.demo import DEMO_ACCOUNT, DEMO_CON_IDS, DemoReadOnlyBroker
 from ibkr_options_manager.app.main import build_parser, main
 from ibkr_options_manager.app.web import StarUIWorkbench
+from ibkr_options_manager.app.web.surface import _position_identity
 from ibkr_options_manager.broker import PortfolioRequest, SnapshotRequest
 from ibkr_options_manager.portfolio import PortfolioCoordinator, PortfolioStatus
 from ibkr_options_manager.snapshot import SnapshotCoordinator, SnapshotStatus
@@ -78,6 +79,14 @@ def test_demo_launch_populates_the_starui_workbench_without_a_tws_refresh() -> N
     assert workbench._state.available_quantity == 5
 
 
+def test_position_identity_preserves_the_inventory_scan_order() -> None:
+    assert _position_identity("MSTR  260925C00150000") == (
+        "MSTR",
+        "150 CALL · SEP 25 '26",
+    )
+    assert _position_identity("Unknown contract") == ("Unknown", "contract")
+
+
 def test_demo_preview_does_not_expire_using_the_live_snapshot_age_setting() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -97,6 +106,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert page.status_code == 200
     assert "Layered OCA draft" in page.text
     assert "Transmission locked" in page.text
+    assert "150 CALL · SEP 25 '26" in page.text
     assert "Connection &amp; layer defaults" in page.text
     assert "<dialog" in page.text
     assert "cdn.jsdelivr.net" not in page.text

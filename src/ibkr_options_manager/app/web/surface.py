@@ -3,6 +3,7 @@ from __future__ import annotations
 # ruff: noqa: E501
 import json
 from dataclasses import replace
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from secrets import token_urlsafe
@@ -373,24 +374,32 @@ class StarUIWorkbench:
         rows = []
         for position in self._state.positions:
             selected = position.con_id == self._selected_con_id
+            symbol, contract_detail = _position_identity(position.local_symbol)
             rows.append(
                 Form(
                     Button(
                         Div(
-                            Span(position.local_symbol.split(maxsplit=1)[0], cls="font-semibold"),
-                            Span(f"{position.quantity} / {position.quantity}", cls="font-mono text-xs"),
-                            cls="flex justify-between",
+                            Span(symbol, cls="text-sm font-semibold"),
+                            Badge(position.quantity, variant="secondary"),
+                            cls="flex w-full items-center justify-between",
                         ),
-                        P(position.local_symbol.split(maxsplit=1)[-1], cls="mt-1 font-mono text-xs text-muted-foreground"),
-                        Div(
-                            Span(f"Basis ${position.unit_basis}", cls="text-xs text-muted-foreground"),
-                            Badge(position.eligibility, variant="outline", cls="text-[10px]"),
-                            cls="mt-3 flex items-center justify-between",
+                        P(
+                            contract_detail,
+                            cls="mt-1.5 w-full text-xs text-muted-foreground",
                         ),
-                        variant="secondary" if selected else "ghost",
+                        variant="ghost",
                         disabled=not position.eligible,
                         type="submit",
-                        cls="h-auto w-full justify-start rounded-none px-3 py-3 text-left",
+                        cls=(
+                            "h-auto min-h-20 w-full flex-col items-stretch justify-center gap-0 "
+                            "rounded-none border-l-2 px-4 py-4 text-left transition-colors "
+                            "hover:bg-accent "
+                            + (
+                                "border-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/15"
+                                if selected
+                                else "border-transparent"
+                            )
+                        ),
                     ),
                     HTMLInput(type="hidden", name="action", value="select"),
                     HTMLInput(type="hidden", name="con_id", value=str(position.con_id)),
@@ -619,6 +628,31 @@ def _field(label: str, control: Any, suffix: str | None = None) -> Any:
         Label(label, cls="text-xs font-medium text-muted-foreground"),
         Div(control, Span(suffix, cls="shrink-0 font-mono text-xs text-muted-foreground") if suffix else None, cls="mt-1 flex items-center gap-2"),
         cls="min-w-0 space-y-0.5",
+    )
+
+
+def _position_identity(local_symbol: str) -> tuple[str, str]:
+    """Render IBKR's OCC-style local symbol as a compact inventory label."""
+    parts = local_symbol.split(maxsplit=1)
+    symbol = parts[0] if parts else local_symbol
+    contract = parts[1] if len(parts) > 1 else ""
+    if (
+        len(contract) != 15
+        or not contract[:6].isdigit()
+        or contract[6] not in {"C", "P"}
+        or not contract[7:].isdigit()
+    ):
+        return symbol, contract or "Option contract"
+    try:
+        expiry = datetime.strptime(contract[:6], "%y%m%d")
+    except ValueError:
+        return symbol, contract
+    strike = Decimal(contract[7:]) / Decimal("1000")
+    right = "CALL" if contract[6] == "C" else "PUT"
+    return (
+        symbol,
+        f"{format(strike, 'f')} {right} · {expiry.strftime('%b').upper()} "
+        f"{expiry.day} '{expiry.strftime('%y')}",
     )
 
 
