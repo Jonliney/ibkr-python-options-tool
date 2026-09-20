@@ -113,10 +113,34 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert "Connection &amp; layer defaults" in page.text
     assert "<dialog" in page.text
     assert "h-screen overflow-hidden" in page.text
-    assert 'aria-label="Draft layers"' in page.text
+    assert 'aria-label="Draft layer rows"' in page.text
     assert 'aria-label="Planned order actions"' in page.text
     assert "cdn.jsdelivr.net" not in page.text
     assert "api.iconify.design" not in page.text
+
+    draft = page.text.split("Layered OCA draft", maxsplit=1)[1].split(
+        "Outcome projection", maxsplit=1
+    )[0]
+    assert 'data-slot="card-action"' in draft
+    assert "Equal split" in draft
+    assert "Add layer" in draft
+    assert "font-mono" not in draft
+    assert "+$280.00 gain" in draft
+    assert "-$340.00 max loss" in draft
+    assert ">%</span>" in draft
+    assert 'for="target_1"' in draft
+    assert 'id="target_1"' in draft
+    assert 'for="stop_1"' in draft
+    assert 'id="stop_1"' in draft
+    assert 'for="quantity_1"' in draft
+    assert 'id="quantity_1"' in draft
+    assert 'for="tif_1"' in draft
+    assert 'id="tif_1"' in draft
+    assert "mx-auto w-fit min-w-[41rem]" in draft
+    assert "items-start gap-3" in draft
+    assert "grid-cols-[5rem_10rem_10rem_5rem_5rem_2.25rem]" in draft
+    assert 'aria-label="Draft layer rows"' in draft
+    assert "mt-5" in draft
 
     response = client.post(
         workbench.path + "action",

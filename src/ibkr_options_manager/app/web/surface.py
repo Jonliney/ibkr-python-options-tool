@@ -42,6 +42,7 @@ from .components.ui.badge import Badge
 from .components.ui.button import Button
 from .components.ui.card import (
     Card,
+    CardAction,
     CardContent,
     CardDescription,
     CardHeader,
@@ -518,12 +519,7 @@ class StarUIWorkbench:
                     variant="line",
                 ),
                 TabsContent(
-                    ScrollArea(
-                        self._draft_panel(),
-                        aria_label="Draft layers",
-                        orientation="both",
-                        cls="h-full",
-                    ),
+                    self._draft_panel(),
                     id="draft",
                     cls="mt-5 min-h-0 flex-1",
                     style="overflow: hidden",
@@ -548,17 +544,56 @@ class StarUIWorkbench:
         return Form(
             Card(
                 CardHeader(
-                    CardTitle("Layered OCA draft"),
-                    CardDescription(_DEFAULT_HELP),
-                    cls="gap-1",
+                    Div(
+                        CardTitle("Layered OCA draft"),
+                        CardDescription(_DEFAULT_HELP, cls="mt-1"),
+                    ),
+                    CardAction(
+                        Div(
+                            Button(
+                                "Equal split",
+                                variant="outline",
+                                size="sm",
+                                type="submit",
+                                name="action",
+                                value="equal-split",
+                            ),
+                            Button(
+                                "Add layer",
+                                variant="secondary",
+                                size="sm",
+                                type="submit",
+                                name="action",
+                                value="add-layer",
+                                disabled=len(layers) >= self._state.available_quantity,
+                            ),
+                            cls="flex items-center gap-2",
+                        ),
+                    ),
                 ),
                 CardContent(
-                    *[self._layer_row(index, layer, len(layers)) for index, layer in enumerate(layers, start=1)],
                     Div(
-                        Button("Equal split", variant="outline", size="sm", type="submit", name="action", value="equal-split"),
-                        Button("Add layer", variant="secondary", size="sm", type="submit", name="action", value="add-layer", disabled=len(layers) >= self._state.available_quantity),
-                        Span(f"{sum(_int_or_zero(layer.quantity) for layer in layers)} / {self._state.available_quantity} contracts", cls="ml-auto font-mono text-xs text-muted-foreground"),
-                        cls="mt-5 flex items-center gap-3",
+                        ScrollArea(
+                            Div(
+                                *[
+                                    self._layer_row(index, layer, len(layers))
+                                    for index, layer in enumerate(layers, start=1)
+                                ],
+                                Div(
+                                    Span(
+                                        f"{sum(_int_or_zero(layer.quantity) for layer in layers)} "
+                                        f"of {self._state.available_quantity} contracts allocated",
+                                        cls="text-xs text-muted-foreground",
+                                    ),
+                                    cls="mt-5 flex justify-end",
+                                ),
+                                cls="mx-auto w-fit min-w-[41rem]",
+                            ),
+                            aria_label="Draft layer rows",
+                            orientation="both",
+                            cls="max-h-[25rem] w-full",
+                        ),
+                        cls="min-w-0",
                     ),
                 ),
             ),
@@ -572,16 +607,65 @@ class StarUIWorkbench:
 
     def _layer_row(self, index: int, layer: DraftLayerForm, count: int) -> Any:
         tif_signal = Signal(f"tif_{index}_value", _ref_only=True)
+        gain, loss = self._layer_projection(layer)
         return Div(
-            Div(Span(f"LAYER {index}", cls="text-xs font-semibold"), P(f"OCA-{index}", cls="mt-2 font-mono text-xs text-muted-foreground"), cls="min-w-20"),
-            _field("LMT target", Input(name=f"target_{index}", type="number", value=layer.target_percentage, min="0.1", step="0.1"), f"${layer.target_price}"),
-            _field("STP loss", Input(name=f"stop_{index}", type="number", value=layer.stop_percentage, min="0.1", max="100", step="0.1"), f"${layer.stop_price}"),
-            _field("Quantity", Input(name=f"quantity_{index}", type="number", value=layer.quantity, min="1", step="1")),
+            Div(
+                Span(f"LAYER {index}", cls="text-xs font-semibold"),
+                P(f"OCA-{index}", cls="mt-2 text-xs text-muted-foreground"),
+                cls="min-w-20",
+            ),
+            _percentage_price_field(
+                "LMT target",
+                Input(
+                    name=f"target_{index}",
+                    id=f"target_{index}",
+                    type="number",
+                    value=layer.target_percentage,
+                    min="0.1",
+                    step="0.1",
+                    cls="pr-8",
+                ),
+                input_id=f"target_{index}",
+                price=layer.target_price,
+                outcome=gain,
+                outcome_label="gain",
+                tone="text-emerald-400",
+            ),
+            _percentage_price_field(
+                "STP loss",
+                Input(
+                    name=f"stop_{index}",
+                    id=f"stop_{index}",
+                    type="number",
+                    value=layer.stop_percentage,
+                    min="0.1",
+                    max="100",
+                    step="0.1",
+                    cls="pr-8",
+                ),
+                input_id=f"stop_{index}",
+                price=layer.stop_price,
+                outcome=loss,
+                outcome_label="max loss",
+                tone="text-rose-400",
+            ),
+            _field(
+                "Quantity",
+                Input(
+                    name=f"quantity_{index}",
+                    id=f"quantity_{index}",
+                    type="number",
+                    value=layer.quantity,
+                    min="1",
+                    step="1",
+                ),
+                input_id=f"quantity_{index}",
+            ),
             _field(
                 "TIF",
                 Div(
                     Select(
-                        SelectTrigger(SelectValue()),
+                        SelectTrigger(SelectValue(), id=f"tif_{index}"),
                         SelectContent(
                             SelectItem("GTC", value="GTC"),
                             SelectItem("DAY", value="DAY"),
@@ -596,10 +680,34 @@ class StarUIWorkbench:
                         data_bind=tif_signal,
                     ),
                 ),
+                input_id=f"tif_{index}",
             ),
-            Button(Icon("lucide:trash-2"), variant="outline", size="icon", type="submit", name="action", value=f"remove-layer:{index}", disabled=count <= 1, aria_label=f"Remove layer {index}"),
-            cls="grid grid-cols-[5rem_minmax(9rem,1fr)_minmax(9rem,1fr)_7rem_6rem_2.25rem] items-end gap-3 border-t border-border py-4 first:border-t-0",
+            Button(
+                Icon("lucide:trash-2"),
+                variant="outline",
+                size="icon",
+                type="submit",
+                name="action",
+                value=f"remove-layer:{index}",
+                disabled=count <= 1,
+                aria_label=f"Remove layer {index}",
+                cls="mt-5",
+            ),
+            cls="grid grid-cols-[5rem_10rem_10rem_5rem_5rem_2.25rem] items-start gap-3 border-t border-border py-4 first:border-t-0",
         )
+
+    def _layer_projection(self, layer: DraftLayerForm) -> tuple[str, str]:
+        basis = self._state.unit_basis
+        multiplier = self._state.multiplier
+        quantity = _int_or_zero(layer.quantity)
+        if basis is None or multiplier is None or quantity <= 0:
+            return "—", "—"
+        try:
+            gain = (Decimal(layer.target_price) - basis) * multiplier * quantity
+            loss = (Decimal(layer.stop_price) - basis) * multiplier * quantity
+        except InvalidOperation:
+            return "—", "—"
+        return _money(gain), _money(loss)
 
     def _outcome_projection(self, layers: tuple[DraftLayerForm, ...]) -> Any:
         basis = self._state.unit_basis
@@ -668,10 +776,49 @@ class StarUIWorkbench:
         )
 
 
-def _field(label: str, control: Any, suffix: str | None = None) -> Any:
+def _field(
+    label: str,
+    control: Any,
+    *,
+    input_id: str | None = None,
+    suffix: str | None = None,
+) -> Any:
     return Div(
-        Label(label, cls="text-xs font-medium text-muted-foreground"),
+        Label(label, fr=input_id, cls="text-xs font-medium text-muted-foreground"),
         Div(control, Span(suffix, cls="shrink-0 font-mono text-xs text-muted-foreground") if suffix else None, cls="mt-1 flex items-center gap-2"),
+        cls="min-w-0 space-y-0.5",
+    )
+
+
+def _percentage_price_field(
+    label: str,
+    control: Any,
+    *,
+    input_id: str,
+    price: str,
+    outcome: str,
+    outcome_label: str,
+    tone: str,
+) -> Any:
+    """Render a percentage input with its calculated price and layer outcome."""
+    return Div(
+        Div(
+            Label(label, fr=input_id, cls="text-xs font-medium text-muted-foreground"),
+            Span(f"${price}", cls=f"text-xs font-semibold {tone}"),
+            cls="flex items-center justify-between gap-2",
+        ),
+        Div(
+            control,
+            Span(
+                "%",
+                cls="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground",
+            ),
+            cls="relative mt-1",
+        ),
+        Div(
+            Span(f"{outcome} {outcome_label}", cls=f"text-xs {tone}"),
+            cls="mt-1 flex justify-end",
+        ),
         cls="min-w-0 space-y-0.5",
     )
 
