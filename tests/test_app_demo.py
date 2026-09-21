@@ -169,9 +169,9 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert "Move stop to B/E" in active.text
     assert "Update layers" in active.text
     assert "Sell layers" in active.text
-    assert "active_layer_1" in active.text
-    assert 'name="active_target_1"' in active.text
-    assert 'name="active_stop_1"' in active.text
+    assert "active_layer_101" in active.text
+    assert 'name="active_target_101"' in active.text
+    assert 'name="active_stop_101"' in active.text
     assert 'id="active-quantity-1"' in active.text
     assert 'id="active-tif-1"' in active.text
     assert "State" not in active.text

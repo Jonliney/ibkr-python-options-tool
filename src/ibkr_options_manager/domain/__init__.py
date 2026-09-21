@@ -19,7 +19,7 @@ from .model import (
     VerifiedOptionContract,
     WorkingOrder,
 )
-from .planner import build_exit_plan, preview_reference_prices
+from .planner import build_exit_plan, preview_reference_prices, round_up_price
 
 __all__ = [
     "BrokerSnapshot",
@@ -41,4 +41,5 @@ __all__ = [
     "WorkingOrder",
     "build_exit_plan",
     "preview_reference_prices",
+    "round_up_price",
 ]

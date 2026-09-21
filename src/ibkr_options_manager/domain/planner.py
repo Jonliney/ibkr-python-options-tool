@@ -153,6 +153,13 @@ def preview_reference_prices(
     )
 
 
+def round_up_price(value: Decimal, bands: tuple[PriceBand, ...]) -> Decimal:
+    """Round a verified positive price upward to its applicable IBKR increment."""
+    if not value.is_finite() or value <= 0 or not bands:
+        raise ValueError("price and market-rule bands must be positive and complete")
+    return _round_up(value, bands)
+
+
 def _validate_snapshot_state(
     snapshot: BrokerSnapshot,
     paper_execution_mode: bool,

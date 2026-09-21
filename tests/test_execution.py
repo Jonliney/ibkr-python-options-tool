@@ -27,6 +27,7 @@ from ibkr_options_manager.execution import (
     ExecutionOutcomeUnknown,
     MarketExitCandidate,
     PaperExecutionService,
+    PriceUpdateCandidate,
     require_paper_execution_snapshot,
 )
 
@@ -126,6 +127,33 @@ class _RecordingMarketTransport(_RecordingTransport):
     ) -> PaperSubmission:
         self.market_candidates.append(candidate)
         return PaperSubmission(order_ids=(301,), perm_ids=(401,))
+
+    def cancel_pairs_then_submit_market(
+        self,
+        _snapshot: BrokerSnapshot,
+        candidates: tuple[MarketExitCandidate, ...],
+        **_kwargs: object,
+    ) -> PaperSubmission:
+        self.market_candidates.extend(candidates)
+        return PaperSubmission(order_ids=(302,), perm_ids=(402,))
+
+    def modify_prices(
+        self,
+        _snapshot: BrokerSnapshot,
+        candidates: tuple[PriceUpdateCandidate, ...],
+        **_kwargs: object,
+    ) -> PaperSubmission:
+        order_ids = tuple(
+            order_id
+            for candidate in candidates
+            for order_id, price in (
+                (candidate.layer.target_order_id, candidate.target_price),
+                (candidate.layer.stop_order_id, candidate.stop_price),
+            )
+            if price is not None
+        )
+        perm_ids = tuple(400 + order_id for order_id in order_ids)
+        return PaperSubmission(order_ids=order_ids, perm_ids=perm_ids)
 
 
 class _EmptyContract:
@@ -309,7 +337,7 @@ def test_market_exit_cancels_only_a_fresh_complete_app_owned_oca_pair_then_submi
     assert receipt.entry.order_ids == (301,)
     assert receipt.entry.perm_ids == (401,)
     with pytest.raises(
-        ExecutionBlocked, match="market-exit attempt is already journaled"
+        ExecutionBlocked, match="management attempt is already journaled"
     ):
         service.cancel_pair_then_submit_market(
             active_snapshot,
@@ -347,6 +375,154 @@ def test_market_exit_rejects_a_layer_that_is_not_journal_owned(tmp_path) -> None
             target_perm_id=201,
             expected_client_id=17,
         )
+
+
+def test_selected_layers_cancel_as_a_set_then_submit_one_total_market_order(
+    tmp_path,
+) -> None:
+    snapshot = _snapshot()
+    plan = build_exit_plan(
+        snapshot,
+        PlanRequest(
+            tranche_size=1,
+            target_percentages=(Decimal("20"), Decimal("40")),
+            stop_loss_percentage=Decimal("25"),
+            remainder_policy=RemainderPolicy.NEXT_RUNG,
+            tif="GTC",
+            layers=(
+                LayerRequest(
+                    quantity=1,
+                    target_price=Decimal("1.20"),
+                    stop_price=Decimal("0.75"),
+                    tif="GTC",
+                    target_percentage=Decimal("20"),
+                ),
+                LayerRequest(
+                    quantity=1,
+                    target_price=Decimal("1.40"),
+                    stop_price=Decimal("0.75"),
+                    tif="GTC",
+                    target_percentage=Decimal("40"),
+                ),
+            ),
+            paper_execution_mode=True,
+        ),
+    )
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.record_submission(
+        plan.fingerprint,
+        order_ids=(101, 102, 103, 104),
+        perm_ids=(201, 202, 203, 204),
+    )
+    first = WorkingOrder(
+        perm_id=201,
+        client_id=17,
+        order_id=101,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("1"),
+        status="Submitted",
+        oca_group=f"{plan.fingerprint[:12]}/tranche-1",
+        tif="GTC",
+    )
+    second = replace(
+        first,
+        perm_id=203,
+        order_id=103,
+        oca_group=f"{plan.fingerprint[:12]}/tranche-2",
+    )
+    active = replace(
+        snapshot,
+        working_orders=(
+            first,
+            replace(first, perm_id=202, order_id=102, order_type="STP"),
+            second,
+            replace(second, perm_id=204, order_id=104, order_type="STP"),
+        ),
+    )
+    transport = _RecordingMarketTransport()
+    service = PaperExecutionService(transport, journal)
+
+    candidates = service.prepare_market_exits(
+        active, target_perm_ids=(201, 203), expected_client_id=17
+    )
+    receipt = service.cancel_pairs_then_submit_market(
+        active,
+        candidates,
+        host="127.0.0.1",
+        port=7497,
+        client_id=17,
+        timeout_seconds=1,
+    )
+
+    assert transport.market_candidates == list(candidates)
+    assert sum(candidate.quantity for candidate in candidates) == Decimal("2")
+    assert receipt.entry.order_ids == (302,)
+    with pytest.raises(ExecutionBlocked, match="already journaled"):
+        service.cancel_pairs_then_submit_market(
+            active,
+            candidates,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+
+
+def test_price_updates_amend_only_the_requested_app_owned_leg(tmp_path) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.record_submission(
+        plan.fingerprint, order_ids=(101, 102), perm_ids=(201, 202)
+    )
+    group = f"{plan.fingerprint[:12]}/tranche-1"
+    target = WorkingOrder(
+        perm_id=201,
+        client_id=17,
+        order_id=101,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("2"),
+        status="Submitted",
+        oca_group=group,
+        tif="GTC",
+        limit_price=Decimal("1.20"),
+    )
+    stop = replace(
+        target,
+        perm_id=202,
+        order_id=102,
+        order_type="STP",
+        limit_price=None,
+        stop_price=Decimal("0.75"),
+    )
+    active = replace(snapshot, working_orders=(target, stop))
+    service = PaperExecutionService(_RecordingMarketTransport(), journal)
+    layer = service.prepare_market_exit(
+        active, target_perm_id=201, expected_client_id=17
+    )
+    update = PriceUpdateCandidate(layer=layer, stop_price=Decimal("1.00"))
+
+    receipt = service.modify_prices(
+        active,
+        service.prepare_price_updates(
+            active, updates=(update,), expected_client_id=17
+        ),
+        host="127.0.0.1",
+        port=7497,
+        client_id=17,
+        timeout_seconds=1,
+    )
+
+    assert receipt.entry.order_ids == (102,)
+    assert receipt.entry.perm_ids == (502,)
 
 
 def test_unknown_submission_reconciles_only_when_a_complete_oca_pair_is_observed(

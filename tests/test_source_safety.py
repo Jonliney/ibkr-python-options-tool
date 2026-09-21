@@ -40,7 +40,15 @@ class ProductionSourceSafetyTests(unittest.TestCase):
             if not name.startswith("_") and callable(value)
         }
 
-        self.assertEqual(public_methods, {"submit", "cancel_pair_then_submit_market"})
+        self.assertEqual(
+            public_methods,
+            {
+                "submit",
+                "cancel_pair_then_submit_market",
+                "cancel_pairs_then_submit_market",
+                "modify_prices",
+            },
+        )
 
     def test_production_source_never_calls_a_forbidden_order_method(self) -> None:
         package = Path(__file__).parents[1] / "src" / "ibkr_options_manager"
@@ -87,7 +95,7 @@ class ProductionSourceSafetyTests(unittest.TestCase):
             and _called_name(call.func) == "cancelOrder"
             and len(call.args) == 1
         }
-        self.assertEqual(cancel_arguments, {"target_order_id", "stop_order_id"})
+        self.assertEqual(cancel_arguments, {"target_order_id", "stop_order_id", None})
 
     def test_only_the_snapshot_and_writer_may_request_client_bound_orders(self) -> None:
         package = Path(__file__).parents[1] / "src" / "ibkr_options_manager"

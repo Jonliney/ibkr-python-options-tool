@@ -79,6 +79,17 @@ class MarketExitCandidate:
     stop_perm_id: int
 
 
+@dataclass(frozen=True, slots=True)
+class PriceUpdateCandidate:
+    """A price-only amendment to one proven app-owned OCA pair."""
+
+    layer: MarketExitCandidate
+    target_price: Decimal | None = None
+    stop_price: Decimal | None = None
+    prior_target_price: Decimal | None = None
+    prior_stop_price: Decimal | None = None
+
+
 @runtime_checkable
 class PaperMarketExitTransport(Protocol):
     """The narrow transport seam for a staged paper market exit."""
@@ -87,6 +98,38 @@ class PaperMarketExitTransport(Protocol):
         self,
         snapshot: BrokerSnapshot,
         candidate: MarketExitCandidate,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmissionResult: ...
+
+
+@runtime_checkable
+class PaperBulkMarketExitTransport(Protocol):
+    """Transport seam for a verified multi-layer market exit."""
+
+    def cancel_pairs_then_submit_market(
+        self,
+        snapshot: BrokerSnapshot,
+        candidates: tuple[MarketExitCandidate, ...],
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmissionResult: ...
+
+
+@runtime_checkable
+class PaperPriceUpdateTransport(Protocol):
+    """Narrow transport seam for price-only amendments to app-owned pairs."""
+
+    def modify_prices(
+        self,
+        snapshot: BrokerSnapshot,
+        candidates: tuple[PriceUpdateCandidate, ...],
         *,
         host: str,
         port: int,
@@ -145,29 +188,49 @@ class ExecutionJournal:
         A cancellation can succeed just before a client disconnects, so this
         operation must be non-retryable in the same way as new OCA submission.
         """
-        material = ":".join(
-            str(value)
-            for value in (
-                snapshot.selected.account,
-                snapshot.selected.con_id,
+        return self.begin_management(
+            snapshot,
+            operation="market-exit",
+            material=(
                 candidate.target_order_id,
                 candidate.target_perm_id,
                 candidate.stop_order_id,
                 candidate.stop_perm_id,
                 candidate.quantity,
+            ),
+            expected_order_count=1,
+        )
+
+    def begin_management(
+        self,
+        snapshot: BrokerSnapshot,
+        *,
+        operation: str,
+        material: tuple[object, ...],
+        expected_order_count: int,
+    ) -> JournalEntry:
+        """Durably reserve one non-retryable app-owned management attempt."""
+        if not operation or expected_order_count <= 0:
+            raise ExecutionBlocked("management journal entry is incomplete")
+        encoded = ":".join(
+            str(value)
+            for value in (
+                snapshot.selected.account,
+                snapshot.selected.con_id,
+                *material,
             )
         )
-        fingerprint = f"market-exit:{sha256(material.encode()).hexdigest()}"
+        fingerprint = f"{operation}:{sha256(encoded.encode()).hexdigest()}"
         if self.find(fingerprint) is not None:
             raise ExecutionBlocked(
-                "this market-exit attempt is already journaled; no retry is automatic"
+                "this management attempt is already journaled; no retry is automatic"
             )
         entry = JournalEntry(
             fingerprint=fingerprint,
             account=snapshot.selected.account,
             con_id=snapshot.selected.con_id,
             state="PREPARED",
-            expected_order_count=1,
+            expected_order_count=expected_order_count,
         )
         self._write((*self._entries(), entry))
         return entry
@@ -440,6 +503,156 @@ class PaperExecutionService:
             stop_perm_id=stop.perm_id,
         )
 
+    def prepare_market_exits(
+        self,
+        snapshot: BrokerSnapshot,
+        *,
+        target_perm_ids: tuple[int, ...],
+        expected_client_id: int,
+    ) -> tuple[MarketExitCandidate, ...]:
+        """Prepare every selected pair before any cancellation can occur."""
+        selected = tuple(sorted(set(target_perm_ids)))
+        if not selected:
+            raise ExecutionBlocked("select at least one active layer")
+        candidates = tuple(
+            self.prepare_market_exit(
+                snapshot,
+                target_perm_id=perm_id,
+                expected_client_id=expected_client_id,
+            )
+            for perm_id in selected
+        )
+        if len({candidate.oca_group for candidate in candidates}) != len(candidates):
+            raise ExecutionBlocked(
+                "selected layers do not resolve to distinct OCA pairs"
+            )
+        total = sum((candidate.quantity for candidate in candidates), Decimal("0"))
+        if snapshot.position.quantity < total:
+            raise ExecutionBlocked(
+                "the position quantity no longer covers selected layers"
+            )
+        return candidates
+
+    def prepare_price_updates(
+        self,
+        snapshot: BrokerSnapshot,
+        *,
+        updates: tuple[PriceUpdateCandidate, ...],
+        expected_client_id: int,
+    ) -> tuple[PriceUpdateCandidate, ...]:
+        """Re-verify selected app pairs and allow only finite positive prices."""
+        if not updates:
+            raise ExecutionBlocked("select at least one active layer")
+        validated: list[PriceUpdateCandidate] = []
+        seen_targets: set[int] = set()
+        for update in updates:
+            if update.layer.target_perm_id in seen_targets:
+                raise ExecutionBlocked("selected layers must be distinct")
+            seen_targets.add(update.layer.target_perm_id)
+            fresh = self.prepare_market_exit(
+                snapshot,
+                target_perm_id=update.layer.target_perm_id,
+                expected_client_id=expected_client_id,
+            )
+            if fresh != update.layer:
+                raise ExecutionBlocked("the selected OCA layer changed since review")
+            orders_by_id = {order.order_id: order for order in snapshot.working_orders}
+            target = orders_by_id.get(update.layer.target_order_id)
+            stop = orders_by_id.get(update.layer.stop_order_id)
+            if target is None or stop is None:
+                raise ExecutionBlocked("the selected OCA layer is no longer complete")
+            if (
+                update.prior_target_price is not None
+                and target.limit_price != update.prior_target_price
+            ) or (
+                update.prior_stop_price is not None
+                and stop.stop_price != update.prior_stop_price
+            ):
+                raise ExecutionBlocked("the selected OCA prices changed since review")
+            for price in (update.target_price, update.stop_price):
+                if price is not None and (not price.is_finite() or price <= 0):
+                    raise ExecutionBlocked("updated prices must be positive and finite")
+            if update.target_price is None and update.stop_price is None:
+                raise ExecutionBlocked("each selected layer needs a price change")
+            validated.append(update)
+        return tuple(validated)
+
+    def modify_prices(
+        self,
+        snapshot: BrokerSnapshot,
+        updates: tuple[PriceUpdateCandidate, ...],
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> SubmissionReceipt:
+        """Perform a revalidated, price-only amendment of selected OCA pairs."""
+        refreshed = self.prepare_price_updates(
+            snapshot,
+            updates=updates,
+            expected_client_id=client_id,
+        )
+        if refreshed != updates:
+            raise ExecutionBlocked("the selected OCA layers changed since confirmation")
+        transport = self._transport
+        if not isinstance(transport, PaperPriceUpdateTransport):
+            raise ExecutionBlocked(
+                "the configured paper transport cannot modify app-owned OCA prices"
+            )
+        expected_order_count = sum(
+            int(update.target_price is not None) + int(update.stop_price is not None)
+            for update in updates
+        )
+        entry = self._journal.begin_management(
+            snapshot,
+            operation="price-update",
+            material=tuple(
+                value
+                for update in updates
+                for value in (
+                    update.layer.target_order_id,
+                    update.layer.target_perm_id,
+                    update.prior_target_price,
+                    update.target_price,
+                    update.layer.stop_order_id,
+                    update.layer.stop_perm_id,
+                    update.prior_stop_price,
+                    update.stop_price,
+                )
+            ),
+            expected_order_count=expected_order_count,
+        )
+        try:
+            result = transport.modify_prices(
+                snapshot,
+                updates,
+                host=host,
+                port=port,
+                client_id=client_id,
+                timeout_seconds=timeout_seconds,
+            )
+            order_ids = tuple(int(value) for value in result.order_ids)
+            perm_ids = tuple(int(value) for value in result.perm_ids)
+            if (
+                len(order_ids) != expected_order_count
+                or len(perm_ids) != expected_order_count
+                or not all(perm_ids)
+            ):
+                raise ExecutionOutcomeUnknown(
+                    "TWS did not acknowledge every selected price amendment"
+                )
+        except Exception:
+            self._journal.mark_unknown(entry.fingerprint)
+            raise
+        return SubmissionReceipt(
+            self._journal.record_submission(
+                entry.fingerprint,
+                order_ids=order_ids,
+                perm_ids=perm_ids,
+            )
+        )
+
     def cancel_pair_then_submit_market(
         self,
         snapshot: BrokerSnapshot,
@@ -468,6 +681,71 @@ class PaperExecutionService:
             result = transport.cancel_pair_then_submit_market(
                 snapshot,
                 candidate,
+                host=host,
+                port=port,
+                client_id=client_id,
+                timeout_seconds=timeout_seconds,
+            )
+            order_ids = tuple(int(value) for value in result.order_ids)
+            perm_ids = tuple(int(value) for value in result.perm_ids)
+            if len(order_ids) != 1 or len(perm_ids) != 1 or not perm_ids[0]:
+                raise ExecutionOutcomeUnknown(
+                    "TWS did not acknowledge the standalone market order"
+                )
+        except Exception:
+            self._journal.mark_unknown(entry.fingerprint)
+            raise
+        return SubmissionReceipt(
+            self._journal.record_submission(
+                entry.fingerprint,
+                order_ids=order_ids,
+                perm_ids=perm_ids,
+            )
+        )
+
+    def cancel_pairs_then_submit_market(
+        self,
+        snapshot: BrokerSnapshot,
+        candidates: tuple[MarketExitCandidate, ...],
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> SubmissionReceipt:
+        """Cancel all selected pairs, recheck once, then send one total MKT."""
+        refreshed = self.prepare_market_exits(
+            snapshot,
+            target_perm_ids=tuple(candidate.target_perm_id for candidate in candidates),
+            expected_client_id=client_id,
+        )
+        if refreshed != candidates:
+            raise ExecutionBlocked("the selected OCA layers changed since confirmation")
+        transport = self._transport
+        if not isinstance(transport, PaperBulkMarketExitTransport):
+            raise ExecutionBlocked(
+                "the configured paper transport cannot execute a staged market exit"
+            )
+        entry = self._journal.begin_management(
+            snapshot,
+            operation="market-exit-many",
+            material=tuple(
+                value
+                for candidate in candidates
+                for value in (
+                    candidate.target_order_id,
+                    candidate.target_perm_id,
+                    candidate.stop_order_id,
+                    candidate.stop_perm_id,
+                    candidate.quantity,
+                )
+            ),
+            expected_order_count=1,
+        )
+        try:
+            result = transport.cancel_pairs_then_submit_market(
+                snapshot,
+                candidates,
                 host=host,
                 port=port,
                 client_id=client_id,

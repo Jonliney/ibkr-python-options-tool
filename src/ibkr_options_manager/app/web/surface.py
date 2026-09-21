@@ -30,12 +30,13 @@ from starhtml.icons import resolver
 from starhtml.plugins import position as position_plugin
 from starlette.requests import Request
 
-from ...domain import preview_reference_prices
+from ...domain import preview_reference_prices, round_up_price
 from ...execution import (
     ExecutionBlocked,
     ExecutionOutcomeUnknown,
     MarketExitCandidate,
     PaperExecutionService,
+    PriceUpdateCandidate,
 )
 from ..view_model import (
     ConnectionSettings,
@@ -99,6 +100,8 @@ class StarUIWorkbench:
         self._paper_execution = paper_execution
         self._armed_execution: PaperExecutionCandidate | None = None
         self._armed_market_exit: MarketExitCandidate | None = None
+        self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
+        self._armed_price_updates: tuple[PriceUpdateCandidate, ...] = ()
         self._preferred_con_id = initial_con_id
         self._selected_con_id: int | None = None
         self._state = view_model.empty()
@@ -179,6 +182,12 @@ class StarUIWorkbench:
                 self._arm_selected_market_exit_locked(values)
             elif action == "market-exit-confirm":
                 self._confirm_market_exit_locked()
+            elif action == "active-move-be-arm":
+                self._arm_price_updates_locked(values, move_stops_to_break_even=True)
+            elif action == "active-update-arm":
+                self._arm_price_updates_locked(values, move_stops_to_break_even=False)
+            elif action == "price-update-confirm":
+                self._confirm_price_updates_locked()
             else:
                 if action not in {"execute-arm", "execute-confirm"}:
                     self._disarm_execution_locked()
@@ -233,6 +242,8 @@ class StarUIWorkbench:
     def _disarm_execution_locked(self) -> None:
         self._armed_execution = None
         self._armed_market_exit = None
+        self._armed_market_exits = ()
+        self._armed_price_updates = ()
 
     def _arm_execution_locked(self) -> None:
         if self._paper_execution is None:
@@ -322,6 +333,7 @@ class StarUIWorkbench:
             self._message = f"Market exit blocked: {error}"
             return
         self._armed_market_exit = candidate
+        self._armed_market_exits = (candidate,)
         self._workspace_tab = "active"
         self._message = (
             f"Fresh paper snapshot verified. Review the MKT exit for "
@@ -329,30 +341,48 @@ class StarUIWorkbench:
         )
 
     def _arm_selected_market_exit_locked(self, values: dict[str, str]) -> None:
-        """Arm the existing one-layer paper exit through the global selection UI.
-
-        Multi-layer exits remain deliberately unavailable until their own
-        ordered cancellation/recheck protocol exists.  Selecting more than one
-        must therefore fail before any broker action, rather than silently
-        selling only the first checked layer.
-        """
-        selected = {
-            _positive_int(value, 0)
-            for name, value in values.items()
-            if name.startswith("active_layer_")
-        }
-        selected.discard(0)
-        if len(selected) != 1:
-            self._message = (
-                "Select exactly one active layer for the staged paper MKT exit. "
-                "Bulk exits are not enabled yet."
-            )
+        """Arm a verified all-selected-layer paper exit for second confirmation."""
+        selected = _selected_active_perm_ids(values)
+        if not selected:
+            self._message = "Select at least one active layer for the staged paper MKT exit."
             return
-        self._arm_market_exit_locked(selected.pop())
+        if self._paper_execution is None or self._selected_con_id is None:
+            self._message = "Paper order management is disabled for this launch."
+            return
+        self._disarm_execution_locked()
+        state = self._view_model.select_position(
+            self._selected_con_id,
+            self._plan_form(self._drafts.get(self._selected_con_id, ())),
+        )
+        self._apply_state_locked(state)
+        self._record_refresh_time_locked()
+        self._announce_reconciliation_locked()
+        snapshot = self._view_model.latest_snapshot()
+        if snapshot is None:
+            self._message = "Market exit blocked: a fresh selected-position snapshot is required."
+            return
+        try:
+            candidates = self._paper_execution.prepare_market_exits(
+                snapshot,
+                target_perm_ids=selected,
+                expected_client_id=self._settings.client_id,
+            )
+        except ExecutionBlocked as error:
+            self._message = f"Market exit blocked: {error}"
+            return
+        self._armed_market_exits = candidates
+        self._workspace_tab = "active"
+        total = sum((candidate.quantity for candidate in candidates), Decimal("0"))
+        self._message = (
+            f"Fresh paper snapshot verified. Review cancellation of {len(candidates)} OCA "
+            f"layers and one MKT sell for {total} contracts, then click to confirm."
+        )
 
     def _confirm_market_exit_locked(self) -> None:
-        armed = self._armed_market_exit
-        if self._paper_execution is None or armed is None or self._selected_con_id is None:
+        armed = self._armed_market_exits or (
+            (self._armed_market_exit,) if self._armed_market_exit is not None else ()
+        )
+        if self._paper_execution is None or not armed or self._selected_con_id is None:
             self._message = "Start the market exit first; every paper change needs a separate confirmation."
             return
         state = self._view_model.select_position(
@@ -368,21 +398,31 @@ class StarUIWorkbench:
             self._message = "Market exit blocked: the fresh snapshot is unavailable."
             return
         try:
-            candidate = self._paper_execution.prepare_market_exit(
+            candidates = self._paper_execution.prepare_market_exits(
                 snapshot,
-                target_perm_id=armed.target_perm_id,
+                target_perm_ids=tuple(candidate.target_perm_id for candidate in armed),
                 expected_client_id=self._settings.client_id,
             )
-            if candidate != armed:
+            if candidates != armed:
                 raise ExecutionBlocked("the OCA layer changed after review")
-            self._paper_execution.cancel_pair_then_submit_market(
-                snapshot,
-                candidate,
-                host="127.0.0.1",
-                port=self._settings.port,
-                client_id=self._settings.client_id,
-                timeout_seconds=self._settings.timeout_seconds,
-            )
+            if len(candidates) == 1:
+                self._paper_execution.cancel_pair_then_submit_market(
+                    snapshot,
+                    candidates[0],
+                    host="127.0.0.1",
+                    port=self._settings.port,
+                    client_id=self._settings.client_id,
+                    timeout_seconds=self._settings.timeout_seconds,
+                )
+            else:
+                self._paper_execution.cancel_pairs_then_submit_market(
+                    snapshot,
+                    candidates,
+                    host="127.0.0.1",
+                    port=self._settings.port,
+                    client_id=self._settings.client_id,
+                    timeout_seconds=self._settings.timeout_seconds,
+                )
         except ExecutionOutcomeUnknown as error:
             self._message = (
                 f"Market exit outcome is unknown: {error}. Refresh TWS before "
@@ -395,8 +435,164 @@ class StarUIWorkbench:
         else:
             self._message = (
                 f"TWS confirmed both selected OCA legs were cancelled and "
-                f"acknowledged the standalone MKT sell for {candidate.quantity} contracts. "
+                f"acknowledged the standalone MKT sell for "
+                f"{sum((candidate.quantity for candidate in candidates), Decimal('0'))} contracts. "
                 "Refresh to verify the outcome."
+            )
+        finally:
+            self._workspace_tab = "active"
+            self._disarm_execution_locked()
+
+    def _arm_price_updates_locked(
+        self,
+        values: dict[str, str],
+        *,
+        move_stops_to_break_even: bool,
+    ) -> None:
+        """Prepare price-only app-owned OCA changes for a second confirmation."""
+        if self._paper_execution is None or self._selected_con_id is None:
+            self._message = "Paper order management is disabled for this launch."
+            return
+        selected = _selected_active_perm_ids(values)
+        if not selected:
+            self._message = "Select at least one active layer to update."
+            return
+        self._disarm_execution_locked()
+        state = self._view_model.select_position(
+            self._selected_con_id,
+            self._plan_form(self._drafts.get(self._selected_con_id, ())),
+        )
+        self._apply_state_locked(state)
+        self._record_refresh_time_locked()
+        self._announce_reconciliation_locked()
+        snapshot = self._view_model.latest_snapshot()
+        basis = self._state.unit_basis
+        calculator = self._state.quote_calculator
+        if snapshot is None or basis is None or calculator is None:
+            self._message = "Price update blocked: a fresh priced position is required."
+            return
+        try:
+            layers = self._paper_execution.prepare_market_exits(
+                snapshot,
+                target_perm_ids=selected,
+                expected_client_id=self._settings.client_id,
+            )
+            orders_by_id = {
+                order.order_id: order for order in snapshot.working_orders
+            }
+            updates: list[PriceUpdateCandidate] = []
+            for layer in layers:
+                target = orders_by_id.get(layer.target_order_id)
+                stop = orders_by_id.get(layer.stop_order_id)
+                if target is None or stop is None:
+                    raise ExecutionBlocked("a selected OCA layer is no longer complete")
+                if move_stops_to_break_even:
+                    desired_target = None
+                    desired_stop = round_up_price(basis, calculator.bands)
+                else:
+                    target_percentage = _decimal_value(
+                        values.get(f"active_target_{layer.target_perm_id}")
+                    )
+                    stop_percentage = _decimal_value(
+                        values.get(f"active_stop_{layer.target_perm_id}")
+                    )
+                    if target_percentage is None or stop_percentage is None:
+                        raise ExecutionBlocked("active target and stop percentages are required")
+                    prices = preview_reference_prices(
+                        basis,
+                        target_percentage,
+                        stop_percentage,
+                        calculator.bands,
+                    )
+                    desired_target = prices.target_price
+                    desired_stop = prices.stop_price
+                updates.append(
+                    PriceUpdateCandidate(
+                        layer=layer,
+                        target_price=(
+                            desired_target
+                            if desired_target is not None
+                            and desired_target != target.limit_price
+                            else None
+                        ),
+                        stop_price=(
+                            desired_stop
+                            if desired_stop != stop.stop_price
+                            else None
+                        ),
+                        prior_target_price=target.limit_price,
+                        prior_stop_price=stop.stop_price,
+                    )
+                )
+            changes = tuple(
+                update
+                for update in updates
+                if update.target_price is not None or update.stop_price is not None
+            )
+            if not changes:
+                raise ExecutionBlocked("none of the selected prices would change")
+            self._armed_price_updates = self._paper_execution.prepare_price_updates(
+                snapshot,
+                updates=changes,
+                expected_client_id=self._settings.client_id,
+            )
+        except (ExecutionBlocked, ValueError) as error:
+            self._message = f"Price update blocked: {error}"
+            return
+        self._workspace_tab = "active"
+        changed_legs = sum(
+            int(update.target_price is not None) + int(update.stop_price is not None)
+            for update in self._armed_price_updates
+        )
+        action = "stops to cost basis" if move_stops_to_break_even else "selected prices"
+        self._message = (
+            f"Fresh paper snapshot verified. Review {changed_legs} {action} "
+            "amendments, then click to confirm."
+        )
+
+    def _confirm_price_updates_locked(self) -> None:
+        updates = self._armed_price_updates
+        if self._paper_execution is None or not updates or self._selected_con_id is None:
+            self._message = "Start a price update first; every paper change needs confirmation."
+            return
+        state = self._view_model.select_position(
+            self._selected_con_id,
+            self._plan_form(self._drafts.get(self._selected_con_id, ())),
+        )
+        self._apply_state_locked(state)
+        self._record_refresh_time_locked()
+        self._announce_reconciliation_locked()
+        snapshot = self._view_model.latest_snapshot()
+        if snapshot is None:
+            self._disarm_execution_locked()
+            self._message = "Price update blocked: the fresh snapshot is unavailable."
+            return
+        try:
+            confirmed = self._paper_execution.prepare_price_updates(
+                snapshot,
+                updates=updates,
+                expected_client_id=self._settings.client_id,
+            )
+            if confirmed != updates:
+                raise ExecutionBlocked("the selected OCA layers changed after review")
+            receipt = self._paper_execution.modify_prices(
+                snapshot,
+                updates,
+                host="127.0.0.1",
+                port=self._settings.port,
+                client_id=self._settings.client_id,
+                timeout_seconds=self._settings.timeout_seconds,
+            )
+        except ExecutionOutcomeUnknown as error:
+            self._message = f"Price update outcome is unknown: {error}. Refresh TWS before any further action."
+        except ExecutionBlocked as error:
+            self._message = f"Price update blocked: {error}"
+        except Exception as error:
+            self._message = f"Price update outcome is unknown: {error}"
+        else:
+            self._message = (
+                f"TWS acknowledged {len(receipt.entry.order_ids)} app-owned OCA "
+                "price amendment(s). Refresh to verify the updated working orders."
             )
         finally:
             self._workspace_tab = "active"
@@ -878,8 +1074,24 @@ class StarUIWorkbench:
                     Div(CardTitle("Active OCA layers")),
                     CardAction(
                         Div(
-                            Button("Move stop to B/E", variant="outline", size="sm", disabled=True),
-                            Button("Update layers", variant="outline", size="sm", disabled=True),
+                            Button(
+                                "Move stop to B/E",
+                                variant="outline",
+                                size="sm",
+                                type="submit",
+                                name="action",
+                                value="active-move-be-arm",
+                                disabled=self._paper_execution is None,
+                            ),
+                            Button(
+                                "Update layers",
+                                variant="outline",
+                                size="sm",
+                                type="submit",
+                                name="action",
+                                value="active-update-arm",
+                                disabled=self._paper_execution is None,
+                            ),
                             Button(
                                 "Sell layers",
                                 variant="destructive",
@@ -935,7 +1147,7 @@ class StarUIWorkbench:
                 HTMLInput(
                     type="checkbox",
                     id=checkbox_id,
-                    name=f"active_layer_{index}",
+                    name=f"active_layer_{target.perm_id}",
                     value=str(target.perm_id),
                     checked=True,
                     cls="mt-0.5 size-4 accent-primary",
@@ -950,7 +1162,7 @@ class StarUIWorkbench:
             _percentage_price_field(
                 "LMT target",
                 Input(
-                    name=f"active_target_{index}",
+                    name=f"active_target_{target.perm_id}",
                     id=f"active-target-{index}",
                     type="number",
                     value=target_percentage,
@@ -969,7 +1181,7 @@ class StarUIWorkbench:
             _percentage_price_field(
                 "STP loss",
                 Input(
-                    name=f"active_stop_{index}",
+                    name=f"active_stop_{target.perm_id}",
                     id=f"active-stop-{index}",
                     type="number",
                     value=stop_percentage,
@@ -1299,11 +1511,19 @@ class StarUIWorkbench:
         )
 
     def _review(self) -> Any:
-        market_exit = self._armed_market_exit
+        market_exits = self._armed_market_exits or (
+            (self._armed_market_exit,) if self._armed_market_exit is not None else ()
+        )
+        price_updates = self._armed_price_updates
         armed_execution = self._armed_execution
         action_rows: list[Any] = []
-        if market_exit is not None:
-            action_rows = [self._review_market_exit(market_exit)]
+        if market_exits:
+            action_rows = [self._review_market_exit(candidate) for candidate in market_exits]
+        elif price_updates:
+            action_rows = [
+                self._review_price_update(index, update)
+                for index, update in enumerate(price_updates, start=1)
+            ]
         elif armed_execution is not None:
             action_rows = [
                 self._review_pair(index, layer)
@@ -1320,7 +1540,9 @@ class StarUIWorkbench:
             Div(
                 Span("ACTION REVIEW", cls="text-xs font-semibold tracking-wide text-muted-foreground"),
                 Badge("MKT EXIT", variant="outline", cls="text-[10px]")
-                if market_exit is not None
+                if market_exits
+                else Badge("PRICE UPDATE", variant="outline", cls="text-[10px]")
+                if price_updates
                 else Badge("DRAFT", variant="outline", cls="text-[10px]")
                 if action_rows
                 else None,
@@ -1340,8 +1562,10 @@ class StarUIWorkbench:
         )
 
     def _execution_control(self) -> Any:
-        market_exit = self._armed_market_exit
-        if market_exit is not None:
+        market_exits = self._armed_market_exits or (
+            (self._armed_market_exit,) if self._armed_market_exit is not None else ()
+        )
+        if market_exits:
             return Form(
                 Button(
                     "Click to confirm cancel + MKT sell",
@@ -1350,6 +1574,19 @@ class StarUIWorkbench:
                     cls="w-full",
                 ),
                 HTMLInput(type="hidden", name="action", value="market-exit-confirm"),
+                action=f"/{self.session_token}/action",
+                method="post",
+                cls="mx-4 mb-4 w-[calc(100%-2rem)]",
+            )
+        if self._armed_price_updates:
+            return Form(
+                Button(
+                    "Click to confirm price updates",
+                    variant="destructive",
+                    type="submit",
+                    cls="w-full",
+                ),
+                HTMLInput(type="hidden", name="action", value="price-update-confirm"),
                 action=f"/{self.session_token}/action",
                 method="post",
                 cls="mx-4 mb-4 w-[calc(100%-2rem)]",
@@ -1420,6 +1657,41 @@ class StarUIWorkbench:
                 ),
                 cls="mt-3 space-y-3 border-l-2 border-border pl-3",
             ),
+            cls="border-b border-border py-4",
+        )
+
+    def _review_price_update(self, index: int, update: PriceUpdateCandidate) -> Any:
+        """Display only the selected legs whose price will actually change."""
+        rows = []
+        if update.target_price is not None:
+            rows.append(
+                Div(
+                    Span("UPDATE SELL LMT", cls="text-xs font-semibold text-emerald-400"),
+                    Span(
+                        f"${format(update.target_price, 'f')}",
+                        cls="text-sm font-semibold text-emerald-400",
+                    ),
+                    cls="flex items-center justify-between gap-3",
+                )
+            )
+        if update.stop_price is not None:
+            rows.append(
+                Div(
+                    Span("UPDATE SELL STP", cls="text-xs font-semibold text-rose-400"),
+                    Span(
+                        f"${format(update.stop_price, 'f')}",
+                        cls="text-sm font-semibold text-rose-400",
+                    ),
+                    cls="flex items-center justify-between gap-3",
+                )
+            )
+        return Div(
+            P(f"OCA-{index}", cls="text-xs font-semibold"),
+            P(
+                f"{update.layer.quantity} contracts · {update.layer.tif}",
+                cls="mt-0.5 text-xs text-muted-foreground",
+            ),
+            Div(*rows, cls="mt-3 space-y-3 border-l-2 border-border pl-3"),
             cls="border-b border-border py-4",
         )
 
@@ -1687,6 +1959,28 @@ def _positive_float(value: str | None, default: float) -> float:
     except ValueError:
         return default
     return number if number > 0 else default
+
+
+def _decimal_value(value: str | None) -> Decimal | None:
+    try:
+        number = Decimal(value or "")
+    except InvalidOperation:
+        return None
+    return number if number.is_finite() else None
+
+
+def _selected_active_perm_ids(values: dict[str, str]) -> tuple[int, ...]:
+    """Read selected active-layer checkboxes without trusting their field name."""
+    return tuple(
+        sorted(
+            {
+                _positive_int(value, 0)
+                for name, value in values.items()
+                if name.startswith("active_layer_")
+            }
+            - {0}
+        )
+    )
 
 
 def _int_or_zero(value: str) -> int:
