@@ -176,6 +176,9 @@ def _publish(
                 oca_group=order.oca_group,
                 parent_id=order.parent_id,
                 observed_at=capture.captured_at,
+                limit_price=order.limit_price,
+                stop_price=order.stop_price,
+                tif=order.tif,
             )
             for order in sorted(
                 capture.orders,
@@ -205,6 +208,7 @@ def _publish(
         server_time=capture.server_time,
         captured_at=capture.captured_at,
         completion_times=capture.completion_times,
+        api_read_only_observed=capture.read_only_api is not None,
     )
     return SnapshotResult(SnapshotStatus.READY, snapshot, ())
 

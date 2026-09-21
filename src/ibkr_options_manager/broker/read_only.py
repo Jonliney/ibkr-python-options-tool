@@ -130,6 +130,9 @@ class CapturedOrder:
     status: str
     oca_group: str | None
     parent_id: int
+    limit_price: Decimal | None = None
+    stop_price: Decimal | None = None
+    tif: str = ""
 
 
 @dataclass(frozen=True, slots=True)

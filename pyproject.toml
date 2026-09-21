@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ibkr-options-manager"
 version = "0.1.0"
-description = "Read-only planning tools for long option exits in IBKR TWS"
+description = "Paper-TWS laddered OCA bracket management for long option exits"
 requires-python = ">=3.12"
 dependencies = [
   "PySide6>=6.10,<7",

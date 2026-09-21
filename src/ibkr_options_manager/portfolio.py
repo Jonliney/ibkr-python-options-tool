@@ -57,7 +57,11 @@ class PortfolioResult:
 
 
 class PortfolioCoordinator:
-    """Publishes a coherent read-only inventory of open option positions."""
+    """Publishes a coherent inventory using read-only API requests only.
+
+    ``paper_execution_mode`` changes the required TWS API setting, not the
+    observation operations this coordinator is allowed to make.
+    """
 
     def __init__(
         self,
@@ -65,12 +69,14 @@ class PortfolioCoordinator:
         *,
         max_age_seconds: Decimal,
         clock: Callable[[], Decimal],
+        paper_execution_mode: bool = False,
     ) -> None:
         if max_age_seconds <= 0:
             raise ValueError("max_age_seconds must be positive")
         self._broker = broker
         self._max_age_seconds = max_age_seconds
         self._clock = clock
+        self._paper_execution_mode = paper_execution_mode
         self._current = PortfolioResult(PortfolioStatus.EMPTY, None, ())
 
     def refresh(self, request: PortfolioRequest) -> PortfolioResult:
@@ -81,6 +87,7 @@ class PortfolioCoordinator:
             request,
             self._max_age_seconds,
             self._clock(),
+            paper_execution_mode=self._paper_execution_mode,
         )
         return self._current
 
@@ -102,6 +109,8 @@ def _publish_portfolio(
     request: PortfolioRequest,
     max_age_seconds: Decimal,
     now: Decimal,
+    *,
+    paper_execution_mode: bool,
 ) -> PortfolioResult:
     errors = [
         _redact(message, request.expected_account, capture.managed_accounts)
@@ -112,7 +121,10 @@ def _publish_portfolio(
         errors.insert(0, f"missing completion barriers: {', '.join(missing)}")
     if not capture.connected:
         errors.append("TWS is disconnected")
-    if capture.read_only_api is not True:
+    if paper_execution_mode:
+        if capture.read_only_api is not False:
+            errors.append("TWS API read-only mode was not explicitly disabled")
+    elif capture.read_only_api is not True:
         errors.append("TWS API read-only mode was not verified")
     if capture.localhost_only is not True:
         errors.append("TWS localhost-only mode was not verified")
@@ -144,7 +156,7 @@ def _publish_portfolio(
         PortfolioSnapshot(
             account=request.expected_account,
             connected=True,
-            read_only_api=True,
+            read_only_api=capture.read_only_api is True,
             localhost_only=True,
             paper_account_verified=True,
             connection_epoch=capture.connection_epoch,
@@ -181,6 +193,9 @@ def _position(position: CapturedPosition, capture: BrokerCapture) -> PortfolioPo
             oca_group=order.oca_group,
             parent_id=order.parent_id,
             observed_at=capture.captured_at,
+            limit_price=order.limit_price,
+            stop_price=order.stop_price,
+            tif=order.tif,
         )
         for order in sorted(
             (

@@ -8,10 +8,21 @@ from time import monotonic
 
 from PySide6.QtWidgets import QApplication
 
-from ..broker import IbkrSnapshotBroker
+from ..broker import IbkrPaperExecutionBroker, IbkrSnapshotBroker
+from ..execution import (
+    ExecutionJournal,
+    PaperExecutionService,
+    default_paper_journal_path,
+)
 from ..portfolio import PortfolioCoordinator
 from ..snapshot import SnapshotCoordinator
-from .demo import DEMO_ACCOUNT, DEMO_CON_IDS, DemoReadOnlyBroker, DemoSnapshotSource
+from .demo import (
+    DEMO_ACCOUNT,
+    DEMO_CON_IDS,
+    DemoPaperExecutionTransport,
+    DemoReadOnlyBroker,
+    DemoSnapshotSource,
+)
 from .view_model import PlannerViewModel
 from .web_window import StarUIPlannerWindow
 
@@ -19,7 +30,7 @@ from .web_window import StarUIPlannerWindow
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ibkr-options-manager-gui",
-        description="Read-only paper-TWS option exit preview",
+        description="Paper-TWS option OCA bracket manager",
     )
     parser.add_argument("--account", default="", help="paper account to prefill")
     parser.add_argument("--con-id", type=int, help="option conId to prefill")
@@ -28,6 +39,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--demo-data",
         action="store_true",
         help="launch with deterministic simulated data; never contacts TWS",
+    )
+    parser.add_argument(
+        "--enable-paper-execution",
+        action="store_true",
+        help=(
+            "enable two-click paper-order submission; requires a DU account and "
+            "TWS API read-only mode disabled"
+        ),
     )
     return parser
 
@@ -50,7 +69,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     broker: DemoReadOnlyBroker | IbkrSnapshotBroker
     coordinator: DemoSnapshotSource | SnapshotCoordinator
     if args.demo_data:
-        broker = DemoReadOnlyBroker(clock=clock)
+        broker = DemoReadOnlyBroker(
+            clock=clock,
+            paper_execution_enabled=args.enable_paper_execution,
+        )
         coordinator = DemoSnapshotSource(broker, clock=clock)
         portfolio_max_age = Decimal("31536000")
     else:
@@ -65,13 +87,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         broker,
         max_age_seconds=portfolio_max_age,
         clock=clock,
+        paper_execution_mode=args.enable_paper_execution,
     )
     view_model = PlannerViewModel(coordinator, portfolio=portfolio, clock=clock)
+    paper_execution: PaperExecutionService | None = None
+    if args.enable_paper_execution:
+        transport = (
+            DemoPaperExecutionTransport()
+            if args.demo_data
+            else IbkrPaperExecutionBroker()
+        )
+        paper_execution = PaperExecutionService(
+            transport,
+            ExecutionJournal(default_paper_journal_path()),
+        )
     window = StarUIPlannerWindow(
         view_model,
         initial_account=initial_account,
         initial_con_id=args.con_id,
         demo_mode=args.demo_data,
+        paper_execution=paper_execution,
     )
     window.show()
     if args.demo_data:

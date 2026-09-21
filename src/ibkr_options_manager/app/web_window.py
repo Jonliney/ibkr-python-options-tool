@@ -16,6 +16,7 @@ from PySide6.QtWebEngineCore import (
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QMainWindow
 
+from ..execution import PaperExecutionService
 from .view_model import PlannerViewModel
 from .web import StarUIWorkbench
 
@@ -30,7 +31,7 @@ class _LoopbackOnlyRequestInterceptor(QWebEngineUrlRequestInterceptor):
 
 
 class StarUIPlannerWindow(QMainWindow):
-    """Embedded, loopback-only StarUI renderer for the read-only workbench."""
+    """Embedded, loopback-only StarUI renderer for the paper workbench."""
 
     def __init__(
         self,
@@ -39,6 +40,7 @@ class StarUIPlannerWindow(QMainWindow):
         initial_account: str = "",
         initial_con_id: int | None = None,
         demo_mode: bool = False,
+        paper_execution: PaperExecutionService | None = None,
     ) -> None:
         super().__init__()
         self._surface = StarUIWorkbench(
@@ -46,10 +48,11 @@ class StarUIPlannerWindow(QMainWindow):
             initial_account=initial_account,
             initial_con_id=initial_con_id,
             demo_mode=demo_mode,
+            paper_execution=paper_execution,
         )
         self._server, self._thread, port = _start_local_server(self._surface.app)
         self._url = QUrl(f"http://127.0.0.1:{port}{self._surface.path}")
-        self.setWindowTitle("IBKR Options Manager — Read-only preview")
+        self.setWindowTitle("IBKR Options Manager — Paper OCA manager")
         self.resize(1500, 920)
         self.setMinimumSize(1120, 720)
         self._view = QWebEngineView(self)

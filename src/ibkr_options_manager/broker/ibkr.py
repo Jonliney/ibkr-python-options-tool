@@ -55,6 +55,9 @@ class _OrderDraft:
     order_type: str
     oca_group: str | None
     parent_id: int
+    limit_price: Decimal | None
+    stop_price: Decimal | None
+    tif: str
 
 
 class IbkrSnapshotBroker:
@@ -87,7 +90,13 @@ class IbkrSnapshotBroker:
             app.reqCurrentTime()
             app.reqManagedAccts()
             app.reqPositions()
-            app.reqAllOpenOrders()
+            # `reqAllOpenOrders` is intentionally retained for inspection of
+            # outside orders, but it does not bind them to this API client.
+            # First collect this application's own orders from the same client
+            # ID that submitted them.  Those non-zero API order IDs are
+            # required for the later, app-owned management flow.
+            app.open_order_source = "client"
+            app.reqOpenOrders()
             _request_configuration(app, imports)
 
             _await(app, "server_time", deadline, "server-time request timed out")
@@ -100,10 +109,19 @@ class IbkrSnapshotBroker:
             _await(app, "positions", deadline, "position snapshot timed out")
             _await(
                 app,
-                "open_orders",
+                "client_open_orders",
                 deadline,
-                "open-order snapshot timed out",
+                "client open-order snapshot timed out",
             )
+            app.open_order_source = "all"
+            app.reqAllOpenOrders()
+            _await(
+                app,
+                "all_open_orders",
+                deadline,
+                "all-open-order snapshot timed out",
+            )
+            app._complete("open_orders")
             _await(
                 app,
                 "configuration",
@@ -155,6 +173,8 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
                     "managed_accounts",
                     "positions",
                     "open_orders",
+                    "client_open_orders",
+                    "all_open_orders",
                     "configuration",
                     "contract_details",
                     "quote",
@@ -169,8 +189,11 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
             self.localhost_only: bool | None = None
             self.managed_accounts: tuple[str, ...] = ()
             self.positions: list[CapturedPosition] = []
-            self.order_drafts: dict[int, _OrderDraft] = {}
-            self.order_statuses: dict[int, tuple[str, Decimal]] = {}
+            self.open_order_source = ""
+            self.client_order_drafts: dict[int, _OrderDraft] = {}
+            self.client_order_statuses: dict[int, tuple[str, Decimal]] = {}
+            self.all_order_drafts: dict[int, _OrderDraft] = {}
+            self.all_order_statuses: dict[int, tuple[str, Decimal]] = {}
             self.contract_details: list[CapturedContract] = []
             self.contract_details_raw: list[Any] = []
             self.quote_values: dict[str, Decimal] = {}
@@ -219,7 +242,7 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
             self, orderId: int, contract: Any, order: Any, orderState: Any
         ) -> None:
             del orderState
-            self.order_drafts[int(orderId)] = _OrderDraft(
+            draft = _OrderDraft(
                 perm_id=int(getattr(order, "permId", 0) or 0),
                 client_id=int(getattr(order, "clientId", 0) or 0),
                 order_id=int(orderId),
@@ -229,7 +252,14 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
                 order_type=str(getattr(order, "orderType", "")),
                 oca_group=str(getattr(order, "ocaGroup", "")) or None,
                 parent_id=int(getattr(order, "parentId", 0) or 0),
+                limit_price=_positive_decimal_or_none(getattr(order, "lmtPrice", 0)),
+                stop_price=_positive_decimal_or_none(getattr(order, "auxPrice", 0)),
+                tif=str(getattr(order, "tif", "")),
             )
+            if self.open_order_source == "client":
+                self.client_order_drafts[int(orderId)] = draft
+            elif self.open_order_source == "all":
+                self.all_order_drafts[int(orderId)] = draft
 
         def orderStatus(self, orderId: int, *args: Any) -> None:
             if len(args) < 3:
@@ -239,10 +269,16 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
                 return
             status = str(args[0])
             remaining = _decimal(args[2])
-            self.order_statuses[int(orderId)] = (status, remaining)
+            if self.open_order_source == "client":
+                self.client_order_statuses[int(orderId)] = (status, remaining)
+            elif self.open_order_source == "all":
+                self.all_order_statuses[int(orderId)] = (status, remaining)
 
         def openOrderEnd(self) -> None:
-            self._complete("open_orders")
+            if self.open_order_source == "client":
+                self._complete("client_open_orders")
+            elif self.open_order_source == "all":
+                self._complete("all_open_orders")
 
         def contractDetails(self, reqId: int, contractDetails: Any) -> None:
             if reqId != self.contract_request_id:
@@ -344,13 +380,21 @@ def _market_rule_exchange(details: Any, rule_id: int) -> str:
 
 
 def _capture(app: Any, epoch: int, *, connected: bool) -> BrokerCapture:
-    orders: list[CapturedOrder] = []
-    for order_id, draft in sorted(app.order_drafts.items()):
-        status, remaining = app.order_statuses.get(
-            order_id, ("MISSING_STATUS", Decimal("NaN"))
-        )
-        orders.append(
-            CapturedOrder(
+    # `reqAllOpenOrders` can report an API order ID of 0 for an otherwise
+    # visible order.  Prefer the same-client `reqOpenOrders` version whenever
+    # permanent IDs match, while retaining the all-orders view for external
+    # coverage inspection.
+    orders_by_perm_id: dict[int, CapturedOrder] = {}
+    anonymous_orders: list[CapturedOrder] = []
+    for drafts, statuses in (
+        (app.all_order_drafts, app.all_order_statuses),
+        (app.client_order_drafts, app.client_order_statuses),
+    ):
+        for order_id, draft in sorted(drafts.items()):
+            status, remaining = statuses.get(
+                order_id, ("MISSING_STATUS", Decimal("NaN"))
+            )
+            captured = CapturedOrder(
                 perm_id=draft.perm_id,
                 client_id=draft.client_id,
                 order_id=draft.order_id,
@@ -362,8 +406,19 @@ def _capture(app: Any, epoch: int, *, connected: bool) -> BrokerCapture:
                 status=status,
                 oca_group=draft.oca_group,
                 parent_id=draft.parent_id,
+                limit_price=draft.limit_price,
+                stop_price=draft.stop_price,
+                tif=draft.tif,
             )
-        )
+            if captured.perm_id <= 0:
+                anonymous_orders.append(captured)
+                continue
+            existing = orders_by_perm_id.get(captured.perm_id)
+            if existing is None or (
+                existing.order_id <= 0 < captured.order_id
+            ):
+                orders_by_perm_id[captured.perm_id] = captured
+    orders = [*orders_by_perm_id.values(), *anonymous_orders]
     captured_at = _now_decimal()
     quote = None
     if app.events["quote"].is_set():
@@ -417,6 +472,11 @@ def _decimal(value: Any) -> Decimal:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return Decimal("NaN")
+
+
+def _positive_decimal_or_none(value: Any) -> Decimal | None:
+    parsed = _decimal(value)
+    return parsed if parsed.is_finite() and parsed > 0 else None
 
 
 def _await(app: Any, name: str, deadline: float, message: str) -> bool:

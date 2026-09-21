@@ -24,7 +24,7 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
     """Build a deterministic preview; this module has no broker side effects."""
 
     state_validations = (
-        *_validate_snapshot_state(snapshot),
+        *_validate_snapshot_state(snapshot, request.paper_execution_mode),
         *_validate_contract_position(snapshot),
         *_validate_basis_and_quote(snapshot),
         *_validate_market_rule(snapshot),
@@ -155,6 +155,7 @@ def preview_reference_prices(
 
 def _validate_snapshot_state(
     snapshot: BrokerSnapshot,
+    paper_execution_mode: bool,
 ) -> tuple[Validation, ...]:
     failures: list[Validation] = []
 
@@ -163,11 +164,18 @@ def _validate_snapshot_state(
             failures.append(Validation(code, message, True))
 
     require(snapshot.connected, "CONNECTION_REQUIRED", "TWS is disconnected")
-    require(
-        snapshot.read_only_api,
-        "READ_ONLY_REQUIRED",
-        "TWS API read-only mode was not verified",
-    )
+    if paper_execution_mode:
+        require(
+            snapshot.api_read_only_observed and not snapshot.read_only_api,
+            "PAPER_EXECUTION_API_REQUIRED",
+            "TWS API must explicitly report non-read-only mode for paper execution",
+        )
+    else:
+        require(
+            snapshot.read_only_api,
+            "READ_ONLY_REQUIRED",
+            "TWS API read-only mode was not verified",
+        )
     require(
         snapshot.localhost_only,
         "LOCALHOST_REQUIRED",
@@ -769,6 +777,7 @@ def _fingerprint(
         "stop_loss_percentage": _decimal_text(request.stop_loss_percentage),
         "remainder_policy": request.remainder_policy.value,
         "tif": request.tif,
+        "paper_execution_mode": request.paper_execution_mode,
         "layers": [
             {
                 "quantity": layer.quantity,

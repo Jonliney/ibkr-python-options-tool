@@ -13,6 +13,7 @@ from ..domain import (
     BrokerSnapshot,
     LayerRequest,
     PlanRequest,
+    PlanResult,
     PlanStatus,
     PriceBand,
     RemainderPolicy,
@@ -60,6 +61,7 @@ class PlanForm:
     remainder_policy: RemainderPolicy = RemainderPolicy.NEXT_RUNG
     tif: str = "GTC"
     layers: tuple[DraftLayerForm, ...] = ()
+    paper_execution_mode: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +129,11 @@ class WorkingOrderLine:
     order_type: str
     remaining: str
     status: str
+    order_id: int = 0
+    oca_group: str | None = None
+    limit_price: Decimal | None = None
+    stop_price: Decimal | None = None
+    tif: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +144,15 @@ class QuoteCalculatorLine:
     market_data_type: str
     fresh: bool
     bands: tuple[PriceBand, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PaperExecutionCandidate:
+    """A valid plan paired with the snapshot captured immediately before send."""
+
+    snapshot: BrokerSnapshot
+    plan: PlanResult
+    selection: ConnectionSelection
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,13 +227,19 @@ class PlannerViewModel:
         self._portfolio_positions: tuple[PortfolioPosition, ...] = ()
         self._portfolio_lines: tuple[PortfolioPositionLine, ...] = ()
         self._bracket_forms: dict[int, PlanForm] = {}
+        self._latest_snapshot: BrokerSnapshot | None = None
 
     def empty(self) -> ViewState:
         return _empty_state()
 
+    def latest_snapshot(self) -> BrokerSnapshot | None:
+        """Return the most recent coherent selected-position snapshot, if any."""
+        return self._latest_snapshot
+
     def refresh_portfolio(self, settings: ConnectionSettings) -> ViewState:
         self._settings = settings
         self._selection = None
+        self._latest_snapshot = None
         self._account = settings.account
         self._portfolio_positions = ()
         self._portfolio_lines = ()
@@ -292,6 +314,7 @@ class PlannerViewModel:
             client_id=settings.client_id,
             timeout_seconds=settings.timeout_seconds,
         )
+        self._latest_snapshot = None
         chosen = self._bracket_forms.get(con_id, form or PlanForm())
         try:
             result = self._snapshots.refresh(
@@ -339,12 +362,65 @@ class PlannerViewModel:
             )
         return self._present_selected(result, form)
 
+    def prepare_paper_execution(
+        self,
+        form: PlanForm,
+    ) -> tuple[ViewState, PaperExecutionCandidate | None]:
+        """Refresh once and return the only snapshot/plan pair eligible to send.
+
+        The caller must still require a separate confirmation before forwarding
+        this candidate to the execution service.
+        """
+        selection = self._selection
+        if selection is None:
+            return _empty_state(), None
+        execution_form = replace(form, paper_execution_mode=True)
+        try:
+            result = self._snapshots.refresh(
+                SnapshotRequest(
+                    host="127.0.0.1",
+                    port=selection.port,
+                    client_id=selection.client_id,
+                    expected_account=selection.account,
+                    option_con_id=selection.con_id,
+                    timeout_seconds=selection.timeout_seconds,
+                )
+            )
+        except Exception as error:  # execution must fail closed at the GUI seam
+            state = _unavailable_state(
+                UiStatus.BLOCKED,
+                selection,
+                (
+                    ValidationLine(
+                        "EXECUTION_REFRESH_FAILED", _redact(str(error), self._account)
+                    ),
+                ),
+            )
+            return self._decorate(
+                state,
+                selected_con_id=selection.con_id,
+                form=execution_form,
+            ), None
+
+        state = self._present_selected(result, execution_form)
+        if result.status is not SnapshotStatus.READY or result.snapshot is None:
+            self._latest_snapshot = None
+            return state, None
+        request, input_error = _parse_plan_form(execution_form)
+        if input_error is not None or request is None:
+            return state, None
+        plan = build_exit_plan(result.snapshot, request)
+        if plan.status is not PlanStatus.VALID:
+            return state, None
+        return state, PaperExecutionCandidate(result.snapshot, plan, selection)
+
     def refresh(
         self,
         selection: ConnectionSelection,
         form: PlanForm,
     ) -> ViewState:
         self._selection = selection
+        self._latest_snapshot = None
         self._account = selection.account
         try:
             request = SnapshotRequest(
@@ -404,6 +480,7 @@ class PlannerViewModel:
                 form=form,
             )
 
+        self._latest_snapshot = result.snapshot
         self._bracket_forms[selection.con_id] = form
         state = _with_preview_rows(
             _ready_state(result.snapshot, selection, form, now=self._clock()),
@@ -449,6 +526,7 @@ class PlannerViewModel:
         if selection is None:
             return _empty_state()
         if result.status is not SnapshotStatus.READY or result.snapshot is None:
+            self._latest_snapshot = None
             status = (
                 UiStatus.STALE
                 if result.status is SnapshotStatus.STALE
@@ -459,6 +537,7 @@ class PlannerViewModel:
                 for message in result.errors
             ) or (ValidationLine("SNAPSHOT_BLOCKED", "No coherent snapshot is ready"),)
             return _unavailable_state(status, selection, validations)
+        self._latest_snapshot = result.snapshot
         return _with_preview_rows(
             _ready_state(result.snapshot, selection, form, now=self._clock()),
             form,
@@ -758,10 +837,15 @@ def _working_order_lines(snapshot: BrokerSnapshot) -> tuple[WorkingOrderLine, ..
     return tuple(
         WorkingOrderLine(
             perm_id=order.perm_id,
+            order_id=order.order_id,
             action=order.action,
             order_type=order.order_type,
             remaining=_quantity(order.remaining),
             status=order.status,
+            oca_group=order.oca_group,
+            limit_price=order.limit_price,
+            stop_price=order.stop_price,
+            tif=order.tif,
         )
         for order in snapshot.working_orders
         if order.key == snapshot.selected
@@ -859,6 +943,7 @@ def _parse_plan_form(
             remainder_policy=form.remainder_policy,
             tif=form.tif.strip().upper(),
             layers=layers,
+            paper_execution_mode=form.paper_execution_mode,
         ),
         None,
     )

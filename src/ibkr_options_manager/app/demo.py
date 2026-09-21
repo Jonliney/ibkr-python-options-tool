@@ -1,8 +1,8 @@
-"""Deterministic, in-process data for exercising the read-only workbench.
+"""Deterministic, in-process data for exercising the workbench.
 
-This module deliberately implements only the existing read-only broker seam.
-It has no TWS, socket, or order-transmission dependency and is available only
-when the GUI is launched with ``--demo-data``.
+It has no TWS or socket dependency.  Its optional execution transport returns
+synthetic acknowledgement IDs only, so ``--demo-data`` can never place an
+order even when the paper-execution UI is being rehearsed.
 """
 
 from __future__ import annotations
@@ -22,7 +22,8 @@ from ..broker import (
     PortfolioRequest,
     SnapshotRequest,
 )
-from ..domain import PriceBand
+from ..broker.execution import PaperSubmission
+from ..domain import BrokerSnapshot, PlanResult, PriceBand
 from ..snapshot import SnapshotCoordinator, SnapshotResult
 
 DEMO_ACCOUNT = "DU0000000"
@@ -118,8 +119,14 @@ DEMO_CON_IDS = frozenset(position.contract.con_id for position in _POSITIONS)
 class DemoReadOnlyBroker:
     """A fresh, coherent demo capture for every read-only refresh request."""
 
-    def __init__(self, *, clock: Callable[[], Decimal]) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], Decimal],
+        paper_execution_enabled: bool = False,
+    ) -> None:
         self._clock = clock
+        self._paper_execution_enabled = paper_execution_enabled
 
     def capture(
         self,
@@ -143,7 +150,7 @@ class DemoReadOnlyBroker:
             connected=True,
             server_version=None,
             server_time=None,
-            read_only_api=True,
+            read_only_api=not self._paper_execution_enabled,
             localhost_only=True,
             managed_accounts=(account,),
             positions=positions,
@@ -203,6 +210,27 @@ class DemoSnapshotSource:
         return self._coordinator.current()
 
 
+class DemoPaperExecutionTransport:
+    """Safe local acknowledgement simulator for the paper execution UI."""
+
+    def submit(
+        self,
+        snapshot: BrokerSnapshot,
+        plan: PlanResult,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmission:
+        del snapshot, host, port, client_id, timeout_seconds
+        count = len(plan.pairs) * 2
+        return PaperSubmission(
+            order_ids=tuple(range(900_001, 900_001 + count)),
+            perm_ids=tuple(range(800_001, 800_001 + count)),
+        )
+
+
 def _selected_position(
     request: PortfolioRequest | SnapshotRequest,
 ) -> _DemoPosition:
@@ -239,6 +267,7 @@ def _orders(account: str) -> tuple[CapturedOrder, ...]:
 __all__ = [
     "DEMO_ACCOUNT",
     "DEMO_CON_IDS",
+    "DemoPaperExecutionTransport",
     "DemoReadOnlyBroker",
     "DemoSnapshotSource",
 ]

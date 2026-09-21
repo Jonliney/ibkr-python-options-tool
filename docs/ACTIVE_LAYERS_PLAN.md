@@ -7,8 +7,11 @@ read-only OCA bracket plan. Add a separate **Active layers** tab for brackets
 that this application created and can therefore identify, reconcile, and
 eventually manage without touching external TWS orders.
 
-This plan does not authorize live transmission. Until a future explicit
-milestone, every active-layer action produces an inspectable action plan only.
+This plan does not authorize live transmission. The explicit paper-only
+milestone permits one narrow active-layer action: cancelling one exact
+app-owned OCA pair and then submitting a standalone MKT after two
+fresh-snapshot checks and a second confirmation. All other active-layer actions
+still produce inspectable plans only.
 
 ## Tabs
 
@@ -57,7 +60,7 @@ confirmation. They never modify orders not proven to be application-owned.
 
 | Action | Intended plan | Required final checks |
 | --- | --- | --- |
-| Sell now (one layer) | Cancel the owned LMT and STP legs, verify their acknowledgements, then submit one replacement exit for that layer's remaining quantity. | Fresh account/contract/order/position snapshot, pair ownership, unchanged remaining quantity, successful cancels, replacement acknowledgement. |
+| Sell now (one layer) | **Paper-only:** cancel the owned LMT and STP pair, confirm both cancellations plus a client-scoped open-order recheck, then submit a new standalone MKT for its verified remaining quantity. | Two fresh account/contract/order/position snapshots, pair ownership, exact client ownership, unchanged remaining quantity, complete two-leg OCA relationship, cancellations, recheck, and MKT acknowledgement. A timeout is indeterminate: inspect TWS, never retry blindly. |
 | Close all brackets | Select all eligible app-owned layers, cancel every leg, verify acknowledgements, then submit exits for the reconciled remaining position quantity. | Same checks per layer plus a final position-level quantity reconciliation after all cancels. |
 | Update STP | Change only the owned stop leg(s) to the requested tick-valid price while preserving quantity, OCA link, parent relationship, and TIF. | Fresh pair details, no fill/change since review, verified tick rule, broker acknowledgement, post-change re-read. |
 | Move to B/E | Resolve the verified average entry cost, round it to the current contract tick rule, and prepare an Update STP plan for the selected layers. | Explicitly show the source entry basis, rounded stop value, eligible remaining quantity, and each affected order before confirmation. |
@@ -72,8 +75,9 @@ execution risk materially and must be made explicitly rather than inferred.
 1. Define the durable app-owned OCA-layer record and reconciliation domain
    model, with fixtures for restarts, disconnects, manual TWS changes, partial
    fills, rejections, and duplicate broker callbacks.
-2. Add the read-only Active layers tab and its status/empty/conflict states.
-   No action controls transmit or modify anything.
+2. Add the Active layers tab and its status/empty/conflict states. The narrow
+   paper-only Sell now action is permitted only behind its explicit feature
+   gate; no other action transmits or modifies anything.
 3. Add pure action-plan builders for Sell now, Close all, Update STP, and Move
    to B/E. Render the complete chronological plan in the action review panel.
 4. Add a paper-only execution adapter behind an explicit feature gate, with
@@ -84,7 +88,9 @@ execution risk materially and must be made explicitly rather than inferred.
 
 ## Open decisions for the next design session
 
-- Which protected exit order type should “Sell now” and “Close all” use?
+- What protected exit order type should “Close all” use? Sell now is a
+  paper-only cancel-then-MKT experiment; it needs paper validation before any
+  broader execution decision.
 - Should Close all operate only on selected app-managed layers, or include
   every app-managed layer for the contract by default?
 - Does Move to B/E use the current verified average cost basis for the entire

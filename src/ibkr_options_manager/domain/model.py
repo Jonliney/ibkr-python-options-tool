@@ -56,6 +56,9 @@ class WorkingOrder:
     oca_group: str | None = None
     parent_id: int = 0
     observed_at: Decimal = Decimal("0")
+    limit_price: Decimal | None = None
+    stop_price: Decimal | None = None
+    tif: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +104,7 @@ class BrokerSnapshot:
     server_time: int | None = None
     captured_at: Decimal = Decimal("0")
     completion_times: tuple[tuple[str, Decimal], ...] = ()
+    api_read_only_observed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +115,7 @@ class PlanRequest:
     remainder_policy: RemainderPolicy
     tif: str
     layers: tuple[LayerRequest, ...] = ()
+    paper_execution_mode: bool = False
 
 
 @dataclass(frozen=True, slots=True)
