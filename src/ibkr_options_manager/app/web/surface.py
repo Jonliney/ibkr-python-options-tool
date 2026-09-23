@@ -182,10 +182,11 @@ class StarUIWorkbench:
                 self._arm_selected_market_exit_locked(values)
             elif action == "market-exit-confirm":
                 self._confirm_market_exit_locked()
-            elif action == "active-move-be-arm":
-                self._arm_price_updates_locked(values, move_stops_to_break_even=True)
+            elif action == "cancel-staged":
+                self._disarm_execution_locked()
+                self._message = "Staged action cancelled. No orders were sent to TWS."
             elif action == "active-update-arm":
-                self._arm_price_updates_locked(values, move_stops_to_break_even=False)
+                self._arm_price_updates_locked(values)
             elif action == "price-update-confirm":
                 self._confirm_price_updates_locked()
             else:
@@ -229,6 +230,16 @@ class StarUIWorkbench:
         state = self._view_model.select_position(
             con_id, self._plan_form(self._drafts.get(con_id, ()))
         )
+        if any(
+            validation.code == "LAYER_QUANTITY_EXCEEDS_AVAILABLE"
+            for validation in state.validations
+        ):
+            # A fresh broker snapshot has changed the reservable quantity (for
+            # example, a bracket was cancelled in TWS). A retained draft is no
+            # longer a draft for the available balance, so replace it rather
+            # than trapping the position behind its obsolete allocation.
+            self._drafts.pop(con_id, None)
+            state = self._view_model.select_position(con_id, self._plan_form(()))
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
         self._announce_reconciliation_locked()
@@ -342,7 +353,8 @@ class StarUIWorkbench:
 
     def _arm_selected_market_exit_locked(self, values: dict[str, str]) -> None:
         """Arm a verified all-selected-layer paper exit for second confirmation."""
-        selected = _selected_active_perm_ids(values)
+        del values
+        selected = self._active_target_perm_ids()
         if not selected:
             self._message = "Select at least one active layer for the staged paper MKT exit."
             return
@@ -446,14 +458,12 @@ class StarUIWorkbench:
     def _arm_price_updates_locked(
         self,
         values: dict[str, str],
-        *,
-        move_stops_to_break_even: bool,
     ) -> None:
         """Prepare price-only app-owned OCA changes for a second confirmation."""
         if self._paper_execution is None or self._selected_con_id is None:
             self._message = "Paper order management is disabled for this launch."
             return
-        selected = _selected_active_perm_ids(values)
+        selected = self._active_target_perm_ids()
         if not selected:
             self._message = "Select at least one active layer to update."
             return
@@ -486,26 +496,36 @@ class StarUIWorkbench:
                 stop = orders_by_id.get(layer.stop_order_id)
                 if target is None or stop is None:
                     raise ExecutionBlocked("a selected OCA layer is no longer complete")
-                if move_stops_to_break_even:
-                    desired_target = None
+                target_percentage = _decimal_value(
+                    values.get(f"active_target_{layer.target_perm_id}")
+                )
+                stop_percentage = _decimal_value(
+                    values.get(f"active_stop_{layer.target_perm_id}")
+                )
+                if (
+                    target_percentage is None
+                    or target_percentage <= 0
+                    or stop_percentage is None
+                    or stop_percentage < 0
+                    or stop_percentage > 100
+                ):
+                    raise ExecutionBlocked(
+                        "active target must be positive and stop must be 0% to 100%"
+                    )
+                if stop_percentage == 0:
+                    desired_target = round_up_price(
+                        basis * (Decimal("1") + target_percentage / Decimal("100")),
+                        calculator.bands,
+                    )
                     desired_stop = round_up_price(basis, calculator.bands)
                 else:
-                    target_percentage = _decimal_value(
-                        values.get(f"active_target_{layer.target_perm_id}")
-                    )
-                    stop_percentage = _decimal_value(
-                        values.get(f"active_stop_{layer.target_perm_id}")
-                    )
-                    if target_percentage is None or stop_percentage is None:
-                        raise ExecutionBlocked("active target and stop percentages are required")
                     prices = preview_reference_prices(
                         basis,
                         target_percentage,
                         stop_percentage,
                         calculator.bands,
                     )
-                    desired_target = prices.target_price
-                    desired_stop = prices.stop_price
+                    desired_target, desired_stop = prices.target_price, prices.stop_price
                 updates.append(
                     PriceUpdateCandidate(
                         layer=layer,
@@ -544,9 +564,8 @@ class StarUIWorkbench:
             int(update.target_price is not None) + int(update.stop_price is not None)
             for update in self._armed_price_updates
         )
-        action = "stops to cost basis" if move_stops_to_break_even else "selected prices"
         self._message = (
-            f"Fresh paper snapshot verified. Review {changed_legs} {action} "
+            f"Fresh paper snapshot verified. Review {changed_legs} selected price "
             "amendments, then click to confirm."
         )
 
@@ -605,7 +624,15 @@ class StarUIWorkbench:
         if state.status is UiStatus.READY:
             self._message = "Verified broker state is ready for read-only planning."
         elif state.status is not UiStatus.EMPTY:
-            self._message = state.status_message
+            blocking = next(
+                (validation.message for validation in state.validations if validation.blocking),
+                None,
+            )
+            self._message = (
+                f"{state.status_message}: {blocking}"
+                if blocking
+                else state.status_message
+            )
 
     def _record_refresh_time_locked(self) -> None:
         """Show the local time of the last completed broker snapshot attempt."""
@@ -1057,6 +1084,10 @@ class StarUIWorkbench:
                 pairs.append((group, targets[0], stops[0]))
         return tuple(pairs)
 
+    def _active_target_perm_ids(self) -> tuple[int, ...]:
+        """Act on every reconciled layer of the currently selected contract."""
+        return tuple(target.perm_id for _group, target, _stop in self._active_oca_pairs())
+
     def _active_layers_panel(self) -> Any:
         pairs = self._active_oca_pairs()
         if not pairs:
@@ -1078,22 +1109,12 @@ class StarUIWorkbench:
                                 "Move stop to B/E",
                                 variant="outline",
                                 size="sm",
-                                type="submit",
-                                name="action",
-                                value="active-move-be-arm",
+                                type="button",
+                                data_move_stops_to_be=True,
                                 disabled=self._paper_execution is None,
                             ),
                             Button(
-                                "Update layers",
-                                variant="outline",
-                                size="sm",
-                                type="submit",
-                                name="action",
-                                value="active-update-arm",
-                                disabled=self._paper_execution is None,
-                            ),
-                            Button(
-                                "Sell layers",
+                                "Close all",
                                 variant="destructive",
                                 size="sm",
                                 type="submit",
@@ -1125,41 +1146,33 @@ class StarUIWorkbench:
                     ),
                 ),
             ),
+            Script(_live_active_script(self._live_active_configuration())),
+            id="active-form",
             action=f"/{self.session_token}/action",
             method="post",
         )
 
     def _active_layer_row(self, index: int, _group: str, target: Any, stop: Any) -> Any:
-        target_percentage = _price_percentage(
+        calculator = self._state.quote_calculator
+        bands = calculator.bands if calculator is not None else ()
+        target_percentage = _active_percentage_for_price(
             target.limit_price,
             self._state.unit_basis,
             target=True,
+            bands=bands,
+            presets=_parse_presets(self._target_presets, maximum=Decimal("1000")) or (),
         )
-        stop_percentage = _price_percentage(
+        stop_percentage = _active_percentage_for_price(
             stop.stop_price,
             self._state.unit_basis,
             target=False,
+            bands=bands,
+            presets=_parse_presets(self._stop_presets, maximum=Decimal("100")) or (),
         )
         gain, loss = self._active_layer_projection(target, stop)
-        checkbox_id = f"active-layer-{index}"
-        return Div(
-            Div(
-                HTMLInput(
-                    type="checkbox",
-                    id=checkbox_id,
-                    name=f"active_layer_{target.perm_id}",
-                    value=str(target.perm_id),
-                    checked=True,
-                    cls="mt-0.5 size-4 accent-primary",
-                ),
-                Div(
-                    Label(f"LAYER {index}", fr=checkbox_id, cls="text-xs font-semibold"),
-                    P(f"OCA-{index}", cls="mt-2 text-xs text-muted-foreground"),
-                    cls="min-w-20",
-                ),
-                cls="flex items-start gap-3",
-            ),
-            _percentage_price_field(
+        return _layer_row_layout(
+            index=index,
+            target_field=_percentage_price_field(
                 "LMT target",
                 Input(
                     name=f"active_target_{target.perm_id}",
@@ -1168,6 +1181,11 @@ class StarUIWorkbench:
                     value=target_percentage,
                     min="0.1",
                     step="0.1",
+                    data_active_input="target",
+                    data_active_perm_id=target.perm_id,
+                    data_active_original=target.limit_price,
+                    data_active_initial=target_percentage,
+                    data_live_layer=index,
                     cls="pr-8",
                 ),
                 input_id=f"active-target-{index}",
@@ -1176,18 +1194,23 @@ class StarUIWorkbench:
                 outcome_label="gain",
                 tone="text-emerald-400",
                 layer_index=index,
-                kind=f"active-target-{index}",
+                kind="active-target",
             ),
-            _percentage_price_field(
+            stop_field=_percentage_price_field(
                 "STP loss",
                 Input(
                     name=f"active_stop_{target.perm_id}",
                     id=f"active-stop-{index}",
                     type="number",
                     value=stop_percentage,
-                    min="0.1",
+                    min="0",
                     max="100",
                     step="0.1",
+                    data_active_input="stop",
+                    data_active_perm_id=target.perm_id,
+                    data_active_original=stop.stop_price,
+                    data_active_initial=stop_percentage,
+                    data_live_layer=index,
                     cls="pr-8",
                 ),
                 input_id=f"active-stop-{index}",
@@ -1196,19 +1219,20 @@ class StarUIWorkbench:
                 outcome_label="max loss",
                 tone="text-rose-400",
                 layer_index=index,
-                kind=f"active-stop-{index}",
+                kind="active-stop",
             ),
-            _field(
+            quantity_field=_field(
                 "Quantity",
                 Input(
                     id=f"active-quantity-{index}",
                     type="number",
                     value=str(target.remaining),
                     readonly=True,
+                    data_active_quantity=target.perm_id,
                 ),
                 input_id=f"active-quantity-{index}",
             ),
-            _field(
+            tif_field=_field(
                 "TIF",
                 Input(
                     id=f"active-tif-{index}",
@@ -1217,11 +1241,7 @@ class StarUIWorkbench:
                 ),
                 input_id=f"active-tif-{index}",
             ),
-            # Reuse the exact, precompiled StarUI grid utility used by draft
-            # rows.  A new arbitrary Tailwind grid class is not available in
-            # the bundled stylesheet and silently collapses to one column.
-            Div(aria_hidden="true"),
-            cls="grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4 first:border-t-0",
+            action_field=Div(aria_hidden="true"),
         )
 
     def _active_layer_projection(self, target: Any, stop: Any) -> tuple[str, str]:
@@ -1248,12 +1268,19 @@ class StarUIWorkbench:
         order_count: int,
     ) -> Any:
         if coverage == "app":
+            available = self._state.available_quantity
+            coverage_message = (
+                f"{app_order_count} app-created orders were reconciled with TWS. "
+                "This position is fully covered; a new bracket will not be created."
+                if available == 0
+                else (
+                    f"{app_order_count} app-created orders were reconciled with TWS. "
+                    f"{available} contracts remain available for a new bracket."
+                )
+            )
             return Alert(
                 AlertTitle("App-managed OCA coverage active"),
-                AlertDescription(
-                    f"{app_order_count} app-created orders were reconciled with TWS. "
-                    "This position is fully covered; a new bracket will not be created."
-                ),
+                AlertDescription(coverage_message),
                 cls="mb-5 border-emerald-500/40 bg-emerald-500/10 text-emerald-100",
             )
         if coverage == "mixed":
@@ -1320,7 +1347,7 @@ class StarUIWorkbench:
                         ScrollArea(
                             Div(
                                 *[
-                                    self._layer_row(index, layer, len(layers))
+                                    self._draft_layer_row(index, layer, len(layers))
                                     for index, layer in enumerate(layers, start=1)
                                 ],
                                 Div(
@@ -1368,16 +1395,30 @@ class StarUIWorkbench:
             ],
         }
 
-    def _layer_row(self, index: int, layer: DraftLayerForm, count: int) -> Any:
+    def _live_active_configuration(self) -> dict[str, Any] | None:
+        """Expose verified price arithmetic for client-side active-change review."""
+        basis = self._state.unit_basis
+        calculator = self._state.quote_calculator
+        if basis is None or calculator is None:
+            return None
+        return {
+            "basis": format(basis, "f"),
+            "multiplier": format(self._state.multiplier or Decimal("0"), "f"),
+            "bands": [
+                {
+                    "low": format(band.low_edge, "f"),
+                    "increment": format(band.increment, "f"),
+                }
+                for band in calculator.bands
+            ],
+        }
+
+    def _draft_layer_row(self, index: int, layer: DraftLayerForm, count: int) -> Any:
         tif_signal = Signal(f"tif_{index}_value", _ref_only=True)
         gain, loss = self._layer_projection(layer)
-        return Div(
-            Div(
-                Span(f"LAYER {index}", cls="text-xs font-semibold"),
-                P(f"OCA-{index}", cls="mt-2 text-xs text-muted-foreground"),
-                cls="min-w-20",
-            ),
-            _percentage_price_field(
+        return _layer_row_layout(
+            index=index,
+            target_field=_percentage_price_field(
                 "LMT target",
                 Input(
                     name=f"target_{index}",
@@ -1398,7 +1439,7 @@ class StarUIWorkbench:
                 layer_index=index,
                 kind="target",
             ),
-            _percentage_price_field(
+            stop_field=_percentage_price_field(
                 "STP loss",
                 Input(
                     name=f"stop_{index}",
@@ -1420,7 +1461,7 @@ class StarUIWorkbench:
                 layer_index=index,
                 kind="stop",
             ),
-            _field(
+            quantity_field=_field(
                 "Quantity",
                 Input(
                     name=f"quantity_{index}",
@@ -1434,7 +1475,7 @@ class StarUIWorkbench:
                 ),
                 input_id=f"quantity_{index}",
             ),
-            _field(
+            tif_field=_field(
                 "TIF",
                 Div(
                     Select(
@@ -1455,7 +1496,7 @@ class StarUIWorkbench:
                 ),
                 input_id=f"tif_{index}",
             ),
-            Button(
+            action_field=Button(
                 Icon("lucide:trash-2"),
                 variant="outline",
                 size="icon",
@@ -1466,7 +1507,6 @@ class StarUIWorkbench:
                 aria_label=f"Remove layer {index}",
                 cls="mt-5",
             ),
-            cls="grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4 first:border-t-0",
         )
 
     def _layer_projection(self, layer: DraftLayerForm) -> tuple[str, str]:
@@ -1515,10 +1555,11 @@ class StarUIWorkbench:
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
         price_updates = self._armed_price_updates
+        live_active = self._workspace_tab == "active" and bool(self._active_oca_pairs())
         armed_execution = self._armed_execution
         action_rows: list[Any] = []
         if market_exits:
-            action_rows = [self._review_market_exit(candidate) for candidate in market_exits]
+            action_rows = self._review_market_exit_plan(market_exits)
         elif price_updates:
             action_rows = [
                 self._review_price_update(index, update)
@@ -1550,6 +1591,8 @@ class StarUIWorkbench:
             ),
             ScrollArea(*action_rows, aria_label="Planned order actions", cls="min-h-0 flex-1 px-4")
             if action_rows
+            else self._live_active_review()
+            if live_active
             else Div(
                 P(
                     "Add a layer or modify an existing one to continue.",
@@ -1567,13 +1610,25 @@ class StarUIWorkbench:
         )
         if market_exits:
             return Form(
-                Button(
-                    "Click to confirm cancel + MKT sell",
-                    variant="destructive",
-                    type="submit",
-                    cls="w-full",
+                Div(
+                    Button(
+                        "Cancel",
+                        variant="outline",
+                        type="submit",
+                        name="action",
+                        value="cancel-staged",
+                        cls="flex-1",
+                    ),
+                    Button(
+                        "Click to confirm close all",
+                        variant="destructive",
+                        type="submit",
+                        name="action",
+                        value="market-exit-confirm",
+                        cls="flex-[2]",
+                    ),
+                    cls="flex gap-2",
                 ),
-                HTMLInput(type="hidden", name="action", value="market-exit-confirm"),
                 action=f"/{self.session_token}/action",
                 method="post",
                 cls="mx-4 mb-4 w-[calc(100%-2rem)]",
@@ -1604,6 +1659,21 @@ class StarUIWorkbench:
                 ),
                 cls="mx-4 mb-4 w-[calc(100%-2rem)]",
             )
+        if self._workspace_tab == "active" and self._active_oca_pairs():
+            return Div(
+                Button(
+                    "Execute paper order",
+                    variant="default",
+                    type="submit",
+                    name="action",
+                    value="active-update-arm",
+                    form="active-form",
+                    data_active_execute=True,
+                    disabled=True,
+                    cls="w-full",
+                ),
+                cls="mx-4 mb-4 w-[calc(100%-2rem)]",
+            )
         can_execute = (
             self._paper_execution is not None
             and self._workspace_tab == "draft"
@@ -1624,113 +1694,221 @@ class StarUIWorkbench:
             cls="mx-4 mb-4 w-[calc(100%-2rem)]",
         )
 
-    def _review_pair(self, index: int, layer: DraftLayerForm) -> Any:
+    def _live_active_review(self) -> Any:
+        """Client-side review rows sharing the draft order-review component."""
+        rows: list[Any] = []
+        for index, (_group, target, _stop) in enumerate(
+            self._active_oca_pairs(), start=1
+        ):
+            rows.append(
+                self._review_oca_pair(
+                    index=index,
+                    quantity=str(target.remaining),
+                    tif=target.tif,
+                    lines=(
+                        self._review_order_line(
+                            "UPDATE SELL LMT",
+                            Span(
+                                data_active_review_target=target.perm_id,
+                                cls="text-sm font-semibold text-emerald-400",
+                            ),
+                            "text-emerald-400",
+                            row_attributes={
+                                "data_active_review_target_row": target.perm_id
+                            },
+                            hidden=True,
+                        ),
+                        self._review_order_line(
+                            "UPDATE SELL STP",
+                            Span(
+                                data_active_review_stop=target.perm_id,
+                                cls="text-sm font-semibold text-rose-400",
+                            ),
+                            "text-rose-400",
+                            row_attributes={
+                                "data_active_review_stop_row": target.perm_id
+                            },
+                            hidden=True,
+                        ),
+                    ),
+                    row_attributes={"data_active_review_row": target.perm_id},
+                    hidden=True,
+                )
+            )
         return Div(
-            Div(
-                P(f"OCA-{index}", cls="text-xs font-semibold"),
-                P(
-                    f"{layer.quantity} contracts · {layer.tif}",
-                    data_live_review_quantity=index,
-                    cls="mt-0.5 text-xs text-muted-foreground",
-                ),
+            P(
+                "Modify an active LMT or STP price to continue.",
+                data_active_review_empty=True,
+                cls="text-center text-sm leading-6 text-muted-foreground",
             ),
-            Div(
-                Div(
-                    Span("SELL LMT", cls="text-xs font-semibold text-emerald-400"),
+            *rows,
+            cls="min-h-0 flex-1 px-4",
+        )
+
+    def _review_pair(self, index: int, layer: DraftLayerForm) -> Any:
+        return self._review_oca_pair(
+            index=index,
+            quantity=layer.quantity,
+            tif=layer.tif,
+            quantity_attributes={"data_live_review_quantity": index},
+            lines=(
+                self._review_order_line(
+                    "SELL LMT",
                     Span(
                         f"${layer.target_price}",
                         data_live_review_price=f"target-{index}",
                         aria_live="polite",
                         cls="text-sm font-semibold text-emerald-400",
                     ),
-                    cls="flex items-center justify-between gap-3",
+                    "text-emerald-400",
                 ),
-                Div(
-                    Span("SELL STP", cls="text-xs font-semibold text-rose-400"),
+                self._review_order_line(
+                    "SELL STP",
                     Span(
                         f"${layer.stop_price}",
                         data_live_review_price=f"stop-{index}",
                         aria_live="polite",
                         cls="text-sm font-semibold text-rose-400",
                     ),
-                    cls="flex items-center justify-between gap-3",
+                    "text-rose-400",
                 ),
-                cls="mt-3 space-y-3 border-l-2 border-border pl-3",
             ),
-            cls="border-b border-border py-4",
         )
 
     def _review_price_update(self, index: int, update: PriceUpdateCandidate) -> Any:
         """Display only the selected legs whose price will actually change."""
-        rows = []
+        rows: list[Any] = []
         if update.target_price is not None:
             rows.append(
-                Div(
-                    Span("UPDATE SELL LMT", cls="text-xs font-semibold text-emerald-400"),
+                self._review_order_line(
+                    "UPDATE SELL LMT",
                     Span(
                         f"${format(update.target_price, 'f')}",
                         cls="text-sm font-semibold text-emerald-400",
                     ),
-                    cls="flex items-center justify-between gap-3",
+                    "text-emerald-400",
                 )
             )
         if update.stop_price is not None:
             rows.append(
-                Div(
-                    Span("UPDATE SELL STP", cls="text-xs font-semibold text-rose-400"),
+                self._review_order_line(
+                    "UPDATE SELL STP",
                     Span(
                         f"${format(update.stop_price, 'f')}",
                         cls="text-sm font-semibold text-rose-400",
                     ),
-                    cls="flex items-center justify-between gap-3",
+                    "text-rose-400",
                 )
             )
-        return Div(
-            P(f"OCA-{index}", cls="text-xs font-semibold"),
-            P(
-                f"{update.layer.quantity} contracts · {update.layer.tif}",
-                cls="mt-0.5 text-xs text-muted-foreground",
-            ),
-            Div(*rows, cls="mt-3 space-y-3 border-l-2 border-border pl-3"),
-            cls="border-b border-border py-4",
+        return self._review_oca_pair(
+            index=index,
+            quantity=str(update.layer.quantity),
+            tif=update.layer.tif,
+            lines=tuple(rows),
         )
 
-    def _review_market_exit(self, candidate: MarketExitCandidate) -> Any:
+    def _review_oca_pair(
+        self,
+        *,
+        index: int,
+        quantity: str,
+        tif: str,
+        lines: tuple[Any, ...],
+        quantity_attributes: dict[str, Any] | None = None,
+        row_attributes: dict[str, Any] | None = None,
+        hidden: bool = False,
+    ) -> Any:
+        """Shared order-review structure for new drafts and active amendments."""
+        row_cls = "border-b border-border py-4"
+        if hidden:
+            row_cls = f"hidden {row_cls}"
         return Div(
             Div(
-                P("Selected app-owned OCA layer", cls="text-xs font-semibold"),
+                P(f"OCA-{index}", cls="text-xs font-semibold"),
                 P(
-                    f"{candidate.quantity} contracts · {candidate.tif}",
+                    f"{quantity} contracts · {tif}",
+                    cls="mt-0.5 text-xs text-muted-foreground",
+                    **(quantity_attributes or {}),
+                ),
+            ),
+            Div(*lines, cls="mt-3 space-y-3 border-l-2 border-border pl-3"),
+            cls=row_cls,
+            **(row_attributes or {}),
+        )
+
+    def _review_order_line(
+        self,
+        label: str,
+        value: Any,
+        tone: str,
+        *,
+        row_attributes: dict[str, Any] | None = None,
+        hidden: bool = False,
+    ) -> Any:
+        """One linked LMT or STP line in the common OCA action-review component."""
+        row_cls = f"flex items-center justify-between gap-3 {tone}"
+        if hidden:
+            row_cls = f"hidden {row_cls}"
+        return Div(
+            Span(label, cls=f"text-xs font-semibold {tone}"),
+            value,
+            cls=row_cls,
+            **(row_attributes or {}),
+        )
+
+    def _review_market_exit_plan(
+        self, candidates: tuple[MarketExitCandidate, ...]
+    ) -> list[Any]:
+        """Show the actual bulk-exit sequence once, without duplicating its MKT leg."""
+        rows: list[Any] = []
+        for index, candidate in enumerate(candidates, start=1):
+            rows.append(
+                self._review_oca_pair(
+                    index=index,
+                    quantity=format(candidate.quantity, "f"),
+                    tif=candidate.tif,
+                    lines=(
+                        Div(
+                            Span(
+                                "CANCEL BRACKET",
+                                cls="block text-xs font-semibold text-amber-300",
+                            ),
+                            Span(
+                                candidate.oca_group,
+                                cls="mt-1 block break-all text-xs font-semibold text-amber-300",
+                            ),
+                        ),
+                    ),
+                )
+            )
+        total = sum((candidate.quantity for candidate in candidates), Decimal("0"))
+        rows.append(
+            Div(
+                P(
+                    "Create MKT sell order",
+                    cls="text-xs font-semibold",
+                ),
+                P(
+                    f"{format(total, 'f')} contracts",
                     cls="mt-0.5 text-xs text-muted-foreground",
                 ),
-            ),
-            Div(
                 Div(
-                    Span("CANCEL SELL LMT", cls="text-xs font-semibold text-amber-300"),
-                    Span(str(candidate.target_order_id), cls="text-sm font-semibold text-amber-300"),
-                    cls="flex items-center justify-between gap-3",
-                ),
-                Div(
-                    Span("CANCEL SELL STP", cls="text-xs font-semibold text-rose-400"),
-                    Span(str(candidate.stop_order_id), cls="text-sm font-semibold text-rose-400"),
-                    cls="flex items-center justify-between gap-3",
-                ),
-                Div(
-                    Span("CREATE STANDALONE SELL MKT", cls="text-xs font-semibold text-amber-300"),
-                    Span(
-                        f"{candidate.quantity} contracts",
-                        cls="text-sm font-semibold text-amber-300",
+                    Div(
+                        Span(
+                            "SELL MKT",
+                            cls="block text-xs font-semibold text-emerald-400",
+                        ),
+                        Span(
+                            f"{format(total, 'f')} contracts",
+                            cls="mt-1 block text-xs font-semibold text-emerald-400",
+                        ),
                     ),
-                    cls="flex items-center justify-between gap-3",
+                    cls="mt-3 border-l-2 border-border pl-3",
                 ),
-                P(
-                    "Wait for both cancellation confirmations, then create one standalone SELL MKT. No other OCA group is modified.",
-                    cls="pt-1 text-xs text-muted-foreground",
-                ),
-                cls="mt-3 space-y-3 border-l-2 border-amber-400/60 pl-3",
-            ),
-            cls="border-b border-border py-4",
+                cls="border-b border-border py-4",
+            )
         )
+        return rows
 
 
 def _live_draft_script(configuration: dict[str, Any] | None) -> str:
@@ -1803,6 +1981,92 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
 """
 
 
+def _live_active_script(configuration: dict[str, Any] | None) -> str:
+    """Use the same local pricing display as draft layers; the server remains authoritative."""
+    if configuration is None:
+        return ""
+    payload = json.dumps(configuration, separators=(",", ":"))
+    return f"""
+(() => {{
+  const config = {payload};
+  const start = () => {{
+    const form = document.getElementById('active-form');
+    if (!form) return;
+    const basis = Number(config.basis), multiplier = Number(config.multiplier);
+    const bands = config.bands.map((band) => ({{ low: Number(band.low), increment: Number(band.increment) }}));
+    const assigned = (selector, text) => document.querySelectorAll(selector).forEach((node) => {{ node.textContent = text; }});
+    const priceText = (number) => `$${{Number(number.toFixed(6)).toString()}}`;
+    const money = (number) => `${{number >= 0 ? '+' : '-'}}$${{Math.abs(number).toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})}}`;
+    const roundUp = (number) => {{
+      let candidate = number;
+      for (let attempt = 0; attempt <= bands.length; attempt += 1) {{
+        const candidates = bands.filter((item) => item.low <= candidate + 1e-9);
+        const band = candidates[candidates.length - 1];
+        if (!band) return NaN;
+        const rounded = Math.ceil(number / band.increment - 1e-9) * band.increment;
+        const roundedCandidates = bands.filter((item) => item.low <= rounded + 1e-9);
+        if (roundedCandidates[roundedCandidates.length - 1] === band) return rounded;
+        candidate = rounded;
+      }}
+      return NaN;
+    }};
+    const setHidden = (node, hidden, display = 'flex') => {{
+      if (!node) return;
+      node.classList.toggle('hidden', hidden);
+      node.classList.toggle(display, !hidden);
+    }};
+    const update = () => {{
+      let changed = false;
+      form.querySelectorAll('[data-active-input="target"]').forEach((targetInput) => {{
+        const permId = targetInput.dataset.activePermId;
+        const stopInput = form.querySelector(`[data-active-input="stop"][data-active-perm-id="${{permId}}"]`);
+        const index = targetInput.dataset.liveLayer;
+        const target = Number(targetInput.value), stop = Number(stopInput?.value);
+        const quantity = Number(form.querySelector(`[data-active-quantity="${{permId}}"]`)?.value);
+        const targetPrice = Number.isFinite(target) && target > 0 ? roundUp(basis * (1 + target / 100)) : NaN;
+        const stopPrice = Number.isFinite(stop) && stop >= 0 && stop <= 100 ? roundUp(basis * (1 - stop / 100)) : NaN;
+        const gain = Number.isFinite(targetPrice) && Number.isFinite(quantity) ? (targetPrice - basis) * multiplier * quantity : NaN;
+        const loss = Number.isFinite(stopPrice) && Number.isFinite(quantity) ? (stopPrice - basis) * multiplier * quantity : NaN;
+        assigned(`[data-live-price="active-target-${{index}}"]`, Number.isFinite(targetPrice) ? priceText(targetPrice) : '—');
+        assigned(`[data-live-price="active-stop-${{index}}"]`, Number.isFinite(stopPrice) ? priceText(stopPrice) : '—');
+        assigned(`[data-live-outcome="active-target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
+        assigned(`[data-live-outcome="active-stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} max loss` : '— max loss');
+        const originalTarget = Number(targetInput.dataset.activeOriginal);
+        const originalStop = Number(stopInput?.dataset.activeOriginal);
+        const targetEdited = targetInput.value.trim() !== (targetInput.dataset.activeInitial || '').trim();
+        const stopEdited = stopInput?.value.trim() !== (stopInput?.dataset.activeInitial || '').trim();
+        const targetChanged = targetEdited && Number.isFinite(targetPrice) && Math.abs(targetPrice - originalTarget) > 1e-8;
+        const stopChanged = stopEdited && Number.isFinite(stopPrice) && Math.abs(stopPrice - originalStop) > 1e-8;
+        const row = document.querySelector(`[data-active-review-row="${{permId}}"]`);
+        const targetRow = document.querySelector(`[data-active-review-target-row="${{permId}}"]`);
+        const stopRow = document.querySelector(`[data-active-review-stop-row="${{permId}}"]`);
+        const targetText = document.querySelector(`[data-active-review-target="${{permId}}"]`);
+        const stopText = document.querySelector(`[data-active-review-stop="${{permId}}"]`);
+        if (targetText) targetText.textContent = targetChanged ? priceText(targetPrice) : '';
+        if (stopText) stopText.textContent = stopChanged ? priceText(stopPrice) : '';
+        setHidden(targetRow, !targetChanged);
+        setHidden(stopRow, !stopChanged);
+        setHidden(row, !(targetChanged || stopChanged), 'block');
+        changed ||= targetChanged || stopChanged;
+      }});
+      const empty = document.querySelector('[data-active-review-empty]');
+      if (empty) empty.classList.toggle('hidden', changed);
+      document.querySelectorAll('[data-active-execute]').forEach((button) => {{ button.disabled = !changed; }});
+    }};
+    form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('input', update));
+    form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('change', update));
+    form.querySelectorAll('[data-move-stops-to-be]').forEach((button) => button.addEventListener('click', () => {{
+      form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{ input.value = '0'; }});
+      update();
+    }}));
+    update();
+  }};
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, {{ once: true }});
+  else start();
+}})();
+"""
+
+
 def _field(
     label: str,
     control: Any,
@@ -1814,6 +2078,33 @@ def _field(
         Label(label, fr=input_id, cls="text-xs font-medium text-muted-foreground"),
         Div(control, Span(suffix, cls="shrink-0 font-mono text-xs text-muted-foreground") if suffix else None, cls="mt-1 flex items-center gap-2"),
         cls="min-w-0 space-y-0.5",
+    )
+
+
+def _layer_row_layout(
+    *,
+    index: int,
+    target_field: Any,
+    stop_field: Any,
+    quantity_field: Any,
+    tif_field: Any,
+    action_field: Any,
+) -> Any:
+    """Keep draft and active OCA rows structurally identical."""
+    return Div(
+        Div(
+            Span(f"LAYER {index}", cls="text-xs font-semibold"),
+            P(f"OCA-{index}", cls="mt-2 text-xs text-muted-foreground"),
+            cls="min-w-20",
+        ),
+        target_field,
+        stop_field,
+        quantity_field,
+        tif_field,
+        action_field,
+        # This is deliberately a shared, bundled grid utility: arbitrary
+        # Tailwind values are not present in StarUI's precompiled stylesheet.
+        cls="grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4 first:border-t-0",
     )
 
 
@@ -1885,6 +2176,36 @@ def _price_percentage(
     if not target:
         percentage = -percentage
     return format(percentage.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP), "f")
+
+
+def _active_percentage_for_price(
+    price: Decimal | None,
+    basis: Decimal | None,
+    *,
+    target: bool,
+    bands: tuple[Any, ...],
+    presets: tuple[Decimal, ...],
+) -> str:
+    """Recover a configured percentage when a broker price was tick-rounded.
+
+    The live order contains the rounded price only. Prefer a configured preset
+    that produces that exact price, so an untouched 20% plan remains 20% rather
+    than being displayed as its rounded-price inverse (for example, 20.3%).
+    A non-preset/manual order falls back to the observable derived percentage.
+    """
+    if price is None or basis is None or basis <= 0:
+        return "—"
+    for percentage in presets:
+        factor = Decimal("1") + percentage / Decimal("100")
+        if not target:
+            factor = Decimal("1") - percentage / Decimal("100")
+        try:
+            candidate = round_up_price(basis * factor, bands)
+        except ValueError:
+            break
+        if candidate == price:
+            return format(percentage, "f")
+    return _price_percentage(price, basis, target=target)
 
 
 def _price_text(price: Decimal | None) -> str:
@@ -1967,20 +2288,6 @@ def _decimal_value(value: str | None) -> Decimal | None:
     except InvalidOperation:
         return None
     return number if number.is_finite() else None
-
-
-def _selected_active_perm_ids(values: dict[str, str]) -> tuple[int, ...]:
-    """Read selected active-layer checkboxes without trusting their field name."""
-    return tuple(
-        sorted(
-            {
-                _positive_int(value, 0)
-                for name, value in values.items()
-                if name.startswith("active_layer_")
-            }
-            - {0}
-        )
-    )
 
 
 def _int_or_zero(value: str) -> int:

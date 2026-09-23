@@ -24,6 +24,13 @@ class PaperSubmission:
     perm_ids: tuple[int, ...]
 
 
+def _cancel_order(app: Any, order_id: int) -> None:
+    """Cancel one app-owned order using the current official IBKR API shape."""
+    from ibapi.order_cancel import OrderCancel
+
+    app.cancelOrder(order_id, OrderCancel())
+
+
 class IbkrPaperExecutionBroker:
     """Bounded paper writer for creation and exact app-owned order changes."""
 
@@ -245,8 +252,8 @@ class IbkrPaperExecutionBroker:
             if not app.ready.wait(max(0, deadline - monotonic())):
                 raise ExecutionBlocked("TWS did not issue a next valid order ID")
 
-            app.cancelOrder(candidate.target_order_id)
-            app.cancelOrder(candidate.stop_order_id)
+            _cancel_order(app, candidate.target_order_id)
+            _cancel_order(app, candidate.stop_order_id)
             while (
                 len(app.cancelled) != 2
                 and not app.errors
@@ -432,7 +439,7 @@ class IbkrPaperExecutionBroker:
             if not app.ready.wait(max(0, deadline - monotonic())):
                 raise ExecutionBlocked("TWS did not issue a next valid order ID")
             for order_id in sorted(selected_ids):
-                app.cancelOrder(order_id)
+                _cancel_order(app, order_id)
             while (
                 len(app.cancelled) != len(selected_ids)
                 and not app.errors

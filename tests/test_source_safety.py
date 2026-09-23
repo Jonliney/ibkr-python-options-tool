@@ -88,14 +88,25 @@ class ProductionSourceSafetyTests(unittest.TestCase):
         self.assertNotIn("reqGlobalCancel", calls)
         self.assertNotIn("reqAutoOpenOrders", calls)
 
-        cancel_arguments = {
-            _attribute_name(call.args[0])
+        cancel_calls = [
+            call
             for call in ast.walk(tree)
             if isinstance(call, ast.Call)
             and _called_name(call.func) == "cancelOrder"
-            and len(call.args) == 1
+        ]
+        cancel_arguments = {
+            _attribute_name(call.args[0])
+            for call in cancel_calls
+            if len(call.args) == 2
         }
-        self.assertEqual(cancel_arguments, {"target_order_id", "stop_order_id", None})
+        self.assertEqual(cancel_arguments, {None})
+        self.assertTrue(
+            all(
+                isinstance(call.args[1], ast.Call)
+                and _called_name(call.args[1].func) == "OrderCancel"
+                for call in cancel_calls
+            )
+        )
 
     def test_only_the_snapshot_and_writer_may_request_client_bound_orders(self) -> None:
         package = Path(__file__).parents[1] / "src" / "ibkr_options_manager"

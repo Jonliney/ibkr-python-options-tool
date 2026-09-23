@@ -6,6 +6,7 @@ import pytest
 from ibkr_options_manager.broker.execution import (
     PaperSubmission,
     _build_submission_contract,
+    _cancel_order,
 )
 from ibkr_options_manager.domain import (
     BrokerSnapshot,
@@ -77,6 +78,20 @@ def _snapshot(*, read_only_api: bool = False) -> BrokerSnapshot:
             bands=(PriceBand(Decimal("0"), Decimal("0.05")),),
         ),
     )
+
+
+def test_cancel_order_supplies_the_required_empty_order_cancel_options() -> None:
+    calls: list[tuple[int, object]] = []
+
+    class RequiredCancelArguments:
+        def cancelOrder(self, order_id: int, order_cancel: object) -> None:
+            calls.append((order_id, order_cancel))
+
+    _cancel_order(RequiredCancelArguments(), 701)
+
+    assert calls[0][0] == 701
+    assert vars(calls[0][1])["manualOrderCancelTime"] == ""
+    assert vars(calls[0][1])["extOperator"] == ""
 
 
 def _plan(snapshot: BrokerSnapshot):
@@ -375,6 +390,71 @@ def test_market_exit_rejects_a_layer_that_is_not_journal_owned(tmp_path) -> None
             target_perm_id=201,
             expected_client_id=17,
         )
+
+
+def test_new_bracket_is_allowed_for_quantity_unreserved_by_active_app_pairs(
+    tmp_path,
+) -> None:
+    snapshot = _snapshot()
+    prior_plan = _plan(snapshot)
+    assert prior_plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, prior_plan)
+    journal.record_submission(
+        prior_plan.fingerprint, order_ids=(101, 102), perm_ids=(201, 202)
+    )
+    active_target = WorkingOrder(
+        perm_id=201,
+        client_id=17,
+        order_id=101,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("1"),
+        status="Submitted",
+        oca_group=f"{prior_plan.fingerprint[:12]}/tranche-1",
+        tif="GTC",
+    )
+    active_snapshot = replace(
+        snapshot,
+        working_orders=(
+            active_target,
+            replace(active_target, perm_id=202, order_id=102, order_type="STP"),
+        ),
+    )
+    replacement_plan = build_exit_plan(
+        active_snapshot,
+        PlanRequest(
+            tranche_size=1,
+            target_percentages=(Decimal("20"),),
+            stop_loss_percentage=Decimal("25"),
+            remainder_policy=RemainderPolicy.NEXT_RUNG,
+            tif="GTC",
+            layers=(
+                LayerRequest(
+                    quantity=1,
+                    target_price=Decimal("1.20"),
+                    stop_price=Decimal("0.75"),
+                    tif="GTC",
+                    target_percentage=Decimal("20"),
+                ),
+            ),
+            paper_execution_mode=True,
+        ),
+    )
+    assert replacement_plan.available_quantity == 1
+    service = PaperExecutionService(_RecordingTransport(), journal)
+
+    receipt = service.submit(
+        active_snapshot,
+        replacement_plan,
+        host="127.0.0.1",
+        port=7497,
+        client_id=17,
+        timeout_seconds=1,
+    )
+
+    assert receipt.entry.state == "SUBMITTED"
 
 
 def test_selected_layers_cancel_as_a_set_then_submit_one_total_market_order(

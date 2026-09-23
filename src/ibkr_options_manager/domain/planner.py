@@ -26,7 +26,7 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
     state_validations = (
         *_validate_snapshot_state(snapshot, request.paper_execution_mode),
         *_validate_contract_position(snapshot),
-        *_validate_basis_and_quote(snapshot),
+        *_validate_cost_basis(snapshot),
         *_validate_market_rule(snapshot),
     )
     if state_validations:
@@ -472,7 +472,7 @@ def _validate_market_rule(
     return tuple(failures)
 
 
-def _validate_basis_and_quote(
+def _validate_cost_basis(
     snapshot: BrokerSnapshot,
 ) -> tuple[Validation, ...]:
     failures: list[Validation] = []
@@ -499,51 +499,6 @@ def _validate_basis_and_quote(
             Validation(
                 "BASIS_MISMATCH",
                 "unit premium does not match average cost and contract multiplier",
-                True,
-            )
-        )
-    quote = snapshot.quote
-    if quote.bid is None or quote.ask is None:
-        failures.append(
-            Validation(
-                "QUOTE_MISSING",
-                "both option bid and ask are required",
-                True,
-            )
-        )
-    quote_values = (
-        value
-        for value in (quote.bid, quote.ask, quote.last, quote.close)
-        if value is not None
-    )
-    if any(not value.is_finite() or value <= 0 for value in quote_values):
-        failures.append(
-            Validation(
-                "QUOTE_NONPOSITIVE",
-                "available quote prices must be finite and positive",
-                True,
-            )
-        )
-    if quote.bid is not None and quote.ask is not None and quote.bid > quote.ask:
-        failures.append(
-            Validation(
-                "QUOTE_CROSSED",
-                "option bid is greater than its ask",
-                True,
-            )
-        )
-    if not quote.fresh:
-        failures.append(Validation("QUOTE_STALE", "option quote is stale", True))
-    if quote.market_data_type not in {
-        "LIVE",
-        "FROZEN",
-        "DELAYED",
-        "DELAYED_FROZEN",
-    }:
-        failures.append(
-            Validation(
-                "QUOTE_TYPE_UNSUPPORTED",
-                "market-data type is unknown",
                 True,
             )
         )

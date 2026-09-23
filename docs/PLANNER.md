@@ -47,7 +47,7 @@ The planner returns `BLOCKED`, no fingerprint, and no pairs when any required
 state is unknown or invalid. Checks cover connection/read-only/account evidence,
 snapshot freshness and completion, request errors, connection epoch, exact
 option identity, positive integral position, multiplier-normalized cost basis,
-quote quality and type, market-rule structure and exchange, existing closing
+market-rule structure and exchange, existing closing
 exposure, target sequence, stop percentage, TIF, trigger method, and available
 quantity.
 

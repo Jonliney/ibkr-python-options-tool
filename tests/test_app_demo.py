@@ -14,10 +14,20 @@ from ibkr_options_manager.app.demo import (
     DemoReadOnlyBroker,
 )
 from ibkr_options_manager.app.main import build_parser, main
+from ibkr_options_manager.app.view_model import PlanForm, UiStatus, ValidationLine
 from ibkr_options_manager.app.web import StarUIWorkbench
-from ibkr_options_manager.app.web.surface import _position_identity
+from ibkr_options_manager.app.web.surface import (
+    _active_percentage_for_price,
+    _live_active_script,
+    _position_identity,
+)
 from ibkr_options_manager.broker import PortfolioRequest, SnapshotRequest
-from ibkr_options_manager.execution import ExecutionJournal, PaperExecutionService
+from ibkr_options_manager.domain import PriceBand
+from ibkr_options_manager.execution import (
+    ExecutionJournal,
+    MarketExitCandidate,
+    PaperExecutionService,
+)
 from ibkr_options_manager.portfolio import PortfolioCoordinator, PortfolioStatus
 from ibkr_options_manager.snapshot import SnapshotCoordinator, SnapshotStatus
 
@@ -116,7 +126,51 @@ def test_reconciled_app_orders_are_not_described_as_external_coverage() -> None:
 
     assert "App-managed OCA coverage active" in page.text
     assert "1 app-created orders were reconciled with TWS" in page.text
+    assert "5 contracts remain available for a new bracket" in page.text
     assert "Associated external orders remain inspect-only" not in page.text
+
+
+def test_refresh_replaces_a_draft_that_exceeds_newly_available_quantity() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    original = workbench._current_layers()[0]
+    workbench._drafts[con_id] = tuple(
+        replace(original, quantity="4") for _ in range(5)
+    )
+    blocked = replace(
+        workbench._state,
+        status=UiStatus.BLOCKED,
+        validations=(
+            ValidationLine(
+                "LAYER_QUANTITY_EXCEEDS_AVAILABLE",
+                "draft layers exceed the verified available quantity",
+            ),
+        ),
+        available_quantity=0,
+        bracket_form=PlanForm(layers=workbench._drafts[con_id]),
+    )
+    refreshed = replace(
+        workbench._state,
+        status=UiStatus.READY,
+        validations=(),
+        available_quantity=4,
+        bracket_form=PlanForm(),
+    )
+    calls: list[PlanForm] = []
+
+    def select_position(_con_id: int, form: PlanForm) -> object:
+        calls.append(form)
+        return blocked if len(calls) == 1 else refreshed
+
+    workbench._view_model.select_position = select_position  # type: ignore[method-assign]
+
+    workbench._select_locked(con_id)
+
+    assert len(calls) == 2
+    assert len(workbench._current_layers()) == 1
+    assert workbench._current_layers()[0].quantity == "4"
 
 
 def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
@@ -167,17 +221,96 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert "$26.20" in active.text
     assert "$16.40" in active.text
     assert "Move stop to B/E" in active.text
-    assert "Update layers" in active.text
-    assert "Sell layers" in active.text
-    assert "active_layer_101" in active.text
+    assert "Update layers" not in active.text
+    assert "Close all" in active.text
     assert 'name="active_target_101"' in active.text
     assert 'name="active_stop_101"' in active.text
+    assert "data-active-review-row" in active.text
+    assert "data-active-execute" in active.text
     assert 'id="active-quantity-1"' in active.text
     assert 'id="active-tif-1"' in active.text
-    assert "State" not in active.text
+    assert ">State<" not in active.text
     assert "requires a second confirmation" not in active.text
     assert "Layered OCA draft" not in active.text
     assert 'aria-current="page"' in active.text
+    assert 'data-active-initial="' in active.text
+    assert 'data-live-price="active-target-1"' in active.text
+    assert 'data-live-outcome="active-target-1"' in active.text
+    assert "const targetEdited" in active.text
+    active_script = _live_active_script(
+        {"basis": "1", "multiplier": "100", "bands": []}
+    )
+    assert "setHidden(row, !(targetChanged || stopChanged), 'block')" in active_script
+    assert "UPDATE SELL LMT" in active.text
+
+
+def test_active_layer_prefers_configured_percentage_over_rounded_inverse() -> None:
+    """An untouched 20% target remains 20% after TWS exposes its tick price."""
+    percentage = _active_percentage_for_price(
+        Decimal("20.80"),
+        Decimal("17.30"),
+        target=True,
+        bands=(PriceBand(Decimal("0"), Decimal("0.10")),),
+        presets=(Decimal("20"), Decimal("40")),
+    )
+
+    assert percentage == "20"
+
+
+def test_close_all_review_lists_pair_cancellations_then_one_market_order() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._workspace_tab = "active"
+    workbench._armed_market_exits = (
+        MarketExitCandidate(
+            account="DU123",
+            con_id=101,
+            target_order_id=11,
+            target_perm_id=101,
+            client_id=17,
+            quantity=Decimal("10"),
+            tif="GTC",
+            oca_group="example/tranche-1",
+            stop_order_id=12,
+            stop_perm_id=102,
+        ),
+        MarketExitCandidate(
+            account="DU123",
+            con_id=101,
+            target_order_id=13,
+            target_perm_id=103,
+            client_id=17,
+            quantity=Decimal("5"),
+            tif="GTC",
+            oca_group="example/tranche-2",
+            stop_order_id=14,
+            stop_perm_id=104,
+        ),
+    )
+    client = TestClient(workbench.app)
+
+    review = client.get(workbench.path)
+    sidebar = review.text.split("ACTION REVIEW", maxsplit=1)[1]
+
+    assert "OCA-1" in sidebar
+    assert "OCA-2" in sidebar
+    assert "CANCEL BRACKET" in sidebar
+    assert "example/tranche-1" in sidebar
+    assert "example/tranche-2" in sidebar
+    assert "Create MKT sell order" in sidebar
+    assert "SELL MKT" in sidebar
+    assert "text-emerald-400" in sidebar
+    assert "15 contracts" in sidebar
+    assert "Click to confirm close all" in sidebar
+    assert ">Cancel<" in sidebar
+    assert "Wait for both cancellation confirmations" not in sidebar
+    assert "Selected app-owned OCA layer" not in sidebar
+    assert "GTC" in sidebar
+
+    cancelled = client.post(workbench.path + "action", data={"action": "cancel-staged"})
+
+    assert workbench._armed_market_exits == ()
+    assert "Staged action cancelled. No orders were sent to TWS." in cancelled.text
 
 
 def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() -> None:

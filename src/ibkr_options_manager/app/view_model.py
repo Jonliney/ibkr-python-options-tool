@@ -315,7 +315,11 @@ class PlannerViewModel:
             timeout_seconds=settings.timeout_seconds,
         )
         self._latest_snapshot = None
-        chosen = self._bracket_forms.get(con_id, form or PlanForm())
+        chosen = (
+            form
+            if form is not None
+            else self._bracket_forms.get(con_id, PlanForm())
+        )
         try:
             result = self._snapshots.refresh(
                 SnapshotRequest(

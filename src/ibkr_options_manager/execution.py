@@ -359,13 +359,22 @@ def require_paper_management_snapshot(snapshot: BrokerSnapshot) -> None:
 def require_paper_execution_snapshot(
     snapshot: BrokerSnapshot,
     plan: PlanResult,
+    *,
+    owned_perm_ids: frozenset[int] = frozenset(),
 ) -> None:
     """Validate the stricter write preconditions before opening a TWS writer."""
     if plan.status is not PlanStatus.VALID or plan.fingerprint is None:
         raise ExecutionBlocked("the refreshed plan is not valid")
     require_paper_management_snapshot(snapshot)
-    if any(order.key == snapshot.selected for order in snapshot.working_orders):
-        raise ExecutionBlocked("existing related orders block a new paper submission")
+    external = [
+        order
+        for order in snapshot.working_orders
+        if order.key == snapshot.selected and order.perm_id not in owned_perm_ids
+    ]
+    if external:
+        raise ExecutionBlocked(
+            "external related orders block a new paper submission"
+        )
 
 
 class PaperExecutionService:
@@ -394,7 +403,14 @@ class PaperExecutionService:
         client_id: int,
         timeout_seconds: float,
     ) -> SubmissionReceipt:
-        require_paper_execution_snapshot(snapshot, plan)
+        require_paper_execution_snapshot(
+            snapshot,
+            plan,
+            owned_perm_ids=self.owned_perm_ids(
+                account=snapshot.selected.account,
+                con_id=snapshot.selected.con_id,
+            ),
+        )
         entry = self._journal.begin(snapshot, plan)
         try:
             result = self._transport.submit(

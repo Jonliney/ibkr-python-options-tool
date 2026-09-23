@@ -17,7 +17,8 @@ proves all of the following:
 - the exact option identity agrees on account, `conId`, security type, expiry,
   strike, right, multiplier, currency, trading class, exchange, and local
   symbol;
-- no existing order is associated with the selected account and option; and
+- every existing selected-option order is either a complete, journal-proven
+  app-owned OCA pair (whose remaining quantity is reserved) or absent; and
 - the new snapshot produces the same deterministic plan fingerprint the user
   armed on the first click.
 

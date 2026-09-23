@@ -521,7 +521,7 @@ def test_invalid_or_ambiguous_market_rules_block_before_rounding(
     assert result.pairs == ()
 
 
-def test_inconsistent_basis_or_crossed_stale_quote_blocks() -> None:
+def test_inconsistent_basis_blocks_even_when_quote_is_crossed() -> None:
     snapshot = complete_snapshot()
     snapshot = replace(
         snapshot,
@@ -537,11 +537,7 @@ def test_inconsistent_basis_or_crossed_stale_quote_blocks() -> None:
     result = build_exit_plan(snapshot, canonical_request())
 
     assert result.status is PlanStatus.BLOCKED
-    assert {validation.code for validation in result.validations} == {
-        "BASIS_MISMATCH",
-        "QUOTE_CROSSED",
-        "QUOTE_STALE",
-    }
+    assert {validation.code for validation in result.validations} == {"BASIS_MISMATCH"}
 
 
 @pytest.mark.parametrize(
@@ -610,7 +606,26 @@ def test_invalid_price_policy_inputs_are_aggregated_as_blockers() -> None:
     }
 
 
-def test_missing_nonpositive_or_unknown_quote_data_blocks() -> None:
+def test_absent_quote_does_not_block_cost_basis_bracket_planning() -> None:
+    snapshot = replace(
+        complete_snapshot(),
+        quote=Quote(
+            bid=None,
+            ask=None,
+            last=None,
+            close=None,
+            market_data_type="LIVE",
+            fresh=False,
+        ),
+    )
+
+    result = build_exit_plan(snapshot, canonical_request())
+
+    assert result.status is PlanStatus.VALID
+    assert result.available_quantity == 10
+
+
+def test_nonpositive_supplied_quote_data_does_not_block_cost_basis_planning() -> None:
     snapshot = complete_snapshot()
     snapshot = replace(
         snapshot,
@@ -618,18 +633,14 @@ def test_missing_nonpositive_or_unknown_quote_data_blocks() -> None:
             snapshot.quote,
             bid=Decimal("0"),
             ask=None,
-            market_data_type="UNKNOWN",
+            market_data_type="LIVE",
         ),
     )
 
     result = build_exit_plan(snapshot, canonical_request())
 
-    assert result.status is PlanStatus.BLOCKED
-    assert {validation.code for validation in result.validations} == {
-        "QUOTE_MISSING",
-        "QUOTE_NONPOSITIVE",
-        "QUOTE_TYPE_UNSUPPORTED",
-    }
+    assert result.status is PlanStatus.VALID
+    assert result.available_quantity == 10
 
 
 def test_nonpositive_cost_basis_blocks_the_plan() -> None:
