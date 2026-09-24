@@ -2,12 +2,12 @@ from __future__ import annotations
 
 # ruff: noqa: E501
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from secrets import token_urlsafe
-from threading import RLock
+from threading import RLock, Thread
 from typing import Any
 
 from starhtml import (
@@ -29,6 +29,7 @@ from starhtml import (
 from starhtml.icons import resolver
 from starhtml.plugins import position as position_plugin
 from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from ...domain import preview_reference_prices, round_up_price
 from ...execution import (
@@ -79,9 +80,19 @@ from .components.ui.select import (
     SelectValue,
 )
 from .components.ui.separator import Separator
+from .components.ui.toast import Toaster
 
 _STATIC_DIR = Path(__file__).with_name("static")
 _ASSETS_DIR = Path(__file__).with_name("assets")
+
+
+@dataclass(frozen=True, slots=True)
+class _ToastNotice:
+    title: str
+    description: str
+    variant: str
+
+
 class StarUIWorkbench:
     """Server-owned StarUI view over planning and explicitly enabled paper sends."""
 
@@ -111,7 +122,13 @@ class StarUIWorkbench:
         self._target_presets = "20, 40, 60, 100"
         self._stop_presets = "25"
         self._last_refreshed_at = "—"
+        self._notifications_enabled = False
+        self._suppress_toasts = False
+        self._toast: _ToastNotice | None = None
+        self._status_message = ""
         self._message = "Refresh and select a position to build a draft."
+        self._launch_connection = "idle"
+        self._launch_refresh_in_progress = False
         self._lock = RLock()
         self.session_token = token_urlsafe(24)
         self.app, route = star_app(
@@ -129,7 +146,20 @@ class StarUIWorkbench:
         )
         self.app.register(position_plugin)
         route(f"/{self.session_token}/")(self._home)
+        route(f"/{self.session_token}/connection-status")(self._connection_status)
         route(f"/{self.session_token}/action", methods=["POST"])(self._action)
+        self._notifications_enabled = True
+
+    @property
+    def _message(self) -> str:
+        """Retain a diagnostic status internally while exposing outcomes as toasts."""
+        return self._status_message
+
+    @_message.setter
+    def _message(self, message: str) -> None:
+        self._status_message = message
+        if self._notifications_enabled and not self._suppress_toasts:
+            self._toast = _toast_notice(message)
 
     @property
     def path(self) -> str:
@@ -150,26 +180,70 @@ class StarUIWorkbench:
         with self._lock:
             self._disarm_execution_locked()
             settings = self._settings
+            self._launch_connection = "connecting"
+            self._suppress_toasts = True
             self._message = "Connecting to TWS…"
-        state = self._view_model.refresh_portfolio(settings)
+        try:
+            state = self._view_model.refresh_portfolio(settings)
+        except Exception as error:
+            with self._lock:
+                self._launch_connection = "failed"
+                self._message = f"TWS connection failed: {error}"
+                self._suppress_toasts = False
+            return
         with self._lock:
             # A user cannot alter launch settings until the page is rendered,
             # but still reject a stale completion rather than overwriting a
             # newer state in a future launch-flow change.
             if settings != self._settings:
+                self._suppress_toasts = False
                 return
             self._apply_refreshed_portfolio_locked(state)
+            self._launch_connection = (
+                "success" if state.status is UiStatus.READY else "failed"
+            )
+            self._suppress_toasts = False
+
+    def start_launch_refresh(self) -> None:
+        """Run the launch refresh in the background so the first page is immediate."""
+        if self._demo_mode:
+            self.load_demo_data()
+            return
+        with self._lock:
+            if self._launch_refresh_in_progress:
+                return
+            self._launch_refresh_in_progress = True
+            self._launch_connection = "connecting"
+        Thread(
+            target=self._finish_launch_refresh,
+            name="ibkr-options-launch-refresh",
+            daemon=True,
+        ).start()
+
+    def _finish_launch_refresh(self) -> None:
+        try:
+            self.refresh_on_launch()
+        finally:
+            with self._lock:
+                self._launch_refresh_in_progress = False
 
     def _home(self) -> Any:
         with self._lock:
             return self._page()
+
+    def _connection_status(self) -> JSONResponse:
+        """Let the launch dialog wait without repeatedly replacing the page."""
+        with self._lock:
+            return JSONResponse({"state": self._launch_connection})
 
     async def _action(self, request: Request) -> Any:
         form = await request.form()
         values = {str(key): str(value) for key, value in form.items()}
         action = values.get("action", "save-draft")
         with self._lock:
-            if action == "refresh":
+            if action == "launch-refresh":
+                self.start_launch_refresh()
+            elif action == "refresh":
                 self._target_presets = values.get(
                     "target_presets", self._target_presets
                 )
@@ -910,7 +984,127 @@ class StarUIWorkbench:
                 self._review(),
                 cls="grid h-[calc(100vh-3.5rem)] min-h-0 grid-cols-[16rem_minmax(0,1fr)_19rem] overflow-hidden border-t border-border",
             ),
+            self._toast_component(),
+            self._launch_connection_dialog(),
+            Script(_busy_submit_script()),
             cls="h-screen overflow-hidden bg-background text-foreground selection:bg-primary selection:text-primary-foreground",
+        )
+
+    def _toast_component(self) -> Any:
+        notice = self._toast
+        if notice is None:
+            return None
+        # The official Toaster consumes its `toasts` Datastar signal. Seed it
+        # in the initial page response rather than invoking its JS helper
+        # before Datastar has hydrated that signal in the embedded WebEngine.
+        initial_toasts = [
+            {
+                "id": 1,
+                "title": notice.title,
+                "description": notice.description,
+                "variant": notice.variant,
+                "timestamp": 1,
+                "order": 0,
+            },
+            None,
+            None,
+        ]
+        return Div(
+            Signal("toasts", initial_toasts),
+            Toaster(position="top-right"),
+        )
+
+    def _launch_connection_dialog(self) -> Any:
+        """Keep first-run connection feedback in one focused, recoverable surface."""
+        state = self._launch_connection
+        if state not in {"connecting", "failed"}:
+            return None
+        connecting = state == "connecting"
+        content: list[Any] = [
+            DialogHeader(
+                DialogTitle("Connecting to TWS" if connecting else "TWS unavailable"),
+                DialogDescription(
+                    "Reading the paper account and open option positions."
+                    if connecting
+                    else "Open TWS, enable its API, then retry the connection.",
+                ),
+            ),
+        ]
+        if connecting:
+            content.append(
+                Div(
+                    Icon("lucide:loader-circle", cls="size-4 animate-spin text-muted-foreground"),
+                    Span("Connecting…", cls="text-sm text-muted-foreground"),
+                    cls="flex items-center gap-2",
+                )
+            )
+        else:
+            content.extend(
+                (
+                    Alert(
+                        Icon("lucide:circle-alert"),
+                        AlertTitle("No verified portfolio loaded"),
+                        AlertDescription(
+                            "The workbench is still available, but order actions remain locked."
+                        ),
+                        variant="destructive",
+                        live=True,
+                        cls="border-destructive/70 bg-red-950 text-red-50 [&_p]:text-red-100/90",
+                    ),
+                    DialogFooter(
+                        Form(
+                            Button(
+                                "Retry connection",
+                                type="submit",
+                                data_busy_text="Retrying…",
+                            ),
+                            HTMLInput(
+                                type="hidden", name="action", value="launch-refresh"
+                            ),
+                            action=f"/{self.session_token}/action",
+                            method="post",
+                        )
+                    ),
+                )
+            )
+        return Div(
+            Dialog(
+                DialogContent(*content, show_close_button=False),
+                signal="launch_connection",
+                default_open=True,
+                size="sm",
+            ),
+            Script(
+                """
+                (() => {
+                  const dialog = document.getElementById('launch_connection');
+                  if (dialog && !dialog.open) dialog.showModal();
+                })();
+                """
+            ),
+            Script(
+                f"""
+                (() => {{
+                  const check = async () => {{
+                    try {{
+                      const response = await fetch('/{self.session_token}/connection-status', {{ cache: 'no-store' }});
+                      const status = await response.json();
+                      if (status.state !== 'connecting') {{
+                        window.location.reload();
+                        return;
+                      }}
+                    }} catch (_) {{
+                      // Keep the existing dialog visible; the user can retry.
+                    }}
+                    window.setTimeout(check, 500);
+                  }};
+                  window.setTimeout(check, 500);
+                }})();
+                """
+            )
+            if connecting
+            else None,
+            data_launch_connection=state,
         )
 
     def _header(self, ready: bool) -> Any:
@@ -934,7 +1128,13 @@ class StarUIWorkbench:
                 cls="text-xs text-muted-foreground",
             ),
             Form(
-                Button("Refresh", variant="outline", size="sm", type="submit"),
+                Button(
+                    "Refresh",
+                    variant="outline",
+                    size="sm",
+                    type="submit",
+                    data_busy_text="Refreshing…",
+                ),
                 HTMLInput(type="hidden", name="action", value="refresh"),
                 HTMLInput(type="hidden", name="account", value=self._settings.account),
                 HTMLInput(type="hidden", name="port", value=str(self._settings.port)),
@@ -1062,7 +1262,11 @@ class StarUIWorkbench:
                     ),
                     DialogFooter(
                         DialogClose("Cancel", variant="outline"),
-                        Button("Refresh with settings", type="submit"),
+                        Button(
+                            "Refresh with settings",
+                            type="submit",
+                            data_busy_text="Refreshing…",
+                        ),
                         cls="mt-6",
                     ),
                     HTMLInput(type="hidden", name="action", value="refresh"),
@@ -1080,7 +1284,13 @@ class StarUIWorkbench:
         return Div(
             self._coverage_alert(coverage, app_order_count, order_count),
             Div(
-                Div(H1(title, cls="text-2xl font-semibold tracking-tight"), P(self._message, cls="mt-2 text-sm text-muted-foreground")),
+                Div(
+                    H1(title, cls="text-2xl font-semibold tracking-tight"),
+                    P(
+                        "Build and manage app-owned OCA layers.",
+                        cls="mt-2 text-sm text-muted-foreground",
+                    ),
+                ),
                 Div(Span("Cost basis / Ask", cls="text-xs text-muted-foreground"), P(" / ".join(fact.value for fact in self._state.quote[:2]) or "—", cls="mt-1 font-mono text-sm"), cls="text-right"),
                 cls="flex items-start justify-between gap-6",
             ),
@@ -1732,6 +1942,7 @@ class StarUIWorkbench:
                         type="submit",
                         name="action",
                         value="cancel-pair-confirm",
+                        data_busy_text="Deleting…",
                         cls="flex-[2]",
                     ),
                     cls="flex gap-2",
@@ -1757,6 +1968,7 @@ class StarUIWorkbench:
                         type="submit",
                         name="action",
                         value="market-exit-confirm",
+                        data_busy_text="Submitting…",
                         cls="flex-[2]",
                     ),
                     cls="flex gap-2",
@@ -1771,6 +1983,7 @@ class StarUIWorkbench:
                     "Click to confirm price updates",
                     variant="destructive",
                     type="submit",
+                    data_busy_text="Submitting…",
                     cls="w-full",
                 ),
                 HTMLInput(type="hidden", name="action", value="price-update-confirm"),
@@ -1787,6 +2000,7 @@ class StarUIWorkbench:
                     name="action",
                     value="execute-confirm",
                     form="draft-form",
+                    data_busy_text="Submitting…",
                     cls="w-full",
                 ),
                 cls="mx-4 mb-4 w-[calc(100%-2rem)]",
@@ -1805,6 +2019,7 @@ class StarUIWorkbench:
                     name="action",
                     value="execute-arm",
                     form="draft-form",
+                    data_busy_text="Checking…",
                     disabled=not can_execute_draft,
                     cls="w-full",
                 ),
@@ -1821,6 +2036,7 @@ class StarUIWorkbench:
                     form="active-form",
                     data_active_execute=True,
                     disabled=True,
+                    data_busy_text="Checking…",
                     cls="w-full",
                 ),
                 data_active_execute_control=True,
@@ -2466,6 +2682,77 @@ def _int_or_zero(value: str) -> int:
 
 def _money(value: Decimal) -> str:
     return f"{'+' if value >= 0 else '-'}${abs(value):,.2f}"
+
+
+def _toast_notice(message: str) -> _ToastNotice:
+    """Turn internal status detail into a short, actionable user notification."""
+    normalized = " ".join(message.split())
+    lowered = normalized.lower()
+    if "portfolio state is not ready" in lowered or "tws connection failed" in lowered:
+        return _ToastNotice(
+            title="Could not connect to TWS",
+            description="Make sure TWS is open and try again.",
+            variant="error",
+        )
+    if any(
+        term in lowered
+        for term in (
+            "blocked",
+            "failed",
+            "unavailable",
+            "unknown",
+            "disabled",
+            "invalid",
+            "not in the verified",
+        )
+    ):
+        variant = "error"
+    elif any(
+        term in lowered
+        for term in (
+            "acknowledged",
+            "confirmed",
+            "reconciled",
+            "recovered",
+            "cancelled",
+            "verified",
+        )
+    ):
+        variant = "success"
+    else:
+        variant = "info"
+    title, separator, detail = normalized.partition(":")
+    if not separator:
+        title, detail = normalized, ""
+    if len(title) > 52:
+        title, detail = title[:49].rstrip() + "…", ""
+    if len(detail) > 150:
+        detail = detail[:147].rstrip() + "…"
+    return _ToastNotice(title=title, description=detail.strip(), variant=variant)
+
+
+def _busy_submit_script() -> str:
+    """Give every server-submit control a guarded busy state during navigation."""
+    return """
+    (() => {
+      if (window.__ibkrBusySubmitInstalled) return;
+      window.__ibkrBusySubmitInstalled = true;
+      document.addEventListener('submit', (event) => {
+        const button = event.submitter;
+        if (!(button instanceof HTMLButtonElement) || button.disabled) return;
+        const text = button.dataset.busyText || 'Working…';
+        button.disabled = true;
+        button.setAttribute('aria-busy', 'true');
+        button.replaceChildren(
+          Object.assign(document.createElement('span'), {
+            className: 'size-3.5 animate-spin rounded-full border-2 border-current border-r-transparent',
+            'aria-hidden': 'true',
+          }),
+          document.createTextNode(text),
+        );
+      }, true);
+    })();
+    """
 
 
 def _metric(label: str, value: str, tone: str, *, live_key: str | None = None) -> Any:

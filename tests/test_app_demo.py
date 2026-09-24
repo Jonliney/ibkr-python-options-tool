@@ -2,6 +2,7 @@ import os
 from dataclasses import replace
 from decimal import Decimal
 from threading import Event, Thread
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -22,7 +23,9 @@ from ibkr_options_manager.app.web.surface import (
     _active_percentage_for_price,
     _live_active_script,
     _position_identity,
+    _toast_notice,
 )
+from ibkr_options_manager.app.web_window import StarUIPlannerWindow
 from ibkr_options_manager.broker import PortfolioRequest, SnapshotRequest
 from ibkr_options_manager.domain import PriceBand
 from ibkr_options_manager.execution import (
@@ -130,7 +133,87 @@ def test_launch_refresh_never_blocks_the_initial_workbench_page() -> None:
 
     assert len(responses) == 1
     assert responses[0].status_code == 200
-    assert "Connecting to TWS…" in responses[0].text
+    assert "Connecting to TWS" in responses[0].text
+
+
+def test_launch_connection_failure_stays_in_the_retry_dialog_without_a_toast() -> None:
+    workbench = _demo_workbench()
+    workbench._demo_mode = False
+    blocked = replace(
+        workbench._state,
+        status=UiStatus.BLOCKED,
+        status_message="TWS did not respond",
+    )
+    workbench._view_model.refresh_portfolio = lambda _settings: blocked  # type: ignore[method-assign]
+
+    workbench.refresh_on_launch()
+    page = TestClient(workbench.app).get(workbench.path)
+
+    assert "TWS unavailable" in page.text
+    assert "Retry connection" in page.text
+    assert "<dialog" in page.text
+    assert "data-dialog" in page.text
+    assert "Dismiss toast" not in page.text
+
+
+def test_status_updates_render_as_short_toasts_not_workspace_copy() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._message = "Execution blocked: TWS must be open"
+
+    page = TestClient(workbench.app).get(workbench.path)
+
+    assert "Execution blocked" in page.text
+    assert "Build and manage app-owned OCA layers." in page.text
+    assert "Dismiss toast" in page.text
+    assert "data-signals:toasts__ifmissing" in page.text
+    assert "document.startViewTransition" not in page.text
+
+
+def test_tws_connection_toast_has_a_short_recovery_message() -> None:
+    notice = _toast_notice(
+        "Portfolio state is not ready: missing completion barriers: positions"
+    )
+
+    assert notice.title == "Could not connect to TWS"
+    assert notice.description == "Make sure TWS is open and try again."
+    assert notice.variant == "error"
+
+
+def test_window_starts_connection_before_loading_the_first_page() -> None:
+    events: list[str] = []
+
+    class Surface:
+        def start_launch_refresh(self) -> None:
+            events.append("connect")
+
+    class View:
+        def setUrl(self, _url: object) -> None:
+            events.append("navigate")
+
+    window = SimpleNamespace(_surface=Surface(), _view=View(), _url=object())
+
+    StarUIPlannerWindow.refresh_on_launch(window)
+
+    assert events == ["connect", "navigate"]
+
+
+def test_launch_dialog_polls_status_without_replacing_the_page_every_interval() -> None:
+    workbench = _demo_workbench()
+    workbench._demo_mode = False
+    workbench._launch_connection = "connecting"
+    client = TestClient(workbench.app)
+
+    page = client.get(workbench.path)
+    status = client.get(f"{workbench.path}connection-status")
+
+    assert page.status_code == 200
+    assert "connection-status" in page.text
+    assert "data-dialog" in page.text
+    assert "dialog.showModal()" in page.text
+    assert "window.setTimeout(check,500)" in page.text
+    assert "window.location.reload(), 600" not in page.text
+    assert status.json() == {"state": "connecting"}
 
 
 def test_position_identity_preserves_the_inventory_scan_order() -> None:
