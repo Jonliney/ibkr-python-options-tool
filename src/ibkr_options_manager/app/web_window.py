@@ -6,7 +6,7 @@ from threading import Thread
 from time import monotonic, sleep
 
 import uvicorn
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWebEngineCore import (
     QWebEngineSettings,
@@ -33,6 +33,8 @@ class _LoopbackOnlyRequestInterceptor(QWebEngineUrlRequestInterceptor):
 class StarUIPlannerWindow(QMainWindow):
     """Embedded, loopback-only StarUI renderer for the paper workbench."""
 
+    _initial_refresh_finished = Signal()
+
     def __init__(
         self,
         view_model: PlannerViewModel,
@@ -43,6 +45,7 @@ class StarUIPlannerWindow(QMainWindow):
         paper_execution: PaperExecutionService | None = None,
     ) -> None:
         super().__init__()
+        self._demo_mode = demo_mode
         self._surface = StarUIWorkbench(
             view_model,
             initial_account=initial_account,
@@ -63,12 +66,37 @@ class StarUIPlannerWindow(QMainWindow):
         self._view.page().profile().setUrlRequestInterceptor(self._interceptor)
         self._view.setUrl(self._url)
         self.setCentralWidget(self._view)
+        self._closed = False
+        self._initial_refresh_finished.connect(self._reload_after_initial_refresh)
 
     def load_demo_data(self) -> None:
         self._surface.load_demo_data()
         self._view.setUrl(self._url)
 
+    def refresh_on_launch(self) -> None:
+        """Start the normal read-only portfolio refresh without blocking the UI."""
+        if self._demo_mode:
+            self.load_demo_data()
+            return
+        Thread(
+            target=self._run_initial_refresh,
+            name="ibkr-options-launch-refresh",
+            daemon=True,
+        ).start()
+
+    def _run_initial_refresh(self) -> None:
+        try:
+            self._surface.refresh_on_launch()
+        finally:
+            self._initial_refresh_finished.emit()
+
+    @Slot()
+    def _reload_after_initial_refresh(self) -> None:
+        if not self._closed:
+            self._view.setUrl(self._url)
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._closed = True
         self._server.should_exit = True
         self._thread.join(timeout=2)
         super().closeEvent(event)

@@ -24,6 +24,7 @@ from ..broker import (
 )
 from ..broker.execution import PaperSubmission
 from ..domain import BrokerSnapshot, PlanResult, PriceBand
+from ..execution import MarketExitCandidate
 from ..snapshot import SnapshotCoordinator, SnapshotResult
 
 DEMO_ACCOUNT = "DU0000000"
@@ -229,6 +230,22 @@ class DemoPaperExecutionTransport:
             order_ids=tuple(range(900_001, 900_001 + count)),
             perm_ids=tuple(range(800_001, 800_001 + count)),
         )
+
+    def cancel_pair(
+        self,
+        snapshot: BrokerSnapshot,
+        candidate: MarketExitCandidate,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmission:
+        """Acknowledge a simulated cancellation without contacting TWS."""
+        del snapshot, host, port, client_id, timeout_seconds
+        target = candidate.target_order_id
+        stop = candidate.stop_order_id
+        return PaperSubmission(order_ids=tuple(sorted((target, stop))), perm_ids=())
 
 
 def _selected_position(

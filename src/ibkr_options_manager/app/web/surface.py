@@ -101,6 +101,7 @@ class StarUIWorkbench:
         self._armed_execution: PaperExecutionCandidate | None = None
         self._armed_market_exit: MarketExitCandidate | None = None
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
+        self._armed_cancellation: MarketExitCandidate | None = None
         self._armed_price_updates: tuple[PriceUpdateCandidate, ...] = ()
         self._preferred_con_id = initial_con_id
         self._selected_con_id: int | None = None
@@ -110,7 +111,6 @@ class StarUIWorkbench:
         self._target_presets = "20, 40, 60, 100"
         self._stop_presets = "25"
         self._last_refreshed_at = "—"
-        self._workspace_tab = "draft"
         self._message = "Refresh and select a position to build a draft."
         self._lock = RLock()
         self.session_token = token_urlsafe(24)
@@ -142,6 +142,24 @@ class StarUIWorkbench:
         with self._lock:
             self._refresh_locked()
 
+    def refresh_on_launch(self) -> None:
+        """Perform the same read-only refresh as the header control at startup."""
+        if self._demo_mode:
+            self.load_demo_data()
+            return
+        with self._lock:
+            self._disarm_execution_locked()
+            settings = self._settings
+            self._message = "Connecting to TWS…"
+        state = self._view_model.refresh_portfolio(settings)
+        with self._lock:
+            # A user cannot alter launch settings until the page is rendered,
+            # but still reject a stale completion rather than overwriting a
+            # newer state in a future launch-flow change.
+            if settings != self._settings:
+                return
+            self._apply_refreshed_portfolio_locked(state)
+
     def _home(self) -> Any:
         with self._lock:
             return self._page()
@@ -171,17 +189,18 @@ class StarUIWorkbench:
                 self._disarm_execution_locked()
                 self._save_form_locked(values)
                 self._select_locked(_positive_int(values.get("con_id"), 0))
-            elif action == "show-draft":
-                self._workspace_tab = "draft"
-            elif action == "show-active":
-                self._workspace_tab = "active"
             elif action.startswith("market-exit-arm:"):
                 _, _, perm_id = action.partition(":")
                 self._arm_market_exit_locked(_positive_int(perm_id, 0))
+            elif action.startswith("cancel-pair-arm:"):
+                _, _, perm_id = action.partition(":")
+                self._arm_cancellation_locked(_positive_int(perm_id, 0))
             elif action == "market-exit-selected":
                 self._arm_selected_market_exit_locked(values)
             elif action == "market-exit-confirm":
                 self._confirm_market_exit_locked()
+            elif action == "cancel-pair-confirm":
+                self._confirm_cancellation_locked()
             elif action == "cancel-staged":
                 self._disarm_execution_locked()
                 self._message = "Staged action cancelled. No orders were sent to TWS."
@@ -211,6 +230,10 @@ class StarUIWorkbench:
     def _refresh_locked(self) -> None:
         self._disarm_execution_locked()
         state = self._view_model.refresh_portfolio(self._settings)
+        self._apply_refreshed_portfolio_locked(state)
+
+    def _apply_refreshed_portfolio_locked(self, state: ViewState) -> None:
+        """Apply an already-read portfolio snapshot while holding the UI lock."""
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
         target = self._preferred_con_id
@@ -226,7 +249,6 @@ class StarUIWorkbench:
             self._message = "The selected contract is not in the verified portfolio."
             return
         self._selected_con_id = con_id
-        self._workspace_tab = "draft"
         state = self._view_model.select_position(
             con_id, self._plan_form(self._drafts.get(con_id, ()))
         )
@@ -254,6 +276,7 @@ class StarUIWorkbench:
         self._armed_execution = None
         self._armed_market_exit = None
         self._armed_market_exits = ()
+        self._armed_cancellation = None
         self._armed_price_updates = ()
 
     def _arm_execution_locked(self) -> None:
@@ -345,11 +368,93 @@ class StarUIWorkbench:
             return
         self._armed_market_exit = candidate
         self._armed_market_exits = (candidate,)
-        self._workspace_tab = "active"
         self._message = (
             f"Fresh paper snapshot verified. Review the MKT exit for "
             f"{candidate.quantity} contracts, then click to confirm."
         )
+
+    def _arm_cancellation_locked(self, target_perm_id: int) -> None:
+        """Stage deletion of one complete, journal-proven OCA pair only."""
+        if self._paper_execution is None or self._selected_con_id is None:
+            self._message = "Paper order management is disabled for this launch."
+            return
+        self._disarm_execution_locked()
+        state = self._view_model.select_position(
+            self._selected_con_id,
+            self._plan_form(self._drafts.get(self._selected_con_id, ())),
+        )
+        self._apply_state_locked(state)
+        self._record_refresh_time_locked()
+        self._announce_reconciliation_locked()
+        snapshot = self._view_model.latest_snapshot()
+        if snapshot is None:
+            self._message = "Bracket cancellation blocked: a fresh selected-position snapshot is required."
+            return
+        try:
+            candidate = self._paper_execution.prepare_market_exit(
+                snapshot,
+                target_perm_id=target_perm_id,
+                expected_client_id=self._settings.client_id,
+            )
+        except ExecutionBlocked as error:
+            self._message = f"Bracket cancellation blocked: {error}"
+            return
+        self._armed_cancellation = candidate
+        self._message = (
+            f"Fresh paper snapshot verified. Review cancellation of OCA bracket "
+            f"{candidate.oca_group}; no replacement sell order will be sent."
+        )
+
+    def _confirm_cancellation_locked(self) -> None:
+        """Cancel the staged pair after one more fresh-snapshot equality check."""
+        candidate = self._armed_cancellation
+        if self._paper_execution is None or candidate is None or self._selected_con_id is None:
+            self._message = "Start bracket cancellation first; every paper change needs a separate confirmation."
+            return
+        state = self._view_model.select_position(
+            self._selected_con_id,
+            self._plan_form(self._drafts.get(self._selected_con_id, ())),
+        )
+        self._apply_state_locked(state)
+        self._record_refresh_time_locked()
+        self._announce_reconciliation_locked()
+        snapshot = self._view_model.latest_snapshot()
+        if snapshot is None:
+            self._disarm_execution_locked()
+            self._message = "Bracket cancellation blocked: the fresh snapshot is unavailable."
+            return
+        try:
+            refreshed = self._paper_execution.prepare_market_exit(
+                snapshot,
+                target_perm_id=candidate.target_perm_id,
+                expected_client_id=self._settings.client_id,
+            )
+            if refreshed != candidate:
+                raise ExecutionBlocked("the OCA bracket changed after review")
+            self._paper_execution.cancel_pair(
+                snapshot,
+                candidate,
+                host="127.0.0.1",
+                port=self._settings.port,
+                client_id=self._settings.client_id,
+                timeout_seconds=self._settings.timeout_seconds,
+            )
+        except ExecutionOutcomeUnknown as error:
+            self._message = (
+                f"Bracket cancellation outcome is unknown: {error}. Refresh TWS before "
+                "taking any further action."
+            )
+        except ExecutionBlocked as error:
+            self._message = f"Bracket cancellation blocked: {error}"
+        except Exception as error:
+            self._message = f"Bracket cancellation outcome is unknown: {error}"
+        else:
+            self._message = (
+                "TWS confirmed both OCA legs were cancelled. Refresh to make the "
+                "contracts available for a new bracket."
+            )
+        finally:
+            self._disarm_execution_locked()
 
     def _arm_selected_market_exit_locked(self, values: dict[str, str]) -> None:
         """Arm a verified all-selected-layer paper exit for second confirmation."""
@@ -383,7 +488,6 @@ class StarUIWorkbench:
             self._message = f"Market exit blocked: {error}"
             return
         self._armed_market_exits = candidates
-        self._workspace_tab = "active"
         total = sum((candidate.quantity for candidate in candidates), Decimal("0"))
         self._message = (
             f"Fresh paper snapshot verified. Review cancellation of {len(candidates)} OCA "
@@ -452,7 +556,6 @@ class StarUIWorkbench:
                 "Refresh to verify the outcome."
             )
         finally:
-            self._workspace_tab = "active"
             self._disarm_execution_locked()
 
     def _arm_price_updates_locked(
@@ -559,7 +662,6 @@ class StarUIWorkbench:
         except (ExecutionBlocked, ValueError) as error:
             self._message = f"Price update blocked: {error}"
             return
-        self._workspace_tab = "active"
         changed_legs = sum(
             int(update.target_price is not None) + int(update.stop_price is not None)
             for update in self._armed_price_updates
@@ -614,7 +716,6 @@ class StarUIWorkbench:
                 "price amendment(s). Refresh to verify the updated working orders."
             )
         finally:
-            self._workspace_tab = "active"
             self._disarm_execution_locked()
 
     def _apply_state_locked(self, state: ViewState) -> None:
@@ -659,9 +760,12 @@ class StarUIWorkbench:
 
     def _ensure_draft_locked(self) -> None:
         con_id = self._selected_con_id
-        if con_id is None or con_id in self._drafts or self._state.bracket_form.layers:
-            if con_id is not None and self._state.bracket_form.layers:
-                self._drafts[con_id] = self._state.bracket_form.layers
+        if con_id is None:
+            return
+        if self._state.bracket_form.layers:
+            self._drafts[con_id] = self._state.bracket_form.layers
+            return
+        if self._drafts.get(con_id):
             return
         basis = self._state.unit_basis
         calculator = self._state.quote_calculator
@@ -973,7 +1077,6 @@ class StarUIWorkbench:
     def _workspace(self, title: str) -> Any:
         coverage, app_order_count, order_count = self._order_coverage()
         active_pairs = self._active_oca_pairs()
-        show_active = self._workspace_tab == "active" and bool(active_pairs)
         return Div(
             self._coverage_alert(coverage, app_order_count, order_count),
             Div(
@@ -983,64 +1086,24 @@ class StarUIWorkbench:
             ),
             P(f"{self._state.available_quantity} contracts verified available to bracket", cls="mt-2 text-sm font-medium text-emerald-400"),
             Div(
-                self._workspace_tab_control(
-                    "Draft layers",
-                    "show-draft",
-                    selected=not show_active,
-                ),
-                self._workspace_tab_control(
-                    "Active layers",
-                    "show-active",
-                    selected=show_active,
-                    disabled=not active_pairs,
-                ),
-                cls="mt-5 flex h-9 items-center gap-4",
-            ),
-            Div(
                 ScrollArea(
-                    self._active_layers_panel() if show_active else self._draft_panel(),
-                    aria_label=(
-                        "Reconciled active OCA layers"
-                        if show_active
-                        else "Layer draft workspace"
-                    ),
+                    self._active_layers_panel() if active_pairs else None,
+                    Div(
+                        Separator(cls="flex-1"),
+                        Span("New bracket layers", cls="text-xs font-semibold text-muted-foreground"),
+                        Separator(cls="flex-1"),
+                        cls="my-6 flex items-center gap-3",
+                    )
+                    if active_pairs
+                    else None,
+                    self._draft_panel(),
+                    aria_label="OCA layers workspace",
                     orientation="vertical",
                     cls="h-full",
                 ),
                 cls="mt-5 min-h-0 flex-1 overflow-hidden",
             ),
             cls="flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6",
-        )
-
-    def _workspace_tab_control(
-        self,
-        label: str,
-        action: str,
-        *,
-        selected: bool,
-        disabled: bool = False,
-    ) -> Any:
-        """Render a server-owned workspace tab to avoid WebView visibility drift."""
-        return Form(
-            Button(
-                label,
-                variant="ghost",
-                size="sm",
-                type="submit",
-                disabled=disabled,
-                aria_current="page" if selected else None,
-                cls=(
-                    "h-9 rounded-none border-b-2 border-foreground px-0 text-foreground "
-                    "hover:bg-transparent hover:text-foreground"
-                    if selected
-                    else "h-9 rounded-none border-b-2 border-transparent px-0 "
-                    "hover:bg-transparent"
-                ),
-            ),
-            HTMLInput(type="hidden", name="action", value=action),
-            action=f"/{self.session_token}/action",
-            method="post",
-            cls="contents",
         )
 
     def _order_coverage(self) -> tuple[str, int, int]:
@@ -1241,7 +1304,18 @@ class StarUIWorkbench:
                 ),
                 input_id=f"active-tif-{index}",
             ),
-            action_field=Div(aria_hidden="true"),
+            action_field=Button(
+                Icon("lucide:trash-2"),
+                variant="outline",
+                size="icon",
+                type="submit",
+                name="action",
+                value=f"cancel-pair-arm:{target.perm_id}",
+                disabled=self._paper_execution is None,
+                aria_label=f"Delete OCA layer {index}",
+                title="Delete OCA bracket",
+                cls="mt-5",
+            ),
         )
 
     def _active_layer_projection(self, target: Any, stop: Any) -> tuple[str, str]:
@@ -1554,12 +1628,14 @@ class StarUIWorkbench:
         market_exits = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
+        cancellation = self._armed_cancellation
         price_updates = self._armed_price_updates
-        live_active = self._workspace_tab == "active" and bool(self._active_oca_pairs())
         armed_execution = self._armed_execution
         action_rows: list[Any] = []
         if market_exits:
             action_rows = self._review_market_exit_plan(market_exits)
+        elif cancellation is not None:
+            action_rows = [self._review_cancellation_plan(cancellation)]
         elif price_updates:
             action_rows = [
                 self._review_price_update(index, update)
@@ -1570,29 +1646,60 @@ class StarUIWorkbench:
                 self._review_pair(index, layer)
                 for index, layer in enumerate(self._current_layers(), start=1)
             ]
-        elif self._workspace_tab == "draft" and self._current_layers():
-            # A draft is an untransmitted order plan.  Keep it continuously
-            # visible in the review panel while its editable inputs change.
-            action_rows = [
-                self._review_pair(index, layer)
-                for index, layer in enumerate(self._current_layers(), start=1)
-            ]
+        draft_rows = [
+            self._review_pair(index, layer)
+            for index, layer in enumerate(self._current_layers(), start=1)
+        ]
+        has_active_layers = bool(self._active_oca_pairs())
+        has_staged_action = bool(action_rows)
+        review_badge = (
+            Badge("MKT EXIT", variant="outline", cls="text-[10px]")
+            if market_exits
+            else Badge("CANCEL", variant="outline", cls="text-[10px]")
+            if cancellation is not None
+            else Badge("PRICE UPDATE", variant="outline", cls="text-[10px]")
+            if price_updates
+            else Badge("DRAFT", variant="outline", cls="text-[10px]")
+            if has_staged_action
+            else Div(
+                Badge(
+                    "DRAFT",
+                    variant="outline",
+                    data_draft_review_badge=True,
+                    cls="text-[10px]" if draft_rows else "hidden text-[10px]",
+                ),
+                Badge(
+                    "PRICE UPDATE",
+                    variant="outline",
+                    data_active_review_badge=True,
+                    cls="hidden text-[10px]",
+                )
+                if has_active_layers
+                else None,
+                cls="flex items-center",
+            )
+        )
         return Div(
             Div(
                 Span("ACTION REVIEW", cls="text-xs font-semibold tracking-wide text-muted-foreground"),
-                Badge("MKT EXIT", variant="outline", cls="text-[10px]")
-                if market_exits
-                else Badge("PRICE UPDATE", variant="outline", cls="text-[10px]")
-                if price_updates
-                else Badge("DRAFT", variant="outline", cls="text-[10px]")
-                if action_rows
-                else None,
+                review_badge,
                 cls="flex items-center justify-between px-4 py-4",
             ),
             ScrollArea(*action_rows, aria_label="Planned order actions", cls="min-h-0 flex-1 px-4")
-            if action_rows
-            else self._live_active_review()
-            if live_active
+            if has_staged_action
+            else ScrollArea(
+                Div(
+                    *draft_rows,
+                    data_draft_review=True,
+                    cls="min-h-0" if draft_rows else "hidden min-h-0",
+                ),
+                self._live_active_review(hidden=bool(draft_rows))
+                if has_active_layers
+                else None,
+                aria_label="Planned order actions",
+                cls="min-h-0 flex-1 px-4",
+            )
+            if draft_rows or has_active_layers
             else Div(
                 P(
                     "Add a layer or modify an existing one to continue.",
@@ -1608,6 +1715,31 @@ class StarUIWorkbench:
         market_exits = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
+        if self._armed_cancellation is not None:
+            return Form(
+                Div(
+                    Button(
+                        "Cancel",
+                        variant="outline",
+                        type="submit",
+                        name="action",
+                        value="cancel-staged",
+                        cls="flex-1",
+                    ),
+                    Button(
+                        "Click to confirm delete layer",
+                        variant="destructive",
+                        type="submit",
+                        name="action",
+                        value="cancel-pair-confirm",
+                        cls="flex-[2]",
+                    ),
+                    cls="flex gap-2",
+                ),
+                action=f"/{self.session_token}/action",
+                method="post",
+                cls="mx-4 mb-4 w-[calc(100%-2rem)]",
+            )
         if market_exits:
             return Form(
                 Div(
@@ -1659,8 +1791,27 @@ class StarUIWorkbench:
                 ),
                 cls="mx-4 mb-4 w-[calc(100%-2rem)]",
             )
-        if self._workspace_tab == "active" and self._active_oca_pairs():
-            return Div(
+        can_execute_draft = (
+            self._paper_execution is not None
+            and self._state.available_quantity > 0
+            and bool(self._current_layers())
+        )
+        return Div(
+            Div(
+                Button(
+                    "Execute paper order",
+                    variant="default",
+                    type="submit",
+                    name="action",
+                    value="execute-arm",
+                    form="draft-form",
+                    disabled=not can_execute_draft,
+                    cls="w-full",
+                ),
+                data_draft_execute=True,
+                cls="w-full",
+            ),
+            Div(
                 Button(
                     "Execute paper order",
                     variant="default",
@@ -1672,29 +1823,15 @@ class StarUIWorkbench:
                     disabled=True,
                     cls="w-full",
                 ),
-                cls="mx-4 mb-4 w-[calc(100%-2rem)]",
+                data_active_execute_control=True,
+                cls="hidden w-full",
             )
-        can_execute = (
-            self._paper_execution is not None
-            and self._workspace_tab == "draft"
-            and self._state.available_quantity > 0
-            and bool(self._current_layers())
-        )
-        return Div(
-            Button(
-                "Execute paper order",
-                variant="default",
-                type="submit",
-                name="action",
-                value="execute-arm",
-                form="draft-form",
-                disabled=not can_execute,
-                cls="w-full",
-            ),
+            if self._active_oca_pairs()
+            else None,
             cls="mx-4 mb-4 w-[calc(100%-2rem)]",
         )
 
-    def _live_active_review(self) -> Any:
+    def _live_active_review(self, *, hidden: bool) -> Any:
         """Client-side review rows sharing the draft order-review component."""
         rows: list[Any] = []
         for index, (_group, target, _stop) in enumerate(
@@ -1742,7 +1879,8 @@ class StarUIWorkbench:
                 cls="text-center text-sm leading-6 text-muted-foreground",
             ),
             *rows,
-            cls="min-h-0 flex-1 px-4",
+            data_active_review=True,
+            cls="hidden min-h-0" if hidden else "min-h-0",
         )
 
     def _review_pair(self, index: int, layer: DraftLayerForm) -> Any:
@@ -1910,6 +2048,26 @@ class StarUIWorkbench:
         )
         return rows
 
+    def _review_cancellation_plan(self, candidate: MarketExitCandidate) -> Any:
+        """Show the complete pair that will be removed, with no replacement leg."""
+        return self._review_oca_pair(
+            index=1,
+            quantity=format(candidate.quantity, "f"),
+            tif=candidate.tif,
+            lines=(
+                Div(
+                    Span(
+                        "CANCEL BRACKET",
+                        cls="block text-xs font-semibold text-amber-300",
+                    ),
+                    Span(
+                        candidate.oca_group,
+                        cls="mt-1 block break-all text-xs font-semibold text-amber-300",
+                    ),
+                ),
+            ),
+        )
+
 
 def _live_draft_script(configuration: dict[str, Any] | None) -> str:
     """Calculate a local, illustrative draft without weakening server validation."""
@@ -2015,6 +2173,14 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       node.classList.toggle('hidden', hidden);
       node.classList.toggle(display, !hidden);
     }};
+    const setReviewMode = (active) => {{
+      document.querySelectorAll('[data-draft-review], [data-draft-review-badge], [data-draft-execute]').forEach((node) => {{
+        node.classList.toggle('hidden', active);
+      }});
+      document.querySelectorAll('[data-active-review], [data-active-review-badge], [data-active-execute-control]').forEach((node) => {{
+        node.classList.toggle('hidden', !active);
+      }});
+    }};
     const update = () => {{
       let changed = false;
       form.querySelectorAll('[data-active-input="target"]').forEach((targetInput) => {{
@@ -2052,6 +2218,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       const empty = document.querySelector('[data-active-review-empty]');
       if (empty) empty.classList.toggle('hidden', changed);
       document.querySelectorAll('[data-active-execute]').forEach((button) => {{ button.disabled = !changed; }});
+      setReviewMode(changed);
     }};
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('input', update));
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('change', update));

@@ -109,8 +109,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         paper_execution=paper_execution,
     )
     window.show()
-    if args.demo_data:
-        window.load_demo_data()
+    window.refresh_on_launch()
     if owns_app:
         return app.exec()
     return 0

@@ -145,6 +145,127 @@ class IbkrPaperExecutionBroker:
             if reader is not None:
                 reader.join(timeout=0.5)
 
+    def cancel_pair(
+        self,
+        snapshot: BrokerSnapshot,
+        candidate: MarketExitCandidate,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmission:
+        """Cancel one exact owned OCA pair and verify both legs disappeared."""
+        if (
+            snapshot.selected.account != candidate.account
+            or snapshot.selected.con_id != candidate.con_id
+            or candidate.client_id != client_id
+            or candidate.quantity <= 0
+            or not candidate.oca_group
+        ):
+            raise ExecutionBlocked("the cancellation candidate does not match TWS")
+        imports = _load_ibapi()
+        selected_ids = {candidate.target_order_id, candidate.stop_order_id}
+
+        class App(imports.EWrapper, imports.EClient):  # type: ignore[name-defined, misc]
+            def __init__(self) -> None:
+                imports.EWrapper.__init__(self)
+                imports.EClient.__init__(self, self)
+                self.ready = Event()
+                self.cancelled: set[int] = set()
+                self.open_orders_done = Event()
+                self.active_order_ids: set[int] = set()
+                self.errors: list[str] = []
+
+            def nextValidId(self, _order_id: int) -> None:
+                self.ready.set()
+
+            def openOrder(
+                self, order_id: int, contract: Any, order: Any, state: Any
+            ) -> None:
+                del contract, order, state
+                self.active_order_ids.add(int(order_id))
+
+            def openOrderEnd(self) -> None:
+                self.open_orders_done.set()
+
+            def orderStatus(self, order_id: int, *args: Any) -> None:
+                current_id = int(order_id)
+                status = str(args[0]) if args else ""
+                if current_id not in selected_ids:
+                    return
+                if status in {"Cancelled", "ApiCancelled"}:
+                    self.cancelled.add(current_id)
+                elif status in {"Filled", "Inactive"}:
+                    self.errors.append(
+                        f"selected OCA order {current_id} changed to {status} "
+                        "while cancelling"
+                    )
+
+            def error(self, req_id: int, *args: Any) -> None:
+                code, message = _parse_error_arguments(args)
+                if code == 202 and req_id in selected_ids:
+                    self.cancelled.add(int(req_id))
+                    return
+                if code not in {2104, 2106, 2107, 2108, 2158}:
+                    self.errors.append(
+                        f"IBKR error reqId={req_id} code={code}: {message}"
+                    )
+
+        app = App()
+        reader: Thread | None = None
+        deadline = monotonic() + timeout_seconds
+        try:
+            app.connect(host, port, client_id)
+            reader = Thread(
+                target=app.run,
+                name="ibkr-paper-oca-cancellation-reader",
+                daemon=True,
+            )
+            reader.start()
+            if not app.ready.wait(max(0, deadline - monotonic())):
+                raise ExecutionBlocked("TWS did not issue a next valid order ID")
+            for order_id in sorted(selected_ids):
+                _cancel_order(app, order_id)
+            while (
+                len(app.cancelled) != len(selected_ids)
+                and not app.errors
+                and monotonic() < deadline
+            ):
+                sleep(0.02)
+            if app.errors:
+                raise ExecutionBlocked("; ".join(app.errors))
+            if len(app.cancelled) != len(selected_ids):
+                raise ExecutionOutcomeUnknown(
+                    "TWS did not acknowledge cancellation of both selected OCA legs "
+                    "before the deadline"
+                )
+            app.active_order_ids.clear()
+            app.open_orders_done.clear()
+            app.reqOpenOrders()
+            while (
+                not app.open_orders_done.is_set()
+                and not app.errors
+                and monotonic() < deadline
+            ):
+                sleep(0.02)
+            if app.errors:
+                raise ExecutionBlocked("; ".join(app.errors))
+            if not app.open_orders_done.is_set():
+                raise ExecutionOutcomeUnknown(
+                    "TWS did not complete the post-cancellation open-order check"
+                )
+            if selected_ids & app.active_order_ids:
+                raise ExecutionBlocked(
+                    "the selected OCA pair remains active after cancellation"
+                )
+            return PaperSubmission(order_ids=tuple(sorted(selected_ids)), perm_ids=())
+        finally:
+            if app.isConnected():
+                app.disconnect()
+            if reader is not None:
+                reader.join(timeout=0.5)
+
     def cancel_pair_then_submit_market(
         self,
         snapshot: BrokerSnapshot,

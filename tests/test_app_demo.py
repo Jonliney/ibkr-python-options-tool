@@ -1,9 +1,11 @@
 import os
 from dataclasses import replace
 from decimal import Decimal
+from threading import Event, Thread
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from httpx import Response
 from PySide6.QtWidgets import QApplication
 from starlette.testclient import TestClient
 
@@ -96,6 +98,41 @@ def test_demo_launch_populates_the_starui_workbench_without_a_tws_refresh() -> N
     assert workbench._state.available_quantity == 5
 
 
+def test_launch_refresh_never_blocks_the_initial_workbench_page() -> None:
+    workbench = _demo_workbench()
+    workbench._demo_mode = False
+    refresh_started = Event()
+    release_refresh = Event()
+    responses: list[Response] = []
+
+    def blocked_refresh(_settings: object) -> object:
+        refresh_started.set()
+        assert release_refresh.wait(timeout=1)
+        return workbench._state
+
+    workbench._view_model.refresh_portfolio = blocked_refresh  # type: ignore[method-assign]
+    launch = Thread(target=workbench.refresh_on_launch, daemon=True)
+    launch.start()
+    assert refresh_started.wait(timeout=1)
+
+    def load_page() -> None:
+        responses.append(TestClient(workbench.app).get(workbench.path))
+
+    page = Thread(target=load_page, daemon=True)
+    page.start()
+    try:
+        page.join(timeout=0.1)
+        assert not page.is_alive()
+    finally:
+        release_refresh.set()
+        page.join(timeout=1)
+        launch.join(timeout=1)
+
+    assert len(responses) == 1
+    assert responses[0].status_code == 200
+    assert "Connecting to TWS…" in responses[0].text
+
+
 def test_position_identity_preserves_the_inventory_scan_order() -> None:
     assert _position_identity("MSTR  260925C00150000") == (
         "MSTR",
@@ -173,6 +210,19 @@ def test_refresh_replaces_a_draft_that_exceeds_newly_available_quantity() -> Non
     assert workbench._current_layers()[0].quantity == "4"
 
 
+def test_empty_draft_rehydrates_when_a_refresh_frees_contracts() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+
+    workbench._drafts[con_id] = ()
+    workbench._ensure_draft_locked()
+
+    assert len(workbench._current_layers()) == 1
+    assert workbench._current_layers()[0].quantity == "5"
+
+
 def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     from ibkr_options_manager.app.view_model import WorkingOrderLine
 
@@ -211,37 +261,39 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     page = client.get(workbench.path)
 
     assert "Layered OCA draft" in page.text
-    active = client.post(
-        workbench.path + "action",
-        data={"action": "show-active"},
-    )
-
-    assert 'aria-label="Reconciled active OCA layers"' in active.text
-    assert "OCA-1" in active.text
-    assert "$26.20" in active.text
-    assert "$16.40" in active.text
-    assert "Move stop to B/E" in active.text
-    assert "Update layers" not in active.text
-    assert "Close all" in active.text
-    assert 'name="active_target_101"' in active.text
-    assert 'name="active_stop_101"' in active.text
-    assert "data-active-review-row" in active.text
-    assert "data-active-execute" in active.text
-    assert 'id="active-quantity-1"' in active.text
-    assert 'id="active-tif-1"' in active.text
-    assert ">State<" not in active.text
-    assert "requires a second confirmation" not in active.text
-    assert "Layered OCA draft" not in active.text
-    assert 'aria-current="page"' in active.text
-    assert 'data-active-initial="' in active.text
-    assert 'data-live-price="active-target-1"' in active.text
-    assert 'data-live-outcome="active-target-1"' in active.text
-    assert "const targetEdited" in active.text
+    assert 'aria-label="OCA layers workspace"' in page.text
+    assert 'aria-label="Active OCA layer rows"' in page.text
+    assert "OCA-1" in page.text
+    assert "$26.20" in page.text
+    assert "$16.40" in page.text
+    assert "Move stop to B/E" in page.text
+    assert "Update layers" not in page.text
+    assert "Close all" in page.text
+    assert "New bracket layers" in page.text
+    assert 'name="active_target_101"' in page.text
+    assert 'name="active_stop_101"' in page.text
+    assert "data-active-review-row" in page.text
+    assert "data-active-execute" in page.text
+    assert 'id="active-quantity-1"' in page.text
+    assert 'id="active-tif-1"' in page.text
+    assert 'value="cancel-pair-arm:101"' in page.text
+    assert 'title="Delete OCA bracket"' in page.text
+    assert ">State<" not in page.text
+    assert "requires a second confirmation" not in page.text
+    assert "Layered OCA draft" in page.text
+    assert 'aria-current="page"' not in page.text
+    assert 'data-active-initial="' in page.text
+    assert 'data-live-price="active-target-1"' in page.text
+    assert 'data-live-outcome="active-target-1"' in page.text
+    assert page.text.index("Active OCA layers") < page.text.index("New bracket layers")
+    assert page.text.index("New bracket layers") < page.text.index("Layered OCA draft")
+    assert "const targetEdited" in page.text
     active_script = _live_active_script(
         {"basis": "1", "multiplier": "100", "bands": []}
     )
     assert "setHidden(row, !(targetChanged || stopChanged), 'block')" in active_script
-    assert "UPDATE SELL LMT" in active.text
+    assert "setReviewMode(changed)" in active_script
+    assert "UPDATE SELL LMT" in page.text
 
 
 def test_active_layer_prefers_configured_percentage_over_rounded_inverse() -> None:
@@ -260,7 +312,6 @@ def test_active_layer_prefers_configured_percentage_over_rounded_inverse() -> No
 def test_close_all_review_lists_pair_cancellations_then_one_market_order() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
-    workbench._workspace_tab = "active"
     workbench._armed_market_exits = (
         MarketExitCandidate(
             account="DU123",
@@ -313,6 +364,35 @@ def test_close_all_review_lists_pair_cancellations_then_one_market_order() -> No
     assert "Staged action cancelled. No orders were sent to TWS." in cancelled.text
 
 
+def test_delete_active_layer_review_cancels_only_that_oca_bracket() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._armed_cancellation = MarketExitCandidate(
+        account="DU123",
+        con_id=101,
+        target_order_id=11,
+        target_perm_id=101,
+        client_id=17,
+        quantity=Decimal("5"),
+        tif="GTC",
+        oca_group="example/tranche-1",
+        stop_order_id=12,
+        stop_perm_id=102,
+    )
+
+    page = TestClient(workbench.app).get(workbench.path)
+    sidebar = page.text.split("ACTION REVIEW", maxsplit=1)[1]
+
+    assert "CANCEL" in sidebar
+    assert "OCA-1" in sidebar
+    assert "5 contracts · GTC" in sidebar
+    assert "CANCEL BRACKET" in sidebar
+    assert "example/tranche-1" in sidebar
+    assert "SELL MKT" not in sidebar
+    assert "Click to confirm delete layer" in sidebar
+    assert ">Cancel<" in sidebar
+
+
 def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -333,7 +413,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert "<dialog" in page.text
     assert "h-screen overflow-hidden" in page.text
     assert 'aria-label="Draft layer rows"' in page.text
-    assert 'aria-label="Layer draft workspace"' in page.text
+    assert 'aria-label="OCA layers workspace"' in page.text
     assert 'aria-label="Planned order actions"' in page.text
     assert 'id="draft-form"' in page.text
     assert 'data-live-input="target"' in page.text
@@ -527,6 +607,7 @@ def test_main_builds_the_embedded_starui_window(monkeypatch: object) -> None:
     assert main(["--demo-data"]) == 0
     assert len(created) == 1
     assert created[0].demo_loaded is True
+    assert created[0].launch_refresh_requested is True
 
 
 def _demo_workbench() -> StarUIWorkbench:
@@ -548,12 +629,17 @@ def _demo_workbench() -> StarUIWorkbench:
 class _WindowStub:
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         self.demo_loaded = False
+        self.launch_refresh_requested = False
 
     def show(self) -> None:
         pass
 
     def load_demo_data(self) -> None:
         self.demo_loaded = True
+
+    def refresh_on_launch(self) -> None:
+        self.launch_refresh_requested = True
+        self.load_demo_data()
 
 
 class _OwnedOrderService:

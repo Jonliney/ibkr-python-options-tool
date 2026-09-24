@@ -123,6 +123,22 @@ class PaperBulkMarketExitTransport(Protocol):
 
 
 @runtime_checkable
+class PaperOcaCancellationTransport(Protocol):
+    """Narrow transport seam for cancelling one app-owned OCA pair only."""
+
+    def cancel_pair(
+        self,
+        snapshot: BrokerSnapshot,
+        candidate: MarketExitCandidate,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmissionResult: ...
+
+
+@runtime_checkable
 class PaperPriceUpdateTransport(Protocol):
     """Narrow transport seam for price-only amendments to app-owned pairs."""
 
@@ -260,6 +276,29 @@ class ExecutionJournal:
     def mark_unknown(self, fingerprint: str) -> JournalEntry:
         """Record an indeterminate transport outcome and permanently block a retry."""
         return self.record_submission(fingerprint, order_ids=(), perm_ids=())
+
+    def record_management_completion(
+        self, fingerprint: str, *, order_ids: tuple[int, ...]
+    ) -> JournalEntry:
+        """Record a broker-confirmed management operation with no new orders."""
+        entries = list(self._entries())
+        for index, entry in enumerate(entries):
+            if entry.fingerprint == fingerprint:
+                updated = JournalEntry(
+                    fingerprint=entry.fingerprint,
+                    account=entry.account,
+                    con_id=entry.con_id,
+                    state="COMPLETED",
+                    expected_order_count=entry.expected_order_count,
+                    order_ids=order_ids,
+                    perm_ids=(),
+                )
+                entries[index] = updated
+                self._write(tuple(entries))
+                return updated
+        raise ExecutionBlocked(
+            "management journal entry disappeared before acknowledgement"
+        )
 
     def reconcile_snapshot(
         self,
@@ -666,6 +705,73 @@ class PaperExecutionService:
                 entry.fingerprint,
                 order_ids=order_ids,
                 perm_ids=perm_ids,
+            )
+        )
+
+    def cancel_pair(
+        self,
+        snapshot: BrokerSnapshot,
+        candidate: MarketExitCandidate,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> SubmissionReceipt:
+        """Cancel one re-verified app-owned bracket without replacing it.
+
+        The cancellation is deliberate and non-retryable.  Its successful
+        receipt records the two broker order IDs that TWS confirmed cancelled;
+        it creates no replacement order and grants no ownership to anything
+        that was not already journal-proven.
+        """
+        refreshed = self.prepare_market_exit(
+            snapshot,
+            target_perm_id=candidate.target_perm_id,
+            expected_client_id=client_id,
+        )
+        if refreshed != candidate:
+            raise ExecutionBlocked("the selected OCA layer changed since confirmation")
+        transport = self._transport
+        if not isinstance(transport, PaperOcaCancellationTransport):
+            raise ExecutionBlocked(
+                "the configured paper transport cannot cancel an app-owned OCA bracket"
+            )
+        entry = self._journal.begin_management(
+            snapshot,
+            operation="cancel-bracket",
+            material=(
+                candidate.target_order_id,
+                candidate.target_perm_id,
+                candidate.stop_order_id,
+                candidate.stop_perm_id,
+            ),
+            expected_order_count=2,
+        )
+        expected_order_ids = tuple(
+            sorted((candidate.target_order_id, candidate.stop_order_id))
+        )
+        try:
+            result = transport.cancel_pair(
+                snapshot,
+                candidate,
+                host=host,
+                port=port,
+                client_id=client_id,
+                timeout_seconds=timeout_seconds,
+            )
+            order_ids = tuple(sorted(int(value) for value in result.order_ids))
+            if order_ids != expected_order_ids:
+                raise ExecutionOutcomeUnknown(
+                    "TWS did not acknowledge cancellation of both selected OCA legs"
+                )
+        except Exception:
+            self._journal.mark_unknown(entry.fingerprint)
+            raise
+        return SubmissionReceipt(
+            self._journal.record_management_completion(
+                entry.fingerprint,
+                order_ids=order_ids,
             )
         )
 

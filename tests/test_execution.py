@@ -133,6 +133,21 @@ class _RecordingMarketTransport(_RecordingTransport):
     def __init__(self) -> None:
         super().__init__()
         self.market_candidates: list[MarketExitCandidate] = []
+        self.cancelled_candidates: list[MarketExitCandidate] = []
+
+    def cancel_pair(
+        self,
+        _snapshot: BrokerSnapshot,
+        candidate: MarketExitCandidate,
+        **_kwargs: object,
+    ) -> PaperSubmission:
+        self.cancelled_candidates.append(candidate)
+        return PaperSubmission(
+            order_ids=tuple(
+                sorted((candidate.target_order_id, candidate.stop_order_id))
+            ),
+            perm_ids=(),
+        )
 
     def cancel_pair_then_submit_market(
         self,
@@ -355,6 +370,70 @@ def test_market_exit_cancels_only_a_fresh_complete_app_owned_oca_pair_then_submi
         ExecutionBlocked, match="management attempt is already journaled"
     ):
         service.cancel_pair_then_submit_market(
+            active_snapshot,
+            candidate,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+
+
+def test_cancel_pair_removes_only_a_fresh_complete_app_owned_oca_bracket(
+    tmp_path,
+) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.record_submission(
+        plan.fingerprint,
+        order_ids=(101, 102),
+        perm_ids=(201, 202),
+    )
+    target = WorkingOrder(
+        perm_id=201,
+        client_id=17,
+        order_id=101,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("2"),
+        status="Submitted",
+        oca_group=f"{plan.fingerprint[:12]}/tranche-1",
+        tif="GTC",
+    )
+    active_snapshot = replace(
+        snapshot,
+        working_orders=(
+            target,
+            replace(target, perm_id=202, order_id=102, order_type="STP"),
+        ),
+    )
+    transport = _RecordingMarketTransport()
+    service = PaperExecutionService(transport, journal)
+    candidate = service.prepare_market_exit(
+        active_snapshot,
+        target_perm_id=201,
+        expected_client_id=17,
+    )
+
+    receipt = service.cancel_pair(
+        active_snapshot,
+        candidate,
+        host="127.0.0.1",
+        port=7497,
+        client_id=17,
+        timeout_seconds=1,
+    )
+
+    assert transport.cancelled_candidates == [candidate]
+    assert receipt.entry.state == "COMPLETED"
+    assert receipt.entry.order_ids == (101, 102)
+    assert receipt.entry.perm_ids == ()
+    with pytest.raises(ExecutionBlocked, match="already journaled"):
+        service.cancel_pair(
             active_snapshot,
             candidate,
             host="127.0.0.1",
