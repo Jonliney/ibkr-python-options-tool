@@ -774,6 +774,10 @@ class IbkrPaperExecutionBroker:
                     order.lmtPrice = float(price)
                 else:
                     order.auxPrice = float(price)
+                # The target was originally staged with transmit=False while
+                # its OCA stop transmitted the pair. An amendment of that
+                # target must itself be sent through TWS precautions.
+                order.transmit = True
                 app.placeOrder(order_id, contract, order)
             while (
                 len(app.acks) != len(selected_ids)
@@ -800,9 +804,13 @@ class IbkrPaperExecutionBroker:
                 sleep(0.02)
             if app.errors:
                 raise ExecutionBlocked("; ".join(app.errors))
-            if not app.open_orders_done.is_set() or set(app.orders) != selected_ids:
+            if (
+                not app.open_orders_done.is_set()
+                or set(app.orders) != selected_ids
+                or set(app.acks) != selected_ids
+            ):
                 raise ExecutionOutcomeUnknown(
-                    "TWS did not complete the post-update open-order check"
+                    "TWS post-update check did not show every requested price"
                 )
             return PaperSubmission(
                 order_ids=tuple(sorted(selected_ids)),

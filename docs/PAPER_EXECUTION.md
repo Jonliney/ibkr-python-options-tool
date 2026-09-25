@@ -75,6 +75,15 @@ verified quantity. It never cancels a different layer, uses global-cancel, or
 touches manual orders. Any rejection, timeout, or incomplete acknowledgement
 fails closed with no retry.
 
+Price-only amendments use the same app-owned, same-client order IDs. The
+original OCA target is staged with `transmit=False` and its stop sends the
+pair, so a later amendment explicitly sets `transmit=True` on the selected
+order. TWS order precautions remain enabled. The app requires both an
+amendment callback and a subsequent `reqOpenOrders` result showing the exact
+requested price before reporting success. If the fresh check still shows the
+old price, the outcome is unknown and the user must inspect TWS before any
+further change.
+
 ## Acknowledgement and recovery
 
 The app waits for an `openOrder` acknowledgement carrying a nonzero permanent

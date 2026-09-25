@@ -117,6 +117,7 @@ class StarUIWorkbench:
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
         self._armed_cancellation: MarketExitCandidate | None = None
         self._armed_price_updates: tuple[PriceUpdateCandidate, ...] = ()
+        self._armed_active_percentages: dict[int, tuple[str, str]] = {}
         # TWS can acknowledge a price amendment before its next open-order
         # snapshot reflects it. Retain only that acknowledged presentation
         # value until the broker snapshot catches up; execution still always
@@ -135,6 +136,7 @@ class StarUIWorkbench:
         self._notifications_enabled = False
         self._suppress_toasts = False
         self._toast: _ToastNotice | None = None
+        self._toast_revision = 0
         self._status_message = ""
         self._message = "Refresh and select a position to build a draft."
         self._launch_connection = "idle"
@@ -169,6 +171,7 @@ class StarUIWorkbench:
     def _message(self, message: str) -> None:
         self._status_message = message
         if self._notifications_enabled and not self._suppress_toasts:
+            self._toast_revision += 1
             self._toast = _toast_notice(message)
 
     @property
@@ -393,6 +396,7 @@ class StarUIWorkbench:
         self._armed_market_exits = ()
         self._armed_cancellation = None
         self._armed_price_updates = ()
+        self._armed_active_percentages = {}
 
     def _arm_execution_locked(self) -> None:
         if self._paper_execution is None:
@@ -471,6 +475,7 @@ class StarUIWorkbench:
                 ),
                 variant="success",
             )
+            self._toast_revision += 1
         finally:
             self._disarm_execution_locked()
 
@@ -735,6 +740,7 @@ class StarUIWorkbench:
             )
             orders_by_id = {order.order_id: order for order in snapshot.working_orders}
             updates: list[PriceUpdateCandidate] = []
+            edited_percentages: dict[int, tuple[str, str]] = {}
             for layer in layers:
                 target = orders_by_id.get(layer.target_order_id)
                 stop = orders_by_id.get(layer.stop_order_id)
@@ -756,6 +762,10 @@ class StarUIWorkbench:
                     raise ExecutionBlocked(
                         "active target must be positive and stop must be 0% to 100%"
                     )
+                edited_percentages[layer.target_perm_id] = (
+                    format(target_percentage, "f"),
+                    format(stop_percentage, "f"),
+                )
                 if stop_percentage == 0:
                     desired_target = round_up_price(
                         basis * (Decimal("1") + target_percentage / Decimal("100")),
@@ -801,6 +811,7 @@ class StarUIWorkbench:
                 updates=changes,
                 expected_client_id=self._settings.client_id,
             )
+            self._armed_active_percentages = edited_percentages
         except (ExecutionBlocked, ValueError) as error:
             self._message = f"Price update blocked: {error}"
             return
@@ -870,6 +881,16 @@ class StarUIWorkbench:
                 f"TWS acknowledged {len(receipt.entry.order_ids)} app-owned OCA "
                 "price amendment(s)."
             )
+            if self._status_message.endswith("TWS state refreshed."):
+                self._toast_revision += 1
+                self._toast = _ToastNotice(
+                    title="Price update sent to TWS",
+                    description=(
+                        f"{len(receipt.entry.order_ids)} amended order(s) verified. "
+                        "Check TWS for any required Transmit."
+                    ),
+                    variant="success",
+                )
         finally:
             self._disarm_execution_locked()
 
@@ -1165,11 +1186,11 @@ class StarUIWorkbench:
         initial_toasts = (
             [
                 {
-                    "id": 1,
+                    "id": self._toast_revision,
                     "title": notice.title,
                     "description": notice.description,
                     "variant": notice.variant,
-                    "timestamp": 1,
+                    "timestamp": self._toast_revision,
                     "order": 0,
                 },
                 None,
@@ -1764,7 +1785,10 @@ class StarUIWorkbench:
                                 size="sm",
                                 type="button",
                                 data_move_stops_to_be=True,
-                                disabled=self._paper_execution is None,
+                                disabled=(
+                                    self._paper_execution is None
+                                    or bool(self._armed_price_updates)
+                                ),
                             ),
                             Button(
                                 "Close all",
@@ -1773,13 +1797,22 @@ class StarUIWorkbench:
                                 type="submit",
                                 name="action",
                                 value="market-exit-selected",
-                                disabled=self._paper_execution is None,
+                                disabled=(
+                                    self._paper_execution is None
+                                    or bool(self._armed_price_updates)
+                                ),
                             ),
                             cls="flex flex-wrap items-center justify-end gap-2",
                         ),
                     ),
                 ),
                 CardContent(
+                    P(
+                        "Proposed prices are shown below. TWS orders stay unchanged "
+                        "until you Confirm.",
+                        cls="mb-4 text-xs text-amber-300",
+                    )
+                    if self._armed_price_updates else None,
                     Div(
                         ScrollArea(
                             Div(
@@ -1829,6 +1862,9 @@ class StarUIWorkbench:
             bands=bands,
             presets=_parse_presets(self._stop_presets, maximum=Decimal("100")) or (),
         )
+        staged_percentages = self._armed_active_percentages.get(target.perm_id)
+        if staged_percentages is not None:
+            target_percentage, stop_percentage = staged_percentages
         gain, loss = self._active_layer_projection(
             target,
             stop,
@@ -1846,6 +1882,7 @@ class StarUIWorkbench:
                     value=target_percentage,
                     min="0.1",
                     step="0.1",
+                    disabled=bool(self._armed_price_updates),
                     data_active_input="target",
                     data_active_perm_id=target.perm_id,
                     data_active_original=display_target_price,
@@ -1871,6 +1908,7 @@ class StarUIWorkbench:
                     min="0",
                     max="100",
                     step="0.1",
+                    disabled=bool(self._armed_price_updates),
                     data_active_input="stop",
                     data_active_perm_id=target.perm_id,
                     data_active_original=display_stop_price,

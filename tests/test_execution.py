@@ -1,9 +1,11 @@
 from dataclasses import replace
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
 from ibkr_options_manager.broker.execution import (
+    IbkrPaperExecutionBroker,
     PaperSubmission,
     _build_submission_contract,
     _cancel_order,
@@ -34,6 +36,7 @@ from ibkr_options_manager.execution import (
     classify_journal_layer,
     require_paper_execution_snapshot,
 )
+from ibkr_options_manager.ibkr_probe import _IbapiImports
 
 
 def _snapshot(*, read_only_api: bool = False) -> BrokerSnapshot:
@@ -983,6 +986,106 @@ def test_price_updates_amend_only_the_requested_app_owned_leg(tmp_path) -> None:
 
     assert receipt.entry.order_ids == (102,)
     assert receipt.entry.perm_ids == (502,)
+
+
+@pytest.mark.parametrize(
+    ("post_price", "confirmed"),
+    [(29.1, False), (31.5, True)],
+)
+def test_price_update_requires_fresh_post_write_order_price(
+    monkeypatch,
+    post_price: float,
+    confirmed: bool,
+) -> None:
+    from ibkr_options_manager.broker import execution as broker_execution
+
+    class FakeWrapper:
+        def __init__(self) -> None:
+            pass
+
+    class FakeClient:
+        def __init__(self, wrapper) -> None:
+            self.wrapper = wrapper
+            self.connected = False
+            self.open_requests = 0
+
+        def connect(self, *_args) -> None:
+            self.connected = True
+            self.wrapper.nextValidId(500)
+
+        def isConnected(self) -> bool:
+            return self.connected
+
+        def disconnect(self) -> None:
+            self.connected = False
+
+        def run(self) -> None:
+            pass
+
+        def reqOpenOrders(self) -> None:
+            self.open_requests += 1
+            observed_price = 29.1 if self.open_requests == 1 else post_price
+            self.wrapper.openOrder(
+                101,
+                None,
+                SimpleNamespace(
+                    permId=201,
+                    action="SELL",
+                    orderType="LMT",
+                    lmtPrice=observed_price,
+                    transmit=False,
+                ),
+                SimpleNamespace(status="Submitted"),
+            )
+            self.wrapper.openOrderEnd()
+
+        def placeOrder(self, order_id, _contract, order) -> None:
+            assert order_id == 101
+            assert order.lmtPrice == 31.5
+            assert order.transmit is True
+            # The write callback reflects the requested value, but a separate
+            # reqOpenOrders check above still sees the old working value.
+            self.wrapper.openOrder(
+                order_id, None, order, SimpleNamespace(status="Submitted")
+            )
+
+    monkeypatch.setattr(
+        broker_execution,
+        "_load_ibapi",
+        lambda: _IbapiImports(
+            FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace
+        ),
+    )
+    snapshot = _snapshot()
+    layer = MarketExitCandidate(
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        target_order_id=101,
+        target_perm_id=201,
+        client_id=17,
+        quantity=Decimal("2"),
+        tif="GTC",
+        oca_group="app/tranche-1",
+        stop_order_id=102,
+        stop_perm_id=202,
+    )
+    update = PriceUpdateCandidate(layer=layer, target_price=Decimal("31.5"))
+
+    def amend() -> PaperSubmission:
+        return IbkrPaperExecutionBroker().modify_prices(
+            snapshot,
+            (update,),
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+
+    if confirmed:
+        assert amend().order_ids == (101,)
+    else:
+        with pytest.raises(ExecutionOutcomeUnknown, match="post-update"):
+            amend()
 
 
 def test_unknown_submission_reconciles_only_when_a_complete_oca_pair_is_observed(

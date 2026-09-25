@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import replace
 from decimal import Decimal
 from threading import Event, Thread
@@ -31,7 +32,8 @@ from ibkr_options_manager.app.web.surface import (
 )
 from ibkr_options_manager.app.web_window import StarUIPlannerWindow, _start_local_server
 from ibkr_options_manager.broker import PortfolioRequest, SnapshotRequest
-from ibkr_options_manager.domain import PriceBand
+from ibkr_options_manager.broker.execution import PaperSubmission
+from ibkr_options_manager.domain import PriceBand, WorkingOrder
 from ibkr_options_manager.execution import (
     ExecutionJournal,
     JournalEntry,
@@ -684,6 +686,130 @@ def test_price_update_confirmation_uses_the_shared_cancel_confirm_bar() -> None:
     assert ">Cancel<" in sidebar
     assert ">Confirm<" in sidebar
     assert "Click to confirm" not in sidebar
+
+
+def test_arming_price_update_preserves_edited_percentage_in_active_input(
+    tmp_path,
+) -> None:
+    from ibkr_options_manager.app.view_model import WorkingOrderLine
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._select_locked(1_002_100_161)
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    fingerprint = "a" * 64
+    group = f"{fingerprint[:12]}/tranche-1"
+    target = WorkingOrder(
+        perm_id=201,
+        client_id=17,
+        order_id=101,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("2"),
+        status="Submitted",
+        oca_group=group,
+        limit_price=Decimal("29.10"),
+        tif="GTC",
+    )
+    stop = replace(
+        target,
+        perm_id=202,
+        order_id=102,
+        order_type="STP",
+        limit_price=None,
+        stop_price=Decimal("18.20"),
+    )
+    active_snapshot = replace(
+        snapshot,
+        read_only_api=False,
+        position=replace(snapshot.position, unit_basis=Decimal("24.22")),
+        working_orders=(target, stop),
+    )
+    workbench._state = replace(
+        workbench._state,
+        unit_basis=Decimal("24.22"),
+        working_orders=(
+            WorkingOrderLine(
+                perm_id=201,
+                order_id=101,
+                action="SELL",
+                order_type="LMT",
+                remaining="2",
+                status="Submitted",
+                oca_group=group,
+                limit_price=Decimal("29.10"),
+                tif="GTC",
+            ),
+            WorkingOrderLine(
+                perm_id=202,
+                order_id=102,
+                action="SELL",
+                order_type="STP",
+                remaining="2",
+                status="Submitted",
+                oca_group=group,
+                stop_price=Decimal("18.20"),
+                tif="GTC",
+            ),
+        ),
+    )
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal._write(
+        (
+            JournalEntry(
+                fingerprint=fingerprint,
+                account=snapshot.selected.account,
+                con_id=snapshot.selected.con_id,
+                state="RECONCILED",
+                expected_order_count=2,
+                order_ids=(101, 102),
+                perm_ids=(201, 202),
+            ),
+        )
+    )
+
+    class PriceWriter(DemoPaperExecutionTransport):
+        def __init__(self) -> None:
+            self.prices: list[Decimal | None] = []
+
+        def modify_prices(self, _snapshot, updates, **_kwargs) -> PaperSubmission:
+            self.prices.extend(update.target_price for update in updates)
+            return PaperSubmission(order_ids=(101,), perm_ids=(201,))
+
+    writer = PriceWriter()
+    workbench._paper_execution = PaperExecutionService(writer, journal)
+    workbench._view_model.select_position = lambda *_args: workbench._state  # type: ignore[method-assign]
+    workbench._view_model.latest_snapshot = lambda: active_snapshot  # type: ignore[method-assign]
+
+    page = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            "active_target_201": "30",
+            "active_stop_201": "25",
+        },
+    )
+
+    assert workbench._armed_price_updates[0].target_price == Decimal("31.50")
+    assert "29.1" in page.text and "31.5" in page.text
+    target_input = re.search(r'<input[^>]*name="active_target_201"[^>]*>', page.text)
+    assert target_input is not None
+    assert 'value="30"' in target_input.group()
+    arm_toast_revision = workbench._toast_revision
+
+    confirmed = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={"action": "price-update-confirm"},
+    )
+
+    assert writer.prices == [Decimal("31.50")]
+    assert workbench._status_message.startswith(
+        "TWS acknowledged 1 app-owned OCA price amendment"
+    ), workbench._status_message
+    assert workbench._toast_revision > arm_toast_revision
+    assert "Price update sent to TWS" in confirmed.text
 
 
 def test_close_all_review_lists_pair_cancellations_then_one_market_order() -> None:
