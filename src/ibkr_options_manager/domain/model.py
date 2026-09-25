@@ -62,6 +62,33 @@ class WorkingOrder:
 
 
 @dataclass(frozen=True, slots=True)
+class ObservedExecution:
+    exec_id: str
+    account: str
+    con_id: int
+    perm_id: int
+    side: str
+    quantity: Decimal
+    price: Decimal
+    time: str
+    realized_pnl: Decimal | None = None
+    currency: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ObservedCompletedOrder:
+    account: str
+    con_id: int
+    perm_id: int
+    order_id: int
+    client_id: int
+    action: str
+    order_type: str
+    oca_group: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
 class Quote:
     bid: Decimal | None
     ask: Decimal | None
@@ -105,6 +132,10 @@ class BrokerSnapshot:
     captured_at: Decimal = Decimal("0")
     completion_times: tuple[tuple[str, Decimal], ...] = ()
     api_read_only_observed: bool = False
+    executions: tuple[ObservedExecution, ...] = ()
+    executions_complete: bool = False
+    completed_orders: tuple[ObservedCompletedOrder, ...] = ()
+    completed_orders_complete: bool = False
 
 
 @dataclass(frozen=True, slots=True)

@@ -16,6 +16,8 @@ from .domain import (
     BrokerSnapshot,
     ContractKey,
     MarketRule,
+    ObservedCompletedOrder,
+    ObservedExecution,
     ObservedPosition,
     Quote,
     VerifiedOptionContract,
@@ -168,6 +170,41 @@ def _publish(
             unit_basis=position.average_cost / contract.multiplier,
         ),
         working_orders=working_orders_from_capture(capture),
+        executions=tuple(
+            ObservedExecution(
+                exec_id=fill.exec_id,
+                account=fill.account,
+                con_id=fill.con_id,
+                perm_id=fill.perm_id,
+                side=fill.side,
+                quantity=fill.quantity,
+                price=fill.price,
+                time=fill.time,
+                realized_pnl=fill.realized_pnl,
+                currency=fill.currency,
+            )
+            for fill in capture.executions
+            if fill.account == request.expected_account
+            and fill.con_id == request.option_con_id
+        ),
+        executions_complete=capture.executions_complete,
+        completed_orders=tuple(
+            ObservedCompletedOrder(
+                account=order.account,
+                con_id=order.con_id,
+                perm_id=order.perm_id,
+                order_id=order.order_id,
+                client_id=order.client_id,
+                action=order.action,
+                order_type=order.order_type,
+                oca_group=order.oca_group,
+                status=order.status,
+            )
+            for order in capture.completed_orders
+            if order.account == request.expected_account
+            and order.con_id == request.option_con_id
+        ),
+        completed_orders_complete=capture.completed_orders_complete,
         quote=Quote(
             bid=quote.bid,
             ask=quote.ask,

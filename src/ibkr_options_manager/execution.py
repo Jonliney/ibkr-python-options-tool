@@ -5,13 +5,19 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass
-from decimal import Decimal
+from dataclasses import asdict, dataclass, replace
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from .domain import BrokerSnapshot, PlanResult, PlanStatus, WorkingOrder
+from .domain import (
+    BrokerSnapshot,
+    ObservedExecution,
+    PlanResult,
+    PlanStatus,
+    WorkingOrder,
+)
 
 
 class ExecutionBlocked(RuntimeError):
@@ -28,6 +34,29 @@ class JournalLayer:
     target_price: str
     stop_price: str
     tif: str
+    target_perm_id: int = 0
+    stop_perm_id: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class JournalFill:
+    exec_id: str
+    perm_id: int
+    side: str
+    quantity: str
+    price: str
+    time: str
+    realized_pnl: str | None = None
+    currency: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class LayerOutcome:
+    status: str
+    filled_quantity: Decimal = Decimal("0")
+    realized_pnl: Decimal | None = None
+    currency: str = ""
+    exit_side: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +70,77 @@ class JournalEntry:
     perm_ids: tuple[int, ...] = ()
     snapshot_captured_at: str = ""
     layers: tuple[JournalLayer, ...] = ()
+    fills: tuple[JournalFill, ...] = ()
+
+
+def classify_journal_layer(
+    entry: JournalEntry,
+    index: int,
+    *,
+    active_perm_ids: frozenset[int],
+    observed_perm_ids: frozenset[int],
+) -> LayerOutcome:
+    """Classify one planned layer only from exact journal and broker evidence."""
+    layer = entry.layers[index]
+    target_id, stop_id = layer.target_perm_id, layer.stop_perm_id
+    if (not target_id or not stop_id) and len(entry.perm_ids) == len(entry.layers) * 2:
+        target_id, stop_id = entry.perm_ids[index * 2 : index * 2 + 2]
+    ids = {target_id, stop_id} - {0}
+    related = tuple(fill for fill in entry.fills if fill.perm_id in ids)
+    try:
+        filled = sum((Decimal(fill.quantity) for fill in related), Decimal("0"))
+    except InvalidOperation:
+        return LayerOutcome("UNKNOWN")
+    if filled > 0:
+        exit_side = (
+            "Target and stop"
+            if {fill.perm_id for fill in related} == ids
+            else "Target"
+            if any(fill.perm_id == target_id for fill in related)
+            else "Stop"
+        )
+        if filled < layer.quantity:
+            return LayerOutcome("PARTIAL", filled_quantity=filled, exit_side=exit_side)
+        if filled > layer.quantity:
+            return LayerOutcome("UNKNOWN", filled_quantity=filled)
+        currencies = {fill.currency for fill in related if fill.currency}
+        if (
+            any(fill.realized_pnl is None or not fill.currency for fill in related)
+            or len(currencies) != 1
+        ):
+            return LayerOutcome(
+                "CLOSED_PNL_UNKNOWN", filled_quantity=filled, exit_side=exit_side
+            )
+        try:
+            pnl = sum(
+                (
+                    Decimal(fill.realized_pnl)
+                    for fill in related
+                    if fill.realized_pnl is not None
+                ),
+                Decimal("0"),
+            )
+        except InvalidOperation:
+            return LayerOutcome(
+                "CLOSED_PNL_UNKNOWN", filled_quantity=filled, exit_side=exit_side
+            )
+        return LayerOutcome(
+            "CLOSED_PROFIT" if pnl > 0 else "CLOSED_LOSS" if pnl < 0 else "CLOSED_FLAT",
+            filled_quantity=filled,
+            realized_pnl=pnl,
+            currency=next(iter(currencies)),
+            exit_side=exit_side,
+        )
+    if ids and ids.issubset(active_perm_ids):
+        return LayerOutcome("ACTIVE")
+    if entry.state in {"PREPARED", "SUBMISSION_UNKNOWN"}:
+        return LayerOutcome("UNKNOWN")
+    if not ids & observed_perm_ids and (
+        entry.state in {"RECONCILED", "SUPERSEDED"}
+        or bool(set(entry.perm_ids) & observed_perm_ids)
+    ):
+        return LayerOutcome("NO_EXECUTION_EVIDENCE")
+    return LayerOutcome("PENDING")
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,9 +302,14 @@ class ExecutionJournal:
             if entry.account == account
             and entry.con_id == con_id
             and len(entry.fingerprint) == 64
-            and entry.state in {
-                "PREPARED", "SUBMITTED", "SUBMISSION_UNKNOWN",
-                "PARTIALLY_RECONCILED", "RECONCILED",
+            and entry.state
+            in {
+                "PREPARED",
+                "SUBMITTED",
+                "SUBMISSION_UNKNOWN",
+                "PARTIALLY_RECONCILED",
+                "RECONCILED",
+                "SUPERSEDED",
             }
         )
 
@@ -243,6 +348,7 @@ class ExecutionJournal:
                 perm_ids=prior.perm_ids,
                 snapshot_captured_at=prior.snapshot_captured_at,
                 layers=prior.layers,
+                fills=prior.fills,
             )
         entry = JournalEntry(
             fingerprint=fingerprint,
@@ -367,6 +473,16 @@ class ExecutionJournal:
         for index in range(len(entries) - 1, -1, -1):
             entry = entries[index]
             if entry.fingerprint == fingerprint:
+                layers = entry.layers
+                if len(perm_ids) == len(layers) * 2 and all(perm_ids):
+                    layers = tuple(
+                        replace(
+                            layer,
+                            target_perm_id=perm_ids[layer_index * 2],
+                            stop_perm_id=perm_ids[layer_index * 2 + 1],
+                        )
+                        for layer_index, layer in enumerate(layers)
+                    )
                 updated = JournalEntry(
                     fingerprint=entry.fingerprint,
                     account=entry.account,
@@ -376,7 +492,8 @@ class ExecutionJournal:
                     order_ids=order_ids,
                     perm_ids=perm_ids,
                     snapshot_captured_at=entry.snapshot_captured_at,
-                    layers=entry.layers,
+                    layers=layers,
+                    fills=entry.fills,
                 )
                 entries[index] = updated
                 self._write(tuple(entries))
@@ -407,6 +524,7 @@ class ExecutionJournal:
                     perm_ids=(),
                     snapshot_captured_at=entry.snapshot_captured_at,
                     layers=entry.layers,
+                    fills=entry.fills,
                 )
                 entries[index] = updated
                 self._write(tuple(entries))
@@ -414,6 +532,115 @@ class ExecutionJournal:
         raise ExecutionBlocked(
             "management journal entry disappeared before acknowledgement"
         )
+
+    def record_completed_orders(self, snapshot: BrokerSnapshot) -> None:
+        """Recover planned layer IDs from exact app OCA groups for display only."""
+        entries = list(self._entries())
+        changed = False
+        for index, entry in enumerate(entries):
+            if (
+                entry.account != snapshot.selected.account
+                or entry.con_id != snapshot.selected.con_id
+                or len(entry.fingerprint) != 64
+                or not entry.layers
+            ):
+                continue
+            layers = list(entry.layers)
+            for layer_index, layer in enumerate(layers):
+                group = f"{entry.fingerprint[:12]}/tranche-{layer_index + 1}"
+                candidates = [
+                    (order.oca_group, order.action, order.order_type, order.perm_id)
+                    for order in snapshot.working_orders
+                    if order.key == snapshot.selected
+                ]
+                if snapshot.completed_orders_complete:
+                    candidates.extend(
+                        (order.oca_group, order.action, order.order_type, order.perm_id)
+                        for order in snapshot.completed_orders
+                        if order.account == entry.account
+                        and order.con_id == entry.con_id
+                    )
+                for order_type, field in (
+                    ("LMT", "target_perm_id"),
+                    ("STP", "stop_perm_id"),
+                ):
+                    matching_ids = {
+                        perm_id
+                        for oca_group, action, kind, perm_id in candidates
+                        if oca_group == group
+                        and action == "SELL"
+                        and kind == order_type
+                        and perm_id > 0
+                    }
+                    if len(matching_ids) != 1:
+                        continue
+                    perm_id = next(iter(matching_ids))
+                    if field == "target_perm_id":
+                        if layer.target_perm_id in {0, perm_id}:
+                            layer = replace(layer, target_perm_id=perm_id)
+                    elif layer.stop_perm_id in {0, perm_id}:
+                        layer = replace(layer, stop_perm_id=perm_id)
+                layers[layer_index] = layer
+            if tuple(layers) != entry.layers:
+                entries[index] = replace(entry, layers=tuple(layers))
+                changed = True
+        if changed:
+            self._write(tuple(entries))
+
+    def record_executions(self, snapshot: BrokerSnapshot) -> None:
+        """Cache complete, exact-contract TWS fill evidence by permanent order ID."""
+        if not snapshot.executions_complete:
+            return
+        entries = list(self._entries())
+        changed = False
+        for index, entry in enumerate(entries):
+            if (
+                entry.account != snapshot.selected.account
+                or entry.con_id != snapshot.selected.con_id
+                or len(entry.fingerprint) != 64
+            ):
+                continue
+            known_ids = set(entry.perm_ids) | {
+                perm_id
+                for layer in entry.layers
+                for perm_id in (layer.target_perm_id, layer.stop_perm_id)
+                if perm_id > 0
+            }
+            if not known_ids:
+                continue
+            fills = {_execution_identity(fill.exec_id): fill for fill in entry.fills}
+            for observed in snapshot.executions:
+                if not _usable_execution(observed, snapshot, known_ids):
+                    continue
+                identity = _execution_identity(observed.exec_id)
+                prior = fills.get(identity)
+                if prior is not None and _execution_revision(
+                    prior.exec_id
+                ) > _execution_revision(observed.exec_id):
+                    continue
+                replacement = JournalFill(
+                    exec_id=observed.exec_id,
+                    perm_id=observed.perm_id,
+                    side=observed.side,
+                    quantity=format(observed.quantity, "f"),
+                    price=format(observed.price, "f"),
+                    time=observed.time,
+                    realized_pnl=(
+                        format(observed.realized_pnl, "f")
+                        if observed.realized_pnl is not None
+                        else prior.realized_pnl
+                        if prior is not None and prior.exec_id == observed.exec_id
+                        else None
+                    ),
+                    currency=observed.currency or (prior.currency if prior else ""),
+                )
+                fills[identity] = replacement
+            updated_fills = tuple(sorted(fills.values(), key=lambda fill: fill.exec_id))
+            if updated_fills != entry.fills:
+                entries[index] = replace(entry, fills=updated_fills)
+                changed = True
+        if changed:
+            self._write(tuple(entries))
 
     def reconcile_snapshot(
         self,
@@ -436,7 +663,9 @@ class ExecutionJournal:
             if (
                 entry.state
                 not in {
-                    "PREPARED", "SUBMITTED", "SUBMISSION_UNKNOWN",
+                    "PREPARED",
+                    "SUBMITTED",
+                    "SUBMISSION_UNKNOWN",
                     "PARTIALLY_RECONCILED",
                 }
                 or entry.account != snapshot.selected.account
@@ -462,6 +691,7 @@ class ExecutionJournal:
                 perm_ids=tuple(order.perm_id for order in observed),
                 snapshot_captured_at=entry.snapshot_captured_at,
                 layers=entry.layers,
+                fills=entry.fills,
             )
             entries[index] = updated
             reconciled.append(updated)
@@ -497,8 +727,27 @@ class ExecutionJournal:
                             target_price=str(layer["target_price"]),
                             stop_price=str(layer["stop_price"]),
                             tif=str(layer["tif"]),
+                            target_perm_id=int(layer.get("target_perm_id", 0)),
+                            stop_perm_id=int(layer.get("stop_perm_id", 0)),
                         )
                         for layer in item.get("layers", ())
+                    ),
+                    fills=tuple(
+                        JournalFill(
+                            exec_id=str(fill["exec_id"]),
+                            perm_id=int(fill["perm_id"]),
+                            side=str(fill["side"]),
+                            quantity=str(fill["quantity"]),
+                            price=str(fill["price"]),
+                            time=str(fill["time"]),
+                            realized_pnl=(
+                                None
+                                if fill.get("realized_pnl") is None
+                                else str(fill["realized_pnl"])
+                            ),
+                            currency=str(fill.get("currency", "")),
+                        )
+                        for fill in item.get("fills", ())
                     ),
                 )
                 for item in payload
@@ -546,9 +795,7 @@ def require_paper_execution_snapshot(
         if order.key == snapshot.selected and order.perm_id not in owned_perm_ids
     ]
     if external:
-        raise ExecutionBlocked(
-            "external related orders block a new paper submission"
-        )
+        raise ExecutionBlocked("external related orders block a new paper submission")
 
 
 class PaperExecutionService:
@@ -613,6 +860,14 @@ class PaperExecutionService:
     def reconcile_snapshot(self, snapshot: BrokerSnapshot) -> tuple[JournalEntry, ...]:
         """Record broker-observed app OCA pairs after an interrupted send."""
         return self._journal.reconcile_snapshot(snapshot)
+
+    def record_completed_orders(self, snapshot: BrokerSnapshot) -> None:
+        """Persist exact layer identifiers found in completed TWS orders."""
+        self._journal.record_completed_orders(snapshot)
+
+    def record_executions(self, snapshot: BrokerSnapshot) -> None:
+        """Persist read-only fill and realized P&L observations."""
+        self._journal.record_executions(snapshot)
 
     def owned_perm_ids(self, *, account: str, con_id: int) -> frozenset[int]:
         """Return only journal-proven app-owned broker order IDs."""
@@ -1039,6 +1294,35 @@ def default_paper_journal_path() -> Path:
     else:
         root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
     return root / "IBKR Options Manager" / "paper-execution-journal.json"
+
+
+def _execution_identity(exec_id: str) -> str:
+    prefix, separator, revision = exec_id.rpartition(".")
+    return prefix if separator and revision.isdigit() else exec_id
+
+
+def _execution_revision(exec_id: str) -> int:
+    _prefix, separator, revision = exec_id.rpartition(".")
+    return int(revision) if separator and revision.isdigit() else 0
+
+
+def _usable_execution(
+    execution: ObservedExecution,
+    snapshot: BrokerSnapshot,
+    known_ids: set[int],
+) -> bool:
+    return (
+        bool(execution.exec_id)
+        and execution.account == snapshot.selected.account
+        and execution.con_id == snapshot.selected.con_id
+        and execution.perm_id in known_ids
+        and execution.side.upper() in {"SLD", "SELL"}
+        and execution.quantity.is_finite()
+        and execution.quantity > 0
+        and execution.price.is_finite()
+        and execution.price > 0
+        and (execution.realized_pnl is None or execution.realized_pnl.is_finite())
+    )
 
 
 def _complete_app_oca_orders(

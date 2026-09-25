@@ -13,6 +13,8 @@ from ibkr_options_manager.domain import (
     ContractKey,
     LayerRequest,
     MarketRule,
+    ObservedCompletedOrder,
+    ObservedExecution,
     ObservedPosition,
     PlanRequest,
     PriceBand,
@@ -29,6 +31,7 @@ from ibkr_options_manager.execution import (
     MarketExitCandidate,
     PaperExecutionService,
     PriceUpdateCandidate,
+    classify_journal_layer,
     require_paper_execution_snapshot,
 )
 
@@ -380,8 +383,229 @@ def test_pending_submission_details_survive_restart_and_become_reconciled(
     assert reconciled[0].layers == entries[0].layers
 
 
-def test_paper_execution_requires_read_only_api_to_have_been_explicitly_disabled(
+def test_completed_tws_bracket_recovers_old_journal_ids_and_realized_profit(
+    tmp_path,
 ) -> None:
+    snapshot = _snapshot()
+    plan = _two_pair_plan(snapshot)
+    assert plan.fingerprint is not None
+    path = tmp_path / "journal.json"
+    journal = ExecutionJournal(path)
+    journal.begin(snapshot, plan)
+    submitted = journal.record_submission(
+        plan.fingerprint,
+        order_ids=(101, 102, 103, 104),
+        perm_ids=(201, 202, 203, 204),
+    )
+    # An older partial reconciliation retained only the surviving order IDs.
+    journal._write(
+        (
+            replace(
+                submitted,
+                state="PARTIALLY_RECONCILED",
+                order_ids=(103, 104),
+                perm_ids=(203, 204),
+                layers=tuple(
+                    replace(layer, target_perm_id=0, stop_perm_id=0)
+                    for layer in submitted.layers
+                ),
+            ),
+        )
+    )
+    group = f"{plan.fingerprint[:12]}/tranche-1"
+    completed = tuple(
+        ObservedCompletedOrder(
+            account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id,
+            perm_id=perm_id,
+            order_id=order_id,
+            client_id=17,
+            action="SELL",
+            order_type=order_type,
+            oca_group=group,
+            status=status,
+        )
+        for perm_id, order_id, order_type, status in (
+            (201, 101, "LMT", "Filled"),
+            (202, 102, "STP", "Cancelled"),
+        )
+    )
+    fill = ObservedExecution(
+        exec_id="filled.01",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=201,
+        side="SLD",
+        quantity=Decimal("4"),
+        price=Decimal("1.20"),
+        time="20260925 12:00:00",
+        realized_pnl=Decimal("75.50"),
+        currency="USD",
+    )
+    active_target = WorkingOrder(
+        perm_id=203,
+        client_id=17,
+        order_id=103,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("3"),
+        status="Submitted",
+        oca_group=f"{plan.fingerprint[:12]}/tranche-2",
+    )
+    active_stop = replace(active_target, perm_id=204, order_id=104, order_type="STP")
+    observed = replace(
+        snapshot,
+        working_orders=(active_target, active_stop),
+        completed_orders=completed,
+        completed_orders_complete=True,
+        executions=(fill,),
+        executions_complete=True,
+    )
+    journal.record_completed_orders(observed)
+    journal.record_executions(observed)
+    restored = ExecutionJournal(path).find(plan.fingerprint)
+    assert restored is not None
+    assert restored.layers[0].target_perm_id == 201
+    assert restored.layers[0].stop_perm_id == 202
+    outcome = classify_journal_layer(
+        restored,
+        0,
+        active_perm_ids=frozenset({203, 204}),
+        observed_perm_ids=frozenset({203, 204}),
+    )
+    assert outcome.status == "CLOSED_PROFIT"
+    assert outcome.realized_pnl == Decimal("75.50")
+    assert outcome.exit_side == "Target"
+    assert (
+        classify_journal_layer(
+            restored,
+            1,
+            active_perm_ids=frozenset({203, 204}),
+            observed_perm_ids=frozenset({203, 204}),
+        ).status
+        == "ACTIVE"
+    )
+
+
+@pytest.mark.parametrize(
+    ("perm_id", "pnl", "expected"),
+    [
+        (201, Decimal("12"), "CLOSED_PROFIT"),
+        (202, Decimal("-18"), "CLOSED_LOSS"),
+        (202, None, "CLOSED_PNL_UNKNOWN"),
+    ],
+)
+def test_layer_outcome_uses_exact_tws_fill_and_commission_report(
+    tmp_path,
+    perm_id,
+    pnl,
+    expected,
+) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.record_submission(
+        plan.fingerprint, order_ids=(101, 102), perm_ids=(201, 202)
+    )
+    execution = ObservedExecution(
+        exec_id="fill.01",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=perm_id,
+        side="SLD",
+        quantity=Decimal("2"),
+        price=Decimal("1.20"),
+        time="now",
+        realized_pnl=pnl,
+        currency="USD" if pnl is not None else "",
+    )
+    journal.record_executions(
+        replace(
+            snapshot,
+            executions=(execution,),
+            executions_complete=True,
+        )
+    )
+    entry = journal.find(plan.fingerprint)
+    assert entry is not None
+    outcome = classify_journal_layer(
+        entry,
+        0,
+        active_perm_ids=frozenset(),
+        observed_perm_ids=frozenset(),
+    )
+    assert outcome.status == expected
+    assert outcome.exit_side == ("Target" if perm_id == 201 else "Stop")
+
+
+def test_execution_history_ignores_other_account_and_corrects_duplicate_fill(
+    tmp_path,
+) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.record_submission(
+        plan.fingerprint, order_ids=(101, 102), perm_ids=(201, 202)
+    )
+    fill = ObservedExecution(
+        exec_id="trade.1",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=201,
+        side="SLD",
+        quantity=Decimal("1"),
+        price=Decimal("1.20"),
+        time="now",
+        realized_pnl=Decimal("10"),
+        currency="USD",
+    )
+    journal.record_executions(
+        replace(
+            snapshot,
+            executions=(replace(fill, account="DU-other"),),
+            executions_complete=True,
+        )
+    )
+    assert journal.find(plan.fingerprint).fills == ()
+    journal.record_executions(
+        replace(
+            snapshot,
+            executions=(fill,),
+            executions_complete=True,
+        )
+    )
+    corrected = replace(
+        fill, exec_id="trade.2", quantity=Decimal("2"), realized_pnl=Decimal("25")
+    )
+    journal.record_executions(
+        replace(
+            snapshot,
+            executions=(corrected,),
+            executions_complete=True,
+        )
+    )
+    entry = journal.find(plan.fingerprint)
+    assert entry is not None
+    assert len(entry.fills) == 1
+    assert entry.fills[0].exec_id == "trade.2"
+    outcome = classify_journal_layer(
+        entry,
+        0,
+        active_perm_ids=frozenset(),
+        observed_perm_ids=frozenset(),
+    )
+    assert outcome.status == "CLOSED_PROFIT"
+    assert outcome.realized_pnl == Decimal("25")
+
+
+def test_paper_execution_requires_read_only_api_to_have_been_explicitly_disabled() -> (
+    None
+):
     snapshot = _snapshot(read_only_api=True)
     plan = _plan(_snapshot())
 
@@ -750,9 +974,7 @@ def test_price_updates_amend_only_the_requested_app_owned_leg(tmp_path) -> None:
 
     receipt = service.modify_prices(
         active,
-        service.prepare_price_updates(
-            active, updates=(update,), expected_client_id=17
-        ),
+        service.prepare_price_updates(active, updates=(update,), expected_client_id=17),
         host="127.0.0.1",
         port=7497,
         client_id=17,

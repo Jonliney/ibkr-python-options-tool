@@ -35,6 +35,8 @@ from ibkr_options_manager.domain import PriceBand
 from ibkr_options_manager.execution import (
     ExecutionJournal,
     JournalEntry,
+    JournalFill,
+    JournalLayer,
     MarketExitCandidate,
     PaperExecutionService,
     PriceUpdateCandidate,
@@ -56,9 +58,7 @@ def test_demo_broker_exercises_inventory_and_reserved_quantity_without_tws() -> 
         return Decimal("100")
 
     broker = DemoReadOnlyBroker(clock=clock)
-    portfolio = PortfolioCoordinator(
-        broker, max_age_seconds=Decimal("15"), clock=clock
-    )
+    portfolio = PortfolioCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock)
     inventory = portfolio.refresh(
         PortfolioRequest(
             host="127.0.0.1",
@@ -77,9 +77,7 @@ def test_demo_broker_exercises_inventory_and_reserved_quantity_without_tws() -> 
     assert inventory.snapshot.positions[0].quantity == Decimal("10")
     assert inventory.snapshot.positions[0].working_orders[0].remaining == Decimal("5")
 
-    snapshots = SnapshotCoordinator(
-        broker, max_age_seconds=Decimal("15"), clock=clock
-    )
+    snapshots = SnapshotCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock)
     selected = inventory.snapshot.positions[0].key.con_id
     snapshot = snapshots.refresh(
         SnapshotRequest(
@@ -305,9 +303,7 @@ def test_refresh_replaces_a_draft_that_exceeds_newly_available_quantity() -> Non
     con_id = workbench._selected_con_id
     assert con_id is not None
     original = workbench._current_layers()[0]
-    workbench._drafts[con_id] = tuple(
-        replace(original, quantity="4") for _ in range(5)
-    )
+    workbench._drafts[con_id] = tuple(replace(original, quantity="4") for _ in range(5))
     blocked = replace(
         workbench._state,
         status=UiStatus.BLOCKED,
@@ -499,6 +495,88 @@ def test_partial_journal_reconciliation_keeps_surviving_pair_active_in_the_ui(
     assert 'value="3"' in page.text
 
 
+def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
+    tmp_path,
+) -> None:
+    from ibkr_options_manager.app.view_model import WorkingOrderLine
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    selected = workbench._selected_con_id
+    assert selected is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    fingerprint = "a" * 64
+    journal._write(
+        (
+            JournalEntry(
+                fingerprint=fingerprint,
+                account=DEMO_ACCOUNT,
+                con_id=selected,
+                state="PARTIALLY_RECONCILED",
+                expected_order_count=4,
+                order_ids=(103, 104),
+                perm_ids=(203, 204),
+                layers=(
+                    JournalLayer(3, "15.50", "9.70", "GTC", 201, 202),
+                    JournalLayer(2, "20.70", "9.70", "GTC", 203, 204),
+                ),
+                fills=(
+                    JournalFill(
+                        exec_id="filled.01",
+                        perm_id=201,
+                        side="SLD",
+                        quantity="3",
+                        price="15.50",
+                        time="20260925 12:00:00",
+                        realized_pnl="557.44",
+                        currency="USD",
+                    ),
+                ),
+            ),
+        )
+    )
+    workbench._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(), journal
+    )
+    workbench._state = replace(
+        workbench._state,
+        working_orders=(
+            WorkingOrderLine(
+                perm_id=203,
+                order_id=103,
+                action="SELL",
+                order_type="LMT",
+                remaining="2",
+                status="Submitted",
+                oca_group=f"{fingerprint[:12]}/tranche-2",
+                limit_price=Decimal("20.70"),
+                tif="GTC",
+            ),
+            WorkingOrderLine(
+                perm_id=204,
+                order_id=104,
+                action="SELL",
+                order_type="STP",
+                remaining="2",
+                status="Submitted",
+                oca_group=f"{fingerprint[:12]}/tranche-2",
+                stop_price=Decimal("9.70"),
+                tif="GTC",
+            ),
+        ),
+    )
+
+    page = TestClient(workbench.app).get(workbench.path)
+
+    assert "Closed bracket history" in page.text
+    assert "Profit" in page.text
+    assert "USD +557.44" in page.text
+    assert "Target filled" in page.text
+    assert "Active OCA layers" in page.text
+    assert "pending TWS verification" not in page.text
+    assert "TWS orders are pending verification" not in page.text
+
+
 def test_active_layer_prefers_configured_percentage_over_rounded_inverse() -> None:
     """An untouched 20% target remains 20% after TWS exposes its tick price."""
     percentage = _active_percentage_for_price(
@@ -512,8 +590,9 @@ def test_active_layer_prefers_configured_percentage_over_rounded_inverse() -> No
     assert percentage == "20"
 
 
-def test_active_layer_keeps_an_acknowledged_stop_display_until_tws_refreshes_it(
-) -> None:
+def test_active_layer_keeps_an_acknowledged_stop_display_until_tws_refreshes_it() -> (
+    None
+):
     """An immediate post-write snapshot must not visually undo a 0% stop."""
     from ibkr_options_manager.app.view_model import WorkingOrderLine
 
@@ -595,9 +674,11 @@ def test_price_update_confirmation_uses_the_shared_cancel_confirm_bar() -> None:
         PriceUpdateCandidate(layer=layer, stop_price=Decimal("2.74")),
     )
 
-    sidebar = TestClient(workbench.app).get(workbench.path).text.split(
-        "ACTION REVIEW", maxsplit=1
-    )[1]
+    sidebar = (
+        TestClient(workbench.app)
+        .get(workbench.path)
+        .text.split("ACTION REVIEW", maxsplit=1)[1]
+    )
 
     assert 'value="price-update-confirm"' in sidebar
     assert ">Cancel<" in sidebar
@@ -728,7 +809,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert action_panel.index("Execute paper order") < action_panel.index(
         "Outcome projection"
     )
-    assert 'data-draft-outcome' in action_panel
+    assert "data-draft-outcome" in action_panel
     assert 'data-slot="card-action"' in draft
     assert "Split all available" in draft
     assert "Split assigned" in draft
@@ -755,7 +836,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
         in draft
     )
     assert 'aria-label="Draft layer rows"' in draft
-    assert 'overflow-x-auto overflow-y-hidden' in draft
+    assert "overflow-x-auto overflow-y-hidden" in draft
 
     assert "mt-5" in draft
 
@@ -900,7 +981,7 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
     assert submitted.status_code == 200
     assert "Orders sent to TWS" in submitted.text
     assert "2 orders acknowledged" in submitted.text
-    assert "Active layers · pending TWS transmission" in submitted.text
+    assert "Active layers · pending TWS verification" in submitted.text
     assert "SELL LMT" in submitted.text
     assert "Waiting for TWS" in submitted.text
     assert 'value="execute-arm"' not in submitted.text
@@ -911,7 +992,7 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
         DemoPaperExecutionTransport(),
         ExecutionJournal(tmp_path / "paper-journal.json"),
     )
-    assert "Active layers · pending TWS transmission" in client.get(workbench.path).text
+    assert "Active layers · pending TWS verification" in client.get(workbench.path).text
 
     entry = journal.submission_entries(account=DEMO_ACCOUNT, con_id=1_002_100_161)[0]
     journal.mark_unknown(entry.fingerprint)
@@ -925,6 +1006,7 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
     tmp_path,
 ) -> None:
     """Exercise the controls that depend on a real browser submit/navigation."""
+
     def clock() -> Decimal:
         return Decimal("100")
 
@@ -1031,7 +1113,7 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
                 inspect_acknowledgement,
             )
         elif phase == 4:
-            if "Active layers · pending TWS transmission" not in body:
+            if "Active layers · pending TWS verification" not in body:
                 finish("Refresh did not render the workbench")
                 return
             result["refresh"] = True

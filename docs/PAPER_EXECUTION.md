@@ -30,8 +30,8 @@ TWS may still apply its own order precaution and require the user to click
 safety control.
 
 After a submission receives complete API acknowledgements, the workbench shows
-an **Orders sent to TWS** toast and journal-backed **Pending transmission** rows
-under Active layers until a fresh snapshot verifies the orders as working.
+an **Orders sent to TWS** toast and journal-backed **Pending TWS verification**
+rows until a fresh snapshot verifies the orders as working.
 These rows show the recorded plan, not permission to modify the orders. A
 timeout or incomplete acknowledgement is labelled **Outcome not confirmed**;
 the UI does not claim that TWS accepted those orders. While either state is
@@ -41,6 +41,27 @@ draft while pending orders may be absent from that snapshot. Pending rows are
 restored from the journal after an app restart. Only complete, broker-observed,
 journal-proven pairs in `Submitted` or `PreSubmitted` status appear as manageable
 active layers.
+
+## Closed bracket history
+
+On refresh, the selected-contract snapshot also requests completed API orders
+and executions from TWS. The app joins a completed order to a planned layer by
+the exact account, contract ID, fingerprinted OCA group, order type, and
+permanent order ID. Executions are then joined by the permanent ID. This also
+recovers order IDs for older journal entries whose partial reconciliation kept
+only the surviving working pair. Closed layers appear in **Closed bracket
+history** while any remaining pair stays in **Active OCA layers**.
+
+A complete exit fill is labelled profit, loss, or flat only when TWS supplies a
+realized P&L report for every matching execution in one currency. A fill without
+that report is labelled **P&L unavailable**. Partial fills and missing execution
+evidence stay flagged for TWS review; a vanished open order is never called a
+profit or a loss from its planned target or stop price. Recorded fills are kept
+in the local journal across restarts. IBKR execution queries normally cover
+the current trading day; a wider window depends on the TWS Trade Log setting.
+Older fills outside that window cannot be reconstructed if they were never
+observed by this app. History evidence is for display only and does not grant
+permission to amend or cancel an order.
 
 The initial active-layer management action is deliberately narrow: **Sell now
 (MKT)** can exit one app-created, fully reconciled OCA layer. It is available

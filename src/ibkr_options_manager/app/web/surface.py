@@ -36,9 +36,11 @@ from ...execution import (
     ExecutionBlocked,
     ExecutionOutcomeUnknown,
     JournalEntry,
+    LayerOutcome,
     MarketExitCandidate,
     PaperExecutionService,
     PriceUpdateCandidate,
+    classify_journal_layer,
 )
 from ..view_model import (
     ConnectionSettings,
@@ -406,11 +408,17 @@ class StarUIWorkbench:
             self._message = "Execution blocked: refresh and validation did not produce a sendable paper draft."
             return
         self._armed_execution = candidate
-        self._message = "Fresh paper snapshot verified. Review the order plan, then confirm."
+        self._message = (
+            "Fresh paper snapshot verified. Review the order plan, then confirm."
+        )
 
     def _confirm_execution_locked(self) -> None:
         armed = self._armed_execution
-        if self._paper_execution is None or armed is None or armed.plan.fingerprint is None:
+        if (
+            self._paper_execution is None
+            or armed is None
+            or armed.plan.fingerprint is None
+        ):
             self._message = "Start execution first; every paper order needs a separate confirmation."
             return
         state, candidate = self._view_model.prepare_paper_execution(
@@ -421,7 +429,9 @@ class StarUIWorkbench:
         self._announce_reconciliation_locked()
         if candidate is None:
             self._disarm_execution_locked()
-            self._message = "Execution blocked: the fresh snapshot is no longer sendable."
+            self._message = (
+                "Execution blocked: the fresh snapshot is no longer sendable."
+            )
             return
         if candidate.plan.fingerprint != armed.plan.fingerprint:
             self._disarm_execution_locked()
@@ -478,7 +488,9 @@ class StarUIWorkbench:
         self._announce_reconciliation_locked()
         snapshot = self._view_model.latest_snapshot()
         if snapshot is None:
-            self._message = "Market exit blocked: a fresh selected-position snapshot is required."
+            self._message = (
+                "Market exit blocked: a fresh selected-position snapshot is required."
+            )
             return
         try:
             candidate = self._paper_execution.prepare_market_exit(
@@ -531,7 +543,11 @@ class StarUIWorkbench:
     def _confirm_cancellation_locked(self) -> None:
         """Cancel the staged pair after one more fresh-snapshot equality check."""
         candidate = self._armed_cancellation
-        if self._paper_execution is None or candidate is None or self._selected_con_id is None:
+        if (
+            self._paper_execution is None
+            or candidate is None
+            or self._selected_con_id is None
+        ):
             self._message = "Start bracket cancellation first; every paper change needs a separate confirmation."
             return
         state = self._view_model.select_position(
@@ -544,7 +560,9 @@ class StarUIWorkbench:
         snapshot = self._view_model.latest_snapshot()
         if snapshot is None:
             self._disarm_execution_locked()
-            self._message = "Bracket cancellation blocked: the fresh snapshot is unavailable."
+            self._message = (
+                "Bracket cancellation blocked: the fresh snapshot is unavailable."
+            )
             return
         try:
             refreshed = self._paper_execution.prepare_market_exit(
@@ -583,7 +601,9 @@ class StarUIWorkbench:
         del values
         selected = self._active_target_perm_ids()
         if not selected:
-            self._message = "Select at least one active layer for the staged paper MKT exit."
+            self._message = (
+                "Select at least one active layer for the staged paper MKT exit."
+            )
             return
         if self._paper_execution is None or self._selected_con_id is None:
             self._message = "Paper order management is disabled for this launch."
@@ -598,7 +618,9 @@ class StarUIWorkbench:
         self._announce_reconciliation_locked()
         snapshot = self._view_model.latest_snapshot()
         if snapshot is None:
-            self._message = "Market exit blocked: a fresh selected-position snapshot is required."
+            self._message = (
+                "Market exit blocked: a fresh selected-position snapshot is required."
+            )
             return
         try:
             candidates = self._paper_execution.prepare_market_exits(
@@ -711,9 +733,7 @@ class StarUIWorkbench:
                 target_perm_ids=selected,
                 expected_client_id=self._settings.client_id,
             )
-            orders_by_id = {
-                order.order_id: order for order in snapshot.working_orders
-            }
+            orders_by_id = {order.order_id: order for order in snapshot.working_orders}
             updates: list[PriceUpdateCandidate] = []
             for layer in layers:
                 target = orders_by_id.get(layer.target_order_id)
@@ -749,7 +769,10 @@ class StarUIWorkbench:
                         stop_percentage,
                         calculator.bands,
                     )
-                    desired_target, desired_stop = prices.target_price, prices.stop_price
+                    desired_target, desired_stop = (
+                        prices.target_price,
+                        prices.stop_price,
+                    )
                 updates.append(
                     PriceUpdateCandidate(
                         layer=layer,
@@ -760,9 +783,7 @@ class StarUIWorkbench:
                             else None
                         ),
                         stop_price=(
-                            desired_stop
-                            if desired_stop != stop.stop_price
-                            else None
+                            desired_stop if desired_stop != stop.stop_price else None
                         ),
                         prior_target_price=target.limit_price,
                         prior_stop_price=stop.stop_price,
@@ -794,8 +815,14 @@ class StarUIWorkbench:
 
     def _confirm_price_updates_locked(self) -> None:
         updates = self._armed_price_updates
-        if self._paper_execution is None or not updates or self._selected_con_id is None:
-            self._message = "Start a price update first; every paper change needs confirmation."
+        if (
+            self._paper_execution is None
+            or not updates
+            or self._selected_con_id is None
+        ):
+            self._message = (
+                "Start a price update first; every paper change needs confirmation."
+            )
             return
         state = self._view_model.select_position(
             self._selected_con_id,
@@ -855,7 +882,11 @@ class StarUIWorkbench:
             self._message = "Verified broker state is ready for read-only planning."
         elif state.status is not UiStatus.EMPTY:
             blocking = next(
-                (validation.message for validation in state.validations if validation.blocking),
+                (
+                    validation.message
+                    for validation in state.validations
+                    if validation.blocking
+                ),
                 None,
             )
             self._message = (
@@ -888,18 +919,24 @@ class StarUIWorkbench:
             return
         orders_by_perm = {order.perm_id: order for order in self._state.working_orders}
         pending: dict[int, tuple[Decimal | None, int, Decimal | None]] = {}
-        for target_perm_id, (target_price, stop_perm_id, stop_price) in (
-            self._pending_active_prices.items()
-        ):
+        for target_perm_id, (
+            target_price,
+            stop_perm_id,
+            stop_price,
+        ) in self._pending_active_prices.items():
             target = orders_by_perm.get(target_perm_id)
             stop = orders_by_perm.get(stop_perm_id)
             if target is None or stop is None:
                 continue
             unresolved_target = (
-                target_price if target_price is not None and target.limit_price != target_price else None
+                target_price
+                if target_price is not None and target.limit_price != target_price
+                else None
             )
             unresolved_stop = (
-                stop_price if stop_price is not None and stop.stop_price != stop_price else None
+                stop_price
+                if stop_price is not None and stop.stop_price != stop_price
+                else None
             )
             if unresolved_target is not None or unresolved_stop is not None:
                 pending[target_perm_id] = (
@@ -921,7 +958,17 @@ class StarUIWorkbench:
         if snapshot is None:
             return
         try:
+            record_completed_orders = getattr(
+                self._paper_execution, "record_completed_orders", None
+            )
+            if callable(record_completed_orders):
+                record_completed_orders(snapshot)
             reconciled = self._paper_execution.reconcile_snapshot(snapshot)
+            record_executions = getattr(
+                self._paper_execution, "record_executions", None
+            )
+            if callable(record_executions):
+                record_executions(snapshot)
         except ExecutionBlocked as error:
             self._message = f"Journal reconciliation blocked: {error}"
             return
@@ -944,7 +991,12 @@ class StarUIWorkbench:
         basis = self._state.unit_basis
         calculator = self._state.quote_calculator
         presets = self._preset_for_index(0)
-        if basis is None or calculator is None or self._state.available_quantity <= 0 or presets is None:
+        if (
+            basis is None
+            or calculator is None
+            or self._state.available_quantity <= 0
+            or presets is None
+        ):
             self._drafts[con_id] = ()
             return
         target, stop = presets
@@ -989,7 +1041,9 @@ class StarUIWorkbench:
                     else (),
                 )
             except (InvalidOperation, ValueError):
-                self._message = "Targets must be above 0%; stops must be between 0% and 100%."
+                self._message = (
+                    "Targets must be above 0%; stops must be between 0% and 100%."
+                )
                 return
             layers.append(
                 DraftLayerForm(
@@ -1014,13 +1068,17 @@ class StarUIWorkbench:
         basis = self._state.unit_basis
         calculator = self._state.quote_calculator
         if presets is None or basis is None or calculator is None:
-            self._message = "Enter valid comma-separated LMT and STP preset percentages first."
+            self._message = (
+                "Enter valid comma-separated LMT and STP preset percentages first."
+            )
             return
         target, stop = presets
         try:
             prices = preview_reference_prices(basis, target, stop, calculator.bands)
         except ValueError:
-            self._message = "The selected position does not have a usable price increment."
+            self._message = (
+                "The selected position does not have a usable price increment."
+            )
             return
         layers.append(
             DraftLayerForm(
@@ -1034,7 +1092,9 @@ class StarUIWorkbench:
         self._drafts[con_id] = tuple(
             replace(layer, quantity=str(quantity))
             for layer, quantity in zip(
-                layers, _split_quantity(self._state.available_quantity, len(layers)), strict=True
+                layers,
+                _split_quantity(self._state.available_quantity, len(layers)),
+                strict=True,
             )
         )
 
@@ -1075,7 +1135,11 @@ class StarUIWorkbench:
     def _page(self) -> Any:
         state = self._state
         ready = state.status is UiStatus.READY
-        title = state.position_title if self._selected_con_id is not None else "Select an option position"
+        title = (
+            state.position_title
+            if self._selected_con_id is not None
+            else "Select an option position"
+        )
         return Div(
             self._header(ready),
             Div(
@@ -1140,7 +1204,10 @@ class StarUIWorkbench:
         if connecting:
             content.append(
                 Div(
-                    Icon("lucide:loader-circle", cls="size-4 animate-spin text-muted-foreground"),
+                    Icon(
+                        "lucide:loader-circle",
+                        cls="size-4 animate-spin text-muted-foreground",
+                    ),
                     Span("Connecting…", cls="text-sm text-muted-foreground"),
                     cls="flex items-center gap-2",
                 )
@@ -1216,8 +1283,14 @@ class StarUIWorkbench:
 
     def _header(self, ready: bool) -> Any:
         return Div(
-            Div(cls="size-2 rounded-full " + ("bg-emerald-500" if ready else "bg-amber-400")),
-            Span("CONNECTED" if ready else self._state.status, cls="text-xs font-semibold tracking-wide"),
+            Div(
+                cls="size-2 rounded-full "
+                + ("bg-emerald-500" if ready else "bg-amber-400")
+            ),
+            Span(
+                "CONNECTED" if ready else self._state.status,
+                cls="text-xs font-semibold tracking-wide",
+            ),
             Badge(
                 "SIMULATED EXECUTION"
                 if self._demo_mode and self._paper_execution is not None
@@ -1228,7 +1301,10 @@ class StarUIWorkbench:
                 else "READ-ONLY",
                 variant="outline",
             ),
-            Span(f"Account {self._state.account or '—'}", cls="text-xs text-muted-foreground"),
+            Span(
+                f"Account {self._state.account or '—'}",
+                cls="text-xs text-muted-foreground",
+            ),
             Span(cls="flex-1"),
             Span(
                 f"Last refreshed {self._last_refreshed_at}",
@@ -1245,8 +1321,14 @@ class StarUIWorkbench:
                 HTMLInput(type="hidden", name="action", value="refresh"),
                 HTMLInput(type="hidden", name="account", value=self._settings.account),
                 HTMLInput(type="hidden", name="port", value=str(self._settings.port)),
-                HTMLInput(type="hidden", name="client_id", value=str(self._settings.client_id)),
-                HTMLInput(type="hidden", name="timeout", value=str(self._settings.timeout_seconds)),
+                HTMLInput(
+                    type="hidden", name="client_id", value=str(self._settings.client_id)
+                ),
+                HTMLInput(
+                    type="hidden",
+                    name="timeout",
+                    value=str(self._settings.timeout_seconds),
+                ),
                 action=f"/{self.session_token}/action",
                 method="post",
             ),
@@ -1293,7 +1375,10 @@ class StarUIWorkbench:
             )
         return Div(
             Div(
-                Span("LONG POSITIONS", cls="text-xs font-semibold tracking-wide text-muted-foreground"),
+                Span(
+                    "LONG POSITIONS",
+                    cls="text-xs font-semibold tracking-wide text-muted-foreground",
+                ),
                 Badge(f"{len(self._state.positions)} active", cls="text-[10px]"),
                 cls="flex items-center justify-between px-3 py-4",
             ),
@@ -1353,9 +1438,7 @@ class StarUIWorkbench:
                     Div(
                         _field(
                             "LMT targets",
-                            Input(
-                                name="target_presets", value=self._target_presets
-                            ),
+                            Input(name="target_presets", value=self._target_presets),
                         ),
                         _field(
                             "STP losses",
@@ -1389,6 +1472,7 @@ class StarUIWorkbench:
         coverage, app_order_count, order_count = self._order_coverage()
         active_pairs = self._active_oca_pairs()
         pending = self._pending_submissions()
+        closed = self._closed_submissions()
         return Div(
             self._coverage_alert(coverage, app_order_count, order_count),
             Div(
@@ -1399,23 +1483,34 @@ class StarUIWorkbench:
                         cls="mt-2 text-sm text-muted-foreground",
                     ),
                 ),
-                Div(Span("Cost basis / Ask", cls="text-xs text-muted-foreground"), P(" / ".join(fact.value for fact in self._state.quote[:2]) or "—", cls="mt-1 font-mono text-sm"), cls="text-right"),
+                Div(
+                    Span("Cost basis / Ask", cls="text-xs text-muted-foreground"),
+                    P(
+                        " / ".join(fact.value for fact in self._state.quote[:2]) or "—",
+                        cls="mt-1 font-mono text-sm",
+                    ),
+                    cls="text-right",
+                ),
                 cls="flex items-start justify-between gap-6",
             ),
             P(
                 "TWS orders are pending verification. The broker snapshot may not yet include them."
-                if pending else f"{self._state.available_quantity} contracts verified available to bracket",
-                cls="mt-2 text-sm font-medium " + (
-                    "text-amber-300" if pending else "text-emerald-400"
-                ),
+                if pending
+                else f"{self._state.available_quantity} contracts verified available to bracket",
+                cls="mt-2 text-sm font-medium "
+                + ("text-amber-300" if pending else "text-emerald-400"),
             ),
             Div(
                 ScrollArea(
                     self._pending_layers_panel(pending) if pending else None,
                     self._active_layers_panel() if active_pairs else None,
+                    self._closed_layers_panel(closed) if closed else None,
                     Div(
                         Separator(cls="flex-1"),
-                        Span("New bracket layers", cls="text-xs font-semibold text-muted-foreground"),
+                        Span(
+                            "New bracket layers",
+                            cls="text-xs font-semibold text-muted-foreground",
+                        ),
                         Separator(cls="flex-1"),
                         cls="my-6 flex items-center gap-3",
                     )
@@ -1472,12 +1567,16 @@ class StarUIWorkbench:
                 len(targets) == 1
                 and len(stops) == 1
                 and len(orders) == 2
-                and all(order.status in {"Submitted", "PreSubmitted"} for order in orders)
+                and all(
+                    order.status in {"Submitted", "PreSubmitted"} for order in orders
+                )
             ):
                 pairs.append((group, targets[0], stops[0]))
         return tuple(pairs)
 
-    def _pending_submissions(self) -> tuple[JournalEntry, ...]:
+    def _submission_outcomes(
+        self,
+    ) -> tuple[tuple[JournalEntry, int, LayerOutcome], ...]:
         if self._paper_execution is None or self._selected_con_id is None:
             return ()
         reader = getattr(self._paper_execution, "submission_entries", None)
@@ -1487,64 +1586,138 @@ class StarUIWorkbench:
             account=self._verified_selected_account(),
             con_id=self._selected_con_id,
         )
-        active_ids = {
-            order.perm_id
-            for _group, target, stop in self._active_oca_pairs()
-            for order in (target, stop)
-        }
-        observed_ids = {order.perm_id for order in self._state.working_orders}
+        active_ids = frozenset(
+            {
+                order.perm_id
+                for _group, target, stop in self._active_oca_pairs()
+                for order in (target, stop)
+            }
+        )
+        observed_ids = frozenset(order.perm_id for order in self._state.working_orders)
         return tuple(
-            entry for entry in entries
-            if not (entry.state == "RECONCILED" and not set(entry.perm_ids) & observed_ids)
-            and (not entry.perm_ids
-            or len(entry.perm_ids) < entry.expected_order_count
-            or not set(entry.perm_ids).issubset(active_ids))
+            (
+                entry,
+                index,
+                classify_journal_layer(
+                    entry,
+                    index,
+                    active_perm_ids=active_ids,
+                    observed_perm_ids=observed_ids,
+                ),
+            )
+            for entry in entries
+            for index in range(len(entry.layers))
         )
 
-    def _pending_layers_panel(self, entries: tuple[JournalEntry, ...]) -> Any:
+    def _pending_submissions(
+        self,
+    ) -> tuple[tuple[JournalEntry, int, LayerOutcome], ...]:
+        return tuple(
+            item
+            for item in self._submission_outcomes()
+            if item[2].status
+            in {"PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE"}
+        )
+
+    def _closed_submissions(self) -> tuple[tuple[JournalEntry, int, LayerOutcome], ...]:
+        return tuple(
+            item
+            for item in self._submission_outcomes()
+            if item[2].status.startswith("CLOSED_")
+        )
+
+    def _pending_layers_panel(
+        self, items: tuple[tuple[JournalEntry, int, LayerOutcome], ...]
+    ) -> Any:
         rows: list[Any] = []
-        for entry in entries:
-            acknowledged = entry.state in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"}
-            heading = "Sent to TWS" if acknowledged else "Outcome not confirmed"
-            detail = (
-                "TWS acknowledged these orders. They may still require Transmit in TWS; "
-                "Refresh after acting there."
-                if acknowledged
-                else "Inspect TWS before taking another action. This attempt cannot be retried automatically."
-            )
+        for entry, index, outcome in items:
+            layer = entry.layers[index]
+            heading = {
+                "PENDING": "Awaiting TWS verification",
+                "UNKNOWN": "Outcome not confirmed",
+                "PARTIAL": "Partially filled",
+                "NO_EXECUTION_EVIDENCE": "No fill evidence",
+            }[outcome.status]
+            detail = {
+                "PENDING": "Check TWS for Transmit or a working order, then Refresh.",
+                "UNKNOWN": "Inspect TWS before taking another action. Do not retry this draft.",
+                "PARTIAL": (
+                    f"{format(outcome.filled_quantity, 'f')} of {layer.quantity} "
+                    "contracts filled. Verify the remaining order in TWS."
+                ),
+                "NO_EXECUTION_EVIDENCE": (
+                    "This layer is no longer shown as working, but TWS has not supplied "
+                    "a matching execution. Check the TWS trade log."
+                ),
+            }[outcome.status]
             rows.append(
                 Div(
                     Div(
-                        Span(heading, cls="text-sm font-semibold"),
-                        Badge("PENDING TRANSMISSION" if acknowledged else "VERIFY IN TWS", variant="outline"),
+                        Span(
+                            f"Layer {index + 1} · {heading}",
+                            cls="text-sm font-semibold",
+                        ),
+                        Badge("VERIFY IN TWS", variant="outline"),
                         cls="flex items-center justify-between gap-3",
                     ),
                     P(detail, cls="mt-2 text-xs leading-5 text-muted-foreground"),
-                    *[
-                        P(
-                            f"Layer {index}: {layer.quantity} contracts · SELL LMT ${layer.target_price} "
-                            f"/ SELL STP ${layer.stop_price} · {layer.tif}",
-                            cls="mt-2 font-mono text-xs",
-                        )
-                        for index, layer in enumerate(entry.layers, start=1)
-                    ],
                     P(
-                        f"{entry.expected_order_count} planned order(s); "
-                        f"{len(entry.perm_ids)} acknowledged or reconciled.",
-                        cls="mt-2 text-xs text-muted-foreground",
-                    ) if not entry.layers else None,
+                        f"{layer.quantity} contracts · SELL LMT ${layer.target_price} "
+                        f"/ SELL STP ${layer.stop_price} · {layer.tif}",
+                        cls="mt-2 font-mono text-xs",
+                    ),
                     cls="border-b border-border py-4 last:border-b-0",
                 )
             )
         title = (
-            "Active layers · pending TWS transmission"
-            if all(entry.state in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"} for entry in entries)
+            "Active layers · pending TWS verification"
+            if all(outcome.status == "PENDING" for _entry, _index, outcome in items)
             else "Active layers · TWS outcome unknown"
         )
         return Card(
             CardHeader(CardTitle(title)),
             CardContent(*rows),
             cls="border-amber-500/40 bg-amber-500/5",
+        )
+
+    def _closed_layers_panel(
+        self, items: tuple[tuple[JournalEntry, int, LayerOutcome], ...]
+    ) -> Any:
+        rows: list[Any] = []
+        for entry, index, outcome in items:
+            layer = entry.layers[index]
+            result = {
+                "CLOSED_PROFIT": "Profit",
+                "CLOSED_LOSS": "Loss",
+                "CLOSED_FLAT": "Flat",
+                "CLOSED_PNL_UNKNOWN": "P&L unavailable",
+            }[outcome.status]
+            pnl_text = (
+                f" · {outcome.currency} {outcome.realized_pnl:+,.2f}"
+                if outcome.realized_pnl is not None
+                else ""
+            )
+            rows.append(
+                Div(
+                    Div(
+                        Span(
+                            f"Layer {index + 1} · {outcome.exit_side} filled",
+                            cls="text-sm font-semibold",
+                        ),
+                        Badge(f"{result}{pnl_text}", variant="outline"),
+                        cls="flex items-center justify-between gap-3",
+                    ),
+                    P(
+                        f"{format(outcome.filled_quantity, 'f')} contracts closed · "
+                        f"planned LMT ${layer.target_price} / STP ${layer.stop_price}",
+                        cls="mt-2 font-mono text-xs text-muted-foreground",
+                    ),
+                    cls="border-b border-border py-4 last:border-b-0",
+                )
+            )
+        return Card(
+            CardHeader(CardTitle("Closed bracket history")),
+            CardContent(*rows),
         )
 
     def _verified_selected_account(self) -> str:
@@ -1564,7 +1737,9 @@ class StarUIWorkbench:
 
     def _active_target_perm_ids(self) -> tuple[int, ...]:
         """Act on every reconciled layer of the currently selected contract."""
-        return tuple(target.perm_id for _group, target, _stop in self._active_oca_pairs())
+        return tuple(
+            target.perm_id for _group, target, _stop in self._active_oca_pairs()
+        )
 
     def _active_layers_panel(self) -> Any:
         pairs = self._active_oca_pairs()
@@ -1634,8 +1809,12 @@ class StarUIWorkbench:
         calculator = self._state.quote_calculator
         bands = calculator.bands if calculator is not None else ()
         pending = self._pending_active_prices.get(target.perm_id)
-        display_target_price = pending[0] if pending and pending[0] is not None else target.limit_price
-        display_stop_price = pending[2] if pending and pending[2] is not None else stop.stop_price
+        display_target_price = (
+            pending[0] if pending and pending[0] is not None else target.limit_price
+        )
+        display_stop_price = (
+            pending[2] if pending and pending[2] is not None else stop.stop_price
+        )
         target_percentage = _active_percentage_for_price(
             display_target_price,
             self._state.unit_basis,
@@ -1893,7 +2072,10 @@ class StarUIWorkbench:
             "multiplier": format(multiplier, "f"),
             "available": self._state.available_quantity,
             "bands": [
-                {"low": format(band.low_edge, "f"), "increment": format(band.increment, "f")}
+                {
+                    "low": format(band.low_edge, "f"),
+                    "increment": format(band.increment, "f"),
+                }
                 for band in calculator.bands
             ],
         }
@@ -2033,7 +2215,9 @@ class StarUIWorkbench:
             for layer in layers:
                 quantity = _int_or_zero(layer.quantity)
                 try:
-                    target = (Decimal(layer.target_price) - basis) * multiplier * quantity
+                    target = (
+                        (Decimal(layer.target_price) - basis) * multiplier * quantity
+                    )
                     stop = (Decimal(layer.stop_price) - basis) * multiplier * quantity
                 except InvalidOperation:
                     continue
@@ -2047,9 +2231,21 @@ class StarUIWorkbench:
             ),
             CardContent(
                 Div(
-                    *_metric("Expected gain", _money(gain), "text-emerald-400", live_key="gain"),
-                    *_metric("Max loss", _money(loss), "text-rose-400", live_key="loss"),
-                    *_metric("Breakeven after", _breakeven(outcomes), "text-amber-300", live_key="breakeven"),
+                    *_metric(
+                        "Expected gain",
+                        _money(gain),
+                        "text-emerald-400",
+                        live_key="gain",
+                    ),
+                    *_metric(
+                        "Max loss", _money(loss), "text-rose-400", live_key="loss"
+                    ),
+                    *_metric(
+                        "Breakeven after",
+                        _breakeven(outcomes),
+                        "text-amber-300",
+                        live_key="breakeven",
+                    ),
                     cls="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] items-baseline gap-x-3 gap-y-3",
                 ),
                 cls="px-4",
@@ -2081,10 +2277,14 @@ class StarUIWorkbench:
                 self._review_pair(index, layer)
                 for index, layer in enumerate(self._current_layers(), start=1)
             ]
-        draft_rows = [
-            self._review_pair(index, layer)
-            for index, layer in enumerate(self._current_layers(), start=1)
-        ] if not pending else []
+        draft_rows = (
+            [
+                self._review_pair(index, layer)
+                for index, layer in enumerate(self._current_layers(), start=1)
+            ]
+            if not pending
+            else []
+        )
         has_active_layers = bool(self._active_oca_pairs())
         has_staged_action = bool(action_rows)
         review_badge = (
@@ -2116,11 +2316,18 @@ class StarUIWorkbench:
         )
         return Div(
             Div(
-                Span("ACTION REVIEW", cls="text-xs font-semibold tracking-wide text-muted-foreground"),
+                Span(
+                    "ACTION REVIEW",
+                    cls="text-xs font-semibold tracking-wide text-muted-foreground",
+                ),
                 review_badge,
                 cls="flex items-center justify-between px-4 py-4",
             ),
-            ScrollArea(*action_rows, aria_label="Planned order actions", cls="min-h-0 flex-1 px-4")
+            ScrollArea(
+                *action_rows,
+                aria_label="Planned order actions",
+                cls="min-h-0 flex-1 px-4",
+            )
             if has_staged_action
             else ScrollArea(
                 Div(
@@ -2138,7 +2345,8 @@ class StarUIWorkbench:
             else Div(
                 P(
                     "Pending TWS orders are shown in Active layers. Refresh after reviewing them in TWS."
-                    if pending else "Add a layer or modify an existing one to continue.",
+                    if pending
+                    else "Add a layer or modify an existing one to continue.",
                     cls="text-center text-sm leading-6 text-muted-foreground",
                 ),
                 cls="flex min-h-0 flex-1 items-center justify-center px-6",
@@ -2690,7 +2898,13 @@ def _field(
 ) -> Any:
     return Div(
         Label(label, fr=input_id, cls="text-xs font-medium text-muted-foreground"),
-        Div(control, Span(suffix, cls="shrink-0 font-mono text-xs text-muted-foreground") if suffix else None, cls="mt-1 flex items-center gap-2"),
+        Div(
+            control,
+            Span(suffix, cls="shrink-0 font-mono text-xs text-muted-foreground")
+            if suffix
+            else None,
+            cls="mt-1 flex items-center gap-2",
+        ),
         cls="min-w-0 space-y-0.5",
     )
 

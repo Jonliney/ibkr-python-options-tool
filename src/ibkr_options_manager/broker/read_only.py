@@ -111,6 +111,33 @@ class CapturedOrder:
 
 
 @dataclass(frozen=True, slots=True)
+class CapturedExecution:
+    exec_id: str
+    account: str
+    con_id: int
+    perm_id: int
+    side: str
+    quantity: Decimal
+    price: Decimal
+    time: str
+    realized_pnl: Decimal | None = None
+    currency: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedCompletedOrder:
+    account: str
+    con_id: int
+    perm_id: int
+    order_id: int
+    client_id: int
+    action: str
+    order_type: str
+    oca_group: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
 class CapturedQuote:
     bid: Decimal | None
     ask: Decimal | None
@@ -144,6 +171,10 @@ class BrokerCapture:
     completion_times: tuple[tuple[str, Decimal], ...]
     errors: tuple[str, ...]
     captured_at: Decimal
+    executions: tuple[CapturedExecution, ...] = ()
+    executions_complete: bool = False
+    completed_orders: tuple[CapturedCompletedOrder, ...] = ()
+    completed_orders_complete: bool = False
 
 
 class ReadOnlyBroker(Protocol):
