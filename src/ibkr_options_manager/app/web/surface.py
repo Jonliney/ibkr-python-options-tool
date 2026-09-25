@@ -50,7 +50,7 @@ from ..view_model import (
 )
 from .components.ui.alert import Alert, AlertDescription, AlertTitle
 from .components.ui.badge import Badge
-from .components.ui.button import Button
+from .components.ui.button import Button, ButtonVariant
 from .components.ui.card import (
     Card,
     CardAction,
@@ -1777,7 +1777,6 @@ class StarUIWorkbench:
                     ),
                 ),
             ),
-            self._outcome_projection(layers),
             HTMLInput(type="hidden", name="target_presets", value=self._target_presets),
             HTMLInput(type="hidden", name="stop_presets", value=self._stop_presets),
             Script(_live_draft_script(self._live_draft_configuration())),
@@ -1946,16 +1945,21 @@ class StarUIWorkbench:
         gain = sum((target for target, _ in outcomes), Decimal("0"))
         loss = sum((stop for _, stop in outcomes), Decimal("0"))
         return Card(
-            CardHeader(CardTitle("Outcome projection"), CardDescription("Based on the current cost basis and planned layer prices."), cls="gap-1"),
+            CardHeader(
+                CardTitle("Outcome projection", cls="text-sm"),
+                cls="px-4",
+            ),
             CardContent(
                 Div(
-                    _metric("Expected gain", _money(gain), "text-emerald-400", live_key="gain"),
-                    _metric("Max loss", _money(loss), "text-rose-400", live_key="loss"),
-                    _metric("Breakeven after", _breakeven(outcomes), "text-amber-300", live_key="breakeven"),
-                    cls="flex flex-wrap items-start gap-x-16 gap-y-5",
+                    *_metric("Expected gain", _money(gain), "text-emerald-400", live_key="gain"),
+                    *_metric("Max loss", _money(loss), "text-rose-400", live_key="loss"),
+                    *_metric("Breakeven after", _breakeven(outcomes), "text-amber-300", live_key="breakeven"),
+                    cls="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] items-baseline gap-x-3 gap-y-3",
                 ),
+                cls="px-4",
             ),
-            cls="mt-5",
+            data_draft_outcome=True,
+            cls="gap-4 rounded-2xl py-4 shadow-none",
         )
 
     def _review(self) -> Any:
@@ -2107,14 +2111,15 @@ class StarUIWorkbench:
             )
             if self._active_oca_pairs()
             else None,
-            cls="mx-4 mb-4 w-[calc(100%-2rem)]",
+            self._outcome_projection(self._current_layers()),
+            cls="mx-4 mb-4 flex w-[calc(100%-2rem)] flex-col gap-3",
         )
 
     def _staged_action_controls(
         self,
         *,
         confirm_action: str,
-        confirm_variant: str = "default",
+        confirm_variant: ButtonVariant = "default",
         busy_text: str = "Submitting…",
     ) -> Any:
         """One deliberate Cancel / Confirm bar for every staged order change."""
@@ -2147,9 +2152,20 @@ class StarUIWorkbench:
     def _live_active_review(self, *, hidden: bool) -> Any:
         """Client-side review rows sharing the draft order-review component."""
         rows: list[Any] = []
-        for index, (_group, target, _stop) in enumerate(
+        for index, (_group, target, stop) in enumerate(
             self._active_oca_pairs(), start=1
         ):
+            pending = self._pending_active_prices.get(target.perm_id)
+            target_price = (
+                pending[0]
+                if pending is not None and pending[0] is not None
+                else target.limit_price
+            )
+            stop_price = (
+                pending[2]
+                if pending is not None and pending[2] is not None
+                else stop.stop_price
+            )
             rows.append(
                 self._review_oca_pair(
                     index=index,
@@ -2158,9 +2174,13 @@ class StarUIWorkbench:
                     lines=(
                         self._review_order_line(
                             "UPDATE SELL LMT",
-                            Span(
-                                data_active_review_target=target.perm_id,
-                                cls="text-sm font-semibold text-emerald-400",
+                            _price_transition(
+                                target_price,
+                                None,
+                                tone="text-emerald-400",
+                                current_attributes={
+                                    "data_active_review_target": target.perm_id
+                                },
                             ),
                             "text-emerald-400",
                             row_attributes={
@@ -2170,9 +2190,13 @@ class StarUIWorkbench:
                         ),
                         self._review_order_line(
                             "UPDATE SELL STP",
-                            Span(
-                                data_active_review_stop=target.perm_id,
-                                cls="text-sm font-semibold text-rose-400",
+                            _price_transition(
+                                stop_price,
+                                None,
+                                tone="text-rose-400",
+                                current_attributes={
+                                    "data_active_review_stop": target.perm_id
+                                },
                             ),
                             "text-rose-400",
                             row_attributes={
@@ -2233,9 +2257,10 @@ class StarUIWorkbench:
             rows.append(
                 self._review_order_line(
                     "UPDATE SELL LMT",
-                    Span(
-                        f"${format(update.target_price, 'f')}",
-                        cls="text-sm font-semibold text-emerald-400",
+                    _price_transition(
+                        update.prior_target_price,
+                        update.target_price,
+                        tone="text-emerald-400",
                     ),
                     "text-emerald-400",
                 )
@@ -2244,9 +2269,10 @@ class StarUIWorkbench:
             rows.append(
                 self._review_order_line(
                     "UPDATE SELL STP",
-                    Span(
-                        f"${format(update.stop_price, 'f')}",
-                        cls="text-sm font-semibold text-rose-400",
+                    _price_transition(
+                        update.prior_stop_price,
+                        update.stop_price,
+                        tone="text-rose-400",
                     ),
                     "text-rose-400",
                 )
@@ -2487,7 +2513,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       node.classList.toggle(display, !hidden);
     }};
     const setReviewMode = (active) => {{
-      document.querySelectorAll('[data-draft-review], [data-draft-review-badge], [data-draft-execute]').forEach((node) => {{
+      document.querySelectorAll('[data-draft-review], [data-draft-review-badge], [data-draft-execute], [data-draft-outcome]').forEach((node) => {{
         node.classList.toggle('hidden', active);
       }});
       document.querySelectorAll('[data-active-review], [data-active-review-badge], [data-active-execute-control]').forEach((node) => {{
@@ -2641,6 +2667,35 @@ def _active_order_value(label: str, price: Decimal | None, tone: str) -> Any:
             cls=f"mt-1 text-sm font-semibold {tone}",
         ),
         cls="min-w-28",
+    )
+
+
+def _price_transition(
+    previous: Decimal | None,
+    current: Decimal | None,
+    *,
+    tone: str,
+    current_attributes: dict[str, Any] | None = None,
+) -> Any:
+    """Render an inspectable old-to-new price transition with a Lucide arrow."""
+    return Span(
+        Span(
+            "—" if previous is None else f"${format(previous, 'f')}",
+            cls="text-muted-foreground",
+        ),
+        Span("to", cls="sr-only"),
+        Icon(
+            "lucide:arrow-right",
+            aria_hidden="true",
+            cls="size-3.5 shrink-0 text-muted-foreground",
+        ),
+        Span(
+            "" if current is None else f"${format(current, 'f')}",
+            cls=tone,
+            **(current_attributes or {}),
+        ),
+        aria_live="polite",
+        cls="inline-flex items-center gap-1.5 font-mono text-sm font-semibold tabular-nums",
     )
 
 
@@ -2869,13 +2924,13 @@ def _busy_submit_script() -> str:
 
 
 def _metric(label: str, value: str, tone: str, *, live_key: str | None = None) -> Any:
-    return Div(
-        P(label, cls="text-xs font-semibold uppercase tracking-wide text-muted-foreground"),
+    return (
+        P(label, cls="min-w-0 text-xs font-medium text-muted-foreground"),
         P(
             value,
             data_live_metric=live_key,
             aria_live="polite" if live_key else None,
-            cls=f"mt-1 font-mono text-lg font-semibold {tone}",
+            cls=f"min-w-0 break-words text-right font-mono text-xs font-semibold tabular-nums {tone}",
         ),
     )
 

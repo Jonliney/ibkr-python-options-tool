@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from ipaddress import ip_address
 from typing import Protocol
+
+from .connection import validate_paper_connection
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,24 +19,13 @@ class ProbeConfig:
     expected_manual_order_perm_id: int | None = None
 
     def __post_init__(self) -> None:
-        try:
-            address = ip_address(self.host)
-        except ValueError as error:
-            raise ValueError("host must be a literal loopback address") from error
-        if not address.is_loopback:
-            raise ValueError("host must be a literal loopback address")
-        if not 1 <= self.port <= 65535:
-            raise ValueError("port must be between 1 and 65535")
-        if self.client_id == 0:
-            raise ValueError("client_id must be nonzero to avoid binding TWS orders")
-        if self.client_id < 0:
-            raise ValueError("client_id must be positive")
-        if not self.expected_account.strip():
-            raise ValueError("expected_account is required")
-        if not self.expected_account.strip().upper().startswith("DU"):
-            raise ValueError("expected_account must be a paper account ID")
-        if self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
+        validate_paper_connection(
+            host=self.host,
+            port=self.port,
+            client_id=self.client_id,
+            expected_account=self.expected_account,
+            timeout_seconds=self.timeout_seconds,
+        )
         if self.option_con_id is not None and self.option_con_id <= 0:
             raise ValueError("option_con_id must be positive")
         if (

@@ -11,6 +11,7 @@ from typing import Any
 from .broker import IbkrSnapshotBroker, SnapshotRequest
 from .capability import ProbeConfig, ProbeReport, run_capability_probe
 from .ibkr_probe import IbapiUnavailableError, IbkrReadOnlyBroker
+from .redaction import redact_account, redact_accounts
 from .snapshot import SnapshotCoordinator, SnapshotResult, SnapshotStatus
 
 
@@ -109,13 +110,10 @@ def build_parser() -> argparse.ArgumentParser:
 def report_to_dict(report: ProbeReport) -> dict[str, Any]:
     observation = report.observation
     accounts = observation.managed_accounts
-    redacted_accounts = [_redact_account(account) for account in accounts]
+    redacted_accounts = [redact_account(account) for account in accounts]
 
     def redact_message(message: str) -> str:
-        result = message
-        for account, redacted in zip(accounts, redacted_accounts, strict=True):
-            result = result.replace(account, redacted)
-        return result
+        return redact_accounts(message, accounts)
 
     return {
         "status": "PASS" if report.passed else "BLOCKED",
@@ -145,10 +143,10 @@ def snapshot_result_to_dict(
     *,
     diagnostic: bool = False,
 ) -> dict[str, Any]:
-    redacted_account = _redact_account(expected_account)
+    redacted_account = redact_account(expected_account)
 
     def redact_message(message: str) -> str:
-        return message.replace(expected_account, redacted_account)
+        return redact_accounts(message, (expected_account,))
 
     output: dict[str, Any] = {
         "status": result.status.value,
@@ -283,12 +281,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(json.dumps(report_to_dict(report), indent=2, sort_keys=True))
     return 0 if report.passed else 2
-
-
-def _redact_account(account: str) -> str:
-    if len(account) <= 4:
-        return "****"
-    return f"***{account[-4:]}"
 
 
 def _decimal_text(value: Decimal | None) -> str | None:

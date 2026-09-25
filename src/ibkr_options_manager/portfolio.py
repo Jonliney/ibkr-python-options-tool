@@ -13,7 +13,9 @@ from .broker import (
     PortfolioBroker,
     PortfolioRequest,
 )
+from .broker.observations import working_orders_from_capture
 from .domain import ContractKey, WorkingOrder
+from .redaction import redact_accounts
 
 
 class PortfolioStatus(StrEnum):
@@ -113,7 +115,10 @@ def _publish_portfolio(
     paper_execution_mode: bool,
 ) -> PortfolioResult:
     errors = [
-        _redact(message, request.expected_account, capture.managed_accounts)
+        redact_accounts(
+            message,
+            (request.expected_account, *capture.managed_accounts),
+        )
         for message in capture.errors
     ]
     missing = sorted(PORTFOLIO_COMPLETIONS - capture.completed)
@@ -180,32 +185,7 @@ def _position(position: CapturedPosition, capture: BrokerCapture) -> PortfolioPo
     )
     eligibility = _eligibility(contract, quantity, unit_basis)
     key = ContractKey(account, contract.con_id)
-    orders = tuple(
-        WorkingOrder(
-            perm_id=order.perm_id,
-            client_id=order.client_id,
-            order_id=order.order_id,
-            key=ContractKey(order.account, order.con_id),
-            action=order.action,
-            order_type=order.order_type,
-            remaining=order.remaining,
-            status=order.status,
-            oca_group=order.oca_group,
-            parent_id=order.parent_id,
-            observed_at=capture.captured_at,
-            limit_price=order.limit_price,
-            stop_price=order.stop_price,
-            tif=order.tif,
-        )
-        for order in sorted(
-            (
-                order
-                for order in capture.orders
-                if order.account == account and order.con_id == contract.con_id
-            ),
-            key=lambda order: (order.perm_id, order.client_id, order.order_id),
-        )
-    )
+    orders = working_orders_from_capture(capture, selected=key)
     return PortfolioPosition(
         key=key,
         contract=contract,
@@ -234,18 +214,6 @@ def _eligibility(
     if unit_basis is None or not unit_basis.is_finite() or unit_basis <= 0:
         return "Invalid basis"
     return "Eligible"
-
-
-def _redact(
-    message: str,
-    expected_account: str,
-    managed_accounts: tuple[str, ...],
-) -> str:
-    result = message
-    for account in {expected_account, *managed_accounts}:
-        redacted = "****" if len(account) <= 4 else f"***{account[-4:]}"
-        result = result.replace(account, redacted)
-    return result
 
 
 __all__ = [

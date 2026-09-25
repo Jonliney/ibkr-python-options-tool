@@ -14,6 +14,8 @@ See [docs/PROJECT_BRIEF.md](docs/PROJECT_BRIEF.md) for the current requirements
 and safety constraints. The reviewed architecture, safety gates, delivery
 slices, and acceptance criteria for the first milestone are in
 [docs/MILESTONE_1_PLAN.md](docs/MILESTONE_1_PLAN.md).
+The implemented module map and current safety seams are documented in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 Slice 0 is complete with a dependency-light
 [read-only paper-TWS capability probe](docs/READ_ONLY_PROBE.md). It deliberately

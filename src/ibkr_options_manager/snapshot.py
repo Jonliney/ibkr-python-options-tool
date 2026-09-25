@@ -11,6 +11,7 @@ from .broker import (
     ReadOnlyBroker,
     SnapshotRequest,
 )
+from .broker.observations import working_orders_from_capture
 from .domain import (
     BrokerSnapshot,
     ContractKey,
@@ -18,8 +19,8 @@ from .domain import (
     ObservedPosition,
     Quote,
     VerifiedOptionContract,
-    WorkingOrder,
 )
+from .redaction import redact_accounts
 
 
 class SnapshotStatus(StrEnum):
@@ -83,7 +84,10 @@ def _publish(
     if missing:
         errors.append(f"missing completion barriers: {', '.join(missing)}")
     errors.extend(
-        _redact(message, request.expected_account, capture.managed_accounts)
+        redact_accounts(
+            message,
+            (request.expected_account, *capture.managed_accounts),
+        )
         for message in capture.errors
     )
     if errors:
@@ -163,34 +167,7 @@ def _publish(
             raw_average_cost=position.average_cost,
             unit_basis=position.average_cost / contract.multiplier,
         ),
-        working_orders=tuple(
-            WorkingOrder(
-                perm_id=order.perm_id,
-                client_id=order.client_id,
-                order_id=order.order_id,
-                key=ContractKey(order.account, order.con_id),
-                action=order.action,
-                order_type=order.order_type,
-                remaining=order.remaining,
-                status=order.status,
-                oca_group=order.oca_group,
-                parent_id=order.parent_id,
-                observed_at=capture.captured_at,
-                limit_price=order.limit_price,
-                stop_price=order.stop_price,
-                tif=order.tif,
-            )
-            for order in sorted(
-                capture.orders,
-                key=lambda item: (
-                    item.account,
-                    item.con_id,
-                    item.perm_id,
-                    item.client_id,
-                    item.order_id,
-                ),
-            )
-        ),
+        working_orders=working_orders_from_capture(capture),
         quote=Quote(
             bid=quote.bid,
             ask=quote.ask,
@@ -211,16 +188,6 @@ def _publish(
         api_read_only_observed=capture.read_only_api is not None,
     )
     return SnapshotResult(SnapshotStatus.READY, snapshot, ())
-
-
-def _redact(
-    message: str, expected_account: str, managed_accounts: tuple[str, ...]
-) -> str:
-    result = message
-    for account in {expected_account, *managed_accounts}:
-        redacted = "****" if len(account) <= 4 else f"***{account[-4:]}"
-        result = result.replace(account, redacted)
-    return result
 
 
 def _same_required_identity(left: object, right: object) -> bool:

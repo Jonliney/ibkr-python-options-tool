@@ -722,8 +722,11 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert client.get("/_pkg/starhtml/plugins/position.js").status_code == 200
 
     draft = page.text.split("Layered OCA draft", maxsplit=1)[1].split(
-        "Outcome projection", maxsplit=1
+        "</form>", maxsplit=1
     )[0]
+    action_panel = page.text.split('aria-label="Planned order actions"', maxsplit=1)[1]
+    assert action_panel.index("Execute paper order") < action_panel.index("Outcome projection")
+    assert 'data-draft-outcome' in action_panel
     assert 'data-slot="card-action"' in draft
     assert "Split all available" in draft
     assert "Split assigned" in draft

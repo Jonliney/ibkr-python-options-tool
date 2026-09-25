@@ -20,6 +20,7 @@ from ..domain import (
     build_exit_plan,
 )
 from ..portfolio import PortfolioPosition, PortfolioResult, PortfolioStatus
+from ..redaction import redact_account, redact_accounts
 from ..snapshot import SnapshotResult, SnapshotStatus
 
 
@@ -350,6 +351,7 @@ class PlannerViewModel:
         try:
             result = self._snapshots.current()
         except Exception as error:  # the GUI boundary must fail closed
+            self._latest_snapshot = None
             state = _unavailable_state(
                 UiStatus.BLOCKED,
                 self._selection,
@@ -378,6 +380,7 @@ class PlannerViewModel:
         selection = self._selection
         if selection is None:
             return _empty_state(), None
+        self._latest_snapshot = None
         execution_form = replace(form, paper_execution_mode=True)
         try:
             result = self._snapshots.refresh(
@@ -451,6 +454,7 @@ class PlannerViewModel:
         try:
             result = self._snapshots.current()
         except Exception as error:  # the GUI boundary must fail closed
+            self._latest_snapshot = None
             message = _redact(str(error), self._account)
             return _unavailable_state(
                 UiStatus.BLOCKED,
@@ -464,37 +468,22 @@ class PlannerViewModel:
         result: SnapshotResult,
         form: PlanForm,
     ) -> ViewState:
+        state = self._present(result, form)
         selection = self._selection
         if selection is None:
-            return _empty_state()
-        if result.status is not SnapshotStatus.READY or result.snapshot is None:
-            status = (
-                UiStatus.STALE
-                if result.status is SnapshotStatus.STALE
-                else UiStatus.BLOCKED
-            )
-            validations = tuple(
-                ValidationLine("SNAPSHOT_BLOCKED", _redact(message, self._account))
-                for message in result.errors
-            ) or (ValidationLine("SNAPSHOT_BLOCKED", "No coherent snapshot is ready"),)
-            state = _unavailable_state(status, selection, validations)
-            return self._decorate(
-                state,
-                selected_con_id=selection.con_id,
-                form=form,
-            )
-
-        self._latest_snapshot = result.snapshot
-        self._bracket_forms[selection.con_id] = form
-        state = _with_preview_rows(
-            _ready_state(result.snapshot, selection, form, now=self._clock()),
-            form,
+            return state
+        snapshot = (
+            result.snapshot
+            if result.status is SnapshotStatus.READY
+            else None
         )
+        if snapshot is not None:
+            self._bracket_forms[selection.con_id] = form
         return self._decorate(
             state,
             selected_con_id=selection.con_id,
             form=form,
-            snapshot=result.snapshot,
+            snapshot=snapshot,
         )
 
     def _decorate(
@@ -556,7 +545,7 @@ def _ready_state(
     now: Decimal,
 ) -> ViewState:
     age = max(Decimal("0"), now - snapshot.captured_at)
-    account = _redact_account(selection.account)
+    account = redact_account(selection.account)
     connection = (
         Fact("Endpoint", f"127.0.0.1:{selection.port}", FactState.PASS),
         Fact("Client ID", str(selection.client_id), FactState.PASS),
@@ -777,7 +766,7 @@ def _portfolio_ready_state(
             if count
             else "No open option positions found"
         ),
-        account=_redact_account(settings.account),
+        account=redact_account(settings.account),
         connection=(
             Fact("Endpoint", f"127.0.0.1:{settings.port}", FactState.PASS),
             Fact("Client ID", str(settings.client_id), FactState.PASS),
@@ -788,7 +777,7 @@ def _portfolio_ready_state(
             Fact("Server time", _server_time(snapshot.server_time)),
             Fact("Read-only API", "verified", FactState.PASS),
             Fact("Localhost only", "verified", FactState.PASS),
-            Fact("Paper account", _redact_account(settings.account), FactState.PASS),
+            Fact("Paper account", redact_account(settings.account), FactState.PASS),
             Fact("Connection epoch", str(snapshot.connection_epoch)),
             Fact("Snapshot age", _format_age(age), FactState.PASS),
         ),
@@ -816,7 +805,7 @@ def _portfolio_unavailable_state(
     return ViewState(
         status=UiStatus.BLOCKED,
         status_message="Portfolio state is not ready",
-        account=_redact_account(settings.account),
+        account=redact_account(settings.account),
         connection=(
             Fact("Endpoint", f"127.0.0.1:{settings.port}"),
             Fact("Client ID", str(settings.client_id)),
@@ -868,7 +857,7 @@ def _unavailable_state(
             if status is UiStatus.STALE
             else "Broker state is not ready"
         ),
-        account=_redact_account(selection.account),
+        account=redact_account(selection.account),
         connection=(
             Fact("Endpoint", f"127.0.0.1:{selection.port}"),
             Fact("Client ID", str(selection.client_id)),
@@ -975,11 +964,7 @@ def _api_version() -> str:
 
 
 def _redact(message: str, account: str) -> str:
-    return message.replace(account, _redact_account(account)) if account else message
-
-
-def _redact_account(account: str) -> str:
-    return "****" if len(account) <= 4 else f"***{account[-4:]}"
+    return redact_accounts(message, (account,))
 
 
 def _pass_or_block(value: bool) -> FactState:
