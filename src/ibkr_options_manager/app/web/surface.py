@@ -2741,7 +2741,7 @@ def _toast_notice(message: str) -> _ToastNotice:
 
 
 def _busy_submit_script() -> str:
-    """Give every server-submit control a guarded busy state during navigation."""
+    """Mark explicitly asynchronous server actions busy during navigation."""
     return """
     (() => {
       if (window.__ibkrBusySubmitInstalled) return;
@@ -2749,9 +2749,25 @@ def _busy_submit_script() -> str:
       document.addEventListener('submit', (event) => {
         const button = event.submitter;
         if (!(button instanceof HTMLButtonElement) || button.disabled) return;
-        const text = button.dataset.busyText || 'Working…';
-        button.disabled = true;
+        // Local form actions (add/remove/split a layer) are immediate state
+        // edits.  Only controls that opt in with data-busy-text should change
+        // appearance or become disabled while a TWS/network request runs.
+        const text = button.dataset.busyText;
+      if (!text) return;
+        const form = event.target;
+        if (form instanceof HTMLFormElement && form.dataset.ibkrSubmitting === 'true') {
+          event.preventDefault();
+          return;
+        }
+        if (form instanceof HTMLFormElement) form.dataset.ibkrSubmitting = 'true';
+        // Do not set `disabled` during the submit event.  Qt WebEngine can
+        // then abandon the form's default navigation, leaving a spinner on a
+        // page that never receives the server response.  `aria-disabled` and
+        // pointer-events preserve the visible lock without changing submitter
+        // semantics.
+        button.setAttribute('aria-disabled', 'true');
         button.setAttribute('aria-busy', 'true');
+        button.style.pointerEvents = 'none';
         button.replaceChildren(
           Object.assign(document.createElement('span'), {
             className: 'size-3.5 animate-spin rounded-full border-2 border-current border-r-transparent',

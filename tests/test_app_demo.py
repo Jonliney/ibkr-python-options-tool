@@ -5,8 +5,11 @@ from threading import Event, Thread
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox --disable-gpu")
 
 from httpx import Response
+from PySide6.QtCore import QTimer, QUrl
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication
 from starlette.testclient import TestClient
 
@@ -21,11 +24,12 @@ from ibkr_options_manager.app.view_model import PlanForm, UiStatus, ValidationLi
 from ibkr_options_manager.app.web import StarUIWorkbench
 from ibkr_options_manager.app.web.surface import (
     _active_percentage_for_price,
+    _busy_submit_script,
     _live_active_script,
     _position_identity,
     _toast_notice,
 )
-from ibkr_options_manager.app.web_window import StarUIPlannerWindow
+from ibkr_options_manager.app.web_window import StarUIPlannerWindow, _start_local_server
 from ibkr_options_manager.broker import PortfolioRequest, SnapshotRequest
 from ibkr_options_manager.domain import PriceBand
 from ibkr_options_manager.execution import (
@@ -206,6 +210,17 @@ def test_tws_connection_toast_has_a_short_recovery_message() -> None:
     assert notice.title == "Could not connect to TWS"
     assert notice.description == "Make sure TWS is open and try again."
     assert notice.variant == "error"
+
+
+def test_busy_submit_only_applies_to_explicitly_async_controls() -> None:
+    script = _busy_submit_script()
+
+    assert "const text = button.dataset.busyText;" in script
+    assert "if (!text) return;" in script
+    assert "|| 'Working…'" not in script
+    assert "button.disabled = true" not in script
+    assert "button.style.pointerEvents = 'none';" in script
+    assert "form.dataset.ibkrSubmitting" in script
 
 
 def test_window_starts_connection_before_loading_the_first_page() -> None:
@@ -585,6 +600,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert response.status_code == 200
     assert [layer.quantity for layer in workbench._current_layers()] == ["3", "2"]
     assert workbench._current_layers()[0].tif == "DAY"
+    assert "LAYER 2" in response.text
 
     response = client.post(
         workbench.path + "action",
@@ -700,6 +716,147 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
     assert submitted.status_code == 200
     assert "Paper submission acknowledged for 2 orders" in submitted.text
     assert "Execute paper order" in submitted.text
+
+
+def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
+    tmp_path,
+) -> None:
+    """Exercise the controls that depend on a real browser submit/navigation."""
+    def clock() -> Decimal:
+        return Decimal("100")
+
+    broker = DemoReadOnlyBroker(clock=clock, paper_execution_enabled=True)
+    snapshots = SnapshotCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock)
+    portfolio = PortfolioCoordinator(
+        broker,
+        max_age_seconds=Decimal("15"),
+        clock=clock,
+        paper_execution_mode=True,
+    )
+    from ibkr_options_manager.app.view_model import PlannerViewModel
+
+    workbench = StarUIWorkbench(
+        PlannerViewModel(snapshots, portfolio=portfolio, clock=clock),
+        initial_account=DEMO_ACCOUNT,
+        demo_mode=True,
+        paper_execution=PaperExecutionService(
+            DemoPaperExecutionTransport(),
+            ExecutionJournal(tmp_path / "webview-paper-journal.json"),
+        ),
+    )
+    workbench.load_demo_data()
+    workbench._select_locked(1_002_100_161)  # NVDA has no related demo order.
+    server, server_thread, port = _start_local_server(workbench.app)
+    application = QApplication.instance() or QApplication([])
+    view = QWebEngineView()
+    phase = 0
+    failure: list[str] = []
+    result: dict[str, bool] = {}
+    finished = False
+
+    def finish(reason: str | None = None) -> None:
+        nonlocal finished
+        if finished:
+            return
+        finished = True
+        if reason is not None:
+            failure.append(reason)
+        server.should_exit = True
+        server_thread.join(timeout=2)
+        application.quit()
+
+    def javascript(script: str, callback) -> None:
+        view.page().runJavaScript(script, callback)
+
+    def click_button(label: str) -> None:
+        javascript(
+            """
+            (() => {
+              const button = Array.from(document.querySelectorAll('button'))
+                .find((candidate) => candidate.textContent.trim() === $LABEL);
+              if (!button || button.disabled) return false;
+              button.click();
+              return true;
+            })();
+            """.replace("$LABEL", repr(label)),
+            lambda clicked: None if clicked else finish(f"{label!r} was not clickable"),
+        )
+
+    def inspect_settings(opened: object) -> None:
+        result["settings"] = bool(opened)
+        if not opened:
+            finish("Settings did not open its Dialog")
+            return
+        click_button("Cancel")
+        QTimer.singleShot(100, lambda: click_button("Add layer"))
+
+    def inspect_page(text: object) -> None:
+        nonlocal phase
+        body = str(text)
+        if phase == 1:
+            if "LAYER 2" not in body:
+                finish("Add layer did not render a second layer")
+                return
+            result["add_layer"] = True
+            phase = 2
+            click_button("Execute paper order")
+        elif phase == 2:
+            if "Click to confirm" not in body:
+                finish("Execute paper order did not arm its confirmation")
+                return
+            phase = 3
+            click_button("Click to confirm")
+        elif phase == 3:
+            if "Paper submission acknowledged for 4 orders" not in body:
+                finish("Paper execution did not render its acknowledgement")
+                return
+            result["execute_arm"] = True
+            phase = 4
+            result["execute_confirm"] = True
+            click_button("Refresh")
+        elif phase == 4:
+            if "Layered OCA draft" not in body:
+                finish("Refresh did not render the workbench")
+                return
+            result["refresh"] = True
+            finish()
+
+    def loaded(ok: bool) -> None:
+        nonlocal phase
+        if not ok:
+            finish("The embedded workbench failed to load")
+            return
+        if phase == 0:
+            phase = 1
+            javascript(
+                """
+                (() => {
+                  const trigger = document.querySelector('[aria-haspopup="dialog"]');
+                  if (!trigger) return false;
+                  trigger.click();
+                  return document.getElementById('connection_settings')?.open === true;
+                })();
+                """,
+                inspect_settings,
+            )
+            return
+        QTimer.singleShot(
+            150, lambda: javascript("document.body.innerText", inspect_page)
+        )
+
+    view.loadFinished.connect(loaded)
+    view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
+    QTimer.singleShot(10_000, lambda: finish("Timed out waiting for browser controls"))
+    application.exec()
+
+    assert failure == []
+    assert result == {
+        "settings": True,
+        "add_layer": True,
+        "execute_arm": True,
+        "execute_confirm": True,
+        "refresh": True,
+    }
 
 
 def test_main_builds_the_embedded_starui_window(monkeypatch: object) -> None:
