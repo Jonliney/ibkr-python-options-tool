@@ -156,6 +156,34 @@ def test_launch_connection_failure_stays_in_the_retry_dialog_without_a_toast() -
     assert "Dismiss toast" not in page.text
 
 
+def test_retry_connection_waits_for_one_terminal_refresh_response() -> None:
+    """Retry must not start a second worker that races the dialog poll."""
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._demo_mode = False
+    ready = workbench._state
+    calls: list[object] = []
+
+    def refreshed(settings: object) -> object:
+        calls.append(settings)
+        return ready
+
+    workbench._view_model.refresh_portfolio = refreshed  # type: ignore[method-assign]
+    workbench._launch_connection = "failed"
+    client = TestClient(workbench.app)
+
+    page = client.post(
+        f"/{workbench.session_token}/action",
+        data={"action": "launch-refresh"},
+    )
+
+    assert page.status_code == 200
+    assert len(calls) == 1
+    assert workbench._launch_connection == "success"
+    assert workbench._launch_refresh_in_progress is False
+    assert "TWS unavailable" not in page.text
+
+
 def test_status_updates_render_as_short_toasts_not_workspace_copy() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()

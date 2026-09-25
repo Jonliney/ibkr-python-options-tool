@@ -240,10 +240,19 @@ class StarUIWorkbench:
         form = await request.form()
         values = {str(key): str(value) for key, value in form.items()}
         action = values.get("action", "save-draft")
+
+        if action == "launch-refresh":
+            # Retry is deliberately a single foreground request.  The retry
+            # dialog remains on screen (and its submit button is busy) while
+            # TWS is contacted; only its terminal response replaces the
+            # page.  Starting another background worker here races the
+            # connection-status poll and can repeatedly reopen the dialog.
+            self.refresh_on_launch()
+            with self._lock:
+                return self._page()
+
         with self._lock:
-            if action == "launch-refresh":
-                self.start_launch_refresh()
-            elif action == "refresh":
+            if action == "refresh":
                 self._target_presets = values.get(
                     "target_presets", self._target_presets
                 )
