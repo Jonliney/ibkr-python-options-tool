@@ -29,6 +29,19 @@ TWS may still apply its own order precaution and require the user to click
 **Transmit** there. The application must not bypass that independent TWS
 safety control.
 
+After a submission receives complete API acknowledgements, the workbench shows
+an **Orders sent to TWS** toast and journal-backed **Pending transmission** rows
+under Active layers until a fresh snapshot verifies the orders as working.
+These rows show the recorded plan, not permission to modify the orders. A
+timeout or incomplete acknowledgement is labelled **Outcome not confirmed**;
+the UI does not claim that TWS accepted those orders. While either state is
+unresolved, the same draft is hidden and another submission is not offered.
+The broker snapshot's available quantity is not treated as available for a new
+draft while pending orders may be absent from that snapshot. Pending rows are
+restored from the journal after an app restart. Only complete, broker-observed,
+journal-proven pairs in `Submitted` or `PreSubmitted` status appear as manageable
+active layers.
+
 The initial active-layer management action is deliberately narrow: **Sell now
 (MKT)** can exit one app-created, fully reconciled OCA layer. It is available
 only after two fresh snapshots prove the selected LMT and its SELL STP peer are

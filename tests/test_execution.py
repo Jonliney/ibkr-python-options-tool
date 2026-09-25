@@ -334,6 +334,52 @@ def test_tws_transmit_confirmation_timeout_is_an_unknown_non_retryable_outcome(
     assert journal.find(plan.fingerprint).state == "SUBMISSION_UNKNOWN"
 
 
+def test_pending_submission_details_survive_restart_and_become_reconciled(
+    tmp_path,
+) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    path = tmp_path / "journal.json"
+    journal = ExecutionJournal(path)
+    journal.begin(snapshot, plan)
+    journal.record_submission(
+        plan.fingerprint, order_ids=(101, 102), perm_ids=(201, 202)
+    )
+
+    reopened = ExecutionJournal(path)
+    entries = reopened.submission_entries(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id
+    )
+    assert len(entries) == 1
+    assert entries[0].state == "SUBMITTED"
+    assert entries[0].layers[0].quantity == 2
+    assert entries[0].layers[0].target_price == format(
+        plan.pairs[0].target.rounded_price, "f"
+    )
+
+    group = f"{plan.fingerprint[:12]}/tranche-1"
+    target = WorkingOrder(
+        perm_id=201,
+        client_id=17,
+        order_id=101,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("2"),
+        status="Submitted",
+        oca_group=group,
+        tif="GTC",
+    )
+    stop = replace(target, perm_id=202, order_id=102, order_type="STP")
+    reconciled = reopened.reconcile_snapshot(
+        replace(snapshot, working_orders=(target, stop))
+    )
+    assert len(reconciled) == 1
+    assert reconciled[0].state == "RECONCILED"
+    assert reconciled[0].layers == entries[0].layers
+
+
 def test_paper_execution_requires_read_only_api_to_have_been_explicitly_disabled(
 ) -> None:
     snapshot = _snapshot(read_only_api=True)

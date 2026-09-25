@@ -35,6 +35,7 @@ from ...domain import preview_reference_prices, round_up_price
 from ...execution import (
     ExecutionBlocked,
     ExecutionOutcomeUnknown,
+    JournalEntry,
     MarketExitCandidate,
     PaperExecutionService,
     PriceUpdateCandidate,
@@ -342,11 +343,12 @@ class StarUIWorkbench:
 
     def _apply_refreshed_portfolio_locked(self, state: ViewState) -> None:
         """Apply an already-read portfolio snapshot while holding the UI lock."""
+        previous_con_id = self._selected_con_id
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
         target = self._preferred_con_id
         if target is None:
-            target = self._selected_con_id
+            target = previous_con_id
         available_con_ids = {position.con_id for position in state.positions}
         if target not in available_con_ids:
             target = state.positions[0].con_id if state.positions else None
@@ -435,6 +437,7 @@ class StarUIWorkbench:
                 timeout_seconds=candidate.selection.timeout_seconds,
             )
         except ExecutionOutcomeUnknown as error:
+            self._drafts.pop(candidate.selection.con_id, None)
             self._message = (
                 f"Submission outcome is unknown: {error}. If TWS shows the complete "
                 "bracket, approve it there if required, then Refresh to reconcile it "
@@ -443,10 +446,20 @@ class StarUIWorkbench:
         except ExecutionBlocked as error:
             self._message = f"Execution blocked: {error}"
         except Exception as error:  # the isolated writer must never crash the UI
+            self._drafts.pop(candidate.selection.con_id, None)
             self._message = f"Submission outcome is unknown: {error}"
         else:
+            self._drafts.pop(candidate.selection.con_id, None)
             self._refresh_after_acknowledged_write_locked(
                 f"Paper submission acknowledged for {len(receipt.entry.order_ids)} orders."
+            )
+            self._toast = _ToastNotice(
+                title="Orders sent to TWS",
+                description=(
+                    f"{len(receipt.entry.order_ids)} orders acknowledged. "
+                    "Check TWS for Transmit, then Refresh."
+                ),
+                variant="success",
             )
         finally:
             self._disarm_execution_locked()
@@ -1375,6 +1388,7 @@ class StarUIWorkbench:
     def _workspace(self, title: str) -> Any:
         coverage, app_order_count, order_count = self._order_coverage()
         active_pairs = self._active_oca_pairs()
+        pending = self._pending_submissions()
         return Div(
             self._coverage_alert(coverage, app_order_count, order_count),
             Div(
@@ -1388,9 +1402,16 @@ class StarUIWorkbench:
                 Div(Span("Cost basis / Ask", cls="text-xs text-muted-foreground"), P(" / ".join(fact.value for fact in self._state.quote[:2]) or "—", cls="mt-1 font-mono text-sm"), cls="text-right"),
                 cls="flex items-start justify-between gap-6",
             ),
-            P(f"{self._state.available_quantity} contracts verified available to bracket", cls="mt-2 text-sm font-medium text-emerald-400"),
+            P(
+                "TWS orders are pending verification. The broker snapshot may not yet include them."
+                if pending else f"{self._state.available_quantity} contracts verified available to bracket",
+                cls="mt-2 text-sm font-medium " + (
+                    "text-amber-300" if pending else "text-emerald-400"
+                ),
+            ),
             Div(
                 ScrollArea(
+                    self._pending_layers_panel(pending) if pending else None,
                     self._active_layers_panel() if active_pairs else None,
                     Div(
                         Separator(cls="flex-1"),
@@ -1398,9 +1419,9 @@ class StarUIWorkbench:
                         Separator(cls="flex-1"),
                         cls="my-6 flex items-center gap-3",
                     )
-                    if active_pairs
+                    if active_pairs and not pending
                     else None,
-                    self._draft_panel(),
+                    self._draft_panel() if not pending else None,
                     aria_label="OCA layers workspace",
                     orientation="vertical",
                     cls="h-full",
@@ -1447,9 +1468,84 @@ class StarUIWorkbench:
             orders = groups[group]
             targets = [order for order in orders if order.order_type == "LMT"]
             stops = [order for order in orders if order.order_type == "STP"]
-            if len(targets) == 1 and len(stops) == 1 and len(orders) == 2:
+            if (
+                len(targets) == 1
+                and len(stops) == 1
+                and len(orders) == 2
+                and all(order.status in {"Submitted", "PreSubmitted"} for order in orders)
+            ):
                 pairs.append((group, targets[0], stops[0]))
         return tuple(pairs)
+
+    def _pending_submissions(self) -> tuple[JournalEntry, ...]:
+        if self._paper_execution is None or self._selected_con_id is None:
+            return ()
+        reader = getattr(self._paper_execution, "submission_entries", None)
+        if not callable(reader):
+            return ()
+        entries = reader(
+            account=self._verified_selected_account(),
+            con_id=self._selected_con_id,
+        )
+        active_ids = {
+            order.perm_id
+            for _group, target, stop in self._active_oca_pairs()
+            for order in (target, stop)
+        }
+        observed_ids = {order.perm_id for order in self._state.working_orders}
+        return tuple(
+            entry for entry in entries
+            if not (entry.state == "RECONCILED" and not set(entry.perm_ids) & observed_ids)
+            and (not entry.perm_ids
+            or len(entry.perm_ids) < entry.expected_order_count
+            or not set(entry.perm_ids).issubset(active_ids))
+        )
+
+    def _pending_layers_panel(self, entries: tuple[JournalEntry, ...]) -> Any:
+        rows: list[Any] = []
+        for entry in entries:
+            acknowledged = entry.state in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"}
+            heading = "Sent to TWS" if acknowledged else "Outcome not confirmed"
+            detail = (
+                "TWS acknowledged these orders. They may still require Transmit in TWS; "
+                "Refresh after acting there."
+                if acknowledged
+                else "Inspect TWS before taking another action. This attempt cannot be retried automatically."
+            )
+            rows.append(
+                Div(
+                    Div(
+                        Span(heading, cls="text-sm font-semibold"),
+                        Badge("PENDING TRANSMISSION" if acknowledged else "VERIFY IN TWS", variant="outline"),
+                        cls="flex items-center justify-between gap-3",
+                    ),
+                    P(detail, cls="mt-2 text-xs leading-5 text-muted-foreground"),
+                    *[
+                        P(
+                            f"Layer {index}: {layer.quantity} contracts · SELL LMT ${layer.target_price} "
+                            f"/ SELL STP ${layer.stop_price} · {layer.tif}",
+                            cls="mt-2 font-mono text-xs",
+                        )
+                        for index, layer in enumerate(entry.layers, start=1)
+                    ],
+                    P(
+                        f"{entry.expected_order_count} planned order(s); "
+                        f"{len(entry.perm_ids)} acknowledged or reconciled.",
+                        cls="mt-2 text-xs text-muted-foreground",
+                    ) if not entry.layers else None,
+                    cls="border-b border-border py-4 last:border-b-0",
+                )
+            )
+        title = (
+            "Active layers · pending TWS transmission"
+            if all(entry.state in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"} for entry in entries)
+            else "Active layers · TWS outcome unknown"
+        )
+        return Card(
+            CardHeader(CardTitle(title)),
+            CardContent(*rows),
+            cls="border-amber-500/40 bg-amber-500/5",
+        )
 
     def _verified_selected_account(self) -> str:
         """Use the unredacted account observed in the selected broker snapshot.
@@ -1963,6 +2059,7 @@ class StarUIWorkbench:
         )
 
     def _review(self) -> Any:
+        pending = self._pending_submissions()
         market_exits = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
@@ -1987,7 +2084,7 @@ class StarUIWorkbench:
         draft_rows = [
             self._review_pair(index, layer)
             for index, layer in enumerate(self._current_layers(), start=1)
-        ]
+        ] if not pending else []
         has_active_layers = bool(self._active_oca_pairs())
         has_staged_action = bool(action_rows)
         review_badge = (
@@ -2040,7 +2137,8 @@ class StarUIWorkbench:
             if draft_rows or has_active_layers
             else Div(
                 P(
-                    "Add a layer or modify an existing one to continue.",
+                    "Pending TWS orders are shown in Active layers. Refresh after reviewing them in TWS."
+                    if pending else "Add a layer or modify an existing one to continue.",
                     cls="text-center text-sm leading-6 text-muted-foreground",
                 ),
                 cls="flex min-h-0 flex-1 items-center justify-center px-6",
@@ -2050,6 +2148,16 @@ class StarUIWorkbench:
         )
 
     def _execution_control(self) -> Any:
+        if self._pending_submissions():
+            return Div(
+                P("Waiting for TWS", cls="text-sm font-semibold"),
+                P(
+                    "Review pending orders in TWS and use Refresh to verify their state. "
+                    "Do not resubmit this draft.",
+                    cls="mt-2 text-xs leading-5 text-muted-foreground",
+                ),
+                cls="mx-4 mb-4 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4",
+            )
         market_exits = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )

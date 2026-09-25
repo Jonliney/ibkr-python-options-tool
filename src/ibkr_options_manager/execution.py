@@ -23,6 +23,14 @@ class ExecutionOutcomeUnknown(ExecutionBlocked):
 
 
 @dataclass(frozen=True, slots=True)
+class JournalLayer:
+    quantity: int
+    target_price: str
+    stop_price: str
+    tif: str
+
+
+@dataclass(frozen=True, slots=True)
 class JournalEntry:
     fingerprint: str
     account: str
@@ -32,6 +40,7 @@ class JournalEntry:
     order_ids: tuple[int, ...] = ()
     perm_ids: tuple[int, ...] = ()
     snapshot_captured_at: str = ""
+    layers: tuple[JournalLayer, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +192,22 @@ class ExecutionJournal:
             if perm_id > 0
         )
 
+    def submission_entries(
+        self, *, account: str, con_id: int
+    ) -> tuple[JournalEntry, ...]:
+        """Read paper order attempts without granting any management authority."""
+        return tuple(
+            entry
+            for entry in self._entries()
+            if entry.account == account
+            and entry.con_id == con_id
+            and len(entry.fingerprint) == 64
+            and entry.state in {
+                "PREPARED", "SUBMITTED", "SUBMISSION_UNKNOWN",
+                "PARTIALLY_RECONCILED", "RECONCILED",
+            }
+        )
+
     def begin(self, snapshot: BrokerSnapshot, plan: PlanResult) -> JournalEntry:
         fingerprint = plan.fingerprint
         if plan.status is not PlanStatus.VALID or fingerprint is None:
@@ -217,6 +242,7 @@ class ExecutionJournal:
                 order_ids=prior.order_ids,
                 perm_ids=prior.perm_ids,
                 snapshot_captured_at=prior.snapshot_captured_at,
+                layers=prior.layers,
             )
         entry = JournalEntry(
             fingerprint=fingerprint,
@@ -225,6 +251,15 @@ class ExecutionJournal:
             state="PREPARED",
             expected_order_count=len(plan.pairs) * 2,
             snapshot_captured_at=str(snapshot.captured_at),
+            layers=tuple(
+                JournalLayer(
+                    quantity=pair.quantity,
+                    target_price=format(pair.target.rounded_price, "f"),
+                    stop_price=format(pair.stop.rounded_price, "f"),
+                    tif=pair.target.tif,
+                )
+                for pair in plan.pairs
+            ),
         )
         self._write(tuple((*entries, entry)))
         return entry
@@ -341,6 +376,7 @@ class ExecutionJournal:
                     order_ids=order_ids,
                     perm_ids=perm_ids,
                     snapshot_captured_at=entry.snapshot_captured_at,
+                    layers=entry.layers,
                 )
                 entries[index] = updated
                 self._write(tuple(entries))
@@ -370,6 +406,7 @@ class ExecutionJournal:
                     order_ids=order_ids,
                     perm_ids=(),
                     snapshot_captured_at=entry.snapshot_captured_at,
+                    layers=entry.layers,
                 )
                 entries[index] = updated
                 self._write(tuple(entries))
@@ -398,7 +435,10 @@ class ExecutionJournal:
         for index, entry in enumerate(entries):
             if (
                 entry.state
-                not in {"PREPARED", "SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED"}
+                not in {
+                    "PREPARED", "SUBMITTED", "SUBMISSION_UNKNOWN",
+                    "PARTIALLY_RECONCILED",
+                }
                 or entry.account != snapshot.selected.account
                 or entry.con_id != snapshot.selected.con_id
             ):
@@ -421,6 +461,7 @@ class ExecutionJournal:
                 order_ids=tuple(order.order_id for order in observed),
                 perm_ids=tuple(order.perm_id for order in observed),
                 snapshot_captured_at=entry.snapshot_captured_at,
+                layers=entry.layers,
             )
             entries[index] = updated
             reconciled.append(updated)
@@ -450,6 +491,15 @@ class ExecutionJournal:
                     order_ids=tuple(int(value) for value in item.get("order_ids", ())),
                     perm_ids=tuple(int(value) for value in item.get("perm_ids", ())),
                     snapshot_captured_at=str(item.get("snapshot_captured_at", "")),
+                    layers=tuple(
+                        JournalLayer(
+                            quantity=int(layer["quantity"]),
+                            target_price=str(layer["target_price"]),
+                            stop_price=str(layer["stop_price"]),
+                            tif=str(layer["tif"]),
+                        )
+                        for layer in item.get("layers", ())
+                    ),
                 )
                 for item in payload
             )
@@ -567,6 +617,12 @@ class PaperExecutionService:
     def owned_perm_ids(self, *, account: str, con_id: int) -> frozenset[int]:
         """Return only journal-proven app-owned broker order IDs."""
         return self._journal.owned_perm_ids(account=account, con_id=con_id)
+
+    def submission_entries(
+        self, *, account: str, con_id: int
+    ) -> tuple[JournalEntry, ...]:
+        """Expose durable submission attempts to the read-only UI."""
+        return self._journal.submission_entries(account=account, con_id=con_id)
 
     def prepare_market_exit(
         self,

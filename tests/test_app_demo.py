@@ -725,7 +725,9 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
         "</form>", maxsplit=1
     )[0]
     action_panel = page.text.split('aria-label="Planned order actions"', maxsplit=1)[1]
-    assert action_panel.index("Execute paper order") < action_panel.index("Outcome projection")
+    assert action_panel.index("Execute paper order") < action_panel.index(
+        "Outcome projection"
+    )
     assert 'data-draft-outcome' in action_panel
     assert 'data-slot="card-action"' in draft
     assert "Split all available" in draft
@@ -859,13 +861,14 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
     )
     from ibkr_options_manager.app.view_model import PlannerViewModel
 
+    journal = ExecutionJournal(tmp_path / "paper-journal.json")
     workbench = StarUIWorkbench(
         PlannerViewModel(snapshots, portfolio=portfolio, clock=clock),
         initial_account=DEMO_ACCOUNT,
         demo_mode=True,
         paper_execution=PaperExecutionService(
             DemoPaperExecutionTransport(),
-            ExecutionJournal(tmp_path / "paper-journal.json"),
+            journal,
         ),
     )
     workbench.load_demo_data()
@@ -895,10 +898,27 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
     )
 
     assert submitted.status_code == 200
-    assert "Paper submission acknowledged for 2 orders" in submitted.text
+    assert "Orders sent to TWS" in submitted.text
+    assert "2 orders acknowledged" in submitted.text
+    assert "Active layers · pending TWS transmission" in submitted.text
+    assert "SELL LMT" in submitted.text
+    assert "Waiting for TWS" in submitted.text
+    assert 'value="execute-arm"' not in submitted.text
     assert workbench._status_message.endswith("TWS state refreshed.")
     assert len(refresh_calls) == 1
-    assert "Execute paper order" in submitted.text
+
+    workbench._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(),
+        ExecutionJournal(tmp_path / "paper-journal.json"),
+    )
+    assert "Active layers · pending TWS transmission" in client.get(workbench.path).text
+
+    entry = journal.submission_entries(account=DEMO_ACCOUNT, con_id=1_002_100_161)[0]
+    journal.mark_unknown(entry.fingerprint)
+    unknown = client.get(workbench.path)
+    assert "Active layers · TWS outcome unknown" in unknown.text
+    assert "Outcome not confirmed" in unknown.text
+    assert 'value="execute-arm"' not in unknown.text
 
 
 def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
@@ -973,6 +993,10 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
         click_button("Cancel")
         QTimer.singleShot(100, lambda: click_button("Add layer"))
 
+    def inspect_acknowledgement(visible: object) -> None:
+        result["acknowledgement_visible"] = bool(visible)
+        click_button("Refresh")
+
     def inspect_page(text: object) -> None:
         nonlocal phase
         body = str(text)
@@ -990,15 +1014,24 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
             phase = 3
             click_button("Confirm")
         elif phase == 3:
-            if "Paper submission acknowledged for 4 orders" not in body:
+            if "Orders sent to TWS" not in body:
                 finish("Paper execution did not render its acknowledgement")
                 return
             result["execute_arm"] = True
             phase = 4
             result["execute_confirm"] = True
-            click_button("Refresh")
+            javascript(
+                """(() => {
+                  const toast = Array.from(document.querySelectorAll('[role="status"]'))
+                    .find((node) => node.textContent.includes('Orders sent to TWS')
+                      && node.getBoundingClientRect().height > 0
+                      && getComputedStyle(node).display !== 'none');
+                  return !!toast;
+                })();""",
+                inspect_acknowledgement,
+            )
         elif phase == 4:
-            if "Layered OCA draft" not in body:
+            if "Active layers · pending TWS transmission" not in body:
                 finish("Refresh did not render the workbench")
                 return
             result["refresh"] = True
@@ -1038,6 +1071,7 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
         "add_layer": True,
         "execute_arm": True,
         "execute_confirm": True,
+        "acknowledgement_visible": True,
         "refresh": True,
     }
 
