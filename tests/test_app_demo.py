@@ -34,6 +34,7 @@ from ibkr_options_manager.broker import PortfolioRequest, SnapshotRequest
 from ibkr_options_manager.domain import PriceBand
 from ibkr_options_manager.execution import (
     ExecutionJournal,
+    JournalEntry,
     MarketExitCandidate,
     PaperExecutionService,
 )
@@ -422,6 +423,77 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert "UPDATE SELL LMT" in page.text
 
 
+def test_partial_journal_reconciliation_keeps_surviving_pair_active_in_the_ui(
+    tmp_path,
+) -> None:
+    """A cancelled sibling pair must not turn the live pair into an external order."""
+    from ibkr_options_manager.app.view_model import WorkingOrderLine
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    selected = workbench._selected_con_id
+    assert selected is not None
+    assert workbench._state.account != DEMO_ACCOUNT
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    # Fixture a persisted partial recovery.
+    journal._write(
+        (
+            JournalEntry(
+                fingerprint="partial-recovery-fingerprint",
+                account=DEMO_ACCOUNT,
+                con_id=selected,
+                state="PARTIALLY_RECONCILED",
+                expected_order_count=4,
+                order_ids=(103, 104),
+                perm_ids=(203, 204),
+            ),
+        )
+    )
+    workbench._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(), journal
+    )
+    # The settings value is stale; ownership must use the full account from
+    # the verified selected snapshot rather than its redacted display value.
+    workbench._settings = replace(workbench._settings, account="DU-stale")
+    workbench._state = replace(
+        workbench._state,
+        available_quantity=4,
+        working_orders=(
+            WorkingOrderLine(
+                perm_id=203,
+                order_id=103,
+                action="SELL",
+                order_type="LMT",
+                remaining="3",
+                status="Submitted",
+                oca_group="partial-reco/tranche-2",
+                limit_price=Decimal("3.30"),
+                tif="GTC",
+            ),
+            WorkingOrderLine(
+                perm_id=204,
+                order_id=104,
+                action="SELL",
+                order_type="STP",
+                remaining="3",
+                status="Submitted",
+                oca_group="partial-reco/tranche-2",
+                stop_price=Decimal("2.06"),
+                tif="GTC",
+            ),
+        ),
+    )
+
+    page = TestClient(workbench.app).get(workbench.path)
+
+    assert "App-managed OCA coverage active" in page.text
+    assert "4 contracts remain available for a new bracket" in page.text
+    assert "Existing order coverage detected" not in page.text
+    assert "Active OCA layers" in page.text
+    assert "OCA-1" in page.text
+    assert 'value="3"' in page.text
+
+
 def test_active_layer_prefers_configured_percentage_over_rounded_inverse() -> None:
     """An untouched 20% target remains 20% after TWS exposes its tick price."""
     percentage = _active_percentage_for_price(
@@ -515,7 +587,7 @@ def test_delete_active_layer_review_cancels_only_that_oca_bracket() -> None:
     assert "CANCEL BRACKET" in sidebar
     assert "example/tranche-1" in sidebar
     assert "SELL MKT" not in sidebar
-    assert "Click to confirm delete layer" in sidebar
+    assert "Confirm deletion" in sidebar
     assert ">Cancel<" in sidebar
 
 
@@ -698,6 +770,14 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
     workbench.load_demo_data()
     workbench._select_locked(1_002_100_161)  # NVDA has no associated demo order.
     client = TestClient(workbench.app)
+    original_refresh = workbench._view_model.refresh_portfolio
+    refresh_calls: list[object] = []
+
+    def refreshed(settings: object) -> object:
+        refresh_calls.append(settings)
+        return original_refresh(settings)
+
+    workbench._view_model.refresh_portfolio = refreshed  # type: ignore[method-assign]
 
     armed = client.post(
         workbench.path + "action",
@@ -715,6 +795,8 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
 
     assert submitted.status_code == 200
     assert "Paper submission acknowledged for 2 orders" in submitted.text
+    assert workbench._status_message.endswith("TWS state refreshed.")
+    assert len(refresh_calls) == 1
     assert "Execute paper order" in submitted.text
 
 

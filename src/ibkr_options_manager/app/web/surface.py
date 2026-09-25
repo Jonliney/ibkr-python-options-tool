@@ -315,13 +315,34 @@ class StarUIWorkbench:
         state = self._view_model.refresh_portfolio(self._settings)
         self._apply_refreshed_portfolio_locked(state)
 
+    def _refresh_after_acknowledged_write_locked(self, acknowledgement: str) -> None:
+        """Replace optimistic post-write UI state with a fresh broker snapshot."""
+        try:
+            self._refresh_locked()
+        except Exception as error:  # keep a confirmed write, never hide it
+            self._message = (
+                f"{acknowledgement} Automatic TWS refresh failed; use Refresh before "
+                f"another action. ({error})"
+            )
+            return
+        if self._state.status is UiStatus.READY:
+            self._message = f"{acknowledgement} TWS state refreshed."
+        else:
+            self._message = (
+                f"{acknowledgement} TWS refresh could not verify the new state; use "
+                "Refresh before another action."
+            )
+
     def _apply_refreshed_portfolio_locked(self, state: ViewState) -> None:
         """Apply an already-read portfolio snapshot while holding the UI lock."""
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
         target = self._preferred_con_id
-        if target is None and state.positions:
-            target = state.positions[0].con_id
+        if target is None:
+            target = self._selected_con_id
+        available_con_ids = {position.con_id for position in state.positions}
+        if target not in available_con_ids:
+            target = state.positions[0].con_id if state.positions else None
         self._preferred_con_id = None
         if target is None:
             return
@@ -417,9 +438,8 @@ class StarUIWorkbench:
         except Exception as error:  # the isolated writer must never crash the UI
             self._message = f"Submission outcome is unknown: {error}"
         else:
-            self._message = (
-                f"Paper submission acknowledged for {len(receipt.entry.order_ids)} orders. "
-                "Refresh to reconcile them into Active layers; no automatic retry will occur."
+            self._refresh_after_acknowledged_write_locked(
+                f"Paper submission acknowledged for {len(receipt.entry.order_ids)} orders."
             )
         finally:
             self._disarm_execution_locked()
@@ -532,9 +552,8 @@ class StarUIWorkbench:
         except Exception as error:
             self._message = f"Bracket cancellation outcome is unknown: {error}"
         else:
-            self._message = (
-                "TWS confirmed both OCA legs were cancelled. Refresh to make the "
-                "contracts available for a new bracket."
+            self._refresh_after_acknowledged_write_locked(
+                "TWS confirmed both OCA legs were cancelled."
             )
         finally:
             self._disarm_execution_locked()
@@ -632,11 +651,10 @@ class StarUIWorkbench:
         except Exception as error:
             self._message = f"Market exit outcome is unknown: {error}"
         else:
-            self._message = (
+            self._refresh_after_acknowledged_write_locked(
                 f"TWS confirmed both selected OCA legs were cancelled and "
                 f"acknowledged the standalone MKT sell for "
-                f"{sum((candidate.quantity for candidate in candidates), Decimal('0'))} contracts. "
-                "Refresh to verify the outcome."
+                f"{sum((candidate.quantity for candidate in candidates), Decimal('0'))} contracts."
             )
         finally:
             self._disarm_execution_locked()
@@ -794,9 +812,9 @@ class StarUIWorkbench:
         except Exception as error:
             self._message = f"Price update outcome is unknown: {error}"
         else:
-            self._message = (
+            self._refresh_after_acknowledged_write_locked(
                 f"TWS acknowledged {len(receipt.entry.order_ids)} app-owned OCA "
-                "price amendment(s). Refresh to verify the updated working orders."
+                "price amendment(s)."
             )
         finally:
             self._disarm_execution_locked()
@@ -1333,7 +1351,7 @@ class StarUIWorkbench:
         if self._paper_execution is None:
             return "external", 0, len(orders)
         owned_perm_ids = self._paper_execution.owned_perm_ids(
-            account=self._settings.account,
+            account=self._verified_selected_account(),
             con_id=self._selected_con_id,
         )
         app_order_count = sum(order.perm_id in owned_perm_ids for order in orders)
@@ -1348,7 +1366,7 @@ class StarUIWorkbench:
         if self._paper_execution is None or self._selected_con_id is None:
             return ()
         owned_perm_ids = self._paper_execution.owned_perm_ids(
-            account=self._settings.account,
+            account=self._verified_selected_account(),
             con_id=self._selected_con_id,
         )
         groups: dict[str, list[Any]] = {}
@@ -1365,6 +1383,21 @@ class StarUIWorkbench:
             if len(targets) == 1 and len(stops) == 1 and len(orders) == 2:
                 pairs.append((group, targets[0], stops[0]))
         return tuple(pairs)
+
+    def _verified_selected_account(self) -> str:
+        """Use the unredacted account observed in the selected broker snapshot.
+
+        ``ViewState.account`` is intentionally display-redacted and must never
+        be used to identify an execution-journal entry.
+        """
+        snapshot = self._view_model.latest_snapshot()
+        if (
+            snapshot is not None
+            and self._selected_con_id is not None
+            and snapshot.selected.con_id == self._selected_con_id
+        ):
+            return snapshot.selected.account
+        return self._settings.account
 
     def _active_target_perm_ids(self) -> tuple[int, ...]:
         """Act on every reconciled layer of the currently selected contract."""
@@ -1946,7 +1979,7 @@ class StarUIWorkbench:
                         cls="flex-1",
                     ),
                     Button(
-                        "Click to confirm delete layer",
+                        "Confirm deletion",
                         variant="destructive",
                         type="submit",
                         name="action",

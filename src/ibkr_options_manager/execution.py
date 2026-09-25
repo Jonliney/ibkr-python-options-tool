@@ -173,7 +173,7 @@ class ExecutionJournal:
             for entry in self._entries()
             if entry.account == account
             and entry.con_id == con_id
-            and entry.state in {"SUBMITTED", "RECONCILED"}
+            and entry.state in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"}
             for perm_id in entry.perm_ids
             if perm_id > 0
         )
@@ -309,31 +309,36 @@ class ExecutionJournal:
         This does not turn an incomplete or arbitrary external order into an
         app-owned order.  Every observed order must use the plan fingerprint's
         OCA-group prefix, have a permanent ID, and form a complete SELL LMT /
-        SELL STP pair.  Newer entries additionally require the exact planned
-        order count.  Older journals have no count and are marked
-        ``RECONCILED`` rather than pretending their original acknowledgement
-        succeeded.
+        SELL STP pair. If an unknown submission has since lost a sibling pair
+        in TWS, its surviving complete pairs can be recovered safely as
+        ``PARTIALLY_RECONCILED``. The original expected count is retained so a
+        later snapshot can promote the entry once every planned order is
+        observed. Older journals have no count and are marked ``RECONCILED``.
         """
         entries = list(self._entries())
         reconciled: list[JournalEntry] = []
         for index, entry in enumerate(entries):
             if (
-                entry.state not in {"PREPARED", "SUBMISSION_UNKNOWN"}
+                entry.state
+                not in {"PREPARED", "SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED"}
                 or entry.account != snapshot.selected.account
                 or entry.con_id != snapshot.selected.con_id
             ):
                 continue
             observed = _complete_app_oca_orders(snapshot, entry)
-            if not observed or (
-                entry.expected_order_count
-                and len(observed) != entry.expected_order_count
-            ):
+            if not observed:
                 continue
+            state = (
+                "RECONCILED"
+                if not entry.expected_order_count
+                or len(observed) == entry.expected_order_count
+                else "PARTIALLY_RECONCILED"
+            )
             updated = JournalEntry(
                 fingerprint=entry.fingerprint,
                 account=entry.account,
                 con_id=entry.con_id,
-                state="RECONCILED",
+                state=state,
                 expected_order_count=entry.expected_order_count,
                 order_ids=tuple(order.order_id for order in observed),
                 perm_ids=tuple(order.perm_id for order in observed),

@@ -117,6 +117,39 @@ def _plan(snapshot: BrokerSnapshot):
     )
 
 
+def _two_pair_plan(snapshot: BrokerSnapshot):
+    return build_exit_plan(
+        replace(
+            snapshot,
+            position=replace(snapshot.position, quantity=Decimal("7")),
+        ),
+        PlanRequest(
+            tranche_size=4,
+            target_percentages=(Decimal("20"), Decimal("40")),
+            stop_loss_percentage=Decimal("25"),
+            remainder_policy=RemainderPolicy.NEXT_RUNG,
+            tif="GTC",
+            layers=(
+                LayerRequest(
+                    quantity=4,
+                    target_price=Decimal("1.20"),
+                    stop_price=Decimal("0.75"),
+                    tif="GTC",
+                    target_percentage=Decimal("20"),
+                ),
+                LayerRequest(
+                    quantity=3,
+                    target_price=Decimal("1.40"),
+                    stop_price=Decimal("0.75"),
+                    tif="GTC",
+                    target_percentage=Decimal("40"),
+                ),
+            ),
+            paper_execution_mode=True,
+        ),
+    )
+
+
 class _RecordingTransport:
     def __init__(self, *, fail: bool = False) -> None:
         self.calls = 0
@@ -726,3 +759,50 @@ def test_unknown_submission_reconciles_only_when_a_complete_oca_pair_is_observed
         account=snapshot.selected.account,
         con_id=snapshot.selected.con_id,
     ) == frozenset({201, 202})
+
+
+def test_unknown_submission_recovers_a_surviving_complete_pair_after_sibling_cancel(
+    tmp_path,
+) -> None:
+    """A manual TWS cancel must not orphan the remaining app-owned OCA pair."""
+    snapshot = _snapshot()
+    plan = _two_pair_plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.mark_unknown(plan.fingerprint)
+
+    # TWS accepted both pairs, but the 4-contract first pair was cancelled
+    # before the app had a chance to reconcile it. Only the transmitted,
+    # still-working 3-contract second pair is visible now.
+    group = f"{plan.fingerprint[:12]}/tranche-2"
+    target = WorkingOrder(
+        perm_id=203,
+        client_id=17,
+        order_id=103,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("3"),
+        status="Submitted",
+        oca_group=group,
+    )
+    stop = replace(
+        target,
+        perm_id=204,
+        order_id=104,
+        order_type="STP",
+    )
+
+    reconciled = journal.reconcile_snapshot(
+        replace(snapshot, working_orders=(target, stop))
+    )
+
+    assert len(reconciled) == 1
+    assert reconciled[0].state == "PARTIALLY_RECONCILED"
+    assert reconciled[0].order_ids == (103, 104)
+    assert reconciled[0].perm_ids == (203, 204)
+    assert journal.owned_perm_ids(
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+    ) == frozenset({203, 204})
