@@ -31,6 +31,7 @@ class JournalEntry:
     expected_order_count: int = 0
     order_ids: tuple[int, ...] = ()
     perm_ids: tuple[int, ...] = ()
+    snapshot_captured_at: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +163,11 @@ class ExecutionJournal:
 
     def find(self, fingerprint: str) -> JournalEntry | None:
         return next(
-            (entry for entry in self._entries() if entry.fingerprint == fingerprint),
+            (
+                entry
+                for entry in reversed(self._entries())
+                if entry.fingerprint == fingerprint
+            ),
             None,
         )
 
@@ -182,9 +187,36 @@ class ExecutionJournal:
         fingerprint = plan.fingerprint
         if plan.status is not PlanStatus.VALID or fingerprint is None:
             raise ExecutionBlocked("only a valid, fingerprinted plan may be sent")
-        if self.find(fingerprint) is not None:
+        entries = list(self._entries())
+        prior_index = next(
+            (
+                index
+                for index in range(len(entries) - 1, -1, -1)
+                if entries[index].fingerprint == fingerprint
+            ),
+            None,
+        )
+        if prior_index is not None and not self._may_replace_absent_attempt(
+            entries[prior_index], snapshot, entries
+        ):
             raise ExecutionBlocked(
                 "this plan fingerprint is already journaled; no retry is automatic"
+            )
+        if prior_index is not None:
+            # A known, app-owned attempt can be retired only after the exact
+            # fresh snapshot proves every acknowledged broker order is gone.
+            # PREPARED and acknowledgement-unknown attempts intentionally
+            # remain non-retryable: a timeout must never create duplicates.
+            prior = entries[prior_index]
+            entries[prior_index] = JournalEntry(
+                fingerprint=prior.fingerprint,
+                account=prior.account,
+                con_id=prior.con_id,
+                state="SUPERSEDED",
+                expected_order_count=prior.expected_order_count,
+                order_ids=prior.order_ids,
+                perm_ids=prior.perm_ids,
+                snapshot_captured_at=prior.snapshot_captured_at,
             )
         entry = JournalEntry(
             fingerprint=fingerprint,
@@ -192,9 +224,50 @@ class ExecutionJournal:
             con_id=snapshot.selected.con_id,
             state="PREPARED",
             expected_order_count=len(plan.pairs) * 2,
+            snapshot_captured_at=str(snapshot.captured_at),
         )
-        self._write((*self._entries(), entry))
+        self._write(tuple((*entries, entry)))
         return entry
+
+    @staticmethod
+    def _may_replace_absent_attempt(
+        entry: JournalEntry,
+        snapshot: BrokerSnapshot,
+        entries: list[JournalEntry],
+    ) -> bool:
+        """Allow an explicit recreation only after known prior orders disappear.
+
+        This is deliberately narrower than an ordinary retry.  We need known
+        permanent IDs, a broker-confirmed submission/reconciliation state, and
+        a later fresh snapshot for the same account and contract with none of
+        those orders still working. Older journal entries without a capture
+        time need a completed app cancellation for the same broker orders.
+        An unknown outcome has no such proof and stays blocked forever pending
+        manual investigation.
+        """
+        if (
+            entry.state not in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"}
+            or not entry.perm_ids
+            or entry.account != snapshot.selected.account
+            or entry.con_id != snapshot.selected.con_id
+        ):
+            return False
+        prior_perm_ids = frozenset(entry.perm_ids)
+        if any(
+            order.key == snapshot.selected and order.perm_id in prior_perm_ids
+            for order in snapshot.working_orders
+        ):
+            return False
+        if entry.snapshot_captured_at:
+            try:
+                return snapshot.captured_at > Decimal(entry.snapshot_captured_at)
+            except ArithmeticError:
+                return False
+        return any(
+            completed.state == "COMPLETED"
+            and set(completed.order_ids) & set(entry.order_ids)
+            for completed in entries
+        )
 
     def begin_market_exit(
         self, snapshot: BrokerSnapshot, candidate: MarketExitCandidate
@@ -247,6 +320,7 @@ class ExecutionJournal:
             con_id=snapshot.selected.con_id,
             state="PREPARED",
             expected_order_count=expected_order_count,
+            snapshot_captured_at=str(snapshot.captured_at),
         )
         self._write((*self._entries(), entry))
         return entry
@@ -255,7 +329,8 @@ class ExecutionJournal:
         self, fingerprint: str, *, order_ids: tuple[int, ...], perm_ids: tuple[int, ...]
     ) -> JournalEntry:
         entries = list(self._entries())
-        for index, entry in enumerate(entries):
+        for index in range(len(entries) - 1, -1, -1):
+            entry = entries[index]
             if entry.fingerprint == fingerprint:
                 updated = JournalEntry(
                     fingerprint=entry.fingerprint,
@@ -265,6 +340,7 @@ class ExecutionJournal:
                     expected_order_count=entry.expected_order_count,
                     order_ids=order_ids,
                     perm_ids=perm_ids,
+                    snapshot_captured_at=entry.snapshot_captured_at,
                 )
                 entries[index] = updated
                 self._write(tuple(entries))
@@ -282,7 +358,8 @@ class ExecutionJournal:
     ) -> JournalEntry:
         """Record a broker-confirmed management operation with no new orders."""
         entries = list(self._entries())
-        for index, entry in enumerate(entries):
+        for index in range(len(entries) - 1, -1, -1):
+            entry = entries[index]
             if entry.fingerprint == fingerprint:
                 updated = JournalEntry(
                     fingerprint=entry.fingerprint,
@@ -292,6 +369,7 @@ class ExecutionJournal:
                     expected_order_count=entry.expected_order_count,
                     order_ids=order_ids,
                     perm_ids=(),
+                    snapshot_captured_at=entry.snapshot_captured_at,
                 )
                 entries[index] = updated
                 self._write(tuple(entries))
@@ -342,6 +420,7 @@ class ExecutionJournal:
                 expected_order_count=entry.expected_order_count,
                 order_ids=tuple(order.order_id for order in observed),
                 perm_ids=tuple(order.perm_id for order in observed),
+                snapshot_captured_at=entry.snapshot_captured_at,
             )
             entries[index] = updated
             reconciled.append(updated)
@@ -370,6 +449,7 @@ class ExecutionJournal:
                     expected_order_count=int(item.get("expected_order_count", 0)),
                     order_ids=tuple(int(value) for value in item.get("order_ids", ())),
                     perm_ids=tuple(int(value) for value in item.get("perm_ids", ())),
+                    snapshot_captured_at=str(item.get("snapshot_captured_at", "")),
                 )
                 for item in payload
             )

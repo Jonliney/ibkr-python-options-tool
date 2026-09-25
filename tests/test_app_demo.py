@@ -37,6 +37,7 @@ from ibkr_options_manager.execution import (
     JournalEntry,
     MarketExitCandidate,
     PaperExecutionService,
+    PriceUpdateCandidate,
 )
 from ibkr_options_manager.portfolio import PortfolioCoordinator, PortfolioStatus
 from ibkr_options_manager.snapshot import SnapshotCoordinator, SnapshotStatus
@@ -158,7 +159,9 @@ def test_launch_connection_failure_stays_in_the_retry_dialog_without_a_toast() -
     assert "Retry connection" in page.text
     assert "<dialog" in page.text
     assert "data-dialog" in page.text
-    assert "Dismiss toast" not in page.text
+    # The official Toaster remains mounted for later action feedback, but the
+    # launch failure is intentionally shown only in the blocking Dialog.
+    assert "TWS did not respond" not in page.text
 
 
 def test_retry_connection_waits_for_one_terminal_refresh_response() -> None:
@@ -199,6 +202,8 @@ def test_status_updates_render_as_short_toasts_not_workspace_copy() -> None:
     assert "Execution blocked" in page.text
     assert "Build and manage app-owned OCA layers." in page.text
     assert "Dismiss toast" in page.text
+    # Action rerenders must replace an already-hydrated empty toast signal.
+    assert "data-signals='{toasts:" in page.text
     assert "data-signals:toasts__ifmissing" in page.text
     assert "document.startViewTransition" not in page.text
 
@@ -507,6 +512,99 @@ def test_active_layer_prefers_configured_percentage_over_rounded_inverse() -> No
     assert percentage == "20"
 
 
+def test_active_layer_keeps_an_acknowledged_stop_display_until_tws_refreshes_it(
+) -> None:
+    """An immediate post-write snapshot must not visually undo a 0% stop."""
+    from ibkr_options_manager.app.view_model import WorkingOrderLine
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._paper_execution = _OwnedOrderService({101, 102})
+    workbench._state = replace(
+        workbench._state,
+        working_orders=(
+            WorkingOrderLine(
+                perm_id=101,
+                order_id=11,
+                action="SELL",
+                order_type="LMT",
+                remaining="4",
+                status="Submitted",
+                oca_group="acknowledged/tranche-1",
+                limit_price=Decimal("3.30"),
+                tif="GTC",
+            ),
+            WorkingOrderLine(
+                perm_id=102,
+                order_id=12,
+                action="SELL",
+                order_type="STP",
+                remaining="4",
+                status="Submitted",
+                oca_group="acknowledged/tranche-1",
+                stop_price=Decimal("2.06"),
+                tif="GTC",
+            ),
+        ),
+    )
+
+    # TWS has acknowledged a B/E amendment, but the first automatic snapshot
+    # still carries the prior $2.06 stop price.
+    workbench._remember_pending_active_prices_locked(
+        target_perm_id=101,
+        stop_perm_id=102,
+        target_price=None,
+        stop_price=Decimal("2.74"),
+    )
+    page = TestClient(workbench.app).get(workbench.path)
+
+    assert 'name="active_stop_101"' in page.text
+    assert 'value="0.0" name="active_stop_101"' in page.text
+    assert "$2.74" in page.text
+
+    # The local display override disappears once a later TWS snapshot carries
+    # the broker-confirmed B/E stop price.
+    workbench._state = replace(
+        workbench._state,
+        working_orders=(
+            workbench._state.working_orders[0],
+            replace(workbench._state.working_orders[1], stop_price=Decimal("2.74")),
+        ),
+    )
+    workbench._reconcile_pending_active_prices_locked()
+
+    assert workbench._pending_active_prices == {}
+
+
+def test_price_update_confirmation_uses_the_shared_cancel_confirm_bar() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    layer = MarketExitCandidate(
+        account=DEMO_ACCOUNT,
+        con_id=workbench._selected_con_id or 0,
+        target_order_id=11,
+        target_perm_id=101,
+        client_id=17,
+        quantity=Decimal("4"),
+        tif="GTC",
+        oca_group="example/tranche-1",
+        stop_order_id=12,
+        stop_perm_id=102,
+    )
+    workbench._armed_price_updates = (
+        PriceUpdateCandidate(layer=layer, stop_price=Decimal("2.74")),
+    )
+
+    sidebar = TestClient(workbench.app).get(workbench.path).text.split(
+        "ACTION REVIEW", maxsplit=1
+    )[1]
+
+    assert 'value="price-update-confirm"' in sidebar
+    assert ">Cancel<" in sidebar
+    assert ">Confirm<" in sidebar
+    assert "Click to confirm" not in sidebar
+
+
 def test_close_all_review_lists_pair_cancellations_then_one_market_order() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -550,7 +648,7 @@ def test_close_all_review_lists_pair_cancellations_then_one_market_order() -> No
     assert "SELL MKT" in sidebar
     assert "text-emerald-400" in sidebar
     assert "15 contracts" in sidebar
-    assert "Click to confirm close all" in sidebar
+    assert ">Confirm<" in sidebar
     assert ">Cancel<" in sidebar
     assert "Wait for both cancellation confirmations" not in sidebar
     assert "Selected app-owned OCA layer" not in sidebar
@@ -587,7 +685,7 @@ def test_delete_active_layer_review_cancels_only_that_oca_bracket() -> None:
     assert "CANCEL BRACKET" in sidebar
     assert "example/tranche-1" in sidebar
     assert "SELL MKT" not in sidebar
-    assert "Confirm deletion" in sidebar
+    assert ">Confirm<" in sidebar
     assert ">Cancel<" in sidebar
 
 
@@ -785,7 +883,7 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
     )
 
     assert armed.status_code == 200
-    assert "Click to confirm" in armed.text
+    assert ">Confirm<" in armed.text
     assert "Fresh paper snapshot verified" in armed.text
 
     submitted = client.post(
@@ -883,11 +981,11 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
             phase = 2
             click_button("Execute paper order")
         elif phase == 2:
-            if "Click to confirm" not in body:
+            if "Confirm" not in body:
                 finish("Execute paper order did not arm its confirmation")
                 return
             phase = 3
-            click_button("Click to confirm")
+            click_button("Confirm")
         elif phase == 3:
             if "Paper submission acknowledged for 4 orders" not in body:
                 finish("Paper execution did not render its acknowledgement")

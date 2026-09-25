@@ -806,3 +806,51 @@ def test_unknown_submission_recovers_a_surviving_complete_pair_after_sibling_can
         account=snapshot.selected.account,
         con_id=snapshot.selected.con_id,
     ) == frozenset({203, 204})
+
+
+def test_recreates_a_cancelled_partially_reconciled_draft_fingerprint(tmp_path) -> None:
+    """A fresh snapshot may replace a known app attempt only after it is absent."""
+    snapshot = _snapshot()
+    plan = _two_pair_plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.record_submission(
+        plan.fingerprint,
+        order_ids=(101, 102, 103, 104),
+        perm_ids=(201, 202, 203, 204),
+    )
+
+    # The previously-reconciled second pair has subsequently been cancelled in
+    # TWS, so the exact current snapshot contains none of the prior perm IDs.
+    surviving_target = WorkingOrder(
+        perm_id=203,
+        client_id=17,
+        order_id=103,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("3"),
+        status="Submitted",
+        oca_group=f"{plan.fingerprint[:12]}/tranche-2",
+        tif="GTC",
+    )
+    journal.reconcile_snapshot(
+        replace(
+            snapshot,
+            working_orders=(
+                surviving_target,
+                replace(surviving_target, perm_id=204, order_id=104, order_type="STP"),
+            ),
+        )
+    )
+
+    replacement = journal.begin(
+        replace(snapshot, captured_at=Decimal("1")),
+        plan,
+    )
+
+    assert replacement.state == "PREPARED"
+    entries = journal._entries()
+    assert entries[-2].state == "SUPERSEDED"
+    assert journal.find(plan.fingerprint) == replacement

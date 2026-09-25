@@ -114,6 +114,13 @@ class StarUIWorkbench:
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
         self._armed_cancellation: MarketExitCandidate | None = None
         self._armed_price_updates: tuple[PriceUpdateCandidate, ...] = ()
+        # TWS can acknowledge a price amendment before its next open-order
+        # snapshot reflects it. Retain only that acknowledged presentation
+        # value until the broker snapshot catches up; execution still always
+        # re-verifies the broker snapshot rather than trusting this display.
+        self._pending_active_prices: dict[
+            int, tuple[Decimal | None, int, Decimal | None]
+        ] = {}
         self._preferred_con_id = initial_con_id
         self._selected_con_id: int | None = None
         self._state = view_model.empty()
@@ -397,7 +404,7 @@ class StarUIWorkbench:
             self._message = "Execution blocked: refresh and validation did not produce a sendable paper draft."
             return
         self._armed_execution = candidate
-        self._message = "Fresh paper snapshot verified. Click to confirm sends the reviewed OCA orders."
+        self._message = "Fresh paper snapshot verified. Review the order plan, then confirm."
 
     def _confirm_execution_locked(self) -> None:
         armed = self._armed_execution
@@ -473,7 +480,7 @@ class StarUIWorkbench:
         self._armed_market_exits = (candidate,)
         self._message = (
             f"Fresh paper snapshot verified. Review the MKT exit for "
-            f"{candidate.quantity} contracts, then click to confirm."
+            f"{candidate.quantity} contracts, then confirm."
         )
 
     def _arm_cancellation_locked(self, target_perm_id: int) -> None:
@@ -593,7 +600,7 @@ class StarUIWorkbench:
         total = sum((candidate.quantity for candidate in candidates), Decimal("0"))
         self._message = (
             f"Fresh paper snapshot verified. Review cancellation of {len(candidates)} OCA "
-            f"layers and one MKT sell for {total} contracts, then click to confirm."
+            f"layers and one MKT sell for {total} contracts, then confirm."
         )
 
     def _confirm_market_exit_locked(self) -> None:
@@ -769,7 +776,7 @@ class StarUIWorkbench:
         )
         self._message = (
             f"Fresh paper snapshot verified. Review {changed_legs} selected price "
-            "amendments, then click to confirm."
+            "amendments, then confirm."
         )
 
     def _confirm_price_updates_locked(self) -> None:
@@ -812,6 +819,13 @@ class StarUIWorkbench:
         except Exception as error:
             self._message = f"Price update outcome is unknown: {error}"
         else:
+            for update in updates:
+                self._remember_pending_active_prices_locked(
+                    target_perm_id=update.layer.target_perm_id,
+                    stop_perm_id=update.layer.stop_perm_id,
+                    target_price=update.target_price,
+                    stop_price=update.stop_price,
+                )
             self._refresh_after_acknowledged_write_locked(
                 f"TWS acknowledged {len(receipt.entry.order_ids)} app-owned OCA "
                 "price amendment(s)."
@@ -822,6 +836,7 @@ class StarUIWorkbench:
     def _apply_state_locked(self, state: ViewState) -> None:
         self._state = state
         self._selected_con_id = state.selected_con_id
+        self._reconcile_pending_active_prices_locked()
         self._ensure_draft_locked()
         if state.status is UiStatus.READY:
             self._message = "Verified broker state is ready for read-only planning."
@@ -835,6 +850,51 @@ class StarUIWorkbench:
                 if blocking
                 else state.status_message
             )
+
+    def _remember_pending_active_prices_locked(
+        self,
+        *,
+        target_perm_id: int,
+        stop_perm_id: int,
+        target_price: Decimal | None,
+        stop_price: Decimal | None,
+    ) -> None:
+        """Retain a TWS-acknowledged amendment through one lagging snapshot."""
+        if target_price is None and stop_price is None:
+            return
+        prior = self._pending_active_prices.get(target_perm_id)
+        self._pending_active_prices[target_perm_id] = (
+            target_price if target_price is not None else (prior[0] if prior else None),
+            stop_perm_id,
+            stop_price if stop_price is not None else (prior[2] if prior else None),
+        )
+
+    def _reconcile_pending_active_prices_locked(self) -> None:
+        """Drop presentation overrides as soon as TWS confirms the new prices."""
+        if not self._pending_active_prices:
+            return
+        orders_by_perm = {order.perm_id: order for order in self._state.working_orders}
+        pending: dict[int, tuple[Decimal | None, int, Decimal | None]] = {}
+        for target_perm_id, (target_price, stop_perm_id, stop_price) in (
+            self._pending_active_prices.items()
+        ):
+            target = orders_by_perm.get(target_perm_id)
+            stop = orders_by_perm.get(stop_perm_id)
+            if target is None or stop is None:
+                continue
+            unresolved_target = (
+                target_price if target_price is not None and target.limit_price != target_price else None
+            )
+            unresolved_stop = (
+                stop_price if stop_price is not None and stop.stop_price != stop_price else None
+            )
+            if unresolved_target is not None or unresolved_stop is not None:
+                pending[target_perm_id] = (
+                    unresolved_target,
+                    stop_perm_id,
+                    unresolved_stop,
+                )
+        self._pending_active_prices = pending
 
     def _record_refresh_time_locked(self) -> None:
         """Show the local time of the last completed broker snapshot attempt."""
@@ -1019,25 +1079,32 @@ class StarUIWorkbench:
 
     def _toast_component(self) -> Any:
         notice = self._toast
-        if notice is None:
-            return None
-        # The official Toaster consumes its `toasts` Datastar signal. Seed it
-        # in the initial page response rather than invoking its JS helper
-        # before Datastar has hydrated that signal in the embedded WebEngine.
-        initial_toasts = [
-            {
-                "id": 1,
-                "title": notice.title,
-                "description": notice.description,
-                "variant": notice.variant,
-                "timestamp": 1,
-                "order": 0,
-            },
-            None,
-            None,
-        ]
+        # Keep the official Toaster mounted on every response so the embedded
+        # Datastar runtime always has its signal and close button. A normal
+        # Toaster uses an ``ifmissing`` signal, which is right for initial
+        # hydration but intentionally does not replace a pre-existing signal
+        # after an action rerender. The explicit non-ifmissing signal below is
+        # the documented server-side update path for each new notice.
+        initial_toasts = (
+            [
+                {
+                    "id": 1,
+                    "title": notice.title,
+                    "description": notice.description,
+                    "variant": notice.variant,
+                    "timestamp": 1,
+                    "order": 0,
+                },
+                None,
+                None,
+            ]
+            if notice is not None
+            else None
+        )
         return Div(
-            Signal("toasts", initial_toasts),
+            Signal("toasts", initial_toasts, ifmissing=False)
+            if initial_toasts is not None
+            else None,
             Toaster(position="top-right"),
         )
 
@@ -1470,21 +1537,29 @@ class StarUIWorkbench:
     def _active_layer_row(self, index: int, _group: str, target: Any, stop: Any) -> Any:
         calculator = self._state.quote_calculator
         bands = calculator.bands if calculator is not None else ()
+        pending = self._pending_active_prices.get(target.perm_id)
+        display_target_price = pending[0] if pending and pending[0] is not None else target.limit_price
+        display_stop_price = pending[2] if pending and pending[2] is not None else stop.stop_price
         target_percentage = _active_percentage_for_price(
-            target.limit_price,
+            display_target_price,
             self._state.unit_basis,
             target=True,
             bands=bands,
             presets=_parse_presets(self._target_presets, maximum=Decimal("1000")) or (),
         )
         stop_percentage = _active_percentage_for_price(
-            stop.stop_price,
+            display_stop_price,
             self._state.unit_basis,
             target=False,
             bands=bands,
             presets=_parse_presets(self._stop_presets, maximum=Decimal("100")) or (),
         )
-        gain, loss = self._active_layer_projection(target, stop)
+        gain, loss = self._active_layer_projection(
+            target,
+            stop,
+            target_price=display_target_price,
+            stop_price=display_stop_price,
+        )
         return _layer_row_layout(
             index=index,
             target_field=_percentage_price_field(
@@ -1498,13 +1573,13 @@ class StarUIWorkbench:
                     step="0.1",
                     data_active_input="target",
                     data_active_perm_id=target.perm_id,
-                    data_active_original=target.limit_price,
+                    data_active_original=display_target_price,
                     data_active_initial=target_percentage,
                     data_live_layer=index,
                     cls="pr-8",
                 ),
                 input_id=f"active-target-{index}",
-                price=_price_text(target.limit_price),
+                price=_price_text(display_target_price),
                 outcome=gain,
                 outcome_label="gain",
                 tone="text-emerald-400",
@@ -1523,13 +1598,13 @@ class StarUIWorkbench:
                     step="0.1",
                     data_active_input="stop",
                     data_active_perm_id=target.perm_id,
-                    data_active_original=stop.stop_price,
+                    data_active_original=display_stop_price,
                     data_active_initial=stop_percentage,
                     data_live_layer=index,
                     cls="pr-8",
                 ),
                 input_id=f"active-stop-{index}",
-                price=_price_text(stop.stop_price),
+                price=_price_text(display_stop_price),
                 outcome=loss,
                 outcome_label="max loss",
                 tone="text-rose-400",
@@ -1570,12 +1645,19 @@ class StarUIWorkbench:
             ),
         )
 
-    def _active_layer_projection(self, target: Any, stop: Any) -> tuple[str, str]:
+    def _active_layer_projection(
+        self,
+        target: Any,
+        stop: Any,
+        *,
+        target_price: Decimal | None,
+        stop_price: Decimal | None,
+    ) -> tuple[str, str]:
         basis = self._state.unit_basis
         multiplier = self._state.multiplier
         if basis is None or multiplier is None:
             return "—", "—"
-        if target.limit_price is None or stop.stop_price is None:
+        if target_price is None or stop_price is None:
             return "—", "—"
         try:
             quantity = Decimal(str(target.remaining))
@@ -1583,8 +1665,8 @@ class StarUIWorkbench:
             return "—", "—"
         if quantity <= 0:
             return "—", "—"
-        gain = (target.limit_price - basis) * multiplier * quantity
-        loss = (stop.stop_price - basis) * multiplier * quantity
+        gain = (target_price - basis) * multiplier * quantity
+        loss = (stop_price - basis) * multiplier * quantity
         return _money(gain), _money(loss)
 
     def _coverage_alert(
@@ -1968,84 +2050,23 @@ class StarUIWorkbench:
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
         if self._armed_cancellation is not None:
-            return Form(
-                Div(
-                    Button(
-                        "Cancel",
-                        variant="outline",
-                        type="submit",
-                        name="action",
-                        value="cancel-staged",
-                        cls="flex-1",
-                    ),
-                    Button(
-                        "Confirm deletion",
-                        variant="destructive",
-                        type="submit",
-                        name="action",
-                        value="cancel-pair-confirm",
-                        data_busy_text="Deleting…",
-                        cls="flex-[2]",
-                    ),
-                    cls="flex gap-2",
-                ),
-                action=f"/{self.session_token}/action",
-                method="post",
-                cls="mx-4 mb-4 w-[calc(100%-2rem)]",
+            return self._staged_action_controls(
+                confirm_action="cancel-pair-confirm",
+                confirm_variant="destructive",
+                busy_text="Cancelling…",
             )
         if market_exits:
-            return Form(
-                Div(
-                    Button(
-                        "Cancel",
-                        variant="outline",
-                        type="submit",
-                        name="action",
-                        value="cancel-staged",
-                        cls="flex-1",
-                    ),
-                    Button(
-                        "Click to confirm close all",
-                        variant="destructive",
-                        type="submit",
-                        name="action",
-                        value="market-exit-confirm",
-                        data_busy_text="Submitting…",
-                        cls="flex-[2]",
-                    ),
-                    cls="flex gap-2",
-                ),
-                action=f"/{self.session_token}/action",
-                method="post",
-                cls="mx-4 mb-4 w-[calc(100%-2rem)]",
+            return self._staged_action_controls(
+                confirm_action="market-exit-confirm",
+                confirm_variant="destructive",
             )
         if self._armed_price_updates:
-            return Form(
-                Button(
-                    "Click to confirm price updates",
-                    variant="destructive",
-                    type="submit",
-                    data_busy_text="Submitting…",
-                    cls="w-full",
-                ),
-                HTMLInput(type="hidden", name="action", value="price-update-confirm"),
-                action=f"/{self.session_token}/action",
-                method="post",
-                cls="mx-4 mb-4 w-[calc(100%-2rem)]",
+            return self._staged_action_controls(
+                confirm_action="price-update-confirm",
             )
         if self._armed_execution is not None:
-            return Div(
-                Button(
-                    "Click to confirm",
-                    variant="destructive",
-                    type="submit",
-                    name="action",
-                    value="execute-confirm",
-                    form="draft-form",
-                    data_busy_text="Submitting…",
-                    cls="w-full",
-                ),
-                cls="mx-4 mb-4 w-[calc(100%-2rem)]",
+            return self._staged_action_controls(
+                confirm_action="execute-confirm",
             )
         can_execute_draft = (
             self._paper_execution is not None
@@ -2086,6 +2107,40 @@ class StarUIWorkbench:
             )
             if self._active_oca_pairs()
             else None,
+            cls="mx-4 mb-4 w-[calc(100%-2rem)]",
+        )
+
+    def _staged_action_controls(
+        self,
+        *,
+        confirm_action: str,
+        confirm_variant: str = "default",
+        busy_text: str = "Submitting…",
+    ) -> Any:
+        """One deliberate Cancel / Confirm bar for every staged order change."""
+        return Form(
+            Div(
+                Button(
+                    "Cancel",
+                    variant="outline",
+                    type="submit",
+                    name="action",
+                    value="cancel-staged",
+                    cls="flex-1",
+                ),
+                Button(
+                    "Confirm",
+                    variant=confirm_variant,
+                    type="submit",
+                    name="action",
+                    value=confirm_action,
+                    data_busy_text=busy_text,
+                    cls="flex-[2]",
+                ),
+                cls="flex gap-2",
+            ),
+            action=f"/{self.session_token}/action",
+            method="post",
             cls="mx-4 mb-4 w-[calc(100%-2rem)]",
         )
 
