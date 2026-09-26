@@ -1047,7 +1047,7 @@ class StarUIWorkbench:
 
     def _record_refresh_time_locked(self) -> None:
         """Show the local time of the last completed broker snapshot attempt."""
-        self._last_refreshed_at = datetime.now().astimezone().strftime("%H:%M")
+        self._last_refreshed_at = datetime.now().astimezone().strftime("%H:%M:%S")
 
     def _announce_reconciliation_locked(self) -> None:
         """Recover app-owned OCA pairs observed after an interrupted send."""
@@ -2069,22 +2069,6 @@ class StarUIWorkbench:
         app_order_count: int,
         order_count: int,
     ) -> Any:
-        if coverage == "app":
-            available = self._state.available_quantity
-            coverage_message = (
-                f"{app_order_count} app-created orders were reconciled with TWS. "
-                "This position is fully covered; a new bracket will not be created."
-                if available == 0
-                else (
-                    f"{app_order_count} app-created orders were reconciled with TWS. "
-                    f"{available} contracts remain available for a new bracket."
-                )
-            )
-            return Alert(
-                AlertTitle("App-managed OCA coverage active"),
-                AlertDescription(coverage_message),
-                cls="mb-5 border-emerald-500/40 bg-emerald-500/10 text-emerald-100",
-            )
         if coverage == "mixed":
             return Alert(
                 AlertTitle("Mixed order coverage detected"),

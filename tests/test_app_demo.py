@@ -363,7 +363,7 @@ def test_demo_draft_has_no_separate_preview_action() -> None:
     assert "Preview current draft" not in page.text
 
 
-def test_reconciled_app_orders_are_not_described_as_external_coverage() -> None:
+def test_reconciled_app_orders_do_not_show_a_coverage_alert() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
     workbench._paper_execution = _OwnedOrderService({496_248_334})
@@ -371,9 +371,8 @@ def test_reconciled_app_orders_are_not_described_as_external_coverage() -> None:
 
     page = client.get(workbench.path)
 
-    assert "App-managed OCA coverage active" in page.text
-    assert "1 app-created orders were reconciled with TWS" in page.text
-    assert "5 contracts remain available for a new bracket" in page.text
+    assert "App-managed OCA coverage active" not in page.text
+    assert "app-created orders were reconciled with TWS" not in page.text
     assert "Associated external orders remain inspect-only" not in page.text
 
 
@@ -567,8 +566,7 @@ def test_partial_journal_reconciliation_keeps_surviving_pair_active_in_the_ui(
 
     page = TestClient(workbench.app).get(workbench.path)
 
-    assert "App-managed OCA coverage active" in page.text
-    assert "4 contracts remain available for a new bracket" in page.text
+    assert "App-managed OCA coverage active" not in page.text
     assert "Existing order coverage detected" not in page.text
     assert "Active OCA layers" in page.text
     assert "OCA-1" in page.text
@@ -1028,7 +1026,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     page = client.get(workbench.path)
     assert page.status_code == 200
     assert "Layered OCA draft" in page.text
-    assert "Last refreshed " in page.text
+    assert re.search(r"Last refreshed \d{2}:\d{2}:\d{2}", page.text)
     assert "Verified 0.0 s" not in page.text
     assert "Each layer creates one SELL LMT + SELL STP OCA pair." not in page.text
     assert "Transmission locked" not in page.text
