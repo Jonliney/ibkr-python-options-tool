@@ -1,41 +1,29 @@
-.be-action-group[data-reset-visible="true"] [data-move-stops-to-be] {
-  border-top-right-radius: 0;
-  border-bottom-right-radius: 0;
-}
-
-.be-reset-slot {
-  width: 0;
+.price-edit-reset {
+  max-height: 0;
+  margin-bottom: 0;
   overflow: hidden;
   opacity: 0;
-  transform: translateX(-8px);
+  transform: translateY(7px);
   pointer-events: none;
   transition:
-    width 180ms ease-out,
-    margin-left 180ms ease-out,
-    opacity 150ms ease-out,
-    transform 180ms ease-out;
+    max-height 160ms cubic-bezier(0.16, 1, 0.3, 1),
+    margin-bottom 160ms cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 110ms ease-out,
+    transform 160ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-.be-reset-slot[data-reset-visible="true"] {
-  width: 33px;
-  margin-left: -1px;
+.price-edit-reset[data-reset-visible="true"] {
+  max-height: 3rem;
+  margin-bottom: 0.75rem;
   opacity: 1;
-  transform: translateX(0);
+  transform: translateY(0);
   pointer-events: auto;
 }
 
-.be-reset-button {
-  width: 33px;
-  min-width: 33px;
-  height: 32px;
-  padding: 0;
-  border-top-left-radius: 0;
-  border-bottom-left-radius: 0;
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .be-reset-slot {
-    transition: none;
+  .price-edit-reset {
+    transform: none;
+    transition: opacity 100ms ease-out;
   }
 }
 

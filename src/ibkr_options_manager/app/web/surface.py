@@ -1958,36 +1958,16 @@ class StarUIWorkbench:
 
         return Form(
             Div(
-                Div(
-                    Button(
-                        "Move stop to B/E",
-                        variant="outline",
-                        size="sm",
-                        type="button",
-                        data_move_stops_to_be=True,
-                        disabled=(
-                            self._paper_execution is None
-                            or bool(self._armed_price_updates)
-                        ),
+                Button(
+                    "Move stop to B/E",
+                    variant="outline",
+                    size="sm",
+                    type="button",
+                    data_move_stops_to_be=True,
+                    disabled=(
+                        self._paper_execution is None
+                        or bool(self._armed_price_updates)
                     ),
-                    Div(
-                        Button(
-                            Icon("lucide:refresh-ccw"),
-                            variant="outline",
-                            size="sm",
-                            type="button",
-                            data_reset_active_prices=True,
-                            aria_label="Reset active layer price fields",
-                            title="Reset active layer price fields",
-                            disabled=True,
-                            cls="be-reset-button",
-                        ),
-                        cls="be-reset-slot",
-                        data_reset_visible="false",
-                        aria_hidden="true",
-                    ),
-                    cls="be-action-group inline-flex items-center",
-                    data_reset_visible="false",
                 ),
                 Button(
                     "Close working",
@@ -2790,6 +2770,23 @@ class StarUIWorkbench:
         return Div(
             Div(
                 Button(
+                    "Discard price edits",
+                    variant="outline",
+                    size="sm",
+                    type="button",
+                    data_reset_active_prices=True,
+                    disabled=True,
+                    cls="w-full",
+                ),
+                cls="price-edit-reset w-full",
+                data_price_edit_reset=True,
+                data_reset_visible="false",
+                aria_hidden="true",
+            )
+            if self._active_oca_pairs()
+            else None,
+            Div(
+                Button(
                     "Execute paper order",
                     variant="default",
                     type="submit",
@@ -2821,7 +2818,7 @@ class StarUIWorkbench:
             )
             if self._active_oca_pairs()
             else None,
-            cls="mx-4 mb-4 flex w-[calc(100%-2rem)] flex-col gap-3",
+            cls="mx-4 mb-4 flex w-[calc(100%-2rem)] flex-col",
         )
 
     def _staged_action_controls(
@@ -3291,12 +3288,13 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       if (empty) empty.classList.toggle('hidden', changed);
       document.querySelectorAll('[data-active-execute]').forEach((button) => {{ button.disabled = !changed; }});
       const resetVisible = edited && !form.querySelector('[data-active-input]:disabled');
-      form.querySelectorAll('[data-reset-active-prices]').forEach((button) => {{ button.disabled = !resetVisible; }});
-      form.querySelectorAll('.be-reset-slot').forEach((slot) => {{
+      document.querySelectorAll('[data-reset-active-prices]').forEach((button) => {{
+        button.disabled = !resetVisible;
+      }});
+      document.querySelectorAll('[data-price-edit-reset]').forEach((slot) => {{
         slot.dataset.resetVisible = String(resetVisible);
         slot.setAttribute('aria-hidden', String(!resetVisible));
       }});
-      form.querySelectorAll('.be-action-group').forEach((group) => {{ group.dataset.resetVisible = String(resetVisible); }});
       setReviewMode(changed);
       window.ibkrProjection?.updateActive(outcomes, invalid);
     }};
@@ -3306,7 +3304,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{ input.value = '0'; }});
       update();
     }}));
-    form.querySelectorAll('[data-reset-active-prices]').forEach((button) => button.addEventListener('click', () => {{
+    document.querySelectorAll('[data-reset-active-prices]').forEach((button) => button.addEventListener('click', () => {{
       form.querySelectorAll('[data-active-input]').forEach((input) => {{
         input.value = input.dataset.activeInitial || '';
       }});

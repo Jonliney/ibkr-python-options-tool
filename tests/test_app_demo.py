@@ -480,7 +480,15 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert "$16.40" in page.text
     assert "Move stop to B/E" in page.text
     assert "data-reset-active-prices" in page.text
-    assert 'aria-label="Reset active layer price fields"' in page.text
+    assert "Discard price edits" in page.text
+    active_form = page.text.split('id="active-form"', maxsplit=1)[1].split(
+        "</form>", maxsplit=1
+    )[0]
+    assert 'data-reset-active-prices="true"' not in active_form
+    review_footer = page.text.rsplit('data-reset-active-prices', maxsplit=1)[1]
+    assert review_footer.index('Discard price edits') < review_footer.index(
+        'data-active-execute'
+    )
     assert "Update layers" not in page.text
     assert "Close working" in page.text
     assert 'data-layer-state="draft"' in page.text
@@ -1079,8 +1087,10 @@ def test_reset_active_prices_restores_target_and_stop_after_move_to_be() -> None
         'data-live-layer="1" data-active-initial="25" '
         'data-active-original="7.5" value="25">'
         '<button type="button" data-move-stops-to-be>Move stop to B/E</button>'
-        '<button type="button" data-reset-active-prices disabled>Reset</button>'
-        f"<script>{script}</script></form>"
+        '</form><div data-price-edit-reset data-reset-visible="false" aria-hidden="true">'
+        '<button type="button" data-reset-active-prices disabled>Discard price edits</button>'
+        '</div>'
+        f"<script>{script}</script>"
     )
 
     def inspect(loaded: bool) -> None:
@@ -1092,12 +1102,13 @@ def test_reset_active_prices_restores_target_and_stop_after_move_to_be() -> None
               const target = document.querySelector('[data-active-input="target"]');
               const stop = document.querySelector('[data-active-input="stop"]');
               const reset = document.querySelector('[data-reset-active-prices]');
+              const slot = document.querySelector('[data-price-edit-reset]');
               target.value = '60';
               target.dispatchEvent(new Event('input', { bubbles: true }));
               document.querySelector('[data-move-stops-to-be]').click();
-              const afterMove = [target.value, stop.value, reset.disabled];
+              const afterMove = [target.value, stop.value, reset.disabled, slot.dataset.resetVisible];
               reset.click();
-              return JSON.stringify({ afterMove, afterReset: [target.value, stop.value, reset.disabled] });
+              return JSON.stringify({ afterMove, afterReset: [target.value, stop.value, reset.disabled, slot.dataset.resetVisible] });
             })()""",
             lambda value: (results.append(value), loop.quit()),
         )
@@ -1109,7 +1120,7 @@ def test_reset_active_prices_restores_target_and_stop_after_move_to_be() -> None
     view.close()
 
     assert results == [
-        '{"afterMove":["60","0",false],"afterReset":["50","25",true]}'
+        '{"afterMove":["60","0",false,"true"],"afterReset":["50","25",true,"false"]}'
     ]
 
 
