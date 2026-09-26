@@ -57,9 +57,7 @@ from .components.ui.badge import Badge
 from .components.ui.button import Button, ButtonVariant
 from .components.ui.card import (
     Card,
-    CardAction,
     CardContent,
-    CardDescription,
     CardHeader,
     CardTitle,
 )
@@ -1573,8 +1571,18 @@ class StarUIWorkbench:
     def _workspace(self, title: str) -> Any:
         coverage, app_order_count, order_count = self._order_coverage()
         active_pairs = self._active_oca_pairs()
-        pending = self._pending_submissions()
-        closed = self._closed_submissions()
+        outcomes = self._submission_outcomes()
+        active_target_ids = {target.perm_id for _group, target, _stop in active_pairs}
+        pending = tuple(
+            item
+            for item in outcomes
+            if item[2].status
+            in {"PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE"}
+            or (
+                item[2].status.startswith("CLOSED_")
+                and _journal_target_perm_id(item[0], item[1]) in active_target_ids
+            )
+        )
         return Div(
             self._coverage_alert(coverage, app_order_count, order_count),
             Div(
@@ -1604,21 +1612,15 @@ class StarUIWorkbench:
             ),
             Div(
                 ScrollArea(
-                    self._pending_layers_panel(pending) if pending else None,
-                    self._active_layers_panel() if active_pairs else None,
-                    self._closed_layers_panel(closed) if closed else None,
-                    Div(
-                        Separator(cls="flex-1"),
-                        Span(
-                            "New bracket layers",
-                            cls="text-xs font-semibold text-muted-foreground",
-                        ),
-                        Separator(cls="flex-1"),
-                        cls="my-6 flex items-center gap-3",
-                    )
-                    if active_pairs and not pending
+                    self._existing_layers_panel(active_pairs, outcomes)
+                    if active_pairs or outcomes
                     else None,
-                    self._draft_panel() if not pending else None,
+                    Div(
+                        self._draft_panel(),
+                        cls="mt-9" if active_pairs or outcomes else "",
+                    )
+                    if not pending
+                    else None,
                     aria_label="OCA layers workspace",
                     orientation="vertical",
                     cls="h-full",
@@ -1721,105 +1723,96 @@ class StarUIWorkbench:
             in {"PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE"}
         )
 
-    def _closed_submissions(self) -> tuple[tuple[JournalEntry, int, LayerOutcome], ...]:
-        return tuple(
-            item
-            for item in self._submission_outcomes()
-            if item[2].status.startswith("CLOSED_")
+    def _pending_layer_row(
+        self, number: int, entry: JournalEntry, index: int, outcome: LayerOutcome
+    ) -> Any:
+        layer = entry.layers[index]
+        heading = {
+            "PENDING": "Awaiting TWS verification",
+            "UNKNOWN": "Outcome not confirmed",
+            "PARTIAL": "Partially filled",
+            "NO_EXECUTION_EVIDENCE": "No fill evidence",
+            "CONFLICT": "Fill and working order conflict",
+        }[outcome.status]
+        detail = {
+            "PENDING": "Check TWS for Transmit or a working order, then Refresh.",
+            "UNKNOWN": "Inspect TWS before taking another action. Do not retry this draft.",
+            "PARTIAL": (
+                f"{format(outcome.filled_quantity, 'f')} of {layer.quantity} "
+                "contracts filled. Verify the remaining order in TWS."
+            ),
+            "NO_EXECUTION_EVIDENCE": (
+                "This layer is no longer shown as working, but TWS has not supplied "
+                "a matching execution. Check the TWS trade log."
+            ),
+            "CONFLICT": (
+                "A fill is recorded, but TWS still shows the pair as working. "
+                "Inspect TWS before taking another action."
+            ),
+        }[outcome.status]
+        return Div(
+            Div(
+                Span(f"LAYER {number}", cls="text-xs font-semibold"),
+                P("VERIFY", cls="mt-2 text-xs font-semibold text-amber-300"),
+                cls="min-w-20",
+            ),
+            Div(
+                Div(
+                    Span(heading, cls="text-sm font-semibold text-amber-300"),
+                    Badge("VERIFY IN TWS", variant="outline"),
+                    cls="flex items-center gap-3",
+                ),
+                P(detail, cls="mt-2 text-xs leading-5 text-muted-foreground"),
+                P(
+                    f"{layer.quantity} contracts · SELL LMT ${layer.target_price} "
+                    f"/ SELL STP ${layer.stop_price} · {layer.tif}",
+                    cls="mt-2 font-mono text-xs",
+                ),
+                cls="min-w-0",
+            ),
+            data_layer_state="verify",
+            cls="flex gap-3 border-t border-amber-500/40 bg-amber-500/5 py-4",
         )
 
-    def _pending_layers_panel(
-        self, items: tuple[tuple[JournalEntry, int, LayerOutcome], ...]
+    def _closed_layer_row(
+        self, number: int, entry: JournalEntry, index: int, outcome: LayerOutcome
     ) -> Any:
-        rows: list[Any] = []
-        for entry, index, outcome in items:
-            layer = entry.layers[index]
-            heading = {
-                "PENDING": "Awaiting TWS verification",
-                "UNKNOWN": "Outcome not confirmed",
-                "PARTIAL": "Partially filled",
-                "NO_EXECUTION_EVIDENCE": "No fill evidence",
-            }[outcome.status]
-            detail = {
-                "PENDING": "Check TWS for Transmit or a working order, then Refresh.",
-                "UNKNOWN": "Inspect TWS before taking another action. Do not retry this draft.",
-                "PARTIAL": (
-                    f"{format(outcome.filled_quantity, 'f')} of {layer.quantity} "
-                    "contracts filled. Verify the remaining order in TWS."
-                ),
-                "NO_EXECUTION_EVIDENCE": (
-                    "This layer is no longer shown as working, but TWS has not supplied "
-                    "a matching execution. Check the TWS trade log."
-                ),
-            }[outcome.status]
-            rows.append(
-                Div(
-                    Div(
-                        Span(
-                            f"Layer {index + 1} · {heading}",
-                            cls="text-sm font-semibold",
-                        ),
-                        Badge("VERIFY IN TWS", variant="outline"),
-                        cls="flex items-center justify-between gap-3",
-                    ),
-                    P(detail, cls="mt-2 text-xs leading-5 text-muted-foreground"),
-                    P(
-                        f"{layer.quantity} contracts · SELL LMT ${layer.target_price} "
-                        f"/ SELL STP ${layer.stop_price} · {layer.tif}",
-                        cls="mt-2 font-mono text-xs",
-                    ),
-                    cls="border-b border-border py-4 last:border-b-0",
-                )
-            )
-        title = (
-            "Active layers · pending TWS verification"
-            if all(outcome.status == "PENDING" for _entry, _index, outcome in items)
-            else "Active layers · TWS outcome unknown"
+        layer = entry.layers[index]
+        result = {
+            "CLOSED_PROFIT": "Profit",
+            "CLOSED_LOSS": "Loss",
+            "CLOSED_FLAT": "Flat",
+            "CLOSED_PNL_UNKNOWN": "P&L unavailable",
+        }[outcome.status]
+        pnl_text = (
+            f" · {outcome.currency} {outcome.realized_pnl:+,.2f}"
+            if outcome.realized_pnl is not None
+            else ""
         )
-        return Card(
-            CardHeader(CardTitle(title)),
-            CardContent(*rows),
-            cls="border-amber-500/40 bg-amber-500/5",
-        )
-
-    def _closed_layers_panel(
-        self, items: tuple[tuple[JournalEntry, int, LayerOutcome], ...]
-    ) -> Any:
-        rows: list[Any] = []
-        for entry, index, outcome in items:
-            layer = entry.layers[index]
-            result = {
-                "CLOSED_PROFIT": "Profit",
-                "CLOSED_LOSS": "Loss",
-                "CLOSED_FLAT": "Flat",
-                "CLOSED_PNL_UNKNOWN": "P&L unavailable",
-            }[outcome.status]
-            pnl_text = (
-                f" · {outcome.currency} {outcome.realized_pnl:+,.2f}"
-                if outcome.realized_pnl is not None
-                else ""
-            )
-            rows.append(
+        return Div(
+            Div(
+                Span(f"LAYER {number}", cls="text-xs font-semibold"),
+                P("SOLD", cls="mt-2 text-xs text-muted-foreground"),
+                cls="min-w-20",
+            ),
+            Div(
                 Div(
-                    Div(
-                        Span(
-                            f"Layer {index + 1} · {outcome.exit_side} filled",
-                            cls="text-sm font-semibold",
-                        ),
-                        Badge(f"{result}{pnl_text}", variant="outline"),
-                        cls="flex items-center justify-between gap-3",
+                    Span(
+                        f"{outcome.exit_side} filled",
+                        cls="text-sm font-medium text-muted-foreground",
                     ),
-                    P(
-                        f"{format(outcome.filled_quantity, 'f')} contracts closed · "
-                        f"planned LMT ${layer.target_price} / STP ${layer.stop_price}",
-                        cls="mt-2 font-mono text-xs text-muted-foreground",
-                    ),
-                    cls="border-b border-border py-4 last:border-b-0",
-                )
-            )
-        return Card(
-            CardHeader(CardTitle("Closed bracket history")),
-            CardContent(*rows),
+                    Badge(f"{result}{pnl_text}", variant="outline"),
+                    cls="flex flex-wrap items-center gap-3",
+                ),
+                P(
+                    f"{format(outcome.filled_quantity, 'f')} contracts closed · "
+                    f"planned LMT ${layer.target_price} / STP ${layer.stop_price}",
+                    cls="mt-2 font-mono text-xs text-muted-foreground",
+                ),
+                cls="min-w-0",
+            ),
+            data_layer_state="sold",
+            cls="flex gap-3 border-t border-border bg-card/30 py-4",
         )
 
     def _verified_selected_account(self) -> str:
@@ -1843,77 +1836,91 @@ class StarUIWorkbench:
             target.perm_id for _group, target, _stop in self._active_oca_pairs()
         )
 
-    def _active_layers_panel(self) -> Any:
-        pairs = self._active_oca_pairs()
-        if not pairs:
-            return Card(
-                CardHeader(
-                    CardTitle("No reconciled active layers"),
-                    CardDescription(
-                        "Refresh TWS to inspect OCA pairs created by this application."
-                    ),
-                ),
-            )
-        return Form(
-            Card(
-                CardHeader(
-                    Div(CardTitle("Active OCA layers")),
-                    CardAction(
-                        Div(
-                            Button(
-                                "Move stop to B/E",
-                                variant="outline",
-                                size="sm",
-                                type="button",
-                                data_move_stops_to_be=True,
-                                disabled=(
-                                    self._paper_execution is None
-                                    or bool(self._armed_price_updates)
-                                ),
-                            ),
-                            Button(
-                                "Close all",
-                                variant="destructive",
-                                size="sm",
-                                type="submit",
-                                name="action",
-                                value="market-exit-selected",
-                                disabled=(
-                                    self._paper_execution is None
-                                    or bool(self._armed_price_updates)
-                                ),
-                            ),
-                            cls="flex flex-wrap items-center justify-end gap-2",
-                        ),
-                    ),
-                ),
-                CardContent(
-                    P(
-                        "Proposed prices are shown below. TWS orders stay unchanged "
-                        "until you Confirm.",
-                        cls="mb-4 text-xs text-amber-300",
+    def _existing_layers_panel(
+        self,
+        pairs: tuple[tuple[str, Any, Any], ...],
+        outcomes: tuple[tuple[JournalEntry, int, LayerOutcome], ...],
+    ) -> Any:
+        """Keep journal layers in submission order as their broker state changes."""
+        pairs_by_target = {
+            target.perm_id: (group, target, stop) for group, target, stop in pairs
+        }
+        used_target_ids: set[int] = set()
+        rows: list[Any] = []
+        working_count = 0
+        for entry, index, outcome in outcomes:
+            target_id = _journal_target_perm_id(entry, index)
+            pair = pairs_by_target.get(target_id)
+            number = len(rows) + 1
+            if outcome.status == "ACTIVE" and pair is not None:
+                rows.append(self._active_layer_row(number, *pair))
+                used_target_ids.add(target_id)
+                working_count += 1
+            elif outcome.status.startswith("CLOSED_"):
+                if pair is not None:
+                    rows.append(
+                        self._pending_layer_row(
+                            number, entry, index, LayerOutcome("CONFLICT")
+                        )
                     )
-                    if self._armed_price_updates else None,
-                    Div(
-                        ScrollArea(
-                            Div(
-                                *[
-                                    self._active_layer_row(index, group, target, stop)
-                                    for index, (group, target, stop) in enumerate(
-                                        pairs, start=1
-                                    )
-                                ],
-                                cls="w-full min-w-[41rem]",
-                            ),
-                            aria_label="Active OCA layer rows",
-                            orientation="horizontal",
-                            cls="w-full",
-                        ),
-                        cls="min-w-0",
+                    used_target_ids.add(target_id)
+                else:
+                    rows.append(self._closed_layer_row(number, entry, index, outcome))
+            elif outcome.status in {
+                "PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE"
+            }:
+                rows.append(self._pending_layer_row(number, entry, index, outcome))
+                if pair is not None:
+                    used_target_ids.add(target_id)
+        for pair in pairs:
+            if pair[1].perm_id not in used_target_ids:
+                rows.append(self._active_layer_row(len(rows) + 1, *pair))
+                working_count += 1
+
+        return Form(
+            Div(
+                Button(
+                    "Move stop to B/E",
+                    variant="outline",
+                    size="sm",
+                    type="button",
+                    data_move_stops_to_be=True,
+                    disabled=(
+                        self._paper_execution is None
+                        or bool(self._armed_price_updates)
                     ),
                 ),
+                Button(
+                    "Close working",
+                    variant="destructive",
+                    size="sm",
+                    type="submit",
+                    name="action",
+                    value="market-exit-selected",
+                    disabled=(
+                        self._paper_execution is None
+                        or bool(self._armed_price_updates)
+                    ),
+                ),
+                cls="mb-3 flex flex-wrap items-center justify-end gap-2",
+            )
+            if working_count
+            else None,
+            P(
+                "Proposed prices are shown below. TWS orders stay unchanged "
+                "until you Confirm.",
+                cls="mb-4 text-xs text-amber-300",
+            )
+            if self._armed_price_updates else None,
+            ScrollArea(
+                Div(*rows, cls="w-full min-w-[41rem]"),
+                aria_label="Existing OCA layer rows",
+                orientation="horizontal",
+                cls="w-full",
             ),
-            Script(_live_active_script(self._live_active_configuration())),
+            Script(_live_active_script(self._live_active_configuration()))
+            if working_count
+            else None,
             id="active-form",
             action=f"/{self.session_token}/action",
             method="post",
@@ -1954,6 +1961,7 @@ class StarUIWorkbench:
         )
         return _layer_row_layout(
             index=index,
+            state="working",
             target_field=_percentage_price_field(
                 "LMT target",
                 Input(
@@ -2092,68 +2100,54 @@ class StarUIWorkbench:
     def _draft_panel(self) -> Any:
         layers = self._current_layers()
         return Form(
-            Card(
-                CardHeader(
+            ScrollArea(
+                Div(
+                    *[
+                        self._draft_layer_row(index, layer, len(layers))
+                        for index, layer in enumerate(layers, start=1)
+                    ],
                     Div(
-                        CardTitle("Layered OCA draft"),
-                    ),
-                    CardAction(
-                        Div(
-                            Button(
-                                "Split all available",
-                                variant="outline",
-                                size="sm",
-                                type="submit",
-                                name="action",
-                                value="equal-split-available",
-                            ),
-                            Button(
-                                "Split assigned",
-                                variant="outline",
-                                size="sm",
-                                type="submit",
-                                name="action",
-                                value="equal-split-assigned",
-                            ),
-                            Button(
-                                "Add layer",
-                                variant="secondary",
-                                size="sm",
-                                type="submit",
-                                name="action",
-                                value="add-layer",
-                                disabled=len(layers) >= self._state.available_quantity,
-                            ),
-                            cls="flex flex-wrap items-center justify-end gap-2",
+                        Span(
+                            f"{sum(_int_or_zero(layer.quantity) for layer in layers)} "
+                            f"of {self._state.available_quantity} contracts allocated",
+                            data_live_allocation=True,
+                            cls="text-xs text-muted-foreground",
                         ),
+                        cls="mt-3 flex justify-end",
                     ),
+                    cls="w-full min-w-[41rem]",
                 ),
-                CardContent(
-                    Div(
-                        ScrollArea(
-                            Div(
-                                *[
-                                    self._draft_layer_row(index, layer, len(layers))
-                                    for index, layer in enumerate(layers, start=1)
-                                ],
-                                Div(
-                                    Span(
-                                        f"{sum(_int_or_zero(layer.quantity) for layer in layers)} "
-                                        f"of {self._state.available_quantity} contracts allocated",
-                                        data_live_allocation=True,
-                                        cls="text-xs text-muted-foreground",
-                                    ),
-                                    cls="mt-5 flex justify-end",
-                                ),
-                                cls="w-full min-w-[41rem]",
-                            ),
-                            aria_label="Draft layer rows",
-                            orientation="horizontal",
-                            cls="w-full",
-                        ),
-                        cls="min-w-0",
-                    ),
+                aria_label="Draft layer rows",
+                orientation="horizontal",
+                cls="w-full",
+            ),
+            Div(
+                Button(
+                    "Split all available",
+                    variant="outline",
+                    size="sm",
+                    type="submit",
+                    name="action",
+                    value="equal-split-available",
                 ),
+                Button(
+                    "Split assigned",
+                    variant="outline",
+                    size="sm",
+                    type="submit",
+                    name="action",
+                    value="equal-split-assigned",
+                ),
+                Button(
+                    "Add layer",
+                    variant="secondary",
+                    size="sm",
+                    type="submit",
+                    name="action",
+                    value="add-layer",
+                    disabled=len(layers) >= self._state.available_quantity,
+                ),
+                cls="mt-4 flex flex-wrap items-center justify-end gap-2",
             ),
             HTMLInput(type="hidden", name="target_presets", value=self._target_presets),
             HTMLInput(type="hidden", name="stop_presets", value=self._stop_presets),
@@ -2206,6 +2200,7 @@ class StarUIWorkbench:
         gain, loss = self._layer_projection(layer)
         return _layer_row_layout(
             index=index,
+            state="draft",
             target_field=_percentage_price_field(
                 "LMT target",
                 Input(
@@ -3024,9 +3019,19 @@ def _field(
     )
 
 
+def _journal_target_perm_id(entry: JournalEntry, index: int) -> int:
+    layer = entry.layers[index]
+    if layer.target_perm_id:
+        return layer.target_perm_id
+    if len(entry.perm_ids) == len(entry.layers) * 2:
+        return entry.perm_ids[index * 2]
+    return 0
+
+
 def _layer_row_layout(
     *,
     index: int,
+    state: str,
     target_field: Any,
     stop_field: Any,
     quantity_field: Any,
@@ -3036,8 +3041,13 @@ def _layer_row_layout(
     """Keep draft and active OCA rows structurally identical."""
     return Div(
         Div(
-            Span(f"LAYER {index}", cls="text-xs font-semibold"),
-            P(f"OCA-{index}", cls="mt-2 text-xs text-muted-foreground"),
+            Span(
+                f"DRAFT {index}" if state == "draft" else f"LAYER {index}",
+                cls="text-xs font-semibold",
+            ),
+            P("WORKING", cls="mt-2 text-xs text-muted-foreground")
+            if state == "working"
+            else None,
             cls="min-w-20",
         ),
         target_field,
@@ -3045,6 +3055,7 @@ def _layer_row_layout(
         quantity_field,
         tif_field,
         action_field,
+        data_layer_state=state,
         # This is deliberately a shared, bundled grid utility: arbitrary
         # Tailwind values are not present in StarUI's precompiled stylesheet.
         cls="grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4 first:border-t-0",

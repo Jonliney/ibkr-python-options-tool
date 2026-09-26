@@ -467,16 +467,16 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
 
     page = client.get(workbench.path)
 
-    assert "Layered OCA draft" in page.text
+    assert "DRAFT 1" in page.text
     assert 'aria-label="OCA layers workspace"' in page.text
-    assert 'aria-label="Active OCA layer rows"' in page.text
-    assert "OCA-1" in page.text
+    assert 'aria-label="Existing OCA layer rows"' in page.text
+    assert 'data-layer-state="working"' in page.text
     assert "$26.20" in page.text
     assert "$16.40" in page.text
     assert "Move stop to B/E" in page.text
     assert "Update layers" not in page.text
-    assert "Close all" in page.text
-    assert "New bracket layers" in page.text
+    assert "Close working" in page.text
+    assert 'data-layer-state="draft"' in page.text
     assert 'name="active_target_101"' in page.text
     assert 'name="active_stop_101"' in page.text
     assert "data-active-review-row" in page.text
@@ -487,13 +487,14 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert 'title="Delete OCA bracket"' in page.text
     assert ">State<" not in page.text
     assert "requires a second confirmation" not in page.text
-    assert "Layered OCA draft" in page.text
+    assert "DRAFT 1" in page.text
     assert 'aria-current="page"' not in page.text
     assert 'data-active-initial="' in page.text
     assert 'data-live-price="active-target-1"' in page.text
     assert 'data-live-outcome="active-target-1"' in page.text
-    assert page.text.index("Active OCA layers") < page.text.index("New bracket layers")
-    assert page.text.index("New bracket layers") < page.text.index("Layered OCA draft")
+    assert page.text.index('data-layer-state="working"') < page.text.index(
+        'data-layer-state="draft"'
+    )
     assert "const targetEdited" in page.text
     active_script = _live_active_script(
         {"basis": "1", "multiplier": "100", "bands": []}
@@ -568,8 +569,8 @@ def test_partial_journal_reconciliation_keeps_surviving_pair_active_in_the_ui(
 
     assert "App-managed OCA coverage active" not in page.text
     assert "Existing order coverage detected" not in page.text
-    assert "Active OCA layers" in page.text
-    assert "OCA-1" in page.text
+    assert 'data-layer-state="working"' in page.text
+    assert "WORKING" in page.text
     assert 'value="3"' in page.text
 
 
@@ -646,13 +647,57 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
 
     page = TestClient(workbench.app).get(workbench.path)
 
-    assert "Closed bracket history" in page.text
+    assert 'data-layer-state="sold"' in page.text
     assert "Profit" in page.text
     assert "USD +557.44" in page.text
     assert "Target filled" in page.text
-    assert "Active OCA layers" in page.text
+    assert 'data-layer-state="working"' in page.text
+    assert page.text.index('data-layer-state="sold"') < page.text.index(
+        'data-layer-state="working"'
+    )
+    existing = page.text.split('id="active-form"', maxsplit=1)[1].split(
+        "</form>", maxsplit=1
+    )[0]
+    assert 'data-slot="card"' not in existing
     assert "pending TWS verification" not in page.text
     assert "TWS orders are pending verification" not in page.text
+
+    # A stale TWS working-order snapshot must not make the filled layer look
+    # editable or allow a new draft while the two sources disagree.
+    entry = journal.submission_entries(account=DEMO_ACCOUNT, con_id=selected)[0]
+    journal._write((replace(entry, perm_ids=(201, 202, 203, 204)),))
+    workbench._state = replace(
+        workbench._state,
+        working_orders=(
+            *workbench._state.working_orders,
+            WorkingOrderLine(
+                perm_id=201,
+                order_id=101,
+                action="SELL",
+                order_type="LMT",
+                remaining="3",
+                status="Submitted",
+                oca_group=f"{fingerprint[:12]}/tranche-1",
+                limit_price=Decimal("15.50"),
+                tif="GTC",
+            ),
+            WorkingOrderLine(
+                perm_id=202,
+                order_id=102,
+                action="SELL",
+                order_type="STP",
+                remaining="3",
+                status="Submitted",
+                oca_group=f"{fingerprint[:12]}/tranche-1",
+                stop_price=Decimal("9.70"),
+                tif="GTC",
+            ),
+        ),
+    )
+    conflict = TestClient(workbench.app).get(workbench.path)
+    assert "Fill and working order conflict" in conflict.text
+    assert 'data-layer-state="verify"' in conflict.text
+    assert 'data-layer-state="draft"' not in conflict.text
 
 
 def test_active_layer_prefers_configured_percentage_over_rounded_inverse() -> None:
@@ -1025,7 +1070,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
 
     page = client.get(workbench.path)
     assert page.status_code == 200
-    assert "Layered OCA draft" in page.text
+    assert "DRAFT 1" in page.text
     assert re.search(r"Last refreshed \d{2}:\d{2}:\d{2}", page.text)
     assert "Verified 0.0 s" not in page.text
     assert "Each layer creates one SELL LMT + SELL STP OCA pair." not in page.text
@@ -1054,7 +1099,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     floating_ui = client.get("/_pkg/ibkr_options_manager/floating-ui-dom.mjs")
     assert floating_ui.status_code == 200
 
-    draft = page.text.split("Layered OCA draft", maxsplit=1)[1].split(
+    draft = page.text.split('id="draft-form"', maxsplit=1)[1].split(
         "</form>", maxsplit=1
     )[0]
     action_panel = page.text.split('aria-label="Planned order actions"', maxsplit=1)[1]
@@ -1062,7 +1107,8 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
         "Outcome projection"
     )
     assert "data-draft-outcome" in action_panel
-    assert 'data-slot="card-action"' in draft
+    assert 'data-layer-state="draft"' in draft
+    assert 'data-slot="card"' not in draft
     assert "Split all available" in draft
     assert "Split assigned" in draft
     assert "Add layer" in draft
@@ -1108,7 +1154,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert response.status_code == 200
     assert [layer.quantity for layer in workbench._current_layers()] == ["3", "2"]
     assert workbench._current_layers()[0].tif == "DAY"
-    assert "LAYER 2" in response.text
+    assert "DRAFT 2" in response.text
 
     response = client.post(
         workbench.path + "action",
@@ -1233,7 +1279,7 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
     assert submitted.status_code == 200
     assert "Orders sent to TWS" in submitted.text
     assert "2 orders acknowledged" in submitted.text
-    assert "Active layers · pending TWS verification" in submitted.text
+    assert "Awaiting TWS verification" in submitted.text
     assert "SELL LMT" in submitted.text
     assert "Waiting for TWS" in submitted.text
     assert 'value="execute-arm"' not in submitted.text
@@ -1244,12 +1290,12 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
         DemoPaperExecutionTransport(),
         ExecutionJournal(tmp_path / "paper-journal.json"),
     )
-    assert "Active layers · pending TWS verification" in client.get(workbench.path).text
+    assert "Awaiting TWS verification" in client.get(workbench.path).text
 
     entry = journal.submission_entries(account=DEMO_ACCOUNT, con_id=1_002_100_161)[0]
     journal.mark_unknown(entry.fingerprint)
     unknown = client.get(workbench.path)
-    assert "Active layers · TWS outcome unknown" in unknown.text
+    assert 'data-layer-state="verify"' in unknown.text
     assert "Outcome not confirmed" in unknown.text
     assert 'value="execute-arm"' not in unknown.text
 
@@ -1337,7 +1383,7 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
         nonlocal phase
         body = str(text)
         if phase == 1:
-            if "LAYER 2" not in body:
+            if "DRAFT 2" not in body:
                 finish("Add layer did not render a second layer")
                 return
             result["add_layer"] = True
@@ -1367,7 +1413,7 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
                 inspect_acknowledgement,
             )
         elif phase == 4:
-            if "Active layers · pending TWS verification" not in body:
+            if "Awaiting TWS verification" not in body:
                 finish("Refresh did not render the workbench")
                 return
             result["refresh"] = True
