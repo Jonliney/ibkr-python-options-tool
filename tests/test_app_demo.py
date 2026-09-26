@@ -645,11 +645,27 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
         ),
     )
 
-    page = TestClient(workbench.app).get(workbench.path)
+    client = TestClient(workbench.app)
+    page = client.get(workbench.path)
 
     assert 'data-layer-state="sold"' in page.text
-    assert "Profit" in page.text
-    assert "USD +557.44" in page.text
+    assert 'data-result-tone="profit"' in page.text
+    assert 'data-revealed="false"' in page.text
+    assert 'aria-pressed="false"' in page.text
+    assert "SOLD" in page.text
+    assert "+$557.44 USD" in page.text
+    assert 'id="sold-target-1"' in page.text
+    assert 'value="$15.50"' in page.text
+    assert re.search(r'id="sold-target-1"[^>]*disabled', page.text)
+    assert 'id="sold-stop-1"' in page.text
+    assert 'value="$9.70"' in page.text
+    assert re.search(r'id="sold-stop-1"[^>]*disabled', page.text)
+    assert 'id="sold-quantity-1"' in page.text
+    assert 'value="3"' in page.text
+    assert 'id="sold-tif-1"' in page.text
+    assert "soldLayerRevealBound" in page.text
+    assert 'href="/layers.css"' in page.text
+    assert client.get("/layers.css").status_code == 200
     assert "Target filled" in page.text
     assert 'data-layer-state="working"' in page.text
     assert page.text.index('data-layer-state="sold"') < page.text.index(

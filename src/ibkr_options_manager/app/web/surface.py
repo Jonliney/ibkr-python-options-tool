@@ -164,7 +164,10 @@ class StarUIWorkbench:
             static_path=str(_STATIC_DIR),
             secret_key=token_urlsafe(32),
             inline_icons=True,
-            hdrs=(Link(rel="stylesheet", href="/starui.css"),),
+            hdrs=(
+                Link(rel="stylesheet", href="/starui.css"),
+                Link(rel="stylesheet", href="/layers.css"),
+            ),
             htmlkw={"lang": "en", "data_theme": "dark"},
             bodykw={"cls": "min-h-screen bg-background text-foreground"},
         )
@@ -1778,41 +1781,75 @@ class StarUIWorkbench:
         self, number: int, entry: JournalEntry, index: int, outcome: LayerOutcome
     ) -> Any:
         layer = entry.layers[index]
-        result = {
-            "CLOSED_PROFIT": "Profit",
-            "CLOSED_LOSS": "Loss",
-            "CLOSED_FLAT": "Flat",
-            "CLOSED_PNL_UNKNOWN": "P&L unavailable",
+        result = "P&L unavailable"
+        if outcome.realized_pnl is not None:
+            result = (
+                f"{_money(outcome.realized_pnl)} USD"
+                if outcome.currency == "USD"
+                else f"{outcome.currency} {outcome.realized_pnl:+,.2f}"
+            )
+        result_tone = {
+            "CLOSED_PROFIT": "profit",
+            "CLOSED_LOSS": "loss",
+            "CLOSED_FLAT": "flat",
+            "CLOSED_PNL_UNKNOWN": "unknown",
         }[outcome.status]
-        pnl_text = (
-            f" · {outcome.currency} {outcome.realized_pnl:+,.2f}"
-            if outcome.realized_pnl is not None
-            else ""
-        )
         return Div(
             Div(
                 Span(f"LAYER {number}", cls="text-xs font-semibold"),
-                P("SOLD", cls="mt-2 text-xs text-muted-foreground"),
+                P(f"{outcome.exit_side} filled", cls="mt-2 text-xs text-muted-foreground"),
                 cls="min-w-20",
             ),
+            _field(
+                "LMT target",
+                Input(
+                    id=f"sold-target-{number}",
+                    value=f"${layer.target_price}",
+                    disabled=True,
+                ),
+                input_id=f"sold-target-{number}",
+            ),
+            _field(
+                "STP loss",
+                Input(
+                    id=f"sold-stop-{number}",
+                    value=f"${layer.stop_price}",
+                    disabled=True,
+                ),
+                input_id=f"sold-stop-{number}",
+            ),
+            _field(
+                "Quantity closed",
+                Input(
+                    id=f"sold-quantity-{number}",
+                    value=format(outcome.filled_quantity, "f"),
+                    disabled=True,
+                ),
+                input_id=f"sold-quantity-{number}",
+            ),
+            _field(
+                "TIF",
+                Input(id=f"sold-tif-{number}", value=layer.tif, disabled=True),
+                input_id=f"sold-tif-{number}",
+            ),
+            Div(cls="min-w-0"),
             Div(
-                Div(
-                    Span(
-                        f"{outcome.exit_side} filled",
-                        cls="text-sm font-medium text-muted-foreground",
-                    ),
-                    Badge(f"{result}{pnl_text}", variant="outline"),
-                    cls="flex flex-wrap items-center gap-3",
-                ),
-                P(
-                    f"{format(outcome.filled_quantity, 'f')} contracts closed · "
-                    f"planned LMT ${layer.target_price} / STP ${layer.stop_price}",
-                    cls="mt-2 font-mono text-xs text-muted-foreground",
-                ),
-                cls="min-w-0",
+                Span("SOLD", cls="sold-layer-status"),
+                Span(result, cls="sold-layer-result"),
+                cls="sold-layer-badge",
             ),
             data_layer_state="sold",
-            cls="flex gap-3 border-t border-border bg-card/30 py-4",
+            data_result_tone=result_tone,
+            data_revealed="false",
+            role="button",
+            tabindex="0",
+            aria_label=(
+                f"Sold layer {number}, {result}. Planned target ${layer.target_price}, "
+                f"stop ${layer.stop_price}, {format(outcome.filled_quantity, 'f')} "
+                f"contracts, {layer.tif}. Press Enter or Space to pin details open."
+            ),
+            aria_pressed="false",
+            cls="sold-layer-row grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4",
         )
 
     def _verified_selected_account(self) -> str:
@@ -1902,7 +1939,7 @@ class StarUIWorkbench:
                         or bool(self._armed_price_updates)
                     ),
                 ),
-                cls="mb-3 flex flex-wrap items-center justify-end gap-2",
+                cls="mb-4 flex flex-wrap items-center justify-end gap-3",
             )
             if working_count
             else None,
@@ -1921,6 +1958,7 @@ class StarUIWorkbench:
             Script(_live_active_script(self._live_active_configuration()))
             if working_count
             else None,
+            Script(_sold_layer_reveal_script()),
             id="active-form",
             action=f"/{self.session_token}/action",
             method="post",
@@ -2147,7 +2185,7 @@ class StarUIWorkbench:
                     value="add-layer",
                     disabled=len(layers) >= self._state.available_quantity,
                 ),
-                cls="mt-4 flex flex-wrap items-center justify-end gap-2",
+                cls="mt-5 flex flex-wrap items-center justify-end gap-3",
             ),
             HTMLInput(type="hidden", name="target_presets", value=self._target_presets),
             HTMLInput(type="hidden", name="stop_presets", value=self._stop_presets),
@@ -2901,6 +2939,31 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, {{ once: true }});
   else start();
 }})();
+"""
+
+
+def _sold_layer_reveal_script() -> str:
+    """Let pointer and keyboard users pin a sold row's planned values open."""
+    return """
+(() => {
+  if (document.documentElement.dataset.soldLayerRevealBound === 'true') return;
+  document.documentElement.dataset.soldLayerRevealBound = 'true';
+  const toggle = (row) => {
+    const revealed = row.dataset.revealed !== 'true';
+    row.dataset.revealed = String(revealed);
+    row.setAttribute('aria-pressed', String(revealed));
+  };
+  document.addEventListener('click', (event) => {
+    const row = event.target.closest('[data-layer-state="sold"]');
+    if (row) toggle(row);
+  });
+  document.addEventListener('keydown', (event) => {
+    const row = event.target.closest('[data-layer-state="sold"]');
+    if (!row || (event.key !== 'Enter' && event.key !== ' ')) return;
+    event.preventDefault();
+    toggle(row);
+  });
+})();
 """
 
 
