@@ -27,7 +27,7 @@ from starhtml import (
     Input as HTMLInput,
 )
 from starhtml.icons import resolver
-from starhtml.plugins import position as position_plugin
+from starhtml.plugins import Plugin
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -88,6 +88,18 @@ from .components.ui.toast import Toaster
 
 _STATIC_DIR = Path(__file__).with_name("static")
 _ASSETS_DIR = Path(__file__).with_name("assets")
+# StarHTML 0.7.0's position.js imports Floating UI from a CDN. Keep the same
+# plugin and API, but serve its dependency locally inside the loopback webview.
+_LOCAL_POSITION_PLUGIN = Plugin(  # type: ignore[no-untyped-call]
+    "position",
+    signals=("x", "y", "placement", "visible", "is_positioning"),
+    critical_css=(
+        "[data-positioning=true]:not([popover]){visibility:hidden!important;opacity:0!important}"
+        "[data-positioning=false]:not([popover]){visibility:visible!important;opacity:1!important;transition:opacity 150ms ease-out}"
+    ),
+    static_path=_STATIC_DIR,
+    package_name="ibkr_options_manager",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +170,7 @@ class StarUIWorkbench:
             htmlkw={"lang": "en", "data_theme": "dark"},
             bodykw={"cls": "min-h-screen bg-background text-foreground"},
         )
-        self.app.register(position_plugin)
+        self.app.register(_LOCAL_POSITION_PLUGIN)
         route(f"/{self.session_token}/")(self._home)
         route(f"/{self.session_token}/connection-status")(self._connection_status)
         route(f"/{self.session_token}/action", methods=["POST"])(self._action)
@@ -1333,14 +1345,17 @@ class StarUIWorkbench:
                 DialogContent(*content, show_close_button=False),
                 signal="launch_connection",
                 default_open=True,
+                # On failure, keep Settings reachable so the user can correct
+                # connection details. Order actions still require verified state.
+                modal=connecting,
                 size="sm",
             ),
             Script(
-                """
-                (() => {
+                f"""
+                (() => {{
                   const dialog = document.getElementById('launch_connection');
-                  if (dialog && !dialog.open) dialog.showModal();
-                })();
+                  if (dialog && !dialog.open) dialog.{"showModal" if connecting else "show"}();
+                }})();
                 """
             ),
             Script(

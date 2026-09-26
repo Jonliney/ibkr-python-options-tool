@@ -12,7 +12,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox --disable-gpu")
 
 from httpx import Response
-from PySide6.QtCore import QTimer, QUrl
+from PySide6.QtCore import QPoint, Qt, QTimer, QUrl
+from PySide6.QtTest import QTest
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication
 from starlette.testclient import TestClient
@@ -33,7 +34,11 @@ from ibkr_options_manager.app.web.surface import (
     _position_identity,
     _toast_notice,
 )
-from ibkr_options_manager.app.web_window import StarUIPlannerWindow, _start_local_server
+from ibkr_options_manager.app.web_window import (
+    StarUIPlannerWindow,
+    _LoopbackOnlyRequestInterceptor,
+    _start_local_server,
+)
 from ibkr_options_manager.broker import PortfolioRequest, SnapshotRequest
 from ibkr_options_manager.broker.execution import PaperSubmission
 from ibkr_options_manager.domain import PriceBand, WorkingOrder
@@ -165,6 +170,76 @@ def test_launch_connection_failure_stays_in_the_retry_dialog_without_a_toast() -
     # The official Toaster remains mounted for later action feedback, but the
     # launch failure is intentionally shown only in the blocking Dialog.
     assert "TWS did not respond" not in page.text
+
+
+@pytest.mark.parametrize("launch_connection", ["failed", "success"])
+def test_settings_open_in_blocked_desktop_webview(launch_connection: str) -> None:
+    workbench = _demo_workbench()
+    workbench._demo_mode = False
+    workbench._state = replace(workbench._state, status=UiStatus.BLOCKED)
+    workbench._launch_connection = launch_connection
+    server, server_thread, port = _start_local_server(workbench.app)
+    application = QApplication.instance() or QApplication([])
+    view = QWebEngineView()
+    view.resize(1500, 920)
+    view.show()
+    interceptor = _LoopbackOnlyRequestInterceptor(view)
+    view.page().profile().setUrlRequestInterceptor(interceptor)
+    opened: list[bool] = []
+
+    def inspect() -> None:
+        view.page().runJavaScript(
+            """(() => {
+              const dialog = document.getElementById('connection_settings');
+              if (!dialog?.open || getComputedStyle(dialog).visibility !== 'visible') {
+                return false;
+              }
+              const rect = dialog.getBoundingClientRect();
+              const hit = document.elementFromPoint(
+                rect.x + rect.width / 2, rect.y + rect.height / 2);
+              return rect.height > 100 && dialog.contains(hit);
+            })();""",
+            lambda result: (opened.append(bool(result)), application.quit()),
+        )
+
+    def loaded(ok: bool) -> None:
+        if not ok:
+            application.quit()
+            return
+
+        def click(point: str) -> None:
+            if not point:
+                application.quit()
+                return
+            QTest.mouseClick(
+                view.focusProxy() or view,
+                Qt.MouseButton.LeftButton,
+                pos=QPoint(*map(int, json.loads(point))),
+            )
+            QTimer.singleShot(250, inspect)
+
+        view.page().runJavaScript(
+            """(() => {
+              const rect = document.querySelector('[aria-haspopup="dialog"]')
+                .getBoundingClientRect();
+              return JSON.stringify([
+                rect.x + rect.width / 2, rect.y + rect.height / 2
+              ]);
+            })();""",
+            click,
+        )
+
+    try:
+        view.loadFinished.connect(loaded)
+        view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
+        QTimer.singleShot(5_000, application.quit)
+        application.exec()
+    finally:
+        view.close()
+        server.should_exit = True
+        server_thread.join(timeout=2)
+
+    assert opened == [True]
 
 
 def test_retry_connection_waits_for_one_terminal_refresh_response() -> None:
@@ -974,8 +1049,12 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert "Preview current draft" not in page.text
     assert "cdn.jsdelivr.net" not in page.text
     assert "api.iconify.design" not in page.text
-    assert "@starhtml/plugins/position" in page.text
-    assert client.get("/_pkg/starhtml/plugins/position.js").status_code == 200
+    assert "@ibkr_options_manager/position" in page.text
+    position_script = client.get("/_pkg/ibkr_options_manager/position.js")
+    assert position_script.status_code == 200
+    assert "cdn.jsdelivr.net" not in position_script.text
+    floating_ui = client.get("/_pkg/ibkr_options_manager/floating-ui-dom.mjs")
+    assert floating_ui.status_code == 200
 
     draft = page.text.split("Layered OCA draft", maxsplit=1)[1].split(
         "</form>", maxsplit=1
@@ -1209,6 +1288,8 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
     server, server_thread, port = _start_local_server(workbench.app)
     application = QApplication.instance() or QApplication([])
     view = QWebEngineView()
+    view.resize(1500, 920)
+    view.show()
     phase = 0
     failure: list[str] = []
     result: dict[str, bool] = {}
@@ -1306,11 +1387,31 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
                 (() => {
                   const trigger = document.querySelector('[aria-haspopup="dialog"]');
                   if (!trigger) return false;
-                  trigger.click();
-                  return document.getElementById('connection_settings')?.open === true;
+                  const rect = trigger.getBoundingClientRect();
+                  return JSON.stringify([
+                    rect.x + rect.width / 2, rect.y + rect.height / 2
+                  ]);
                 })();
                 """,
-                inspect_settings,
+                lambda point: (
+                    QTest.mouseClick(
+                        view.focusProxy() or view, Qt.MouseButton.LeftButton,
+                        pos=QPoint(*map(int, json.loads(point))),
+                    ),
+                    QTimer.singleShot(
+                        250,
+                        lambda: javascript(
+                            """(() => {
+                              const dialog = document.getElementById(
+                                'connection_settings');
+                              return dialog?.open === true
+                                && dialog.getBoundingClientRect().height > 100
+                                && getComputedStyle(dialog).visibility === 'visible';
+                            })();""",
+                            inspect_settings,
+                        ),
+                    ),
+                ) if point else finish(f"Settings was not clickable: {point!r}"),
             )
             return
         QTimer.singleShot(

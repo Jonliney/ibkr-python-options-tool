@@ -97,3 +97,10 @@ Run from the repository root:
 
 The embedded-webview regression test binds an ephemeral loopback port. It must
 run in an environment that permits local socket binding.
+
+The WebView rejects non-loopback requests. StarHTML's positioning plugin must
+therefore load its Floating UI dependency from packaged local assets. A failed
+JavaScript module import prevents reactive controls such as Settings from
+initializing, even while native form buttons still work. The desktop regression
+test uses the same request filter as the application. UI availability does not
+relax server-side paper-account, fresh-state, or order-ownership checks.

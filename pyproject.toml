@@ -61,4 +61,11 @@ css_output = "src/ibkr_options_manager/app/web/static/starui.css"
 css_dir = "."
 
 [tool.setuptools.package-data]
-"ibkr_options_manager.app.web" = ["assets/*.json", "static/*.css"]
+"ibkr_options_manager.app.web" = [
+  "assets/*.json",
+  "static/*.css",
+  "static/*.js",
+  "static/*.mjs",
+  "static/*-LICENSE.txt",
+  "static/*-NOTICE.txt",
+]
