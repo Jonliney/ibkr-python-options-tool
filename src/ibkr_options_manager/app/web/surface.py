@@ -32,6 +32,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ...domain import BrokerSnapshot, preview_reference_prices, round_up_price
+from ...domain.outcome import ExitScenario, PositionOutcome, project_position_outcome
 from ...execution import (
     ExecutionBlocked,
     ExecutionOutcomeUnknown,
@@ -150,6 +151,7 @@ class StarUIWorkbench:
         self._selected_con_id: int | None = None
         self._state = view_model.empty()
         self._drafts: dict[int, tuple[DraftLayerForm, ...]] = {}
+        self._projection_comparison: PositionOutcome | None = None
         self._settings = ConnectionSettings(account=initial_account)
         self._target_presets = "20, 40, 60, 100"
         self._stop_presets = "25"
@@ -289,6 +291,13 @@ class StarUIWorkbench:
                 return self._page()
 
         with self._lock:
+            draft_change = action in {
+                "add-layer", "equal-split", "equal-split-available", "equal-split-assigned"
+            } or action.startswith("remove-layer:")
+            if draft_change:
+                self._projection_comparison = self._projection_state()[1]
+            else:
+                self._projection_comparison = None
             if action == "refresh":
                 self._target_presets = values.get(
                     "target_presets", self._target_presets
@@ -348,6 +357,7 @@ class StarUIWorkbench:
             return self._page()
 
     def _refresh_locked(self) -> None:
+        self._projection_comparison = None
         self._disarm_execution_locked()
         state = self._view_model.refresh_portfolio(self._settings)
         self._apply_refreshed_portfolio_locked(state)
@@ -1259,17 +1269,19 @@ class StarUIWorkbench:
     def _page(self) -> Any:
         state = self._state
         ready = state.status is UiStatus.READY
+        projection = self._projection_state()
         title = (
             state.position_title
             if self._selected_con_id is not None
             else "Select an option position"
         )
         return Div(
+            Script(_projection_script(projection[2])),
             self._header(ready),
             Div(
                 self._inventory(),
                 self._workspace(title),
-                self._review(),
+                self._review(projection),
                 cls="grid h-[calc(100vh-3.5rem)] min-h-0 grid-cols-[16rem_minmax(0,1fr)_19rem] overflow-hidden border-t border-border",
             ),
             self._toast_component(),
@@ -2387,23 +2399,180 @@ class StarUIWorkbench:
             return "—", "—"
         return _money(gain), _money(loss)
 
-    def _outcome_projection(self, layers: tuple[DraftLayerForm, ...]) -> Any:
-        basis = self._state.unit_basis
-        multiplier = self._state.multiplier
-        outcomes = []
-        if basis is not None and multiplier is not None:
-            for layer in layers:
-                quantity = _int_or_zero(layer.quantity)
-                try:
-                    target = (
-                        (Decimal(layer.target_price) - basis) * multiplier * quantity
-                    )
-                    stop = (Decimal(layer.stop_price) - basis) * multiplier * quantity
-                except InvalidOperation:
-                    continue
-                outcomes.append((target, stop))
-        gain = sum((target for target, _ in outcomes), Decimal("0"))
-        loss = sum((stop for _, stop in outcomes), Decimal("0"))
+    def _projection_state(self) -> tuple[PositionOutcome, PositionOutcome, dict[str, Any]]:
+        """Compare observed exits with the proposed whole-position exit plan."""
+        basis, multiplier = self._state.unit_basis, self._state.multiplier
+        position = next(
+            (item for item in self._state.positions if item.con_id == self._selected_con_id),
+            None,
+        )
+        try:
+            held = Decimal(position.quantity) if position is not None else Decimal("0")
+        except InvalidOperation:
+            held = Decimal("-1")
+        outcomes = self._submission_outcomes()
+        snapshot = self._view_model.latest_snapshot()
+        currency = snapshot.contract.currency if snapshot is not None else None
+        realized = Decimal("0")
+        blocking_codes = {
+            validation.code
+            for validation in self._state.validations
+            if validation.blocking
+        }
+        projection_status_usable = (
+            self._state.status is UiStatus.READY
+            or (
+                self._state.status is UiStatus.BLOCKED
+                and blocking_codes == {"POSITION_FULLY_ALLOCATED"}
+            )
+        )
+        unresolved = (
+            not projection_status_usable
+            or position is None
+            or snapshot is None
+            or not snapshot.connected
+            or not snapshot.complete
+            or not snapshot.fresh
+            or not snapshot.paper_account_verified
+            or snapshot.connection_epoch <= 0
+            or bool(snapshot.errors)
+            or snapshot.selected.con_id != self._selected_con_id
+            or snapshot.position.quantity != held
+        )
+        for _entry, _index, outcome in outcomes:
+            if outcome.status.startswith("CLOSED_"):
+                if outcome.realized_pnl is None or outcome.currency != currency:
+                    unresolved = True
+                else:
+                    realized += outcome.realized_pnl
+            elif outcome.status != "ACTIVE":
+                unresolved = True
+        observed: list[ExitScenario] = []
+        proposed: list[ExitScenario] = []
+        active_config: list[dict[str, Any]] = []
+        removed_ids = {
+            candidate.target_perm_id
+            for candidate in self._armed_market_exits
+        }
+        if self._armed_market_exit is not None:
+            removed_ids.add(self._armed_market_exit.target_perm_id)
+        if self._armed_cancellation is not None:
+            removed_ids.add(self._armed_cancellation.target_perm_id)
+        updates = {
+            update.layer.target_perm_id: update for update in self._armed_price_updates
+        }
+        for _group, target, stop in self._active_oca_pairs():
+            try:
+                quantity = Decimal(target.remaining)
+                stop_quantity = Decimal(stop.remaining)
+            except InvalidOperation:
+                unresolved = True
+                continue
+            if quantity <= 0 or quantity != stop_quantity:
+                unresolved = True
+                continue
+            if basis is None or multiplier is None or target.limit_price is None or stop.stop_price is None:
+                unresolved = True
+                continue
+            current = ExitScenario(
+                quantity,
+                (target.limit_price - basis) * multiplier * quantity,
+                (stop.stop_price - basis) * multiplier * quantity,
+            )
+            observed.append(current)
+            if target.perm_id in removed_ids:
+                continue
+            pending = self._pending_active_prices.get(target.perm_id)
+            update = updates.get(target.perm_id)
+            target_price = (
+                update.target_price if update is not None and update.target_price is not None
+                else pending[0] if pending is not None and pending[0] is not None
+                else target.limit_price
+            )
+            stop_price = (
+                update.stop_price if update is not None and update.stop_price is not None
+                else pending[2] if pending is not None and pending[2] is not None
+                else stop.stop_price
+            )
+            changed = ExitScenario(
+                quantity,
+                (target_price - basis) * multiplier * quantity,
+                (stop_price - basis) * multiplier * quantity,
+            )
+            proposed.append(changed)
+            active_config.append({
+                "id": target.perm_id,
+                "quantity": format(quantity, "f"),
+                "gain": format(changed.target_pnl, "f"),
+                "loss": format(changed.stop_pnl, "f"),
+            })
+        draft_config: list[dict[str, Any]] = []
+        for layer in self._current_layers():
+            try:
+                quantity = Decimal(layer.quantity)
+                target_price = Decimal(layer.target_price)
+                stop_price = Decimal(layer.stop_price)
+            except InvalidOperation:
+                unresolved = True
+                continue
+            if quantity <= 0 or basis is None or multiplier is None:
+                unresolved = True
+                continue
+            item = ExitScenario(
+                quantity,
+                (target_price - basis) * multiplier * quantity,
+                (stop_price - basis) * multiplier * quantity,
+            )
+            proposed.append(item)
+            observed.append(item)
+            draft_config.append({
+                "quantity": format(quantity, "f"),
+                "gain": format(item.target_pnl, "f"),
+                "loss": format(item.stop_pnl, "f"),
+            })
+        if basis is None or multiplier is None or self._pending_active_prices:
+            unresolved = True
+        baseline = project_position_outcome(
+            held_quantity=held,
+            realized_pnl=realized,
+            exits=tuple(observed),
+            unresolved=unresolved,
+        )
+        proposed_outcome = project_position_outcome(
+            held_quantity=held,
+            realized_pnl=realized,
+            exits=tuple(proposed),
+            unresolved=unresolved or bool(self._armed_market_exits or self._armed_market_exit),
+        )
+        baseline = self._projection_comparison or baseline
+        return baseline, proposed_outcome, {
+            "held": format(held, "f"),
+            "realized": format(realized, "f"),
+            "unresolved": unresolved,
+            "marketExit": bool(self._armed_market_exits or self._armed_market_exit),
+            "removed": list(removed_ids),
+            "staged": bool(removed_ids or updates or self._armed_execution),
+            "active": active_config,
+            "draft": draft_config,
+            "baselineGain": format(baseline.expected_gain, "f") if baseline.expected_gain is not None else None,
+            "baselineLoss": format(baseline.max_loss, "f") if baseline.max_loss is not None else None,
+        }
+
+    def _outcome_projection(
+        self, projection: tuple[PositionOutcome, PositionOutcome, dict[str, Any]]
+    ) -> Any:
+        baseline, outcome, config = projection
+        gain_delta = (
+            outcome.expected_gain - baseline.expected_gain
+            if outcome.expected_gain is not None and baseline.expected_gain is not None
+            else None
+        )
+        loss_delta = (
+            outcome.max_loss - baseline.max_loss
+            if outcome.max_loss is not None and baseline.max_loss is not None
+            else None
+        )
+        status = _projection_status(outcome, config["unresolved"], config["marketExit"])
         return Card(
             CardHeader(
                 CardTitle("Outcome projection", cls="text-sm"),
@@ -2413,29 +2582,50 @@ class StarUIWorkbench:
                 Div(
                     *_metric(
                         "Expected gain",
-                        _money(gain),
+                        _projection_gain_value(outcome.expected_gain, gain_delta),
                         "text-emerald-400",
                         live_key="gain",
+                        help_text=(
+                            "Realized P&L from sold app-owned layers, plus the "
+                            "projected result for held layers at their LMT targets. "
+                            "An up arrow means expected gain increased; a down "
+                            "arrow means it decreased against the loaded plan."
+                        ),
                     ),
                     *_metric(
-                        "Max loss", _money(loss), "text-rose-400", live_key="loss"
-                    ),
-                    *_metric(
-                        "Cost basis",
-                        f"${basis.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
-                        if basis is not None
-                        else "—",
-                        "text-amber-300",
+                        "Max loss",
+                        _projection_loss_value(outcome.max_loss, loss_delta),
+                        "text-rose-400",
+                        live_key="loss",
+                        help_text=(
+                            "Projected result for held layers at their STP prices. "
+                            "Realized P&L from sold layers is excluded. "
+                            "An up arrow means more loss or a lower stop outcome; "
+                            "a down arrow means less loss or a higher stop outcome. "
+                            "The dollar change compares with the loaded plan."
+                        ),
                     ),
                     cls="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] items-baseline gap-x-3 gap-y-3",
                 ),
+                P(
+                    status,
+                    data_projection_status=True,
+                    cls="mt-3 text-xs leading-5 text-muted-foreground" + (" hidden" if not status else ""),
+                ),
+                P(
+                    f"Covered subtotal: {_money(outcome.covered_gain)} gain / {_money(outcome.covered_loss)} open loss",
+                    data_projection_subtotal=True,
+                    cls="mt-1 text-xs leading-5 text-muted-foreground" + (" hidden" if outcome.expected_gain is not None else ""),
+                ),
                 cls="px-4",
             ),
-            data_draft_outcome=True,
+            data_outcome_projection=True,
             cls="gap-4 rounded-2xl py-4 shadow-none",
         )
 
-    def _review(self) -> Any:
+    def _review(
+        self, projection: tuple[PositionOutcome, PositionOutcome, dict[str, Any]]
+    ) -> Any:
         pending = self._pending_submissions()
         market_exits = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
@@ -2532,6 +2722,7 @@ class StarUIWorkbench:
                 ),
                 cls="flex min-h-0 flex-1 items-center justify-center px-6",
             ),
+            Div(self._outcome_projection(projection), cls="mx-4 mb-3"),
             self._execution_control(),
             cls="flex min-h-0 flex-col overflow-hidden border-l border-border bg-card/30",
         )
@@ -2630,7 +2821,6 @@ class StarUIWorkbench:
             )
             if self._active_oca_pairs()
             else None,
-            self._outcome_projection(self._current_layers()),
             cls="mx-4 mb-4 flex w-[calc(100%-2rem)] flex-col gap-3",
         )
 
@@ -2981,6 +3171,7 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
     }};
     const update = () => {{
       const outcomes = [];
+      let invalid = false;
       let allocated = 0;
       form.querySelectorAll('[data-live-input="target"]').forEach((input) => {{
         const index = input.dataset.liveLayer;
@@ -2999,12 +3190,10 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         assigned(`[data-live-outcome="target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
         assigned(`[data-live-outcome="stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} max loss` : '— max loss');
         assigned(`[data-live-review-quantity="${{index}}"]`, `${{Number.isInteger(quantity) && quantity > 0 ? quantity : '—'}} contracts · ${{form.elements[`tif_${{index}}`]?.value || 'GTC'}}`);
-        if (Number.isFinite(gain) && Number.isFinite(loss)) outcomes.push({{ gain, loss }});
+        if (Number.isFinite(gain) && Number.isFinite(loss)) outcomes.push({{ quantity, gain, loss }});
+        else invalid = true;
       }});
-      const gain = outcomes.reduce((total, outcome) => total + outcome.gain, 0);
-      const loss = outcomes.reduce((total, outcome) => total + outcome.loss, 0);
-      assigned('[data-live-metric="gain"]', money(gain));
-      assigned('[data-live-metric="loss"]', money(loss));
+      window.ibkrProjection?.updateDraft(outcomes, invalid);
       assigned('[data-live-allocation]', `${{allocated}} of ${{config.available}} contracts allocated`);
     }};
     form.querySelectorAll('[data-live-input]').forEach((input) => input.addEventListener('input', update));
@@ -3052,7 +3241,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       node.classList.toggle(display, !hidden);
     }};
     const setReviewMode = (active) => {{
-      document.querySelectorAll('[data-draft-review], [data-draft-review-badge], [data-draft-execute], [data-draft-outcome]').forEach((node) => {{
+      document.querySelectorAll('[data-draft-review], [data-draft-review-badge], [data-draft-execute]').forEach((node) => {{
         node.classList.toggle('hidden', active);
       }});
       document.querySelectorAll('[data-active-review], [data-active-review-badge], [data-active-execute-control]').forEach((node) => {{
@@ -3061,6 +3250,8 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
     }};
     const update = () => {{
       let changed = false, edited = false;
+      const outcomes = [];
+      let invalid = false;
       form.querySelectorAll('[data-active-input="target"]').forEach((targetInput) => {{
         const permId = targetInput.dataset.activePermId;
         const stopInput = form.querySelector(`[data-active-input="stop"][data-active-perm-id="${{permId}}"]`);
@@ -3071,6 +3262,8 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         const stopPrice = Number.isFinite(stop) && stop >= 0 && stop <= 100 ? roundUp(basis * (1 - stop / 100)) : NaN;
         const gain = Number.isFinite(targetPrice) && Number.isFinite(quantity) ? (targetPrice - basis) * multiplier * quantity : NaN;
         const loss = Number.isFinite(stopPrice) && Number.isFinite(quantity) ? (stopPrice - basis) * multiplier * quantity : NaN;
+        if (Number.isFinite(gain) && Number.isFinite(loss) && quantity > 0) outcomes.push({{ id: Number(permId), quantity, gain, loss }});
+        else invalid = true;
         assigned(`[data-live-price="active-target-${{index}}"]`, Number.isFinite(targetPrice) ? priceText(targetPrice) : '—');
         assigned(`[data-live-price="active-stop-${{index}}"]`, Number.isFinite(stopPrice) ? priceText(stopPrice) : '—');
         assigned(`[data-live-outcome="active-target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
@@ -3105,6 +3298,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       }});
       form.querySelectorAll('.be-action-group').forEach((group) => {{ group.dataset.resetVisible = String(resetVisible); }});
       setReviewMode(changed);
+      window.ibkrProjection?.updateActive(outcomes, invalid);
     }};
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('input', update));
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('change', update));
@@ -3609,6 +3803,157 @@ def _money(value: Decimal) -> str:
     return f"{'+' if value >= 0 else '-'}${abs(value):,.2f}"
 
 
+def _projection_gain_value(value: Decimal | None, delta: Decimal | None) -> Any:
+    return _projection_change_value(value, delta, metric="gain")
+
+
+def _projection_loss_value(value: Decimal | None, delta: Decimal | None) -> Any:
+    return _projection_change_value(value, delta, metric="loss")
+
+
+def _projection_change_value(
+    value: Decimal | None, delta: Decimal | None, *, metric: str
+) -> Any:
+    changed = value is not None and delta is not None and bool(delta)
+    up = changed and (delta > 0 if metric == "gain" else delta < 0)
+    amount = f"${abs(delta):,.2f}" if changed else "—"
+    baseline = value - delta if changed else None
+    if metric == "gain":
+        direction = "Expected gain increased" if up else "Expected gain decreased"
+    elif changed and (value < 0 or baseline < 0):
+        direction = "More loss" if up else "Less loss"
+    else:
+        direction = "Lower stop outcome" if up else "Higher stop outcome"
+    comparison_label = (
+        f"{direction} by {amount}"
+        if changed
+        else "No change from loaded plan"
+        if value is not None and delta is not None
+        else "Comparison unavailable"
+    )
+    return Span(
+        Span(
+            _money(value) if value is not None else "— Incomplete",
+            cls="whitespace-nowrap",
+            **{f"data_{metric}_value": True},
+        ),
+        Span(
+            "(",
+            Span(
+                Span(
+                    Icon("lucide:arrow-up", cls="size-3", aria_hidden="true"),
+                    cls="" if up else "hidden",
+                    **{f"data_{metric}_arrow": "up"},
+                ),
+                Span(
+                    Icon("lucide:arrow-down", cls="size-3", aria_hidden="true"),
+                    cls="hidden" if up or not changed else "",
+                    **{f"data_{metric}_arrow": "down"},
+                ),
+                Span(amount, **{f"data_{metric}_amount": True}),
+                cls="inline-flex items-center gap-0.5",
+            ),
+            ")",
+            aria_label=comparison_label,
+            cls="text-muted-foreground text-[11px] font-normal leading-4 whitespace-nowrap",
+            **{f"data_{metric}_change": True},
+        ),
+        cls="inline-flex flex-col items-end",
+    )
+
+
+def _projection_status(
+    outcome: PositionOutcome, unresolved: bool, market_exit: bool
+) -> str:
+    if market_exit:
+        return "Market exit price is unknown until filled."
+    if unresolved:
+        return "Broker or layer state needs verification before a whole-position total is available."
+    if outcome.covered_quantity > outcome.held_quantity:
+        return "Proposed exits exceed the held quantity."
+    if outcome.uncovered_quantity:
+        count = format(outcome.uncovered_quantity, "f")
+        return f"{count} held contract(s) have no verified target and stop scenario."
+    return ""
+
+
+def _projection_script(configuration: dict[str, Any]) -> str:
+    """Fast local preview; server-rendered Decimal projection is authoritative."""
+    payload = json.dumps(configuration, separators=(",", ":"))
+    return f"""
+(() => {{
+  const config = {payload};
+  const start = () => {{
+    const active = new Map(config.active.map((item) => [item.id, item]));
+    let draft = config.draft, invalidDraft = false, invalidActive = false;
+    const money = (number) => `${{number >= 0 ? '+' : '-'}}$${{Math.abs(number).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}})}}`;
+    const updateMetric = (node, value, baseline, kind) => {{
+      if (!node) return;
+      const select = (part) => node.querySelector('[data-' + kind + '-' + part + ']');
+      const change = select('change');
+      select('value').textContent = value === null ? '— Incomplete' : money(value);
+      const changed = value !== null && baseline !== null && Math.abs(value - baseline) > 0.005;
+      if (!changed) {{
+        select('amount').textContent = '—';
+        node.querySelector('[data-' + kind + '-arrow="up"]').classList.add('hidden');
+        node.querySelector('[data-' + kind + '-arrow="down"]').classList.add('hidden');
+        change.setAttribute('aria-label', value !== null && baseline !== null ? 'No change from loaded plan' : 'Comparison unavailable');
+        return;
+      }}
+      const up = kind === 'gain' ? value > baseline : value < baseline;
+      const amount = `$${{Math.abs(value - baseline).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}})}}`;
+      select('amount').textContent = amount;
+      node.querySelector('[data-' + kind + '-arrow="up"]').classList.toggle('hidden', !up);
+      node.querySelector('[data-' + kind + '-arrow="down"]').classList.toggle('hidden', up);
+      const direction = kind === 'gain'
+        ? (up ? 'Expected gain increased' : 'Expected gain decreased')
+        : (value < 0 || baseline < 0)
+          ? (up ? 'More loss' : 'Less loss')
+          : (up ? 'Lower stop outcome' : 'Higher stop outcome');
+      change.setAttribute('aria-label', `${{direction}} by ${{amount}}`);
+    }};
+    const render = () => {{
+      const exits = [...active.values()].filter((item) => !config.removed.includes(item.id)).concat(draft);
+      const covered = exits.reduce((total, item) => total + Number(item.quantity), 0);
+      const gain = Number(config.realized) + exits.reduce((total, item) => total + Number(item.gain), 0);
+      const loss = exits.reduce((total, item) => total + Number(item.loss), 0);
+      const uncovered = Math.max(0, Number(config.held) - covered);
+      const complete = !config.unresolved && !config.marketExit && !invalidDraft && !invalidActive && Number.isFinite(covered) && Math.abs(covered - Number(config.held)) < 1e-8;
+      const gainNode = document.querySelector('[data-live-metric="gain"]');
+      const lossNode = document.querySelector('[data-live-metric="loss"]');
+      updateMetric(gainNode, complete ? gain : null, config.baselineGain === null ? null : Number(config.baselineGain), 'gain');
+      updateMetric(lossNode, complete ? loss : null, config.baselineLoss === null ? null : Number(config.baselineLoss), 'loss');
+      const status = document.querySelector('[data-projection-status]');
+      if (status) {{
+        status.textContent = config.marketExit ? 'Market exit price is unknown until filled.' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : config.unresolved ? 'Broker or layer state needs verification before a whole-position total is available.' : covered > Number(config.held) ? 'Proposed exits exceed the held quantity.' : uncovered > 0 ? `${{uncovered}} held contract(s) have no verified target and stop scenario.` : '';
+        status.classList.toggle('hidden', !status.textContent);
+      }}
+      const subtotal = document.querySelector('[data-projection-subtotal]');
+      if (subtotal) {{
+        subtotal.textContent = `Covered subtotal: ${{money(gain)}} gain / ${{money(loss)}} open loss`;
+        subtotal.classList.toggle('hidden', complete);
+      }}
+    }};
+    window.ibkrProjection = {{
+      updateDraft(items, invalid) {{
+        if (config.staged) return;
+        draft = items; invalidDraft = invalid; render();
+      }},
+      updateActive(items, invalid) {{
+        if (config.staged) return;
+        items.forEach((item) => active.set(item.id, item));
+        invalidActive = invalid;
+        render();
+      }},
+    }};
+    render();
+  }};
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, {{once: true}});
+  else start();
+}})();
+"""
+
+
 def _toast_notice(message: str) -> _ToastNotice:
     """Turn internal status detail into a short, actionable user notification."""
     normalized = " ".join(message.split())
@@ -3696,9 +4041,39 @@ def _busy_submit_script() -> str:
     """
 
 
-def _metric(label: str, value: str, tone: str, *, live_key: str | None = None) -> Any:
+def _metric(
+    label: str,
+    value: str,
+    tone: str,
+    *,
+    live_key: str | None = None,
+    help_text: str | None = None,
+) -> Any:
+    label_node = (
+        Div(
+            Span(label),
+            Tooltip(
+                TooltipTrigger(
+                    Button(
+                        Icon("lucide:info", cls="size-3"),
+                        variant="ghost",
+                        size="icon",
+                        type="button",
+                        aria_label=f"How {label.lower()} is calculated",
+                        cls="size-5 shrink-0 text-muted-foreground",
+                    ),
+                    delay_duration=250,
+                ),
+                TooltipContent(help_text, side="left", cls="max-w-56 leading-5"),
+                signal=f"projection_{live_key}",
+            ),
+            cls="flex min-w-0 items-center gap-1 text-xs font-medium text-muted-foreground",
+        )
+        if help_text
+        else P(label, cls="min-w-0 text-xs font-medium text-muted-foreground")
+    )
     return (
-        P(label, cls="min-w-0 text-xs font-medium text-muted-foreground"),
+        label_node,
         P(
             value,
             data_live_metric=live_key,

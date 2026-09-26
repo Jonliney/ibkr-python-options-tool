@@ -31,8 +31,11 @@ from ibkr_options_manager.app.web.surface import (
     _active_percentage_for_price,
     _busy_submit_script,
     _live_active_script,
-    _price_update_impact,
+    _money,
     _position_identity,
+    _price_update_impact,
+    _projection_gain_value,
+    _projection_loss_value,
     _toast_notice,
 )
 from ibkr_options_manager.app.web_window import (
@@ -446,7 +449,7 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
                 order_id=11,
                 action="SELL",
                 order_type="LMT",
-                remaining="4",
+                remaining="5",
                 status="Submitted",
                 oca_group="3ad441753bb9/tranche-1",
                 limit_price=Decimal("26.20"),
@@ -457,7 +460,7 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
                 order_id=12,
                 action="SELL",
                 order_type="STP",
-                remaining="4",
+                remaining="5",
                 status="Submitted",
                 oca_group="3ad441753bb9/tranche-1",
                 stop_price=Decimal("16.40"),
@@ -507,6 +510,173 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert "setReviewMode(changed)" in active_script
     assert "input.value = input.dataset.activeInitial || ''" in active_script
     assert "UPDATE SELL LMT" in page.text
+
+    baseline, proposed, _config = workbench._projection_state()
+    assert baseline.expected_gain is not None
+    assert baseline.max_loss is not None
+    assert proposed == baseline
+
+    candidate = MarketExitCandidate(
+        account=DEMO_ACCOUNT,
+        con_id=workbench._selected_con_id or 0,
+        target_order_id=11,
+        target_perm_id=101,
+        client_id=17,
+        quantity=Decimal("5"),
+        tif="GTC",
+        oca_group="3ad441753bb9/tranche-1",
+        stop_order_id=12,
+        stop_perm_id=102,
+    )
+    workbench._armed_price_updates = (
+        PriceUpdateCandidate(layer=candidate, stop_price=Decimal("17.40")),
+    )
+    _before, edited, _config = workbench._projection_state()
+    assert edited.expected_gain == baseline.expected_gain
+    assert edited.max_loss == baseline.max_loss + Decimal("500")
+    improved_page = client.get(workbench.path).text
+    assert 'data-loss-arrow="down"' in improved_page
+    improvement_label = "Less loss" if baseline.max_loss < 0 else "Higher stop outcome"
+    assert f'aria-label="{improvement_label} by $500.00"' in improved_page
+
+    workbench._armed_price_updates = (
+        PriceUpdateCandidate(layer=candidate, stop_price=Decimal("15.40")),
+    )
+    _before, worsened, _config = workbench._projection_state()
+    assert worsened.max_loss == baseline.max_loss - Decimal("500")
+    worsened_page = client.get(workbench.path).text
+    assert 'data-loss-arrow="up"' in worsened_page
+    deterioration_label = "More loss" if worsened.max_loss < 0 else "Lower stop outcome"
+    assert f'aria-label="{deterioration_label} by $500.00"' in worsened_page
+
+    workbench._armed_price_updates = ()
+    workbench._armed_cancellation = candidate
+    _before, deleted, _config = workbench._projection_state()
+    assert deleted.expected_gain is None
+    assert deleted.max_loss is None
+    assert deleted.uncovered_quantity == Decimal("5")
+
+    workbench._armed_cancellation = None
+    added_page = client.post(workbench.path + "action", data={"action": "add-layer"})
+    before_add, after_add, _config = workbench._projection_state()
+    assert before_add.expected_gain is not None
+    assert after_add.expected_gain is not None
+    assert after_add.expected_gain != before_add.expected_gain
+    assert "Outcome projection" in added_page.text
+    delta = after_add.expected_gain - before_add.expected_gain
+    direction = "increased" if delta > 0 else "decreased"
+    assert f'aria-label="Expected gain {direction} by ${abs(delta):,.2f}"' in added_page.text
+
+
+def test_max_loss_change_uses_unsigned_amount_and_directional_arrows() -> None:
+    worse = str(_projection_loss_value(Decimal("-1282.56"), Decimal("-640")))
+    better = str(_projection_loss_value(Decimal("-642.56"), Decimal("640")))
+
+    assert 'aria-label="More loss by $640.00"' in worse
+    assert 'data-loss-arrow="up"' in worse
+    assert re.search(r'data-loss-arrow="down" class="hidden"><span data-icon-sh', worse)
+    assert '<span data-loss-amount>$640.00</span>' in worse
+    assert 'aria-label="Less loss by $640.00"' in better
+    assert 'data-loss-arrow="down"' in better
+    assert re.search(r'data-loss-arrow="up" class="hidden"><span data-icon-sh', better)
+    assert '<span data-loss-amount>$640.00</span>' in better
+
+
+def test_expected_gain_change_uses_opposite_arrow_mapping_to_loss() -> None:
+    increased = str(_projection_gain_value(Decimal("3882.08"), Decimal("640")))
+    decreased = str(_projection_gain_value(Decimal("3242.08"), Decimal("-640")))
+
+    assert 'aria-label="Expected gain increased by $640.00"' in increased
+    assert re.search(r'data-gain-arrow="down" class="hidden"><span data-icon-sh', increased)
+    assert 'data-gain-change' in increased
+    assert 'text-muted-foreground' in increased
+    assert '<span data-gain-amount>$640.00</span>' in increased
+    assert 'aria-label="Expected gain decreased by $640.00"' in decreased
+    assert re.search(r'data-gain-arrow="up" class="hidden"><span data-icon-sh', decreased)
+    assert 'text-muted-foreground' in decreased
+    assert '<span data-gain-amount>$640.00</span>' in decreased
+
+
+def test_unchanged_projection_keeps_neutral_placeholder_and_hides_arrows() -> None:
+    for metric, markup in (
+        ("gain", str(_projection_gain_value(Decimal("3882.08"), Decimal("0")))),
+        ("loss", str(_projection_loss_value(Decimal("-642.56"), Decimal("0")))),
+    ):
+        assert 'aria-label="No change from loaded plan"' in markup
+        assert f'<span data-{metric}-amount>—</span>' in markup
+        assert re.search(
+            rf'data-{metric}-arrow="up" class="hidden"><span data-icon-sh', markup
+        )
+        assert re.search(
+            rf'data-{metric}-arrow="down" class="hidden"><span data-icon-sh', markup
+        )
+        assert 'text-muted-foreground' in markup
+
+
+def test_fully_allocated_position_keeps_active_outcome_visible() -> None:
+    from ibkr_options_manager.app.view_model import WorkingOrderLine
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    selected = workbench._selected_con_id
+    assert selected is not None
+    workbench._paper_execution = _OwnedOrderService({101, 102})
+    workbench._drafts[selected] = ()
+    workbench._state = replace(
+        workbench._state,
+        status=UiStatus.BLOCKED,
+        validations=(
+            ValidationLine(
+                "POSITION_FULLY_ALLOCATED",
+                "Existing closing exposure already covers the whole position",
+            ),
+        ),
+        available_quantity=0,
+        working_orders=(
+            WorkingOrderLine(
+                perm_id=101,
+                order_id=11,
+                action="SELL",
+                order_type="LMT",
+                remaining="10",
+                status="Submitted",
+                oca_group="test/tranche-1",
+                limit_price=Decimal("3.30"),
+                tif="GTC",
+            ),
+            WorkingOrderLine(
+                perm_id=102,
+                order_id=12,
+                action="SELL",
+                order_type="STP",
+                remaining="10",
+                status="Submitted",
+                oca_group="test/tranche-1",
+                stop_price=Decimal("2.06"),
+                tif="GTC",
+            ),
+        ),
+    )
+
+    _baseline, projected, _config = workbench._projection_state()
+    assert projected.expected_gain == Decimal("560")
+    assert projected.max_loss == Decimal("-680")
+    page = TestClient(workbench.app).get(workbench.path)
+    assert 'data-live-metric="gain"' in page.text
+    assert "+$560.00" in page.text
+    assert "-$680.00" in page.text
+    assert "All 10 held contract(s) covered." not in page.text
+    assert ">Realized P&amp;L<" not in page.text
+    assert ">Cost basis<" not in page.text
+    assert "How expected gain is calculated" in page.text
+    assert "How max loss is calculated" in page.text
+    assert "Realized P&amp;L from sold layers is excluded." in page.text
+
+    workbench._state = replace(
+        workbench._state,
+        validations=(ValidationLine("OCA_QUANTITY_MISMATCH", "Conflicting orders"),),
+    )
+    assert workbench._projection_state()[1].expected_gain is None
 
 
 def test_partial_journal_reconciliation_keeps_surviving_pair_active_in_the_ui(
@@ -668,6 +838,7 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
     assert "soldLayerRevealBound" not in page.text
     assert "SOLD" in page.text
     assert "+$557.44 USD" in page.text
+    assert workbench._projection_state()[1].realized_pnl == Decimal("557.44")
     assert "Closed" in page.text
     assert "Active" in page.text
     assert "Target filled" not in page.text
@@ -698,6 +869,46 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
     assert 'data-slot="card"' not in existing
     assert "pending TWS verification" not in page.text
     assert "TWS orders are pending verification" not in page.text
+
+    # Sold gains remain in expected gain, while the stop scenario concerns
+    # only contracts still held. Full allocation blocks new drafts, not this
+    # already-reconciled active-layer projection.
+    original_state = workbench._state
+    original_snapshot = workbench._view_model.latest_snapshot()
+    assert original_snapshot is not None
+    original_draft = workbench._drafts[selected]
+    workbench._drafts[selected] = ()
+    workbench._view_model._latest_snapshot = replace(
+        original_snapshot,
+        position=replace(original_snapshot.position, quantity=Decimal("2")),
+    )
+    workbench._state = replace(
+        original_state,
+        status=UiStatus.BLOCKED,
+        validations=(
+            ValidationLine("POSITION_FULLY_ALLOCATED", "Position fully allocated"),
+        ),
+        available_quantity=0,
+        positions=tuple(
+            replace(position, quantity="2")
+            if position.con_id == selected
+            else position
+            for position in original_state.positions
+        ),
+        working_orders=(
+            replace(original_state.working_orders[0], limit_price=Decimal("3.30")),
+            replace(original_state.working_orders[1], stop_price=Decimal("2.06")),
+        ),
+    )
+    _baseline, combined, _config = workbench._projection_state()
+    assert combined.expected_gain == Decimal("669.44")
+    assert combined.max_loss == Decimal("-136.00")
+    combined_page = client.get(workbench.path).text
+    assert "+$669.44" in combined_page
+    assert "-$136.00" in combined_page
+    workbench._state = original_state
+    workbench._view_model._latest_snapshot = original_snapshot
+    workbench._drafts[selected] = original_draft
 
     # A stale TWS working-order snapshot must not make the filled layer look
     # editable or allow a new draft while the two sources disagree.
@@ -1198,6 +1409,8 @@ def test_close_all_review_lists_pair_cancellations_then_one_market_order() -> No
     assert "SELL MKT" in sidebar
     assert "text-emerald-400" in sidebar
     assert "15 contracts" in sidebar
+    assert "Market exit price is unknown until filled." in sidebar
+    assert workbench._projection_state()[1].expected_gain is None
     assert ">Confirm<" in sidebar
     assert ">Cancel<" in sidebar
     assert "Wait for both cancellation confirmations" not in sidebar
@@ -1279,10 +1492,12 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
         "</form>", maxsplit=1
     )[0]
     action_panel = page.text.split('aria-label="Planned order actions"', maxsplit=1)[1]
-    assert action_panel.index("Execute paper order") < action_panel.index(
-        "Outcome projection"
+    assert action_panel.index("Outcome projection") < action_panel.index(
+        "Execute paper order"
     )
-    assert "data-draft-outcome" in action_panel
+    assert "data-outcome-projection" in action_panel
+    assert "— Incomplete" in action_panel
+    assert "Covered subtotal:" in action_panel
     assert 'data-layer-state="draft"' in draft
     assert 'data-slot="card"' not in draft
     assert "Split all available" in draft
