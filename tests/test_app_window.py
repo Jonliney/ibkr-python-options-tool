@@ -285,7 +285,7 @@ def test_outcome_projection_uses_the_draft_layers_and_cost_basis() -> None:
     window.close()
 
 
-def test_layer_outcomes_show_each_layer_impact_and_modeled_breakeven() -> None:
+def test_layer_outcomes_show_each_layer_impact_and_cost_basis() -> None:
     qt_app = app()
     window = PlannerWindow(FakeViewModel())  # type: ignore[arg-type]
     window._apply_state(state())
@@ -305,7 +305,7 @@ def test_layer_outcomes_show_each_layer_impact_and_modeled_breakeven() -> None:
         "-$1774.89",
         "-$1183.26",
     ]
-    assert window.outcome_breakeven_label.text() == "Layer 1 (+$251.85)"
+    assert window.outcome_breakeven_label.text() == "$23.82"
     assert window.findChild(QLabel, "outcomeBreakevenDetail") is None
     remove = next(
         button

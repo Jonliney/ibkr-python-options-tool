@@ -3,7 +3,7 @@ from __future__ import annotations
 # ruff: noqa: E501
 from collections.abc import Callable
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Protocol
 
 from PySide6.QtCore import (
@@ -703,7 +703,7 @@ class PlannerWindow(QMainWindow):
         metrics.addLayout(loss)
         breakeven = QVBoxLayout()
         breakeven.setSpacing(2)
-        breakeven_label = QLabel("Breakeven after")
+        breakeven_label = QLabel("Cost basis")
         breakeven_label.setObjectName("outcomeMetricLabel")
         breakeven.addWidget(breakeven_label)
         self.outcome_breakeven_label = QLabel("—")
@@ -716,6 +716,7 @@ class PlannerWindow(QMainWindow):
 
     def _update_outcome_projection(self) -> None:
         basis = self._state.unit_basis
+        basis_text = _basis_text(basis) if self._selected_con_id is not None else "—"
         multiplier = self._state.multiplier
         layers = self._draft_layer_forms()
         if (
@@ -729,7 +730,7 @@ class PlannerWindow(QMainWindow):
             )
             self.outcome_gain_label.setText("—")
             self.outcome_loss_label.setText("—")
-            self.outcome_breakeven_label.setText("—")
+            self.outcome_breakeven_label.setText(basis_text)
             return
         outcomes = self._draft_layer_outcomes()
         if outcomes is None:
@@ -738,7 +739,7 @@ class PlannerWindow(QMainWindow):
             )
             self.outcome_gain_label.setText("—")
             self.outcome_loss_label.setText("—")
-            self.outcome_breakeven_label.setText("—")
+            self.outcome_breakeven_label.setText(basis_text)
             return
         quantity = sum(layer_quantity for layer_quantity, _, _ in outcomes)
         if quantity > self._state.available_quantity:
@@ -747,13 +748,13 @@ class PlannerWindow(QMainWindow):
             )
             self.outcome_gain_label.setText("—")
             self.outcome_loss_label.setText("—")
-            self.outcome_breakeven_label.setText("—")
+            self.outcome_breakeven_label.setText(basis_text)
             return
         target_pnl = sum((target for _, target, _ in outcomes), Decimal("0"))
         stop_pnl = sum((stop for _, _, stop in outcomes), Decimal("0"))
         cost = basis * multiplier * quantity
         self.outcome_summary_label.setText(
-            f"{quantity} assigned contract(s) · Basis {_price_text(basis)} · "
+            f"{quantity} assigned contract(s) · Basis {_basis_text(basis)} · "
             f"multiplier {format(multiplier, 'f')}"
         )
         self.outcome_gain_label.setText(
@@ -762,14 +763,7 @@ class PlannerWindow(QMainWindow):
         self.outcome_loss_label.setText(
             f"{_signed_money_text(stop_pnl)} ({_return_percentage_text(stop_pnl, cost)})"
         )
-        breakeven = _modeled_breakeven(outcomes)
-        if breakeven is None:
-            self.outcome_breakeven_label.setText("—")
-        else:
-            layer_index, floor = breakeven
-            self.outcome_breakeven_label.setText(
-                f"Layer {layer_index} ({_signed_money_text(floor)})"
-            )
+        self.outcome_breakeven_label.setText(_basis_text(basis))
 
     def _build_action_extended_view(self) -> QWidget:
         panel = QFrame()
@@ -984,7 +978,7 @@ class PlannerWindow(QMainWindow):
             self.position_title.setText(state.position_title)
             self.position_overview.setText(
                 "Cost basis / Ask  "
-                f"{_price_text(state.unit_basis)} / "
+                f"{_basis_text(state.unit_basis)} / "
                 f"{_price_text(None if state.quote_calculator is None else state.quote_calculator.ask)}"
             )
             self._populate_positions(state)
@@ -1520,7 +1514,7 @@ class PlannerWindow(QMainWindow):
                     _review_timeline_item(
                         f"Action {action_index:02d}",
                         f"Create SELL {order_type} · {layer.quantity} {symbol}",
-                        f"{_price_text_from_raw(price)} · {layer.tif}",
+                        f"{_sell_price_with_return(price, self._state.unit_basis)} · {layer.tif}",
                         f"OCA-{index}",
                         tone,
                     )
@@ -1744,12 +1738,30 @@ def _price_text(value: Decimal | None) -> str:
     return f"${format(value.normalize(), 'f')}"
 
 
+def _basis_text(value: Decimal | None) -> str:
+    if value is None:
+        return "—"
+    return f"${value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
+
+
 def _price_text_from_raw(value: str) -> str:
     try:
         price = Decimal(value.strip())
     except InvalidOperation:
         return "$—"
     return _price_text(price) if price.is_finite() and price > 0 else "$—"
+
+
+def _sell_price_with_return(raw_price: str, basis: Decimal | None) -> str:
+    try:
+        price = Decimal(raw_price)
+    except InvalidOperation:
+        return "$—"
+    amount = _price_text(price) if price.is_finite() and price > 0 else "$—"
+    if amount == "$—" or basis is None or basis <= 0:
+        return amount
+    change = (price / basis - 1) * Decimal("100")
+    return f"{amount} ({change:+.1f}%)"
 
 
 def _raw_price_text(value: str) -> str:

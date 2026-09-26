@@ -1,3 +1,44 @@
+.be-action-group[data-reset-visible="true"] [data-move-stops-to-be] {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.be-reset-slot {
+  width: 0;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateX(-8px);
+  pointer-events: none;
+  transition:
+    width 180ms ease-out,
+    margin-left 180ms ease-out,
+    opacity 150ms ease-out,
+    transform 180ms ease-out;
+}
+
+.be-reset-slot[data-reset-visible="true"] {
+  width: 33px;
+  margin-left: -1px;
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
+}
+
+.be-reset-button {
+  width: 33px;
+  min-width: 33px;
+  height: 32px;
+  padding: 0;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .be-reset-slot {
+    transition: none;
+  }
+}
+
 .sold-layer-row {
   position: relative;
   isolation: isolate;

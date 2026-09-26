@@ -98,7 +98,8 @@ without a broker session.
    verified contract multiplier and an integration fixture must compare the
    result with the value displayed in TWS. A missing, zero, non-integral, or
    inconsistent multiplier blocks planning. No quote-derived fallback is
-   allowed.
+   allowed. The outcome panel may round this basis to cents for display, but
+   planning, return percentages, and P&L use the unrounded broker value.
 
 7. **Remainders need a required policy, not an implicit rule.** Support two
    explicit policies initially:

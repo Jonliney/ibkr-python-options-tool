@@ -1923,16 +1923,36 @@ class StarUIWorkbench:
 
         return Form(
             Div(
-                Button(
-                    "Move stop to B/E",
-                    variant="outline",
-                    size="sm",
-                    type="button",
-                    data_move_stops_to_be=True,
-                    disabled=(
-                        self._paper_execution is None
-                        or bool(self._armed_price_updates)
+                Div(
+                    Button(
+                        "Move stop to B/E",
+                        variant="outline",
+                        size="sm",
+                        type="button",
+                        data_move_stops_to_be=True,
+                        disabled=(
+                            self._paper_execution is None
+                            or bool(self._armed_price_updates)
+                        ),
                     ),
+                    Div(
+                        Button(
+                            Icon("lucide:refresh-ccw"),
+                            variant="outline",
+                            size="sm",
+                            type="button",
+                            data_reset_active_prices=True,
+                            aria_label="Reset active layer price fields",
+                            title="Reset active layer price fields",
+                            disabled=True,
+                            cls="be-reset-button",
+                        ),
+                        cls="be-reset-slot",
+                        data_reset_visible="false",
+                        aria_hidden="true",
+                    ),
+                    cls="be-action-group inline-flex items-center",
+                    data_reset_visible="false",
                 ),
                 Button(
                     "Close working",
@@ -2384,10 +2404,11 @@ class StarUIWorkbench:
                         "Max loss", _money(loss), "text-rose-400", live_key="loss"
                     ),
                     *_metric(
-                        "Breakeven after",
-                        _breakeven(outcomes),
+                        "Cost basis",
+                        f"${basis.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
+                        if basis is not None
+                        else "—",
                         "text-amber-300",
-                        live_key="breakeven",
                     ),
                     cls="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] items-baseline gap-x-3 gap-y-3",
                 ),
@@ -2701,7 +2722,7 @@ class StarUIWorkbench:
                 self._review_order_line(
                     "SELL LMT",
                     Span(
-                        f"${layer.target_price}",
+                        _sell_price_with_return(layer.target_price, self._state.unit_basis),
                         data_live_review_price=f"target-{index}",
                         aria_live="polite",
                         cls="text-sm font-semibold text-emerald-400",
@@ -2711,7 +2732,7 @@ class StarUIWorkbench:
                 self._review_order_line(
                     "SELL STP",
                     Span(
-                        f"${layer.stop_price}",
+                        _sell_price_with_return(layer.stop_price, self._state.unit_basis),
                         data_live_review_price=f"stop-{index}",
                         aria_live="polite",
                         cls="text-sm font-semibold text-rose-400",
@@ -2895,6 +2916,7 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
     const value = (name, index) => Number(form.elements[`${{name}}_${{index}}`]?.value);
     const assigned = (selector, text) => document.querySelectorAll(selector).forEach((node) => {{ node.textContent = text; }});
     const priceText = (number) => `$${{Number(number.toFixed(6)).toString()}}`;
+    const sellPriceText = (number) => `${{priceText(number)}} (${{((number / basis - 1) * 100) >= 0 ? '+' : ''}}${{((number / basis - 1) * 100).toFixed(1)}}%)`;
     const money = (number) => `${{number >= 0 ? '+' : '-'}}$${{Math.abs(number).toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})}}`;
     const roundUp = (number) => {{
       let candidate = number;
@@ -2923,8 +2945,10 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         const stopPrice = valid ? roundUp(basis * (1 - stop / 100)) : NaN;
         const gain = valid && Number.isFinite(targetPrice) ? (targetPrice - basis) * multiplier * quantity : NaN;
         const loss = valid && Number.isFinite(stopPrice) ? (stopPrice - basis) * multiplier * quantity : NaN;
-        assigned(`[data-live-price="target-${{index}}"], [data-live-review-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? priceText(targetPrice) : '—');
-        assigned(`[data-live-price="stop-${{index}}"], [data-live-review-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? priceText(stopPrice) : '—');
+        assigned(`[data-live-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? priceText(targetPrice) : '—');
+        assigned(`[data-live-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? priceText(stopPrice) : '—');
+        assigned(`[data-live-review-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? sellPriceText(targetPrice) : '—');
+        assigned(`[data-live-review-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? sellPriceText(stopPrice) : '—');
         assigned(`[data-live-outcome="target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
         assigned(`[data-live-outcome="stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} max loss` : '— max loss');
         assigned(`[data-live-review-quantity="${{index}}"]`, `${{Number.isInteger(quantity) && quantity > 0 ? quantity : '—'}} contracts · ${{form.elements[`tif_${{index}}`]?.value || 'GTC'}}`);
@@ -2934,9 +2958,6 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
       const loss = outcomes.reduce((total, outcome) => total + outcome.loss, 0);
       assigned('[data-live-metric="gain"]', money(gain));
       assigned('[data-live-metric="loss"]', money(loss));
-      let remainingStops = outcomes.reduce((total, outcome) => total + outcome.loss, 0), secured = 0, breakeven = '—';
-      outcomes.slice(0, -1).some((outcome, index) => {{ secured += outcome.gain; remainingStops -= outcome.loss; const floor = secured + remainingStops; if (floor >= 0) {{ breakeven = `Layer ${{index + 1}} (${{money(floor)}})`; return true; }} return false; }});
-      assigned('[data-live-metric="breakeven"]', breakeven);
       assigned('[data-live-allocation]', `${{allocated}} of ${{config.available}} contracts allocated`);
     }};
     form.querySelectorAll('[data-live-input]').forEach((input) => input.addEventListener('input', update));
@@ -2992,7 +3013,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       }});
     }};
     const update = () => {{
-      let changed = false;
+      let changed = false, edited = false;
       form.querySelectorAll('[data-active-input="target"]').forEach((targetInput) => {{
         const permId = targetInput.dataset.activePermId;
         const stopInput = form.querySelector(`[data-active-input="stop"][data-active-perm-id="${{permId}}"]`);
@@ -3011,6 +3032,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         const originalStop = Number(stopInput?.dataset.activeOriginal);
         const targetEdited = targetInput.value.trim() !== (targetInput.dataset.activeInitial || '').trim();
         const stopEdited = stopInput?.value.trim() !== (stopInput?.dataset.activeInitial || '').trim();
+        edited ||= targetEdited || stopEdited;
         const targetChanged = targetEdited && Number.isFinite(targetPrice) && Math.abs(targetPrice - originalTarget) > 1e-8;
         const stopChanged = stopEdited && Number.isFinite(stopPrice) && Math.abs(stopPrice - originalStop) > 1e-8;
         const row = document.querySelector(`[data-active-review-row="${{permId}}"]`);
@@ -3028,12 +3050,25 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       const empty = document.querySelector('[data-active-review-empty]');
       if (empty) empty.classList.toggle('hidden', changed);
       document.querySelectorAll('[data-active-execute]').forEach((button) => {{ button.disabled = !changed; }});
+      const resetVisible = edited && !form.querySelector('[data-active-input]:disabled');
+      form.querySelectorAll('[data-reset-active-prices]').forEach((button) => {{ button.disabled = !resetVisible; }});
+      form.querySelectorAll('.be-reset-slot').forEach((slot) => {{
+        slot.dataset.resetVisible = String(resetVisible);
+        slot.setAttribute('aria-hidden', String(!resetVisible));
+      }});
+      form.querySelectorAll('.be-action-group').forEach((group) => {{ group.dataset.resetVisible = String(resetVisible); }});
       setReviewMode(changed);
     }};
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('input', update));
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('change', update));
     form.querySelectorAll('[data-move-stops-to-be]').forEach((button) => button.addEventListener('click', () => {{
       form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{ input.value = '0'; }});
+      update();
+    }}));
+    form.querySelectorAll('[data-reset-active-prices]').forEach((button) => button.addEventListener('click', () => {{
+      form.querySelectorAll('[data-active-input]').forEach((input) => {{
+        input.value = input.dataset.activeInitial || '';
+      }});
       update();
     }}));
     update();
@@ -3354,6 +3389,20 @@ def _active_percentage_for_price(
 
 def _price_text(price: Decimal | None) -> str:
     return "—" if price is None else format(price, "f")
+
+
+def _sell_price_with_return(raw_price: str, basis: Decimal | None) -> str:
+    try:
+        price = Decimal(raw_price)
+    except InvalidOperation:
+        return "—"
+    if not price.is_finite() or price <= 0:
+        return "—"
+    amount = f"${format(price, 'f')}"
+    if basis is None or basis <= 0:
+        return amount
+    change = (price / basis - 1) * Decimal("100")
+    return f"{amount} ({change:+.1f}%)"
 
 
 def _position_identity(local_symbol: str) -> tuple[str, str]:

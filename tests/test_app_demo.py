@@ -12,7 +12,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox --disable-gpu")
 
 from httpx import Response
-from PySide6.QtCore import QPoint, Qt, QTimer, QUrl
+from PySide6.QtCore import QEventLoop, QPoint, Qt, QTimer, QUrl
 from PySide6.QtTest import QTest
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication
@@ -475,6 +475,8 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert "$26.20" in page.text
     assert "$16.40" in page.text
     assert "Move stop to B/E" in page.text
+    assert "data-reset-active-prices" in page.text
+    assert 'aria-label="Reset active layer price fields"' in page.text
     assert "Update layers" not in page.text
     assert "Close working" in page.text
     assert 'data-layer-state="draft"' in page.text
@@ -502,6 +504,7 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     )
     assert "setHidden(row, !(targetChanged || stopChanged), 'block')" in active_script
     assert "setReviewMode(changed)" in active_script
+    assert "input.value = input.dataset.activeInitial || ''" in active_script
     assert "UPDATE SELL LMT" in page.text
 
 
@@ -841,6 +844,61 @@ def test_active_layer_keeps_an_acknowledged_stop_display_until_tws_refreshes_it(
     workbench._reconcile_pending_active_prices_locked()
 
     assert workbench._pending_active_prices == {}
+
+
+def test_reset_active_prices_restores_target_and_stop_after_move_to_be() -> None:
+    application = QApplication.instance() or QApplication([])
+    view = QWebEngineView()
+    loop = QEventLoop()
+    results: list[object] = []
+    script = _live_active_script(
+        {
+            "basis": "10",
+            "multiplier": "100",
+            "bands": [{"low": "0", "increment": "0.1"}],
+        }
+    )
+    html = (
+        '<form id="active-form">'
+        '<input data-active-input="target" data-active-perm-id="1" '
+        'data-live-layer="1" data-active-initial="50" '
+        'data-active-original="15" value="50">'
+        '<input data-active-input="stop" data-active-perm-id="1" '
+        'data-live-layer="1" data-active-initial="25" '
+        'data-active-original="7.5" value="25">'
+        '<button type="button" data-move-stops-to-be>Move stop to B/E</button>'
+        '<button type="button" data-reset-active-prices disabled>Reset</button>'
+        f"<script>{script}</script></form>"
+    )
+
+    def inspect(loaded: bool) -> None:
+        if not loaded:
+            loop.quit()
+            return
+        view.page().runJavaScript(
+            """(() => {
+              const target = document.querySelector('[data-active-input="target"]');
+              const stop = document.querySelector('[data-active-input="stop"]');
+              const reset = document.querySelector('[data-reset-active-prices]');
+              target.value = '60';
+              target.dispatchEvent(new Event('input', { bubbles: true }));
+              document.querySelector('[data-move-stops-to-be]').click();
+              const afterMove = [target.value, stop.value, reset.disabled];
+              reset.click();
+              return JSON.stringify({ afterMove, afterReset: [target.value, stop.value, reset.disabled] });
+            })()""",
+            lambda value: (results.append(value), loop.quit()),
+        )
+
+    view.loadFinished.connect(inspect)
+    view.setHtml(html)
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    view.close()
+
+    assert results == [
+        '{"afterMove":["60","0",false],"afterReset":["50","25",true]}'
+    ]
 
 
 def test_price_update_confirmation_uses_the_shared_cancel_confirm_bar() -> None:
