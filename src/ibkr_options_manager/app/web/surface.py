@@ -31,7 +31,7 @@ from starhtml.plugins import Plugin
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from ...domain import preview_reference_prices, round_up_price
+from ...domain import BrokerSnapshot, preview_reference_prices, round_up_price
 from ...execution import (
     ExecutionBlocked,
     ExecutionOutcomeUnknown,
@@ -108,6 +108,13 @@ class _ToastNotice:
     variant: str
 
 
+@dataclass(frozen=True, slots=True)
+class _PriceUpdateImpact:
+    title: str
+    details: tuple[str, ...]
+    concerns: frozenset[tuple[int, str]]
+
+
 class StarUIWorkbench:
     """Server-owned StarUI view over planning and explicitly enabled paper sends."""
 
@@ -129,6 +136,7 @@ class StarUIWorkbench:
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
         self._armed_cancellation: MarketExitCandidate | None = None
         self._armed_price_updates: tuple[PriceUpdateCandidate, ...] = ()
+        self._warned_price_update_concerns: frozenset[tuple[int, str]] = frozenset()
         self._price_update_retry_required = False
         self._armed_active_percentages: dict[int, tuple[str, str]] = {}
         # TWS can acknowledge a price amendment before its next open-order
@@ -412,6 +420,7 @@ class StarUIWorkbench:
         self._armed_market_exits = ()
         self._armed_cancellation = None
         self._armed_price_updates = ()
+        self._warned_price_update_concerns = frozenset()
         self._price_update_retry_required = False
         self._armed_active_percentages = {}
 
@@ -837,6 +846,9 @@ class StarUIWorkbench:
                 )
             self._price_update_retry_required = prior_state == "SUBMISSION_UNKNOWN"
             self._armed_active_percentages = edited_percentages
+            self._warned_price_update_concerns = _price_update_impact(
+                snapshot, self._armed_price_updates
+            ).concerns
         except (ExecutionBlocked, ValueError) as error:
             self._disarm_execution_locked()
             self._message = f"Price update blocked: {error}"
@@ -905,6 +917,17 @@ class StarUIWorkbench:
             self._message = "Price update blocked: the fresh snapshot is unavailable."
             record_price_update_event(
                 "ui_result", outcome="blocked", reason="fresh snapshot unavailable"
+            )
+            return
+        latest_concerns = _price_update_impact(snapshot, updates).concerns
+        if latest_concerns - self._warned_price_update_concerns:
+            self._warned_price_update_concerns = latest_concerns
+            self._message = (
+                "The fresh quote changes the immediate-sell warning. Review it and "
+                "confirm again; no price amendment was sent."
+            )
+            record_price_update_event(
+                "ui_result", outcome="blocked", reason="new immediate-sell concern after refresh"
             )
             return
         try:
@@ -1970,12 +1993,6 @@ class StarUIWorkbench:
             )
             if working_count
             else None,
-            P(
-                "Proposed prices are shown below. TWS orders stay unchanged "
-                "until you Confirm.",
-                cls="mb-4 text-xs text-amber-300",
-            )
-            if self._armed_price_updates else None,
             ScrollArea(
                 Div(*rows, cls="w-full min-w-[41rem]"),
                 aria_label="Existing OCA layer rows",
@@ -2538,16 +2555,37 @@ class StarUIWorkbench:
                 confirm_action="cancel-pair-confirm",
                 confirm_variant="destructive",
                 busy_text="Cancelling…",
+                impact=(
+                    "Bracket will close",
+                    (
+                        "Confirm requests cancellation of both working orders in this "
+                        "OCA bracket. If both cancel, the position stays open without "
+                        "this bracket's protection.",
+                    ),
+                ),
             )
         if market_exits:
             return self._staged_action_controls(
                 confirm_action="market-exit-confirm",
                 confirm_variant="destructive",
+                impact=(
+                    "Sell and close bracket",
+                    (
+                        "Confirm requests cancellation of the selected OCA bracket. "
+                        "Only after both legs are confirmed cancelled does the app "
+                        "submit a SELL MKT for the remaining contracts. The fill "
+                        "price is not guaranteed.",
+                    ),
+                ),
             )
         if self._armed_price_updates:
+            impact = _price_update_impact(
+                self._view_model.latest_snapshot(), self._armed_price_updates
+            )
             return self._staged_action_controls(
                 confirm_action="price-update-confirm",
                 retry_acknowledgement=self._price_update_retry_required,
+                impact=(impact.title, impact.details),
             )
         if self._armed_execution is not None:
             return self._staged_action_controls(
@@ -2603,9 +2641,18 @@ class StarUIWorkbench:
         confirm_variant: ButtonVariant = "default",
         busy_text: str = "Submitting…",
         retry_acknowledgement: bool = False,
+        impact: tuple[str, tuple[str, ...]] | None = None,
     ) -> Any:
         """One deliberate Cancel / Confirm bar for every staged order change."""
         return Form(
+            Alert(
+                AlertTitle(impact[0]),
+                AlertDescription(
+                    *(P(detail) for detail in impact[1]),
+                    cls="space-y-1",
+                ),
+                cls="mb-3 border-amber-500/40 bg-amber-500/10 text-amber-100",
+            ) if impact else None,
             Label(
                 HTMLInput(
                     type="checkbox",
@@ -3403,6 +3450,74 @@ def _sell_price_with_return(raw_price: str, basis: Decimal | None) -> str:
         return amount
     change = (price / basis - 1) * Decimal("100")
     return f"{amount} ({change:+.1f}%)"
+
+
+def _price_update_impact(
+    snapshot: BrokerSnapshot | None,
+    updates: tuple[PriceUpdateCandidate, ...],
+) -> _PriceUpdateImpact:
+    """Describe quote proximity without treating one quote as a fill guarantee."""
+    quote = snapshot.quote if snapshot is not None else None
+    reliable = bool(
+        snapshot is not None
+        and snapshot.fresh
+        and quote is not None
+        and quote.fresh
+        and quote.market_data_type == "LIVE"
+    )
+    ask = quote.ask if quote is not None else None
+    bid = quote.bid if quote is not None else None
+    ask = ask if ask is not None and ask.is_finite() and ask > 0 else None
+    bid = bid if bid is not None and bid.is_finite() and bid > 0 else None
+    concerns: set[tuple[int, str]] = set()
+    details: list[str] = []
+    crosses_quote = False
+    for index, update in enumerate(updates, start=1):
+        perm_id = update.layer.target_perm_id
+        if update.stop_price is not None:
+            if ask is not None and update.stop_price >= ask:
+                concerns.add((perm_id, "stop-crosses-ask"))
+                crosses_quote = True
+                details.append(
+                    f"Layer {index}: SELL STP ${_price_text(update.stop_price)} is at or above "
+                    f"the {'current' if reliable else 'latest snapshot'} ask ${_price_text(ask)}."
+                )
+            elif ask is None or not reliable:
+                concerns.add((perm_id, "stop-quote-unknown"))
+        if update.target_price is not None:
+            if bid is not None and update.target_price <= bid:
+                concerns.add((perm_id, "limit-crosses-bid"))
+                crosses_quote = True
+                details.append(
+                    f"Layer {index}: SELL LMT ${_price_text(update.target_price)} is at or below "
+                    f"the {'current' if reliable else 'latest snapshot'} bid ${_price_text(bid)}."
+                )
+            elif bid is None or not reliable:
+                concerns.add((perm_id, "limit-quote-unknown"))
+    if crosses_quote:
+        title = "Possible immediate sell"
+        details.append(
+            "Confirming may cause these sell orders to execute soon and close "
+            "their OCA brackets. A stop does not guarantee its fill price."
+        )
+    elif concerns:
+        title = "Immediate sell risk cannot be assessed"
+        details.append(
+            "A current live bid or ask is unavailable for every modified sell leg. "
+            "Check TWS before confirming; a changed order may execute soon."
+        )
+    else:
+        title = "No immediate sell indicated by quote"
+        details.append(
+            "The modified sell prices do not cross the latest live bid or ask. "
+            "Market prices can change before TWS acknowledges the amendment."
+        )
+    if quote is not None and not reliable:
+        details.append(
+            f"Quote status: {quote.market_data_type.lower().replace('_', ' ')}; "
+            "the displayed prices may not reflect the current market."
+        )
+    return _PriceUpdateImpact(title, tuple(details), frozenset(concerns))
 
 
 def _position_identity(local_symbol: str) -> tuple[str, str]:

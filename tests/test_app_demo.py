@@ -31,6 +31,7 @@ from ibkr_options_manager.app.web.surface import (
     _active_percentage_for_price,
     _busy_submit_script,
     _live_active_script,
+    _price_update_impact,
     _position_identity,
     _toast_notice,
 )
@@ -927,9 +928,61 @@ def test_price_update_confirmation_uses_the_shared_cancel_confirm_bar() -> None:
     )
 
     assert 'value="price-update-confirm"' in sidebar
+    assert "Quote status: frozen" in sidebar
     assert ">Cancel<" in sidebar
     assert ">Confirm<" in sidebar
     assert "Click to confirm" not in sidebar
+
+
+def test_stop_above_latest_ask_warns_before_price_update_and_quote_change_rearms(
+    monkeypatch,
+) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    layer = MarketExitCandidate(
+        account=DEMO_ACCOUNT,
+        con_id=snapshot.selected.con_id,
+        target_order_id=11,
+        target_perm_id=101,
+        client_id=17,
+        quantity=Decimal("1"),
+        tif="GTC",
+        oca_group="example/tranche-1",
+        stop_order_id=12,
+        stop_perm_id=102,
+    )
+    updates = (PriceUpdateCandidate(layer=layer, stop_price=Decimal("10.10")),)
+    safe = replace(
+        snapshot,
+        quote=replace(
+            snapshot.quote,
+            bid=Decimal("10.00"),
+            ask=Decimal("10.20"),
+            market_data_type="LIVE",
+            fresh=True,
+        ),
+    )
+    risky = replace(
+        safe, quote=replace(safe.quote, bid=Decimal("9.70"), ask=Decimal("9.80"))
+    )
+    impact = _price_update_impact(risky, updates)
+    assert impact.title == "Possible immediate sell"
+    assert "SELL STP $10.10 is at or above the current ask $9.80" in impact.details[0]
+
+    workbench._paper_execution = object()  # type: ignore[assignment]
+    workbench._armed_price_updates = updates
+    workbench._warned_price_update_concerns = _price_update_impact(safe, updates).concerns
+    monkeypatch.setattr(workbench._view_model, "select_position", lambda *_: workbench._state)
+    monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: risky)
+    monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
+
+    workbench._confirm_price_updates_locked({})
+
+    assert "confirm again" in workbench._message
+    assert workbench._armed_price_updates == updates
+    assert workbench._warned_price_update_concerns == impact.concerns
 
 
 @pytest.mark.parametrize("prior_unknown", [False, True])

@@ -91,6 +91,15 @@ requested price before reporting success. If the fresh check still shows the
 old price, the outcome is unknown and the user must inspect TWS before any
 further change.
 
+The price-amendment review compares modified SELL STP prices with the latest
+option ask and modified SELL LMT prices with the latest bid. A crossing quote
+warns that the leg may execute soon and close its OCA bracket. Missing,
+delayed, or frozen quotes are identified as uncertain; a quote is never a fill
+guarantee, and TWS trigger methods or later market movement can change the
+outcome. Confirmation refreshes broker state again. If that refresh introduces
+an immediate-sell concern not shown during review, no amendment is sent until
+the operator reviews the new warning and confirms again.
+
 If an earlier price amendment is journaled with an unknown outcome, the app
 requires a later fresh snapshot showing the same app-owned orders at their old
 prices. The operator must also inspect TWS and explicitly confirm that no

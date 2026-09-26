@@ -53,7 +53,7 @@ def AlertTitle(
     return Div(
         *children,
         cls=cn(
-            "col-start-2 line-clamp-1 min-h-4 min-w-0 font-medium tracking-tight",
+            "col-start-2 min-h-4 min-w-0 font-medium tracking-tight",
             cls,
         ),
         data_slot="alert-title",
