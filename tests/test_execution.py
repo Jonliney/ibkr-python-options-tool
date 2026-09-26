@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
@@ -988,16 +989,106 @@ def test_price_updates_amend_only_the_requested_app_owned_leg(tmp_path) -> None:
     assert receipt.entry.perm_ids == (502,)
 
 
+def test_unknown_price_amendment_needs_explicit_fresh_retry(tmp_path) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.record_submission(
+        plan.fingerprint, order_ids=(101, 102), perm_ids=(201, 202)
+    )
+    group = f"{plan.fingerprint[:12]}/tranche-1"
+    target = WorkingOrder(
+        perm_id=201, client_id=17, order_id=101, key=snapshot.selected,
+        action="SELL", order_type="LMT", remaining=Decimal("2"),
+        status="Submitted", oca_group=group, tif="GTC",
+        limit_price=Decimal("1.20"),
+    )
+    stop = replace(
+        target, perm_id=202, order_id=102, order_type="STP",
+        limit_price=None, stop_price=Decimal("0.75"),
+    )
+    active = replace(snapshot, working_orders=(target, stop))
+
+    class FlakyTransport(_RecordingMarketTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        def modify_prices(self, snapshot, candidates, **kwargs):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ExecutionOutcomeUnknown("lost TWS acknowledgement")
+            return super().modify_prices(snapshot, candidates, **kwargs)
+
+    transport = FlakyTransport()
+    service = PaperExecutionService(transport, journal)
+    layer = service.prepare_market_exit(
+        active, target_perm_id=201, expected_client_id=17
+    )
+    update = PriceUpdateCandidate(
+        layer=layer, target_price=Decimal("1.40"),
+        prior_target_price=Decimal("1.20"),
+        prior_stop_price=Decimal("0.75"),
+    )
+
+    def amend(current, *, allow_unknown_retry=False):
+        return service.modify_prices(
+            current, (update,), host="127.0.0.1", port=7497,
+            client_id=17, timeout_seconds=1,
+            allow_unknown_retry=allow_unknown_retry,
+        )
+
+    with pytest.raises(ExecutionOutcomeUnknown, match="lost TWS"):
+        amend(active)
+    with pytest.raises(ExecutionBlocked, match="already journaled"):
+        amend(active)
+    with pytest.raises(ExecutionBlocked, match=r"fresh.*later"):
+        amend(active, allow_unknown_retry=True)
+    assert transport.attempts == 1
+
+    refreshed = replace(active, captured_at=Decimal("1"))
+    already_changed = replace(
+        refreshed,
+        working_orders=(replace(target, limit_price=Decimal("1.40")), stop),
+    )
+    with pytest.raises(ExecutionBlocked, match="prices changed"):
+        amend(already_changed, allow_unknown_retry=True)
+    assert transport.attempts == 1
+    assert (
+        service.price_update_attempt_state(refreshed, (update,))
+        == "SUBMISSION_UNKNOWN"
+    )
+    receipt = amend(refreshed, allow_unknown_retry=True)
+    assert receipt.entry.order_ids == (101,)
+    assert transport.attempts == 2
+    attempts = [
+        entry for entry in journal._entries()
+        if entry.fingerprint.startswith("price-update:")
+    ]
+    assert [entry.state for entry in attempts] == ["SUBMISSION_UNKNOWN", "SUBMITTED"]
+    assert attempts[0].fingerprint != attempts[1].fingerprint
+    with pytest.raises(ExecutionBlocked, match="already journaled"):
+        amend(replace(refreshed, captured_at=Decimal("2")), allow_unknown_retry=True)
+    assert transport.attempts == 2
+
+
 @pytest.mark.parametrize(
-    ("post_price", "confirmed"),
-    [(29.1, False), (31.5, True)],
+    ("post_price", "confirmed", "rejected"),
+    [(29.1, False, False), (31.5, True, False), (29.1, False, True)],
 )
 def test_price_update_requires_fresh_post_write_order_price(
     monkeypatch,
+    tmp_path,
     post_price: float,
     confirmed: bool,
+    rejected: bool,
 ) -> None:
     from ibkr_options_manager.broker import execution as broker_execution
+
+    trace_path = tmp_path / "price-amendments.jsonl"
+    monkeypatch.setenv("IBKR_OPTIONS_MANAGER_PRICE_TRACE", str(trace_path))
 
     class FakeWrapper:
         def __init__(self) -> None:
@@ -1043,6 +1134,9 @@ def test_price_update_requires_fresh_post_write_order_price(
             assert order_id == 101
             assert order.lmtPrice == 31.5
             assert order.transmit is True
+            if rejected:
+                self.wrapper.error(order_id, 109, "TWS price precaution")
+                return
             # The write callback reflects the requested value, but a separate
             # reqOpenOrders check above still sees the old working value.
             self.wrapper.openOrder(
@@ -1083,9 +1177,37 @@ def test_price_update_requires_fresh_post_write_order_price(
 
     if confirmed:
         assert amend().order_ids == (101,)
+    elif rejected:
+        with pytest.raises(ExecutionBlocked, match="TWS price precaution"):
+            amend()
     else:
         with pytest.raises(ExecutionOutcomeUnknown, match="post-update"):
             amend()
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert any(
+        event["event"] == "place_order"
+        and event["requested_price"] == "31.5"
+        and event["submitted_transmit"] is True
+        for event in events
+    )
+    if rejected:
+        assert any(
+            event["event"] == "tws_error"
+            and event["code"] == 109
+            and event["message"] == "TWS price precaution"
+            for event in events
+        )
+    else:
+        assert any(
+            event["event"] == "open_order"
+            and event["phase"] == "read_after"
+            and event["observed_price"] == str(post_price)
+            for event in events
+        )
+    outcomes = [event for event in events if event["event"] == "writer_outcome"]
+    assert outcomes[-1]["outcome"] == (
+        "blocked" if rejected else "verified" if confirmed else "unknown"
+    )
 
 
 def test_unknown_submission_reconciles_only_when_a_complete_oca_pair_is_observed(

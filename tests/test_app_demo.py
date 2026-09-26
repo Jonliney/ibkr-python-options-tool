@@ -1,9 +1,12 @@
+import json
 import os
 import re
 from dataclasses import replace
 from decimal import Decimal
 from threading import Event, Thread
 from types import SimpleNamespace
+
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox --disable-gpu")
@@ -688,10 +691,16 @@ def test_price_update_confirmation_uses_the_shared_cancel_confirm_bar() -> None:
     assert "Click to confirm" not in sidebar
 
 
+@pytest.mark.parametrize("prior_unknown", [False, True])
 def test_arming_price_update_preserves_edited_percentage_in_active_input(
     tmp_path,
+    monkeypatch,
+    prior_unknown,
 ) -> None:
     from ibkr_options_manager.app.view_model import WorkingOrderLine
+
+    trace_path = tmp_path / "price-amendments.jsonl"
+    monkeypatch.setenv("IBKR_OPTIONS_MANAGER_PRICE_TRACE", str(trace_path))
 
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -769,6 +778,26 @@ def test_arming_price_update_preserves_edited_percentage_in_active_input(
             ),
         )
     )
+    if prior_unknown:
+        journal.begin_management(
+            replace(active_snapshot, captured_at=Decimal("0")),
+            operation="price-update",
+            material=(
+                101, 201, Decimal("29.10"), Decimal("31.50"),
+                102, 202, Decimal("18.20"), None,
+            ),
+            expected_order_count=1,
+        )
+        prior_entry = journal.latest_management_attempt(
+            active_snapshot,
+            operation="price-update",
+            material=(
+                101, 201, Decimal("29.10"), Decimal("31.50"),
+                102, 202, Decimal("18.20"), None,
+            ),
+        )
+        assert prior_entry is not None
+        journal.mark_unknown(prior_entry.fingerprint)
 
     class PriceWriter(DemoPaperExecutionTransport):
         def __init__(self) -> None:
@@ -797,11 +826,23 @@ def test_arming_price_update_preserves_edited_percentage_in_active_input(
     target_input = re.search(r'<input[^>]*name="active_target_201"[^>]*>', page.text)
     assert target_input is not None
     assert 'value="30"' in target_input.group()
+    assert ('name="ack_unknown_price_update"' in page.text) is prior_unknown
     arm_toast_revision = workbench._toast_revision
+
+    if prior_unknown:
+        blocked = TestClient(workbench.app).post(
+            workbench.path + "action", data={"action": "price-update-confirm"}
+        )
+        assert writer.prices == []
+        assert "acknowledge" in blocked.text
+        assert workbench._armed_price_updates
 
     confirmed = TestClient(workbench.app).post(
         workbench.path + "action",
-        data={"action": "price-update-confirm"},
+        data={
+            "action": "price-update-confirm",
+            **({"ack_unknown_price_update": "on"} if prior_unknown else {}),
+        },
     )
 
     assert writer.prices == [Decimal("31.50")]
@@ -810,6 +851,14 @@ def test_arming_price_update_preserves_edited_percentage_in_active_input(
     ), workbench._status_message
     assert workbench._toast_revision > arm_toast_revision
     assert "Price update sent to TWS" in confirmed.text
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    requested = next(
+        event for event in events if event["event"] == "ui_confirm_requested"
+    )
+    assert requested["requested"][0]["target_price"] == "31.50"
+    assert requested["retry_acknowledged"] is prior_unknown
+    assert events[-1]["event"] == "ui_result"
+    assert events[-1]["outcome"] == "acknowledged"
 
 
 def test_close_all_review_lists_pair_cancellations_then_one_market_order() -> None:

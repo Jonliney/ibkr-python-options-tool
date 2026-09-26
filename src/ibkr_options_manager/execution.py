@@ -280,6 +280,34 @@ class ExecutionJournal:
             None,
         )
 
+    @staticmethod
+    def _management_fingerprint(
+        snapshot: BrokerSnapshot, operation: str, material: tuple[object, ...]
+    ) -> str:
+        encoded = ":".join(
+            str(value)
+            for value in (
+                snapshot.selected.account,
+                snapshot.selected.con_id,
+                *material,
+            )
+        )
+        return f"{operation}:{sha256(encoded.encode()).hexdigest()}"
+
+    def latest_management_attempt(
+        self, snapshot: BrokerSnapshot, *, operation: str, material: tuple[object, ...]
+    ) -> JournalEntry | None:
+        base = self._management_fingerprint(snapshot, operation, material)
+        return next(
+            (
+                entry
+                for entry in reversed(self._entries())
+                if entry.fingerprint == base
+                or entry.fingerprint.startswith(f"{base}:retry-")
+            ),
+            None,
+        )
+
     def owned_perm_ids(self, *, account: str, con_id: int) -> frozenset[int]:
         """Return permanent IDs of broker orders proven to be app-owned."""
         return frozenset(
@@ -438,23 +466,43 @@ class ExecutionJournal:
         operation: str,
         material: tuple[object, ...],
         expected_order_count: int,
+        allow_unknown_price_retry: bool = False,
     ) -> JournalEntry:
-        """Durably reserve one non-retryable app-owned management attempt."""
+        """Reserve a management attempt, retaining any indeterminate predecessor."""
         if not operation or expected_order_count <= 0:
             raise ExecutionBlocked("management journal entry is incomplete")
-        encoded = ":".join(
-            str(value)
-            for value in (
-                snapshot.selected.account,
-                snapshot.selected.con_id,
-                *material,
-            )
+        fingerprint = self._management_fingerprint(snapshot, operation, material)
+        previous = self.latest_management_attempt(
+            snapshot, operation=operation, material=material
         )
-        fingerprint = f"{operation}:{sha256(encoded.encode()).hexdigest()}"
-        if self.find(fingerprint) is not None:
-            raise ExecutionBlocked(
-                "this management attempt is already journaled; no retry is automatic"
+        if previous is not None:
+            if (
+                not allow_unknown_price_retry
+                or operation != "price-update"
+                or previous.state != "SUBMISSION_UNKNOWN"
+            ):
+                raise ExecutionBlocked(
+                    "this management attempt is already journaled; "
+                    "no retry is automatic"
+                )
+            try:
+                later = (
+                    snapshot.captured_at.is_finite()
+                    and snapshot.captured_at > Decimal(previous.snapshot_captured_at)
+                )
+            except (InvalidOperation, ValueError, ArithmeticError):
+                later = False
+            if not later:
+                raise ExecutionBlocked(
+                    "a fresh TWS snapshot later than the unknown price "
+                    "amendment is required"
+                )
+            attempts = sum(
+                entry.fingerprint == fingerprint
+                or entry.fingerprint.startswith(f"{fingerprint}:retry-")
+                for entry in self._entries()
             )
+            fingerprint = f"{fingerprint}:retry-{attempts}"
         entry = JournalEntry(
             fingerprint=fingerprint,
             account=snapshot.selected.account,
@@ -503,7 +551,7 @@ class ExecutionJournal:
         )
 
     def mark_unknown(self, fingerprint: str) -> JournalEntry:
-        """Record an indeterminate transport outcome and permanently block a retry."""
+        """Record an indeterminate outcome; never retry it automatically."""
         return self.record_submission(fingerprint, order_ids=(), perm_ids=())
 
     def record_management_completion(
@@ -1028,6 +1076,35 @@ class PaperExecutionService:
             validated.append(update)
         return tuple(validated)
 
+    @staticmethod
+    def _price_update_material(
+        updates: tuple[PriceUpdateCandidate, ...],
+    ) -> tuple[object, ...]:
+        return tuple(
+            value
+            for update in updates
+            for value in (
+                update.layer.target_order_id,
+                update.layer.target_perm_id,
+                update.prior_target_price,
+                update.target_price,
+                update.layer.stop_order_id,
+                update.layer.stop_perm_id,
+                update.prior_stop_price,
+                update.stop_price,
+            )
+        )
+
+    def price_update_attempt_state(
+        self, snapshot: BrokerSnapshot, updates: tuple[PriceUpdateCandidate, ...]
+    ) -> str | None:
+        attempt = self._journal.latest_management_attempt(
+            snapshot,
+            operation="price-update",
+            material=self._price_update_material(updates),
+        )
+        return attempt.state if attempt is not None else None
+
     def modify_prices(
         self,
         snapshot: BrokerSnapshot,
@@ -1037,6 +1114,7 @@ class PaperExecutionService:
         port: int,
         client_id: int,
         timeout_seconds: float,
+        allow_unknown_retry: bool = False,
     ) -> SubmissionReceipt:
         """Perform a revalidated, price-only amendment of selected OCA pairs."""
         refreshed = self.prepare_price_updates(
@@ -1046,6 +1124,12 @@ class PaperExecutionService:
         )
         if refreshed != updates:
             raise ExecutionBlocked("the selected OCA layers changed since confirmation")
+        if allow_unknown_retry and any(
+            (update.target_price is not None and update.prior_target_price is None)
+            or (update.stop_price is not None and update.prior_stop_price is None)
+            for update in updates
+        ):
+            raise ExecutionBlocked("the prior broker price is required for recovery")
         transport = self._transport
         if not isinstance(transport, PaperPriceUpdateTransport):
             raise ExecutionBlocked(
@@ -1058,21 +1142,9 @@ class PaperExecutionService:
         entry = self._journal.begin_management(
             snapshot,
             operation="price-update",
-            material=tuple(
-                value
-                for update in updates
-                for value in (
-                    update.layer.target_order_id,
-                    update.layer.target_perm_id,
-                    update.prior_target_price,
-                    update.target_price,
-                    update.layer.stop_order_id,
-                    update.layer.stop_perm_id,
-                    update.prior_stop_price,
-                    update.stop_price,
-                )
-            ),
+            material=self._price_update_material(updates),
             expected_order_count=expected_order_count,
+            allow_unknown_price_retry=allow_unknown_retry,
         )
         try:
             result = transport.modify_prices(

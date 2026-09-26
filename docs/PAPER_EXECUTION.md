@@ -84,6 +84,26 @@ requested price before reporting success. If the fresh check still shows the
 old price, the outcome is unknown and the user must inspect TWS before any
 further change.
 
+If an earlier price amendment is journaled with an unknown outcome, the app
+requires a later fresh snapshot showing the same app-owned orders at their old
+prices. The operator must also inspect TWS and explicitly confirm that no
+amendment is waiting for Transmit. Only then can a new, separately journaled
+price-only attempt be sent. The uncertain attempt remains in the audit trail;
+other management operations remain non-retryable. If the broker snapshot has
+changed or cannot be established as later than the unknown attempt, the app
+blocks the recovery.
+
+Each price-update confirmation writes a local JSON Lines trace to
+`~/Library/Application Support/IBKR Options Manager/logs/price-amendments.jsonl`
+on macOS (under the journal's state directory on other platforms). Set
+`IBKR_OPTIONS_MANAGER_PRICE_TRACE` to an absolute path to override it. The
+file records the staged request, submitted order fields, selected TWS
+`openOrder`/`orderStatus` callbacks, TWS errors and warnings, the post-write
+open-order check, and the UI result. It rotates at approximately 2 MB to a
+`.1` backup and is limited to the current user. Treat the trace as private
+brokerage data. A trace file that cannot be opened blocks the amendment before
+the broker write; a trace failure after sending leaves the outcome unknown.
+
 ## Acknowledgement and recovery
 
 The app waits for an `openOrder` acknowledgement carrying a nonzero permanent

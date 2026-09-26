@@ -42,6 +42,7 @@ from ...execution import (
     PriceUpdateCandidate,
     classify_journal_layer,
 )
+from ...price_update_trace import record_price_update_event
 from ..view_model import (
     ConnectionSettings,
     DraftLayerForm,
@@ -117,6 +118,7 @@ class StarUIWorkbench:
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
         self._armed_cancellation: MarketExitCandidate | None = None
         self._armed_price_updates: tuple[PriceUpdateCandidate, ...] = ()
+        self._price_update_retry_required = False
         self._armed_active_percentages: dict[int, tuple[str, str]] = {}
         # TWS can acknowledge a price amendment before its next open-order
         # snapshot reflects it. Retain only that acknowledged presentation
@@ -303,7 +305,7 @@ class StarUIWorkbench:
             elif action == "active-update-arm":
                 self._arm_price_updates_locked(values)
             elif action == "price-update-confirm":
-                self._confirm_price_updates_locked()
+                self._confirm_price_updates_locked(values)
             else:
                 if action not in {"execute-arm", "execute-confirm"}:
                     self._disarm_execution_locked()
@@ -396,6 +398,7 @@ class StarUIWorkbench:
         self._armed_market_exits = ()
         self._armed_cancellation = None
         self._armed_price_updates = ()
+        self._price_update_retry_required = False
         self._armed_active_percentages = {}
 
     def _arm_execution_locked(self) -> None:
@@ -811,20 +814,35 @@ class StarUIWorkbench:
                 updates=changes,
                 expected_client_id=self._settings.client_id,
             )
+            prior_state = self._paper_execution.price_update_attempt_state(
+                snapshot, self._armed_price_updates
+            )
+            if prior_state is not None and prior_state != "SUBMISSION_UNKNOWN":
+                raise ExecutionBlocked(
+                    "this exact amendment has already been sent or reserved; refresh TWS"
+                )
+            self._price_update_retry_required = prior_state == "SUBMISSION_UNKNOWN"
             self._armed_active_percentages = edited_percentages
         except (ExecutionBlocked, ValueError) as error:
+            self._disarm_execution_locked()
             self._message = f"Price update blocked: {error}"
             return
         changed_legs = sum(
             int(update.target_price is not None) + int(update.stop_price is not None)
             for update in self._armed_price_updates
         )
-        self._message = (
-            f"Fresh paper snapshot verified. Review {changed_legs} selected price "
-            "amendments, then confirm."
-        )
+        if self._price_update_retry_required:
+            self._message = (
+                "An earlier price amendment has an unknown outcome. Inspect the order "
+                "in TWS for a pending change, then confirm the check below before retrying."
+            )
+        else:
+            self._message = (
+                f"Fresh paper snapshot verified. Review {changed_legs} selected price "
+                "amendments, then confirm."
+            )
 
-    def _confirm_price_updates_locked(self) -> None:
+    def _confirm_price_updates_locked(self, values: dict[str, str]) -> None:
         updates = self._armed_price_updates
         if (
             self._paper_execution is None
@@ -835,6 +853,31 @@ class StarUIWorkbench:
                 "Start a price update first; every paper change needs confirmation."
             )
             return
+        retry_acknowledged = values.get("ack_unknown_price_update") == "on"
+        if self._price_update_retry_required and not retry_acknowledged:
+            self._message = (
+                "Price update blocked: check TWS and acknowledge that the old working "
+                "price remains and no amendment is waiting for Transmit."
+            )
+            record_price_update_event(
+                "ui_result", outcome="blocked", reason="unknown amendment acknowledgement missing"
+            )
+            return
+        record_price_update_event(
+            "ui_confirm_requested",
+            con_id=self._selected_con_id,
+            client_id=self._settings.client_id,
+            retry_acknowledged=retry_acknowledged,
+            requested=[
+                {
+                    "target_order_id": update.layer.target_order_id,
+                    "target_price": str(update.target_price) if update.target_price is not None else None,
+                    "stop_order_id": update.layer.stop_order_id,
+                    "stop_price": str(update.stop_price) if update.stop_price is not None else None,
+                }
+                for update in updates
+            ],
+        )
         state = self._view_model.select_position(
             self._selected_con_id,
             self._plan_form(self._drafts.get(self._selected_con_id, ())),
@@ -846,6 +889,9 @@ class StarUIWorkbench:
         if snapshot is None:
             self._disarm_execution_locked()
             self._message = "Price update blocked: the fresh snapshot is unavailable."
+            record_price_update_event(
+                "ui_result", outcome="blocked", reason="fresh snapshot unavailable"
+            )
             return
         try:
             confirmed = self._paper_execution.prepare_price_updates(
@@ -862,13 +908,17 @@ class StarUIWorkbench:
                 port=self._settings.port,
                 client_id=self._settings.client_id,
                 timeout_seconds=self._settings.timeout_seconds,
+                allow_unknown_retry=self._price_update_retry_required,
             )
         except ExecutionOutcomeUnknown as error:
             self._message = f"Price update outcome is unknown: {error}. Refresh TWS before any further action."
+            record_price_update_event("ui_result", outcome="unknown", reason=str(error))
         except ExecutionBlocked as error:
             self._message = f"Price update blocked: {error}"
+            record_price_update_event("ui_result", outcome="blocked", reason=str(error))
         except Exception as error:
             self._message = f"Price update outcome is unknown: {error}"
+            record_price_update_event("ui_result", outcome="unknown", reason=str(error))
         else:
             for update in updates:
                 self._remember_pending_active_prices_locked(
@@ -880,6 +930,22 @@ class StarUIWorkbench:
             self._refresh_after_acknowledged_write_locked(
                 f"TWS acknowledged {len(receipt.entry.order_ids)} app-owned OCA "
                 "price amendment(s)."
+            )
+            record_price_update_event(
+                "ui_result",
+                outcome="acknowledged",
+                refreshed_message=self._status_message,
+                displayed_orders=[
+                    {
+                        "perm_id": order.perm_id,
+                        "order_id": order.order_id,
+                        "limit_price": str(order.limit_price) if order.limit_price is not None else None,
+                        "stop_price": str(order.stop_price) if order.stop_price is not None else None,
+                        "status": order.status,
+                    }
+                    for order in self._state.working_orders
+                    if order.order_id in receipt.entry.order_ids
+                ],
             )
             if self._status_message.endswith("TWS state refreshed."):
                 self._toast_revision += 1
@@ -2421,6 +2487,7 @@ class StarUIWorkbench:
         if self._armed_price_updates:
             return self._staged_action_controls(
                 confirm_action="price-update-confirm",
+                retry_acknowledgement=self._price_update_retry_required,
             )
         if self._armed_execution is not None:
             return self._staged_action_controls(
@@ -2475,9 +2542,20 @@ class StarUIWorkbench:
         confirm_action: str,
         confirm_variant: ButtonVariant = "default",
         busy_text: str = "Submitting…",
+        retry_acknowledgement: bool = False,
     ) -> Any:
         """One deliberate Cancel / Confirm bar for every staged order change."""
         return Form(
+            Label(
+                HTMLInput(
+                    type="checkbox",
+                    name="ack_unknown_price_update",
+                    value="on",
+                    cls="mr-2 align-middle",
+                ),
+                "I checked TWS: the order still shows the old price and no amendment is waiting for Transmit.",
+                cls="mb-3 block text-xs leading-5 text-amber-300",
+            ) if retry_acknowledgement else None,
             Div(
                 Button(
                     "Cancel",

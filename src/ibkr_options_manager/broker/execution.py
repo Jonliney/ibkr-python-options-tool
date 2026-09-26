@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation
 from threading import Event, Thread
 from time import monotonic, sleep
 from typing import Any
+from uuid import uuid4
 
 from ..domain import BrokerSnapshot, PlanResult
 from ..execution import (
@@ -16,6 +17,7 @@ from ..execution import (
     PriceUpdateCandidate,
 )
 from ..ibkr_probe import _load_ibapi, _parse_error_arguments
+from ..price_update_trace import record_price_update_event
 
 
 @dataclass(frozen=True, slots=True)
@@ -680,6 +682,19 @@ class IbkrPaperExecutionBroker:
                     candidate.layer.stop_perm_id,
                 )
 
+        attempt_id = uuid4().hex[:12]
+        if not record_price_update_event(
+            "writer_attempt",
+            attempt_id=attempt_id,
+            con_id=snapshot.selected.con_id,
+            client_id=client_id,
+            expected={
+                order_id: {"type": kind, "price": str(price), "perm_id": perm_id}
+                for order_id, (kind, price, perm_id) in expected.items()
+            },
+        ):
+            raise ExecutionBlocked("price update diagnostic file is unavailable")
+
         class App(imports.EWrapper, imports.EClient):  # type: ignore[name-defined, misc]
             def __init__(self) -> None:
                 imports.EWrapper.__init__(self)
@@ -689,14 +704,23 @@ class IbkrPaperExecutionBroker:
                 self.orders: dict[int, Any] = {}
                 self.acks: dict[int, int] = {}
                 self.errors: list[str] = []
+                self.phase = "connect"
+                self.trace_failed = False
+
+            def trace(self, event: str, **fields: Any) -> None:
+                if not record_price_update_event(
+                    event, attempt_id=attempt_id, phase=self.phase, **fields
+                ):
+                    self.trace_failed = True
 
             def nextValidId(self, _order_id: int) -> None:
+                self.trace("next_valid_id", next_order_id=int(_order_id))
                 self.ready.set()
 
             def openOrder(
                 self, order_id: int, contract: Any, order: Any, state: Any
             ) -> None:
-                del contract, state
+                del contract
                 current_id = int(order_id)
                 if current_id not in expected:
                     return
@@ -707,6 +731,17 @@ class IbkrPaperExecutionBroker:
                     getattr(order, "lmtPrice", None)
                     if order_type == "LMT"
                     else getattr(order, "auxPrice", None)
+                )
+                self.trace(
+                    "open_order",
+                    order_id=current_id,
+                    perm_id=perm_id,
+                    order_type=received_type,
+                    observed_price=str(raw_price),
+                    expected_price=str(price),
+                    transmit=getattr(order, "transmit", None),
+                    status=str(getattr(state, "status", "")),
+                    warning=str(getattr(state, "warningText", "")),
                 )
                 try:
                     received_price = Decimal(str(raw_price))
@@ -730,10 +765,34 @@ class IbkrPaperExecutionBroker:
                     self.acks[current_id] = perm_id
 
             def openOrderEnd(self) -> None:
+                self.trace(
+                    "open_order_end",
+                    observed_order_ids=sorted(self.orders),
+                    matching_price_ids=sorted(self.acks),
+                )
                 self.open_orders_done.set()
+
+            def orderStatus(self, order_id: int, status: str, *args: Any) -> None:
+                if int(order_id) not in expected:
+                    return
+                self.trace(
+                    "order_status",
+                    order_id=int(order_id),
+                    status=status,
+                    remaining=str(args[1]) if len(args) > 1 else "",
+                    perm_id=str(args[3]) if len(args) > 3 else "",
+                    why_held=str(args[7]) if len(args) > 7 else "",
+                )
 
             def error(self, req_id: int, *args: Any) -> None:
                 code, message = _parse_error_arguments(args)
+                self.trace(
+                    "tws_error",
+                    req_id=req_id,
+                    code=code,
+                    message=message,
+                    advanced_rejection=str(args[2]) if len(args) > 2 else "",
+                )
                 if code not in {2104, 2106, 2107, 2108, 2158}:
                     self.errors.append(
                         f"IBKR error reqId={req_id} code={code}: {message}"
@@ -743,6 +802,7 @@ class IbkrPaperExecutionBroker:
         reader: Thread | None = None
         deadline = monotonic() + timeout_seconds
         try:
+            app.trace("connect_requested", host=host, port=port, client_id=client_id)
             app.connect(host, port, client_id)
             reader = Thread(
                 target=app.run,
@@ -752,6 +812,8 @@ class IbkrPaperExecutionBroker:
             reader.start()
             if not app.ready.wait(max(0, deadline - monotonic())):
                 raise ExecutionBlocked("TWS did not issue a next valid order ID")
+            app.phase = "read_before"
+            app.trace("request_open_orders")
             app.reqOpenOrders()
             while (
                 not app.open_orders_done.is_set()
@@ -765,11 +827,21 @@ class IbkrPaperExecutionBroker:
                 raise ExecutionBlocked(
                     "selected app-owned OCA orders are no longer open"
                 )
+            app.trace(
+                "prewrite_orders_verified", order_ids=sorted(app.orders)
+            )
 
             contract = _build_submission_contract(imports, snapshot)
+            app.phase = "submit"
             for order_id in sorted(selected_ids):
                 order = app.orders[order_id]
                 order_type, price, _perm_id = expected[order_id]
+                prior_price = (
+                    getattr(order, "lmtPrice", None)
+                    if order_type == "LMT"
+                    else getattr(order, "auxPrice", None)
+                )
+                prior_transmit = getattr(order, "transmit", None)
                 if order_type == "LMT":
                     order.lmtPrice = float(price)
                 else:
@@ -778,6 +850,15 @@ class IbkrPaperExecutionBroker:
                 # its OCA stop transmitted the pair. An amendment of that
                 # target must itself be sent through TWS precautions.
                 order.transmit = True
+                app.trace(
+                    "place_order",
+                    order_id=order_id,
+                    order_type=order_type,
+                    prior_price=str(prior_price),
+                    requested_price=str(price),
+                    prior_transmit=prior_transmit,
+                    submitted_transmit=order.transmit,
+                )
                 app.placeOrder(order_id, contract, order)
             while (
                 len(app.acks) != len(selected_ids)
@@ -791,10 +872,15 @@ class IbkrPaperExecutionBroker:
                 raise ExecutionOutcomeUnknown(
                     "TWS did not acknowledge every selected price amendment"
                 )
+            app.trace(
+                "write_callbacks_complete", matching_price_ids=sorted(app.acks)
+            )
             acknowledged = dict(app.acks)
             app.acks.clear()
             app.orders.clear()
             app.open_orders_done.clear()
+            app.phase = "read_after"
+            app.trace("request_open_orders")
             app.reqOpenOrders()
             while (
                 not app.open_orders_done.is_set()
@@ -812,14 +898,40 @@ class IbkrPaperExecutionBroker:
                 raise ExecutionOutcomeUnknown(
                     "TWS post-update check did not show every requested price"
                 )
+            if app.trace_failed:
+                raise ExecutionOutcomeUnknown(
+                    "price update diagnostic file stopped accepting events"
+                )
+            app.trace(
+                "writer_outcome",
+                outcome="verified",
+                order_ids=sorted(selected_ids),
+            )
+            if app.trace_failed:
+                raise ExecutionOutcomeUnknown(
+                    "price update diagnostic file stopped accepting events"
+                )
             return PaperSubmission(
                 order_ids=tuple(sorted(selected_ids)),
                 perm_ids=tuple(
                     acknowledged[order_id] for order_id in sorted(selected_ids)
                 ),
             )
+        except Exception as error:
+            app.trace(
+                "writer_outcome",
+                outcome=(
+                    "unknown"
+                    if isinstance(error, ExecutionOutcomeUnknown)
+                    else "blocked"
+                ),
+                error_type=type(error).__name__,
+                reason=str(error),
+            )
+            raise
         finally:
             if app.isConnected():
+                app.trace("disconnect")
                 app.disconnect()
             if reader is not None:
                 reader.join(timeout=0.5)
