@@ -83,6 +83,7 @@ from .components.ui.select import (
 )
 from .components.ui.separator import Separator
 from .components.ui.toast import Toaster
+from .components.ui.tooltip import Tooltip, TooltipContent, TooltipTrigger
 
 _STATIC_DIR = Path(__file__).with_name("static")
 _ASSETS_DIR = Path(__file__).with_name("assets")
@@ -1755,7 +1756,7 @@ class StarUIWorkbench:
         }[outcome.status]
         return Div(
             Div(
-                Span(f"LAYER {number}", cls="text-xs font-semibold"),
+                _oca_layer_label(number, _journal_oca_group(entry, index)),
                 P("VERIFY", cls="mt-2 text-xs font-semibold text-amber-300"),
                 cls="min-w-20",
             ),
@@ -1781,6 +1782,25 @@ class StarUIWorkbench:
         self, number: int, entry: JournalEntry, index: int, outcome: LayerOutcome
     ) -> Any:
         layer = entry.layers[index]
+        recovered = None
+        calculator = self._state.quote_calculator
+        if (
+            (not layer.target_percentage or not layer.stop_percentage)
+            and calculator is not None
+        ):
+            recovered = _recover_legacy_layer_percentages(
+                target_price=layer.target_price,
+                stop_price=layer.stop_price,
+                bands=calculator.bands,
+                target_presets=_parse_presets(
+                    self._target_presets, maximum=Decimal("1000")
+                )
+                or (),
+                stop_presets=_parse_presets(self._stop_presets, maximum=Decimal("100"))
+                or (),
+            )
+        target_percentage = layer.target_percentage or (recovered[0] if recovered else "")
+        stop_percentage = layer.stop_percentage or (recovered[1] if recovered else "")
         result = "P&L unavailable"
         if outcome.realized_pnl is not None:
             result = (
@@ -1796,30 +1816,26 @@ class StarUIWorkbench:
         }[outcome.status]
         return Div(
             Div(
-                Span(f"LAYER {number}", cls="text-xs font-semibold"),
-                P(f"{outcome.exit_side} filled", cls="mt-2 text-xs text-muted-foreground"),
+                _oca_layer_label(number, _journal_oca_group(entry, index)),
+                P("Closed", cls="mt-2 text-xs text-muted-foreground"),
                 cls="min-w-20",
             ),
-            _field(
+            _sold_percentage_price_field(
                 "LMT target",
-                Input(
-                    id=f"sold-target-{number}",
-                    value=f"${layer.target_price}",
-                    disabled=True,
-                ),
+                value=target_percentage,
+                price=layer.target_price,
                 input_id=f"sold-target-{number}",
+                inferred=not layer.target_percentage and bool(recovered),
             ),
-            _field(
+            _sold_percentage_price_field(
                 "STP loss",
-                Input(
-                    id=f"sold-stop-{number}",
-                    value=f"${layer.stop_price}",
-                    disabled=True,
-                ),
+                value=stop_percentage,
+                price=layer.stop_price,
                 input_id=f"sold-stop-{number}",
+                inferred=not layer.stop_percentage and bool(recovered),
             ),
             _field(
-                "Quantity closed",
+                "Quantity",
                 Input(
                     id=f"sold-quantity-{number}",
                     value=format(outcome.filled_quantity, "f"),
@@ -1840,15 +1856,6 @@ class StarUIWorkbench:
             ),
             data_layer_state="sold",
             data_result_tone=result_tone,
-            data_revealed="false",
-            role="button",
-            tabindex="0",
-            aria_label=(
-                f"Sold layer {number}, {result}. Planned target ${layer.target_price}, "
-                f"stop ${layer.stop_price}, {format(outcome.filled_quantity, 'f')} "
-                f"contracts, {layer.tif}. Press Enter or Space to pin details open."
-            ),
-            aria_pressed="false",
             cls="sold-layer-row grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4",
         )
 
@@ -1958,13 +1965,12 @@ class StarUIWorkbench:
             Script(_live_active_script(self._live_active_configuration()))
             if working_count
             else None,
-            Script(_sold_layer_reveal_script()),
             id="active-form",
             action=f"/{self.session_token}/action",
             method="post",
         )
 
-    def _active_layer_row(self, index: int, _group: str, target: Any, stop: Any) -> Any:
+    def _active_layer_row(self, index: int, group: str, target: Any, stop: Any) -> Any:
         calculator = self._state.quote_calculator
         bands = calculator.bands if calculator is not None else ()
         pending = self._pending_active_prices.get(target.perm_id)
@@ -2000,6 +2006,7 @@ class StarUIWorkbench:
         return _layer_row_layout(
             index=index,
             state="working",
+            oca_group=group,
             target_field=_percentage_price_field(
                 "LMT target",
                 Input(
@@ -2942,31 +2949,6 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
 """
 
 
-def _sold_layer_reveal_script() -> str:
-    """Let pointer and keyboard users pin a sold row's planned values open."""
-    return """
-(() => {
-  if (document.documentElement.dataset.soldLayerRevealBound === 'true') return;
-  document.documentElement.dataset.soldLayerRevealBound = 'true';
-  const toggle = (row) => {
-    const revealed = row.dataset.revealed !== 'true';
-    row.dataset.revealed = String(revealed);
-    row.setAttribute('aria-pressed', String(revealed));
-  };
-  document.addEventListener('click', (event) => {
-    const row = event.target.closest('[data-layer-state="sold"]');
-    if (row) toggle(row);
-  });
-  document.addEventListener('keydown', (event) => {
-    const row = event.target.closest('[data-layer-state="sold"]');
-    if (!row || (event.key !== 'Enter' && event.key !== ' ')) return;
-    event.preventDefault();
-    toggle(row);
-  });
-})();
-"""
-
-
 def _live_active_script(configuration: dict[str, Any] | None) -> str:
     """Use the same local pricing display as draft layers; the server remains authoritative."""
     if configuration is None:
@@ -3091,6 +3073,29 @@ def _journal_target_perm_id(entry: JournalEntry, index: int) -> int:
     return 0
 
 
+def _journal_oca_group(entry: JournalEntry, index: int) -> str:
+    """Use the plan's deterministic broker OCA name for a journaled layer."""
+    return f"{entry.fingerprint[:12]}/tranche-{index + 1}"
+
+
+def _oca_layer_label(index: int, group: str) -> Any:
+    return Tooltip(
+        TooltipTrigger(
+            Button(
+                f"LAYER {index}",
+                variant="ghost",
+                size="sm",
+                type="button",
+                aria_label=f"Layer {index}, OCA group {group}",
+                cls="oca-layer-trigger",
+            ),
+            delay_duration=250,
+        ),
+        TooltipContent(group, side="right", cls="font-mono"),
+        signal=f"oca_layer_{index}",
+    )
+
+
 def _layer_row_layout(
     *,
     index: int,
@@ -3100,15 +3105,15 @@ def _layer_row_layout(
     quantity_field: Any,
     tif_field: Any,
     action_field: Any,
+    oca_group: str | None = None,
 ) -> Any:
     """Keep draft and active OCA rows structurally identical."""
     return Div(
         Div(
-            Span(
-                f"DRAFT {index}" if state == "draft" else f"LAYER {index}",
-                cls="text-xs font-semibold",
-            ),
-            P("WORKING", cls="mt-2 text-xs text-muted-foreground")
+            _oca_layer_label(index, oca_group)
+            if oca_group
+            else Span(f"DRAFT {index}", cls="text-xs font-semibold"),
+            P("Active", cls="mt-2 text-xs text-muted-foreground")
             if state == "working"
             else None,
             cls="min-w-20",
@@ -3170,6 +3175,40 @@ def _percentage_price_field(
     )
 
 
+def _sold_percentage_price_field(
+    label: str, *, value: str, price: str, input_id: str, inferred: bool = False
+) -> Any:
+    """Retain the active field geometry without inventing old percentages."""
+    return Div(
+        Div(
+            Label(label, fr=input_id, cls="text-xs font-medium text-muted-foreground"),
+            Span(f"${price}", cls="text-xs font-semibold text-foreground"),
+            cls="flex items-center justify-between gap-2",
+        ),
+        Div(
+            Input(
+                id=input_id,
+                value=f"≈{value}" if inferred else value or "—",
+                disabled=True,
+                cls="pr-8",
+                aria_label=(
+                    f"{label} approximately {value} percent, inferred from the "
+                    "recorded prices and configured presets"
+                )
+                if inferred
+                else None,
+            ),
+            Span(
+                "%",
+                cls="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground",
+            ),
+            cls="relative mt-1",
+        ),
+        Div(cls="sold-field-spacer"),
+        cls="min-w-0 space-y-0.5",
+    )
+
+
 def _active_order_value(label: str, price: Decimal | None, tone: str) -> Any:
     return Div(
         Span(label, cls="text-xs text-muted-foreground"),
@@ -3222,6 +3261,65 @@ def _price_percentage(
     if not target:
         percentage = -percentage
     return format(percentage.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP), "f")
+
+
+def _recover_legacy_layer_percentages(
+    *,
+    target_price: str,
+    stop_price: str,
+    bands: tuple[Any, ...],
+    target_presets: tuple[Decimal, ...],
+    stop_presets: tuple[Decimal, ...],
+) -> tuple[str, str] | None:
+    """Recover old journal percentages only when both prices identify one pair."""
+    if not bands:
+        return None
+    try:
+        target = Decimal(target_price)
+        stop = Decimal(stop_price)
+        if (
+            not target.is_finite()
+            or not stop.is_finite()
+            or target <= 0
+            or stop <= 0
+        ):
+            return None
+        target_tick = max(
+            (band for band in bands if band.low_edge <= target),
+            key=lambda band: band.low_edge,
+        ).increment
+        stop_tick = max(
+            (band for band in bands if band.low_edge <= stop),
+            key=lambda band: band.low_edge,
+        ).increment
+        matches: list[tuple[Decimal, Decimal]] = []
+        for target_pct in target_presets:
+            target_factor = Decimal("1") + target_pct / Decimal("100")
+            if target_factor <= 0:
+                continue
+            target_low = (target - target_tick) / target_factor
+            target_high = target / target_factor
+            for stop_pct in stop_presets:
+                stop_factor = Decimal("1") - stop_pct / Decimal("100")
+                if stop_factor <= 0:
+                    continue
+                stop_low = (stop - stop_tick) / stop_factor
+                stop_high = stop / stop_factor
+                lower = max(target_low, stop_low)
+                upper = min(target_high, stop_high)
+                if lower >= upper:
+                    continue
+                basis = (lower + upper) / Decimal("2")
+                if (
+                    round_up_price(basis * target_factor, bands) == target
+                    and round_up_price(basis * stop_factor, bands) == stop
+                ):
+                    matches.append((target_pct, stop_pct))
+    except (InvalidOperation, ValueError):
+        return None
+    if len(matches) != 1:
+        return None
+    return format(matches[0][0], "f"), format(matches[0][1], "f")
 
 
 def _active_percentage_for_price(

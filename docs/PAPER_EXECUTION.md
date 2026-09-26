@@ -49,8 +49,15 @@ and executions from TWS. The app joins a completed order to a planned layer by
 the exact account, contract ID, fingerprinted OCA group, order type, and
 permanent order ID. Executions are then joined by the permanent ID. This also
 recovers order IDs for older journal entries whose partial reconciliation kept
-only the surviving working pair. Closed layers appear in **Closed bracket
-history** while any remaining pair stays in **Active OCA layers**.
+only the surviving working pair. Closed and active layers stay in journal order
+in the same layer list. The OCA group ID is shown in a tooltip on the layer
+label. New journal entries keep the target percentage and the stop percentage
+derived from the submission-time reference price for this display. For older
+entries without those values, the UI shows approximate percentages only when
+both recorded prices uniquely identify a pair of configured presets under the
+contract's market-rule increments. Otherwise it shows an unknown percentage
+beside each recorded planned price. These display values do not authorize an
+order change.
 
 A complete exit fill is labelled profit, loss, or flat only when TWS supplies a
 realized P&L report for every matching execution in one currency. A fill without

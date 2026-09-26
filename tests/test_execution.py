@@ -364,6 +364,8 @@ def test_pending_submission_details_survive_restart_and_become_reconciled(
     assert entries[0].layers[0].target_price == format(
         plan.pairs[0].target.rounded_price, "f"
     )
+    assert entries[0].layers[0].target_percentage == "20"
+    assert entries[0].layers[0].stop_percentage == "25"
 
     group = f"{plan.fingerprint[:12]}/tranche-1"
     target = WorkingOrder(
@@ -385,6 +387,16 @@ def test_pending_submission_details_survive_restart_and_become_reconciled(
     assert len(reconciled) == 1
     assert reconciled[0].state == "RECONCILED"
     assert reconciled[0].layers == entries[0].layers
+
+    legacy_payload = json.loads(path.read_text())
+    legacy_payload[0]["layers"][0].pop("target_percentage")
+    legacy_payload[0]["layers"][0].pop("stop_percentage")
+    path.write_text(json.dumps(legacy_payload))
+    legacy = ExecutionJournal(path).submission_entries(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id
+    )
+    assert legacy[0].layers[0].target_percentage == ""
+    assert legacy[0].layers[0].stop_percentage == ""
 
 
 def test_completed_tws_bracket_recovers_old_journal_ids_and_realized_profit(

@@ -1,8 +1,26 @@
 .sold-layer-row {
   position: relative;
   isolation: isolate;
-  background: color-mix(in srgb, var(--card) 42%, transparent);
-  cursor: pointer;
+}
+
+.oca-layer-trigger {
+  height: auto;
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.oca-layer-trigger:hover {
+  background: transparent;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+.sold-field-spacer {
+  height: 1rem;
+  margin-top: 0.25rem;
 }
 
 .sold-layer-row input:disabled {
@@ -16,9 +34,11 @@
   position: absolute;
   inset: 0;
   z-index: 1;
-  background: rgb(8 13 11 / 48%);
+  background: rgba(10, 10, 10, 0.65);
   pointer-events: none;
-  transition: opacity 160ms ease-out, visibility 160ms ease-out;
+  transition:
+    opacity 160ms ease-out,
+    visibility 160ms ease-out;
 }
 
 .sold-layer-badge {
@@ -38,7 +58,9 @@
   transform: translate(-50%, -50%);
   white-space: nowrap;
   pointer-events: none;
-  transition: opacity 160ms ease-out, visibility 160ms ease-out;
+  transition:
+    opacity 160ms ease-out,
+    visibility 160ms ease-out;
 }
 
 .sold-layer-status {
@@ -64,17 +86,10 @@
 
 .sold-layer-row:hover::after,
 .sold-layer-row:hover .sold-layer-badge,
-.sold-layer-row:focus-visible::after,
-.sold-layer-row:focus-visible .sold-layer-badge,
-.sold-layer-row[data-revealed="true"]::after,
-.sold-layer-row[data-revealed="true"] .sold-layer-badge {
+.sold-layer-row:has(.oca-layer-trigger:focus-visible)::after,
+.sold-layer-row:has(.oca-layer-trigger:focus-visible) .sold-layer-badge {
   opacity: 0;
   visibility: hidden;
-}
-
-.sold-layer-row:focus-visible {
-  outline: 2px solid var(--ring);
-  outline-offset: -2px;
 }
 
 @media (prefers-reduced-motion: reduce) {

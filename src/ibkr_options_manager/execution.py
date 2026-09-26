@@ -6,7 +6,7 @@ import json
 import os
 import sys
 from dataclasses import asdict, dataclass, replace
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -36,6 +36,8 @@ class JournalLayer:
     tif: str
     target_perm_id: int = 0
     stop_perm_id: int = 0
+    target_percentage: str = ""
+    stop_percentage: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +393,23 @@ class ExecutionJournal:
                     target_price=format(pair.target.rounded_price, "f"),
                     stop_price=format(pair.stop.rounded_price, "f"),
                     tif=pair.target.tif,
+                    target_percentage=format(pair.target_percentage, "f"),
+                    stop_percentage=(
+                        format(
+                            (
+                                (
+                                    Decimal("1")
+                                    - pair.stop.raw_price / snapshot.position.unit_basis
+                                )
+                                * Decimal("100")
+                            )
+                            .quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+                            .normalize(),
+                            "f",
+                        )
+                        if snapshot.position.unit_basis > 0
+                        else ""
+                    ),
                 )
                 for pair in plan.pairs
             ),
@@ -777,6 +796,8 @@ class ExecutionJournal:
                             tif=str(layer["tif"]),
                             target_perm_id=int(layer.get("target_perm_id", 0)),
                             stop_perm_id=int(layer.get("stop_perm_id", 0)),
+                            target_percentage=str(layer.get("target_percentage", "")),
+                            stop_percentage=str(layer.get("stop_percentage", "")),
                         )
                         for layer in item.get("layers", ())
                     ),

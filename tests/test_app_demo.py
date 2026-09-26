@@ -47,6 +47,7 @@ from ibkr_options_manager.execution import (
     JournalEntry,
     JournalFill,
     JournalLayer,
+    LayerOutcome,
     MarketExitCandidate,
     PaperExecutionService,
     PriceUpdateCandidate,
@@ -570,7 +571,7 @@ def test_partial_journal_reconciliation_keeps_surviving_pair_active_in_the_ui(
     assert "App-managed OCA coverage active" not in page.text
     assert "Existing order coverage detected" not in page.text
     assert 'data-layer-state="working"' in page.text
-    assert "WORKING" in page.text
+    assert "Active" in page.text
     assert 'value="3"' in page.text
 
 
@@ -596,7 +597,16 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
                 order_ids=(103, 104),
                 perm_ids=(203, 204),
                 layers=(
-                    JournalLayer(3, "15.50", "9.70", "GTC", 201, 202),
+                    JournalLayer(
+                        3,
+                        "15.50",
+                        "9.70",
+                        "GTC",
+                        201,
+                        202,
+                        target_percentage="20",
+                        stop_percentage="25",
+                    ),
                     JournalLayer(2, "20.70", "9.70", "GTC", 203, 204),
                 ),
                 fills=(
@@ -650,23 +660,30 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
 
     assert 'data-layer-state="sold"' in page.text
     assert 'data-result-tone="profit"' in page.text
-    assert 'data-revealed="false"' in page.text
-    assert 'aria-pressed="false"' in page.text
+    assert 'data-revealed="false"' not in page.text
+    assert "soldLayerRevealBound" not in page.text
     assert "SOLD" in page.text
     assert "+$557.44 USD" in page.text
+    assert "Closed" in page.text
+    assert "Active" in page.text
+    assert "Target filled" not in page.text
+    assert "WORKING" not in page.text
     assert 'id="sold-target-1"' in page.text
-    assert 'value="$15.50"' in page.text
+    assert 'value="20"' in page.text
+    assert "$15.50" in page.text
     assert re.search(r'id="sold-target-1"[^>]*disabled', page.text)
     assert 'id="sold-stop-1"' in page.text
-    assert 'value="$9.70"' in page.text
+    assert 'value="25"' in page.text
+    assert "$9.70" in page.text
     assert re.search(r'id="sold-stop-1"[^>]*disabled', page.text)
     assert 'id="sold-quantity-1"' in page.text
     assert 'value="3"' in page.text
     assert 'id="sold-tif-1"' in page.text
-    assert "soldLayerRevealBound" in page.text
+    assert "aaaaaaaaaaaa/tranche-1" in page.text
+    assert "aaaaaaaaaaaa/tranche-2" in page.text
+    assert 'data-slot="tooltip-content"' in page.text
     assert 'href="/layers.css"' in page.text
     assert client.get("/layers.css").status_code == 200
-    assert "Target filled" in page.text
     assert 'data-layer-state="working"' in page.text
     assert page.text.index('data-layer-state="sold"') < page.text.index(
         'data-layer-state="working"'
@@ -714,6 +731,38 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
     assert "Fill and working order conflict" in conflict.text
     assert 'data-layer-state="verify"' in conflict.text
     assert 'data-layer-state="draft"' not in conflict.text
+
+
+def test_legacy_sold_layer_recovers_unique_percentages_without_current_basis() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    entry = JournalEntry(
+        fingerprint="a" * 64,
+        account=DEMO_ACCOUNT,
+        con_id=1,
+        state="RECONCILED",
+        layers=(JournalLayer(3, "15.50", "9.70", "GTC"),),
+    )
+    outcome = LayerOutcome(
+        "CLOSED_PROFIT",
+        filled_quantity=Decimal("3"),
+        realized_pnl=Decimal("557.44"),
+        currency="USD",
+        exit_side="Target",
+    )
+
+    # The surviving position's basis is unrelated to this old layer.
+    workbench._state = replace(workbench._state, unit_basis=Decimal("2.74"))
+    recovered = str(workbench._closed_layer_row(1, entry, 0, outcome))
+    assert re.search(r'value="≈20"[^>]*id="sold-target-1"', recovered)
+    assert re.search(r'value="≈25"[^>]*id="sold-stop-1"', recovered)
+
+    unmatched_entry = replace(
+        entry, layers=(replace(entry.layers[0], stop_price="8.60"),)
+    )
+    unmatched = str(workbench._closed_layer_row(1, unmatched_entry, 0, outcome))
+    assert re.search(r'value="—"[^>]*id="sold-target-1"', unmatched)
+    assert re.search(r'value="—"[^>]*id="sold-stop-1"', unmatched)
 
 
 def test_active_layer_prefers_configured_percentage_over_rounded_inverse() -> None:
