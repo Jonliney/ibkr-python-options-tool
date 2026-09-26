@@ -30,6 +30,7 @@ from ibkr_options_manager.app.web import StarUIWorkbench
 from ibkr_options_manager.app.web.surface import (
     _active_percentage_for_price,
     _busy_submit_script,
+    _contract_display_name,
     _live_active_script,
     _money,
     _position_identity,
@@ -118,6 +119,64 @@ def test_demo_launch_populates_the_starui_workbench_without_a_tws_refresh() -> N
     assert workbench._state.selected_con_id is not None
     assert workbench._state.quote_calculator is not None
     assert workbench._state.available_quantity == 5
+
+
+def test_selected_contract_header_uses_verified_position_and_quote_values() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+
+    page = TestClient(workbench.app).get(workbench.path).text
+
+    assert "MSTR Sep25'26 150 Call" in page
+    assert 'data-header-status="Demo data ready"' in page
+    assert 'data-header-status="New layer ready"' in page
+    assert 'data-header-status="Market data: Frozen"' in page
+    assert page.index("Market data: Frozen") < page.index("MSTR Sep25'26 150 Call")
+    assert "Active / total" in page
+    assert ">10 / 10<" in page
+    assert "Average price" in page
+    assert ">$2.74<" in page
+    assert "Last bid" in page
+    assert ">$3.12<" in page
+    assert "Last ask" in page
+    assert ">$3.18<" in page
+    assert "Realised P&amp;L" in page
+    assert "Realised P&amp;L · app exits" not in page
+    assert 'class="mt-1 block font-mono' not in page
+    assert "Build and manage app-owned OCA layers." not in page
+    assert "contracts verified available to bracket" not in page
+    assert "Cost basis / Ask" not in page
+
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    assert (
+        _contract_display_name(
+            replace(
+                snapshot.contract,
+                trading_class="SPXW",
+                expiry="20260918",
+                strike=Decimal("7750"),
+            )
+        )
+        == "SPXW Sep18'26 7750 Call"
+    )
+
+
+def test_header_distinguishes_a_blocked_layer_from_connection_status() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._state = replace(
+        workbench._state,
+        status=UiStatus.BLOCKED,
+        validations=(ValidationLine("INPUT_INVALID", "Target price is invalid"),),
+    )
+
+    page = TestClient(workbench.app).get(workbench.path).text
+
+    assert 'data-header-status="Demo data ready"' in page
+    assert 'data-header-status="New layer unavailable"' in page
+    assert 'title="Target price is invalid"' in page
+    assert ">BLOCKED<" not in page
 
 
 def test_launch_refresh_never_blocks_the_initial_workbench_page() -> None:
@@ -283,7 +342,7 @@ def test_status_updates_render_as_short_toasts_not_workspace_copy() -> None:
     page = TestClient(workbench.app).get(workbench.path)
 
     assert "Execution blocked" in page.text
-    assert "Build and manage app-owned OCA layers." in page.text
+    assert "Average price" in page.text
     assert "Dismiss toast" in page.text
     # Action rerenders must replace an already-hydrated empty toast signal.
     assert "data-signals='{toasts:" in page.text
@@ -914,6 +973,8 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
     combined_page = client.get(workbench.path).text
     assert "+$669.44" in combined_page
     assert "-$136.00" in combined_page
+    assert ">2 / 5<" in combined_page
+    assert ">+$557.44<" in combined_page
     workbench._state = original_state
     workbench._view_model._latest_snapshot = original_snapshot
     workbench._drafts[selected] = original_draft

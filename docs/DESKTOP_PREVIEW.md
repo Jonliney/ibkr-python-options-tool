@@ -46,6 +46,16 @@ The exact ID is kept only in memory for the current process. The evidence view
 redacts it, and changing any connection-selection field immediately clears the
 visible plan and requires another refresh.
 
+The selected-contract header uses verified contract fields for its readable
+name and the latest selected snapshot for open quantity, average option price,
+bid, and ask. The app header separately identifies connection, new-layer
+availability, and IBKR market-data type, so a valid connection is not confused
+with a blocked order plan. The displayed total is the open quantity
+plus fully reconciled app-recorded sold layers; it cannot reconstruct external
+or manual sales. Realised P&L includes only those app-recorded exits. A partial
+or uncertain outcome leaves the affected total or P&L unavailable rather than
+displaying a misleading zero.
+
 ## Workflow
 
 1. Verify the literal loopback endpoint, paper port, nonzero client ID, and

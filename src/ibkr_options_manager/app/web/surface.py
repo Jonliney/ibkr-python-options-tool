@@ -31,7 +31,12 @@ from starhtml.plugins import Plugin
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from ...domain import BrokerSnapshot, preview_reference_prices, round_up_price
+from ...domain import (
+    BrokerSnapshot,
+    VerifiedOptionContract,
+    preview_reference_prices,
+    round_up_price,
+)
 from ...domain.outcome import ExitScenario, PositionOutcome, project_position_outcome
 from ...execution import (
     ExecutionBlocked,
@@ -47,6 +52,7 @@ from ...price_update_trace import record_price_update_event
 from ..view_model import (
     ConnectionSettings,
     DraftLayerForm,
+    FactState,
     PaperExecutionCandidate,
     PlanForm,
     PlannerViewModel,
@@ -1268,16 +1274,21 @@ class StarUIWorkbench:
 
     def _page(self) -> Any:
         state = self._state
-        ready = state.status is UiStatus.READY
         projection = self._projection_state()
+        snapshot = self._view_model.latest_snapshot()
         title = (
-            state.position_title
-            if self._selected_con_id is not None
-            else "Select an option position"
+            _contract_display_name(snapshot.contract)
+            if snapshot is not None
+            and snapshot.selected.con_id == self._selected_con_id
+            else (
+                state.position_title
+                if self._selected_con_id is not None
+                else "Select an option position"
+            )
         )
         return Div(
             Script(_projection_script(projection[2])),
-            self._header(ready),
+            self._header(),
             Div(
                 self._inventory(),
                 self._workspace(title),
@@ -1420,16 +1431,71 @@ class StarUIWorkbench:
             data_launch_connection=state,
         )
 
-    def _header(self, ready: bool) -> Any:
+    def _header(self) -> Any:
+        state = self._state
+        snapshot = self._view_model.latest_snapshot()
+        selected_snapshot = (
+            snapshot
+            if snapshot is not None
+            and snapshot.selected.con_id == self._selected_con_id
+            else None
+        )
+        verified_data = selected_snapshot is not None or any(
+            fact.label == "Paper account" and fact.state is FactState.PASS
+            for fact in state.connection
+        )
+        if self._launch_connection == "connecting":
+            connection = _header_status("Connecting to TWS", "arrow-right", "muted")
+        elif verified_data:
+            connection = _header_status(
+                "Demo data ready" if self._demo_mode else "TWS connected",
+                "check",
+                "ready",
+            )
+        elif self._launch_connection == "failed":
+            connection = _header_status("TWS unavailable", "x", "warning")
+        elif state.status is UiStatus.EMPTY:
+            connection = _header_status("Not connected", "x", "muted")
+        else:
+            connection = _header_status("Connection unverified", "x", "muted")
+        plan_status = None
+        if self._selected_con_id is not None:
+            if state.status is UiStatus.READY and selected_snapshot is not None:
+                plan_status = _header_status("New layer ready", "check", "ready")
+            elif state.status is UiStatus.STALE:
+                plan_status = _header_status("Refresh required", "x", "warning")
+            elif any(
+                validation.code == "POSITION_FULLY_ALLOCATED"
+                for validation in state.validations
+            ):
+                plan_status = _header_status("No contracts available", "x", "muted")
+            else:
+                reason = next(
+                    (
+                        validation.message
+                        for validation in state.validations
+                        if validation.blocking
+                    ),
+                    None,
+                )
+                plan_status = _header_status(
+                    "New layer unavailable", "x", "warning", title=reason
+                )
+        quote_status = (
+            _header_status(
+                f"Market data: {selected_snapshot.quote.market_data_type.title()}",
+                "activity",
+                "ready"
+                if selected_snapshot.quote.market_data_type == "LIVE"
+                else "muted",
+            )
+            if selected_snapshot is not None
+            else None
+        )
         return Div(
-            Div(
-                cls="size-2 rounded-full "
-                + ("bg-emerald-500" if ready else "bg-amber-400")
-            ),
-            Span(
-                "CONNECTED" if ready else self._state.status,
-                cls="text-xs font-semibold tracking-wide",
-            ),
+            connection,
+            plan_status,
+            quote_status,
             Badge(
                 "SIMULATED EXECUTION"
                 if self._demo_mode and self._paper_execution is not None
@@ -1441,7 +1507,7 @@ class StarUIWorkbench:
                 variant="outline",
             ),
             Span(
-                f"Account {self._state.account or '—'}",
+                f"Account {state.account or '—'}",
                 cls="text-xs text-muted-foreground",
             ),
             Span(cls="flex-1"),
@@ -1622,33 +1688,66 @@ class StarUIWorkbench:
                 and _journal_target_perm_id(item[0], item[1]) in active_target_ids
             )
         )
+        snapshot = self._view_model.latest_snapshot()
+        selected_snapshot = (
+            snapshot
+            if snapshot is not None
+            and snapshot.selected.con_id == self._selected_con_id
+            else None
+        )
+        quote = selected_snapshot.quote if selected_snapshot is not None else None
+        basis = (
+            selected_snapshot.position.unit_basis
+            if selected_snapshot is not None
+            else None
+        )
+        currency = selected_snapshot.contract.currency if selected_snapshot else "USD"
+        realized = (
+            Decimal("0")
+            if callable(getattr(self._paper_execution, "submission_entries", None))
+            else None
+        )
+        for _entry, _index, outcome in outcomes:
+            if outcome.status in {"PARTIAL", "UNKNOWN", "NO_EXECUTION_EVIDENCE"}:
+                realized = None
+                break
+            if not outcome.status.startswith("CLOSED_"):
+                continue
+            if outcome.realized_pnl is None or outcome.currency != currency:
+                realized = None
+                break
+            if realized is not None:
+                realized += outcome.realized_pnl
         return Div(
             self._coverage_alert(coverage, app_order_count, order_count),
+            H1(title, cls="text-2xl font-semibold tracking-tight"),
             Div(
-                Div(
-                    H1(title, cls="text-2xl font-semibold tracking-tight"),
-                    P(
-                        "Build and manage app-owned OCA layers.",
-                        cls="mt-2 text-sm text-muted-foreground",
-                    ),
+                _contract_header_metric(
+                    "Active / total",
+                    self._header_quantity(outcomes, selected_snapshot),
                 ),
-                Div(
-                    Span("Cost basis / Ask", cls="text-xs text-muted-foreground"),
-                    P(
-                        " / ".join(fact.value for fact in self._state.quote[:2]) or "—",
-                        cls="mt-1 font-mono text-sm",
-                    ),
-                    cls="text-right",
+                _contract_header_metric(
+                    "Average price", _header_price(basis, currency)
                 ),
-                cls="flex items-start justify-between gap-6",
-            ),
+                _contract_header_metric(
+                    "Last bid", _header_price(quote.bid if quote else None, currency)
+                ),
+                _contract_header_metric(
+                    "Last ask", _header_price(quote.ask if quote else None, currency)
+                ),
+                _contract_header_metric(
+                    "Realised P&L", _header_pnl(realized, currency)
+                ),
+                cls="contract-header-facts",
+            )
+            if selected_snapshot is not None
+            else None,
             P(
-                "TWS orders are pending verification. The broker snapshot may not yet include them."
-                if pending
-                else f"{self._state.available_quantity} contracts verified available to bracket",
-                cls="mt-2 text-sm font-medium "
-                + ("text-amber-300" if pending else "text-emerald-400"),
-            ),
+                "TWS orders are pending verification. The broker snapshot may not yet include them.",
+                cls="mt-3 text-sm font-medium text-amber-300",
+            )
+            if pending
+            else None,
             Div(
                 ScrollArea(
                     self._existing_layers_panel(active_pairs, outcomes)
@@ -1668,6 +1767,22 @@ class StarUIWorkbench:
             ),
             cls="flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6",
         )
+
+    def _header_quantity(
+        self,
+        outcomes: tuple[tuple[JournalEntry, int, LayerOutcome], ...],
+        snapshot: BrokerSnapshot | None,
+    ) -> str:
+        if snapshot is None:
+            return "—"
+        held = snapshot.position.quantity
+        sold = Decimal("0")
+        for _entry, _index, outcome in outcomes:
+            if outcome.status in {"PARTIAL", "UNKNOWN", "NO_EXECUTION_EVIDENCE"}:
+                return f"{held:g} / —"
+            if outcome.status.startswith("CLOSED_"):
+                sold += outcome.filled_quantity
+        return f"{held:g} / {held + sold:g}"
 
     def _order_coverage(self) -> tuple[str, int, int]:
         """Classify displayed order coverage using durable app ownership proof."""
@@ -3735,6 +3850,60 @@ def _position_identity(local_symbol: str) -> tuple[str, str]:
         f"{format(strike, 'f')} {right} · {expiry.strftime('%b').upper()} "
         f"{expiry.day} '{expiry.strftime('%y')}",
     )
+
+
+def _contract_display_name(contract: VerifiedOptionContract) -> str:
+    """Use verified contract fields for the selected position heading."""
+    try:
+        expiry = datetime.strptime(contract.expiry, "%Y%m%d")
+    except (ValueError, TypeError):
+        return contract.local_symbol
+    right = {"C": "Call", "P": "Put"}.get(contract.right)
+    if right is None:
+        return contract.local_symbol
+    strike = format(contract.strike.normalize(), "f")
+    return (
+        f"{contract.trading_class} {expiry.strftime('%b')}{expiry.day}'"
+        f"{expiry.strftime('%y')} {strike} {right}"
+    )
+
+
+def _contract_header_metric(label: str, value: str) -> Any:
+    return Div(
+        Span(label, cls="block text-xs text-muted-foreground"),
+        Span(value, cls="mt-1 block text-sm font-medium tabular-nums"),
+        cls="min-w-0",
+    )
+
+
+def _header_status(
+    label: str, icon: str, tone: str, *, title: str | None = None
+) -> Any:
+    icon_color = {
+        "ready": "text-emerald-400",
+        "warning": "text-amber-300",
+        "muted": "text-muted-foreground",
+    }[tone]
+    return Div(
+        Icon(f"lucide:{icon}", cls=f"size-4 shrink-0 {icon_color}", aria_hidden="true"),
+        Span(label, cls="text-xs font-medium whitespace-nowrap"),
+        cls="flex shrink-0 items-center gap-1.5",
+        title=title,
+        data_header_status=label,
+    )
+
+
+def _header_price(price: Decimal | None, currency: str) -> str:
+    if price is None or not price.is_finite():
+        return "—"
+    amount = f"{price:,.2f}"
+    return f"${amount}" if currency == "USD" else f"{currency} {amount}"
+
+
+def _header_pnl(value: Decimal | None, currency: str) -> str:
+    if value is None or not value.is_finite():
+        return "—"
+    return _money(value) if currency == "USD" else f"{currency} {value:+,.2f}"
 
 
 def _register_bundled_icons() -> None:
