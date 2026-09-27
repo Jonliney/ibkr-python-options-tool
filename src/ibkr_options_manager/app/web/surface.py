@@ -1050,11 +1050,23 @@ class StarUIWorkbench:
                 ),
                 None,
             )
-            self._message = (
+            message = (
                 f"{state.status_message}: {blocking}"
                 if blocking
                 else state.status_message
             )
+            blocking_codes = {
+                validation.code
+                for validation in state.validations
+                if validation.blocking
+            }
+            if blocking_codes == {"POSITION_FULLY_ALLOCATED"}:
+                # This is an expected inventory state, not a failed position
+                # selection. Keep the planner blocked without an error toast.
+                self._status_message = message
+                self._toast = None
+            else:
+                self._message = message
 
     def _remember_pending_active_prices_locked(
         self,
@@ -1344,12 +1356,10 @@ class StarUIWorkbench:
                 None,
             ]
             if notice is not None
-            else None
+            else [None, None, None]
         )
         return Div(
-            Signal("toasts", initial_toasts, ifmissing=False)
-            if initial_toasts is not None
-            else None,
+            Signal("toasts", initial_toasts, ifmissing=False),
             Toaster(position="top-right"),
         )
 

@@ -411,6 +411,63 @@ def test_status_updates_render_as_short_toasts_not_workspace_copy() -> None:
     assert "document.startViewTransition" not in page.text
 
 
+def test_selecting_fully_allocated_position_does_not_raise_error_toast() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    workbench._message = "Execution blocked: an earlier action failed"
+    blocked = replace(
+        workbench._state,
+        status=UiStatus.BLOCKED,
+        status_message="Plan blocked by validation",
+        validations=(
+            ValidationLine(
+                "POSITION_FULLY_ALLOCATED",
+                "existing closing exposure already covers the whole position",
+            ),
+        ),
+        available_quantity=0,
+    )
+    workbench._view_model.select_position = lambda *_: blocked  # type: ignore[method-assign]
+
+    workbench._select_locked(con_id)
+
+    assert workbench._state.status is UiStatus.BLOCKED
+    assert workbench._state.available_quantity == 0
+    assert workbench._toast is None
+    assert workbench._status_message.endswith(
+        "existing closing exposure already covers the whole position"
+    )
+    page = TestClient(workbench.app).get(workbench.path).text
+    assert 'data-signals:toasts__ifmissing' in page
+    assert 'data-signals="{toasts: [null, null, null]}"' in page
+
+
+def test_overallocated_position_still_raises_error_toast() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    blocked = replace(
+        workbench._state,
+        status=UiStatus.BLOCKED,
+        status_message="Plan blocked by validation",
+        validations=(
+            ValidationLine(
+                "ALLOCATION_EXCEEDS_POSITION",
+                "existing closing exposure exceeds the current position",
+            ),
+        ),
+    )
+    workbench._view_model.select_position = lambda *_: blocked  # type: ignore[method-assign]
+
+    workbench._select_locked(con_id)
+
+    assert workbench._toast is not None
+    assert workbench._toast.variant == "error"
+
+
 def test_tws_connection_toast_has_a_short_recovery_message() -> None:
     notice = _toast_notice(
         "Portfolio state is not ready: missing completion barriers: positions"
