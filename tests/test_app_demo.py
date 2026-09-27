@@ -430,6 +430,35 @@ def test_busy_submit_only_applies_to_explicitly_async_controls() -> None:
     assert "button.disabled = true" not in script
     assert "button.style.pointerEvents = 'none';" in script
     assert "form.dataset.ibkrSubmitting" in script
+    assert "button.querySelector('[data-position-quantity]')" in script
+    assert "quantity.dataset.loading = 'true';" in script
+
+
+def test_position_selection_shows_a_quantity_spinner_while_loading() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+
+    page = TestClient(workbench.app).get(workbench.path).text
+    inventory = page.split('aria-label="Open option positions"', maxsplit=1)[1]
+
+    assert 'data-busy-text="Loading position…"' in inventory
+    assert 'data-position-quantity' in inventory
+    assert 'data-loading="false"' in inventory
+    assert 'data-position-count' in inventory
+    assert 'data-position-spinner' in inventory
+    assert 'data-position-loading' in inventory
+    assert 'name="action" value="select"' in inventory
+    css = TestClient(workbench.app).get("/layers.css").text
+    assert (
+        "[data-position-quantity] [data-position-spinner] {\n"
+        "  display: inline-flex;\n  width: 0;"
+    ) in css
+    assert (
+        '[data-position-quantity][data-loading="true"] [data-position-spinner] {\n'
+        "  width: 0.75rem;"
+    ) in css
+    assert '[data-position-quantity][data-loading="true"] [data-position-count]' not in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
 
 
 def test_window_starts_connection_before_loading_the_first_page() -> None:

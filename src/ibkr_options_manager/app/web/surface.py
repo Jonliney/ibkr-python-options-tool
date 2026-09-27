@@ -1567,7 +1567,26 @@ class StarUIWorkbench:
                     Button(
                         Div(
                             Span(symbol, cls="text-sm font-semibold"),
-                            Badge(position.quantity, variant="secondary"),
+                            Badge(
+                                Span(position.quantity, data_position_count=True),
+                                Span(
+                                    Icon(
+                                        "lucide:loader-circle",
+                                        cls="size-3 animate-spin",
+                                    ),
+                                    data_position_spinner=True,
+                                    aria_hidden="true",
+                                ),
+                                Span(
+                                    "Loading position",
+                                    cls="sr-only hidden",
+                                    data_position_loading=True,
+                                ),
+                                variant="secondary",
+                                data_position_quantity=True,
+                                data_loading="false",
+                                aria_live="polite",
+                            ),
                             cls="flex w-full items-center justify-between",
                         ),
                         P(
@@ -1577,6 +1596,7 @@ class StarUIWorkbench:
                         variant="ghost",
                         disabled=not position.eligible,
                         type="submit",
+                        data_busy_text="Loading position…",
                         cls=(
                             "h-auto min-h-20 w-full flex-col items-stretch justify-center gap-0 "
                             "rounded-none border-l-2 px-4 py-4 text-left transition-colors "
@@ -4287,7 +4307,7 @@ def _busy_submit_script() -> str:
         // edits.  Only controls that opt in with data-busy-text should change
         // appearance or become disabled while a TWS/network request runs.
         const text = button.dataset.busyText;
-      if (!text) return;
+        if (!text) return;
         const form = event.target;
         if (form instanceof HTMLFormElement && form.dataset.ibkrSubmitting === 'true') {
           event.preventDefault();
@@ -4302,6 +4322,12 @@ def _busy_submit_script() -> str:
         button.setAttribute('aria-disabled', 'true');
         button.setAttribute('aria-busy', 'true');
         button.style.pointerEvents = 'none';
+        const quantity = button.querySelector('[data-position-quantity]');
+        if (quantity) {
+          quantity.dataset.loading = 'true';
+          quantity.querySelector('[data-position-loading]')?.classList.remove('hidden');
+          return;
+        }
         button.replaceChildren(
           Object.assign(document.createElement('span'), {
             className: 'size-3.5 animate-spin rounded-full border-2 border-current border-r-transparent',
