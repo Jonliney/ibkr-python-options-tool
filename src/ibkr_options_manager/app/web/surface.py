@@ -1832,7 +1832,9 @@ class StarUIWorkbench:
             if realized is not None:
                 realized += outcome.realized_pnl
         return Div(
-            self._coverage_alert(coverage, app_order_count, order_count),
+            self._coverage_alert(
+                coverage, app_order_count, order_count, selected_snapshot
+            ),
             Div(
                 H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
                 Div(
@@ -1942,8 +1944,12 @@ class StarUIWorkbench:
             ),
             Div(
                 _contract_header_metric(
-                    "Active / total",
+                    "Held / total",
                     self._header_quantity(outcomes, selected_snapshot),
+                ),
+                _contract_header_metric(
+                    "Available",
+                    f"{self._state.available_quantity:g}",
                 ),
                 _contract_header_metric(
                     "Average price", _header_price(basis, currency)
@@ -2460,22 +2466,33 @@ class StarUIWorkbench:
         coverage: str,
         app_order_count: int,
         order_count: int,
+        snapshot: BrokerSnapshot | None,
     ) -> Any:
+        held = snapshot.position.quantity if snapshot is not None else None
+        available = self._state.available_quantity
+        reserved = held - available if held is not None else None
+        quantity_message = (
+            f"{available:g} of {held:g} held contracts available to bracket. "
+            f"Existing orders reserve {reserved:g}. "
+            if reserved is not None and reserved >= 0
+            else f"{available:g} contracts available to bracket. "
+        )
         if coverage == "mixed":
             return Alert(
-                AlertTitle("Mixed order coverage detected"),
+                AlertTitle("Existing orders limit new brackets"),
                 AlertDescription(
-                    f"{app_order_count} of {order_count} related orders are app-managed. "
-                    "External orders remain inspect-only and prevent a new bracket."
+                    quantity_message
+                    + f"{app_order_count} of {order_count} related orders are app-managed. "
+                    "External orders are view-only and block paper execution for this position."
                 ),
                 cls="mb-5 border-amber-500/40 bg-amber-500/10 text-amber-100",
             )
         if coverage == "external":
             return Alert(
-                AlertTitle("Existing order coverage detected"),
+                AlertTitle("Existing orders limit new brackets"),
                 AlertDescription(
-                    "Associated external orders remain inspect-only. "
-                    "Only verified available contracts can be bracketed."
+                    quantity_message
+                    + "External orders are view-only and block paper execution for this position."
                 ),
                 cls="mb-5 border-amber-500/40 bg-amber-500/10 text-amber-100",
             )
@@ -2839,6 +2856,7 @@ class StarUIWorkbench:
             baseline,
             proposed_outcome,
             {
+                "externalOrders": self._order_coverage()[0] == "external",
                 "held": format(held, "f"),
                 "realized": format(realized, "f"),
                 "unresolved": unresolved,
@@ -2853,6 +2871,9 @@ class StarUIWorkbench:
                 "baselineLoss": format(baseline.max_loss, "f")
                 if baseline.max_loss is not None
                 else None,
+                "baselineCoveredGain": format(baseline.covered_gain, "f"),
+                "baselineCoveredLoss": format(baseline.covered_loss, "f"),
+                "baselineCoveredQuantity": format(baseline.covered_quantity, "f"),
             },
         )
 
@@ -2860,17 +2881,32 @@ class StarUIWorkbench:
         self, projection: tuple[PositionOutcome, PositionOutcome, dict[str, Any]]
     ) -> Any:
         baseline, outcome, config = projection
+        partial = (
+            not config["unresolved"]
+            and not config["marketExit"]
+            and 0 < outcome.covered_quantity < outcome.held_quantity
+        )
+        gain_value = outcome.covered_gain if partial else outcome.expected_gain
+        loss_value = outcome.covered_loss if partial else outcome.max_loss
+        baseline_gain = baseline.covered_gain if partial else baseline.expected_gain
+        baseline_loss = baseline.covered_loss if partial else baseline.max_loss
+        if partial and baseline.covered_quantity != outcome.covered_quantity:
+            baseline_gain = None
+            baseline_loss = None
         gain_delta = (
-            outcome.expected_gain - baseline.expected_gain
-            if outcome.expected_gain is not None and baseline.expected_gain is not None
+            gain_value - baseline_gain
+            if gain_value is not None and baseline_gain is not None
             else None
         )
         loss_delta = (
-            outcome.max_loss - baseline.max_loss
-            if outcome.max_loss is not None and baseline.max_loss is not None
+            loss_value - baseline_loss
+            if loss_value is not None and baseline_loss is not None
             else None
         )
-        status = _projection_status(outcome, config["unresolved"], config["marketExit"])
+        status = _projection_status(
+            outcome, config["unresolved"], config["marketExit"],
+            config["externalOrders"],
+        )
         return Card(
             CardHeader(
                 CardTitle("Outcome projection", cls="text-sm"),
@@ -2880,17 +2916,27 @@ class StarUIWorkbench:
                 Div(
                     *_metric(
                         "Expected gain",
-                        _projection_gain_value(outcome.expected_gain, gain_delta),
+                        _projection_gain_value(gain_value, gain_delta),
                         "text-emerald-400",
                         live_key="gain",
-                        help_text="Realised P&L plus projected gains from the current layer plan.",
+                        help_text=(
+                            "Realised P&L plus projected gains from the shown layers. "
+                            "Excludes contracts without a verified target and stop."
+                            if partial else
+                            "Realised P&L plus projected gains from the current layer plan."
+                        ),
                     ),
                     *_metric(
                         "Max loss",
-                        _projection_loss_value(outcome.max_loss, loss_delta),
+                        _projection_loss_value(loss_value, loss_delta),
                         "text-rose-400",
                         live_key="loss",
-                        help_text="Projected losses at the current layer stops; excludes realised P&L.",
+                        help_text=(
+                            "Projected result at the shown layer stops; excludes "
+                            "realised P&L and contracts without a verified target and stop."
+                            if partial else
+                            "Projected losses at the current layer stops; excludes realised P&L."
+                        ),
                     ),
                     cls="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] items-baseline gap-x-3 gap-y-3",
                 ),
@@ -4296,7 +4342,10 @@ def _projection_change_value(
 
 
 def _projection_status(
-    outcome: PositionOutcome, unresolved: bool, market_exit: bool
+    outcome: PositionOutcome,
+    unresolved: bool,
+    market_exit: bool,
+    external_orders: bool,
 ) -> str:
     if market_exit:
         return ""
@@ -4305,8 +4354,17 @@ def _projection_status(
     if outcome.covered_quantity > outcome.held_quantity:
         return "Proposed exits exceed the held quantity."
     if outcome.uncovered_quantity:
-        count = format(outcome.uncovered_quantity, "f")
-        return f"{count} held contract(s) have no verified target and stop scenario."
+        covered = format(outcome.covered_quantity, "f")
+        uncovered = format(outcome.uncovered_quantity, "f")
+        if external_orders:
+            return (
+                f"Projection covers {covered} held contracts. The other {uncovered} "
+                "have existing orders; their outcome is not included."
+            )
+        return (
+            f"Projection covers {covered} held contracts. The other {uncovered} "
+            "have no verified target and stop here."
+        )
     return ""
 
 
@@ -4352,13 +4410,18 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       const loss = exits.reduce((total, item) => total + Number(item.loss), 0);
       const uncovered = Math.max(0, Number(config.held) - covered);
       const complete = config.marketExit || (!config.unresolved && !invalidDraft && !invalidActive && Number.isFinite(covered) && Math.abs(covered - Number(config.held)) < 1e-8);
+      const partial = !config.marketExit && !config.unresolved && !invalidDraft && !invalidActive && covered > 0 && covered < Number(config.held);
+      const projected = complete || partial;
       const gainNode = document.querySelector('[data-live-metric="gain"]');
       const lossNode = document.querySelector('[data-live-metric="loss"]');
-      updateMetric(gainNode, complete ? (config.marketExit ? (config.baselineGain === null ? null : Number(config.baselineGain)) : gain) : null, config.baselineGain === null ? null : Number(config.baselineGain), 'gain');
-      updateMetric(lossNode, complete ? (config.marketExit ? (config.baselineLoss === null ? null : Number(config.baselineLoss)) : loss) : null, config.baselineLoss === null ? null : Number(config.baselineLoss), 'loss');
+      const comparablePartial = partial && Math.abs(covered - Number(config.baselineCoveredQuantity)) < 1e-8;
+      const gainBaseline = partial ? (comparablePartial ? Number(config.baselineCoveredGain) : null) : config.baselineGain === null ? null : Number(config.baselineGain);
+      const lossBaseline = partial ? (comparablePartial ? Number(config.baselineCoveredLoss) : null) : config.baselineLoss === null ? null : Number(config.baselineLoss);
+      updateMetric(gainNode, projected ? (config.marketExit ? (config.baselineGain === null ? null : Number(config.baselineGain)) : gain) : null, gainBaseline, 'gain');
+      updateMetric(lossNode, projected ? (config.marketExit ? (config.baselineLoss === null ? null : Number(config.baselineLoss)) : loss) : null, lossBaseline, 'loss');
       const status = document.querySelector('[data-projection-status]');
       if (status) {{
-        status.textContent = config.marketExit ? '' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : config.unresolved ? 'Broker or layer state needs verification before a whole-position total is available.' : covered > Number(config.held) ? 'Proposed exits exceed the held quantity.' : uncovered > 0 ? `${{uncovered}} held contract(s) have no verified target and stop scenario.` : '';
+        status.textContent = config.marketExit ? '' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : config.unresolved ? 'Broker or layer state needs verification before a whole-position total is available.' : covered > Number(config.held) ? 'Proposed exits exceed the held quantity.' : uncovered > 0 ? config.externalOrders ? `Projection covers ${{covered}} held contracts. The other ${{uncovered}} have existing orders; their outcome is not included.` : `Projection covers ${{covered}} held contracts. The other ${{uncovered}} have no verified target and stop here.` : '';
         status.classList.toggle('hidden', !status.textContent);
       }}
     }};

@@ -134,8 +134,20 @@ def test_selected_contract_header_uses_verified_position_and_quote_values() -> N
     assert 'd="M2 2 22 22"' in page
     assert 'data-header-status="New layer ready"' not in page
     assert 'data-header-status="Market data: Frozen"' not in page
-    assert "Active / total" in page
+    assert "Held / total" in page
     assert ">10 / 10<" in page
+    assert "Available" in page
+    assert "5 of 10 held contracts available to bracket." in page
+    assert "Existing orders reserve 5." in page
+    assert "External orders are view-only and block paper execution" in page
+    assert "Expected gain" in page
+    assert "Max loss" in page
+    assert "+$280.00" in page
+    assert "-$340.00" in page
+    assert (
+        "Projection covers 5 held contracts. The other 5 have existing orders; "
+        "their outcome is not included."
+    ) in page
     assert "Average price" in page
     assert ">$2.74<" in page
     assert "Last bid" in page
@@ -672,7 +684,7 @@ def test_reconciled_app_orders_do_not_show_a_coverage_alert() -> None:
 
     assert "App-managed OCA coverage active" not in page.text
     assert "app-created orders were reconciled with TWS" not in page.text
-    assert "Associated external orders remain inspect-only" not in page.text
+    assert "External orders are view-only and block paper execution" not in page.text
 
 
 def test_refresh_replaces_a_draft_that_exceeds_newly_available_quantity() -> None:
@@ -2028,7 +2040,8 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
         "Execute paper order"
     )
     assert "data-outcome-projection" in action_panel
-    assert "— Incomplete" in action_panel
+    assert "Expected gain" in action_panel
+    assert "Max loss" in action_panel
     assert "Covered subtotal:" not in action_panel
     assert 'data-layer-state="draft"' in draft
     assert 'data-slot="card"' not in draft
