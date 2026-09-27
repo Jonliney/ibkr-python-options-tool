@@ -129,10 +129,10 @@ def test_selected_contract_header_uses_verified_position_and_quote_values() -> N
     page = TestClient(workbench.app).get(workbench.path).text
 
     assert "MSTR Sep25'26 150 Call" in page
-    assert 'data-header-status="Demo data ready"' in page
+    assert 'data-header-status="TWS not connected"' in page
     assert 'data-header-status="Test data"' in page
     assert 'd="M2 2 22 22"' in page
-    assert 'data-header-status="New layer ready"' in page
+    assert 'data-header-status="New layer ready"' not in page
     assert 'data-header-status="Market data: Frozen"' not in page
     assert "Active / total" in page
     assert ">10 / 10<" in page
@@ -175,7 +175,7 @@ def test_header_distinguishes_a_blocked_layer_from_connection_status() -> None:
 
     page = TestClient(workbench.app).get(workbench.path).text
 
-    assert 'data-header-status="Demo data ready"' in page
+    assert 'data-header-status="TWS not connected"' in page
     assert 'data-header-status="New layer unavailable"' in page
     assert 'title="Target price is invalid"' in page
     assert ">BLOCKED<" not in page
@@ -403,7 +403,8 @@ def test_status_updates_render_as_short_toasts_not_workspace_copy() -> None:
 
     page = TestClient(workbench.app).get(workbench.path)
 
-    assert "Execution blocked" in page.text
+    assert workbench._toast is not None
+    assert workbench._toast.title == "Couldn't send bracket orders"
     assert "Average price" in page.text
     assert "Dismiss toast" in page.text
     # Action rerenders must replace an already-hydrated empty toast signal.
@@ -474,9 +475,95 @@ def test_tws_connection_toast_has_a_short_recovery_message() -> None:
         "Portfolio state is not ready: missing completion barriers: positions"
     )
 
-    assert notice.title == "Could not connect to TWS"
-    assert notice.description == "Make sure TWS is open and try again."
+    assert notice.title == "Couldn't connect to TWS"
+    assert notice.description == "Check that TWS is open, then try again."
     assert notice.variant == "error"
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Verified broker state is ready for read-only planning.",
+        "Recovered 2 app-owned orders from TWS. Their journal status is reconciled.",
+        "Fresh paper snapshot verified. Review the order plan, then confirm.",
+        "Staged action cancelled. No orders were sent to TWS.",
+        "Paper submission acknowledged for 2 orders. TWS state refreshed.",
+    ),
+)
+def test_routine_statuses_do_not_create_toasts(message: str) -> None:
+    assert _toast_notice(message) is None
+
+
+def test_problem_toast_has_actionable_title_and_body() -> None:
+    notice = _toast_notice(
+        "Paper submission acknowledged. Automatic TWS refresh failed; use Refresh before another action."
+    )
+
+    assert notice is not None
+    assert notice.title == "Couldn't verify the latest state"
+    assert notice.description == "TWS received the action. Refresh before making another change."
+    assert notice.variant == "error"
+
+
+@pytest.mark.parametrize(
+    ("message", "title", "body"),
+    (
+        (
+            "Submission outcome is unknown: TWS timed out",
+            "Order status is uncertain",
+            "Check TWS and refresh. Do not resend this draft.",
+        ),
+        (
+            "Market exit outcome is unknown: TWS timed out",
+            "Order status is uncertain",
+            "Check TWS and refresh. Do not retry until the outcome is clear.",
+        ),
+        (
+            "Bracket cancellation blocked: orders changed",
+            "Couldn't cancel bracket orders",
+            "orders changed",
+        ),
+        (
+            "Price update blocked: the snapshot is stale",
+            "Couldn't change prices",
+            "the snapshot is stale",
+        ),
+        (
+            "The fresh quote changes the immediate-sell warning.",
+            "Check the changed quote",
+            "The price warning changed. Review it before confirming again.",
+        ),
+        (
+            "Targets must be above 0%; stops must be between 0% and 100%.",
+            "Fix the layer prices",
+            "Target must be above 0%; stop must be between 0% and 100%.",
+        ),
+    ),
+)
+def test_problem_toasts_use_short_specific_copy(
+    message: str, title: str, body: str
+) -> None:
+    notice = _toast_notice(message)
+
+    assert notice is not None
+    assert (notice.title, notice.description, notice.variant) == (title, body, "error")
+
+
+def test_failed_post_write_refresh_does_not_show_a_success_toast() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+
+    def failed_refresh() -> None:
+        raise RuntimeError("connection lost")
+
+    workbench._refresh_locked = failed_refresh  # type: ignore[method-assign]
+
+    assert not workbench._refresh_after_acknowledged_write_locked(
+        "Paper submission acknowledged."
+    )
+    assert workbench._toast is not None
+    assert workbench._toast.title == "Couldn't verify the latest state"
+    assert workbench._toast.variant == "error"
 
 
 def test_busy_submit_only_applies_to_explicitly_async_controls() -> None:
@@ -779,7 +866,10 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert deleted.uncovered_quantity == Decimal("5")
 
     workbench._armed_cancellation = None
+    workbench._message = "Execution blocked: previous action failed"
+    assert workbench._toast is not None
     added_page = client.post(workbench.path + "action", data={"action": "add-layer"})
+    assert workbench._toast is None
     before_add, after_add, _config = workbench._projection_state()
     assert before_add.expected_gain is not None
     assert after_add.expected_gain is not None
@@ -835,7 +925,11 @@ def test_cancelled_review_with_no_draft_keeps_active_empty_state_visible() -> No
     review_classes = re.search(r'class="([^"]+)"', active_review.group())
     assert badge_classes is not None and 'hidden' not in badge_classes[1].split()
     assert review_classes is not None and 'hidden' not in review_classes[1].split()
-    assert "Modify an active LMT or STP price to continue." in page
+    assert "Ready to adjust a price?" in page
+    assert "Change a target or stop in an active layer to preview the update here." in page
+    assert 'data-edit-active-prices' in page
+    assert "firstPrice.scrollIntoView" in page
+    assert re.search(r'data-active-review-empty class="absolute inset-0 flex', page)
     assert "const showActive = active || !hasDraftRows;" in _live_active_script(
         {"basis": "1", "multiplier": "100", "bands": []}
     )
@@ -2114,7 +2208,8 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
 
     assert armed.status_code == 200
     assert ">Confirm<" in armed.text
-    assert "Fresh paper snapshot verified" in armed.text
+    assert workbench._status_message.startswith("Fresh paper snapshot verified")
+    assert workbench._toast is None
 
     submitted = client.post(
         workbench.path + "action",
@@ -2122,8 +2217,11 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
     )
 
     assert submitted.status_code == 200
-    assert "Orders sent to TWS" in submitted.text
-    assert "2 orders acknowledged" in submitted.text
+    assert "Bracket orders sent to TWS" in submitted.text
+    assert "Check TWS for any required Transmit." in submitted.text
+    assert workbench._toast is not None
+    assert workbench._toast.title == "Bracket orders sent to TWS"
+    assert workbench._toast.description == "Check TWS for any required Transmit."
     assert "Awaiting TWS verification" in submitted.text
     assert "SELL LMT" in submitted.text
     assert "Waiting for TWS" in submitted.text
@@ -2241,7 +2339,7 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
             phase = 3
             click_button("Confirm")
         elif phase == 3:
-            if "Orders sent to TWS" not in body:
+            if "Bracket orders sent to TWS" not in body:
                 finish("Paper execution did not render its acknowledgement")
                 return
             result["execute_arm"] = True
@@ -2250,7 +2348,7 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
             javascript(
                 """(() => {
                   const toast = Array.from(document.querySelectorAll('[role="status"]'))
-                    .find((node) => node.textContent.includes('Orders sent to TWS')
+                    .find((node) => node.textContent.includes('Bracket orders sent to TWS')
                       && node.getBoundingClientRect().height > 0
                       && getComputedStyle(node).display !== 'none');
                   return !!toast;

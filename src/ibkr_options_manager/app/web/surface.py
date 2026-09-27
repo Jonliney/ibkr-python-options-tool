@@ -211,8 +211,9 @@ class StarUIWorkbench:
     def _message(self, message: str) -> None:
         self._status_message = message
         if self._notifications_enabled and not self._suppress_toasts:
-            self._toast_revision += 1
             self._toast = _toast_notice(message)
+            if self._toast is not None:
+                self._toast_revision += 1
 
     @property
     def path(self) -> str:
@@ -305,6 +306,8 @@ class StarUIWorkbench:
                 return self._page()
 
         with self._lock:
+            # Each response carries only feedback produced by this action.
+            self._toast = None
             draft_change = action in {
                 "add-layer",
                 "equal-split",
@@ -383,7 +386,7 @@ class StarUIWorkbench:
         state = self._view_model.refresh_portfolio(self._settings)
         self._apply_refreshed_portfolio_locked(state)
 
-    def _refresh_after_acknowledged_write_locked(self, acknowledgement: str) -> None:
+    def _refresh_after_acknowledged_write_locked(self, acknowledgement: str) -> bool:
         """Replace optimistic post-write UI state with a fresh broker snapshot."""
         try:
             self._refresh_locked()
@@ -392,14 +395,16 @@ class StarUIWorkbench:
                 f"{acknowledgement} Automatic TWS refresh failed; use Refresh before "
                 f"another action. ({error})"
             )
-            return
+            return False
         if self._state.status is UiStatus.READY:
             self._message = f"{acknowledgement} TWS state refreshed."
+            return True
         else:
             self._message = (
                 f"{acknowledgement} TWS refresh could not verify the new state; use "
                 "Refresh before another action."
             )
+            return False
 
     def _apply_refreshed_portfolio_locked(self, state: ViewState) -> None:
         """Apply an already-read portfolio snapshot while holding the UI lock."""
@@ -461,6 +466,10 @@ class StarUIWorkbench:
         """Keep routine review transitions out of the notification queue."""
         self._status_message = message
         self._toast = None
+
+    def _show_success_toast_locked(self, title: str, description: str) -> None:
+        self._toast_revision += 1
+        self._toast = _ToastNotice(title, description, "success")
 
     def _arm_execution_locked(self) -> None:
         if self._paper_execution is None:
@@ -528,18 +537,14 @@ class StarUIWorkbench:
             self._message = f"Submission outcome is unknown: {error}"
         else:
             self._drafts.pop(candidate.selection.con_id, None)
-            self._refresh_after_acknowledged_write_locked(
+            refreshed = self._refresh_after_acknowledged_write_locked(
                 f"Paper submission acknowledged for {len(receipt.entry.order_ids)} orders."
             )
-            self._toast = _ToastNotice(
-                title="Orders sent to TWS",
-                description=(
-                    f"{len(receipt.entry.order_ids)} orders acknowledged. "
-                    "Check TWS for Transmit, then Refresh."
-                ),
-                variant="success",
-            )
-            self._toast_revision += 1
+            if refreshed:
+                self._show_success_toast_locked(
+                    "Bracket orders sent to TWS",
+                    "Check TWS for any required Transmit.",
+                )
         finally:
             self._disarm_execution_locked()
 
@@ -704,9 +709,14 @@ class StarUIWorkbench:
         except Exception as error:
             self._message = f"Bracket cancellation outcome is unknown: {error}"
         else:
-            self._refresh_after_acknowledged_write_locked(
+            refreshed = self._refresh_after_acknowledged_write_locked(
                 "TWS confirmed both OCA legs were cancelled."
             )
+            if refreshed:
+                self._show_success_toast_locked(
+                    "Selected bracket orders cancelled",
+                    "The position remains open.",
+                )
         finally:
             self._disarm_execution_locked()
 
@@ -810,11 +820,16 @@ class StarUIWorkbench:
         except Exception as error:
             self._message = f"Market exit outcome is unknown: {error}"
         else:
-            self._refresh_after_acknowledged_write_locked(
+            refreshed = self._refresh_after_acknowledged_write_locked(
                 f"TWS confirmed both selected OCA legs were cancelled and "
                 f"acknowledged the standalone MKT sell for "
                 f"{sum((candidate.quantity for candidate in candidates), Decimal('0'))} contracts."
             )
+            if refreshed:
+                self._show_success_toast_locked(
+                    "Market sell sent to TWS",
+                    "Selected bracket orders were cancelled. Check TWS for the fill.",
+                )
         finally:
             self._disarm_execution_locked()
 
@@ -1083,14 +1098,9 @@ class StarUIWorkbench:
                 ],
             )
             if self._status_message.endswith("TWS state refreshed."):
-                self._toast_revision += 1
-                self._toast = _ToastNotice(
-                    title="Price update sent to TWS",
-                    description=(
-                        f"{len(receipt.entry.order_ids)} amended order(s) verified. "
-                        "Check TWS for any required Transmit."
-                    ),
-                    variant="success",
+                self._show_success_toast_locked(
+                    "Price update sent to TWS",
+                    "Check TWS for any required Transmit.",
                 )
         finally:
             self._disarm_execution_locked()
@@ -1544,14 +1554,12 @@ class StarUIWorkbench:
             fact.label == "Paper account" and fact.state is FactState.PASS
             for fact in state.connection
         )
-        if self._launch_connection == "connecting":
+        if self._demo_mode:
+            connection = _header_status("TWS not connected", "link-2", "muted")
+        elif self._launch_connection == "connecting":
             connection = _header_status("Connecting to TWS", "link-2", "muted")
         elif verified_data:
-            connection = _header_status(
-                "Demo data ready" if self._demo_mode else "TWS connected",
-                "check" if self._demo_mode else "link-2",
-                "ready",
-            )
+            connection = _header_status("TWS connected", "link-2", "ready")
         elif self._launch_connection == "failed":
             connection = _header_status("TWS unavailable", "link-2", "warning")
         elif state.status is UiStatus.EMPTY:
@@ -1560,11 +1568,9 @@ class StarUIWorkbench:
             connection = _header_status("Connection unverified", "link-2", "muted")
         plan_status = None
         if self._selected_con_id is not None:
-            if state.status is UiStatus.READY and selected_snapshot is not None:
-                plan_status = _header_status("New layer ready", "check", "ready")
-            elif state.status is UiStatus.STALE:
+            if state.status is UiStatus.STALE:
                 plan_status = _header_status("Refresh required", "x", "warning")
-            elif any(
+            elif state.status is UiStatus.READY or any(
                 validation.code == "POSITION_FULLY_ALLOCATED"
                 for validation in state.validations
             ):
@@ -1912,7 +1918,7 @@ class StarUIWorkbench:
                                         "lucide:plus", cls="size-4", aria_hidden="true"
                                     ),
                                     "Add Layer",
-                                    variant="secondary",
+                                    variant="default",
                                     size="default",
                                     type="submit",
                                     form="draft-form",
@@ -2979,14 +2985,17 @@ class StarUIWorkbench:
             if has_staged_action
             else ScrollArea(
                 Div(
-                    *draft_rows,
-                    data_draft_review=True,
-                    data_has_draft_rows="true" if draft_rows else "false",
-                    cls="min-h-0" if draft_rows else "hidden min-h-0",
+                    Div(
+                        *draft_rows,
+                        data_draft_review=True,
+                        data_has_draft_rows="true" if draft_rows else "false",
+                        cls="min-h-0" if draft_rows else "hidden min-h-0",
+                    ),
+                    self._live_active_review(hidden=bool(draft_rows))
+                    if has_active_layers
+                    else None,
+                    cls="flex min-h-full flex-col",
                 ),
-                self._live_active_review(hidden=bool(draft_rows))
-                if has_active_layers
-                else None,
                 aria_label="Planned order actions",
                 cls="min-h-0 flex-1 px-4",
             )
@@ -3282,14 +3291,33 @@ class StarUIWorkbench:
                 )
             )
         return Div(
-            P(
-                "Modify an active LMT or STP price to continue.",
+            Div(
+                Div(
+                    Icon("lucide:equal", cls="size-7", aria_hidden="true"),
+                    cls="mb-5 flex size-14 items-center justify-center rounded-2xl border border-border bg-muted/40 text-foreground",
+                ),
+                H3(
+                    "Ready to adjust a price?",
+                    cls="text-base font-semibold tracking-tight text-foreground",
+                ),
+                P(
+                    "Change a target or stop in an active layer to preview the update here.",
+                    cls="mt-2 max-w-64 text-center text-sm leading-6 text-muted-foreground",
+                ),
+                Button(
+                    "Edit active prices",
+                    Icon("lucide:arrow-right", cls="size-4", aria_hidden="true"),
+                    variant="outline",
+                    type="button",
+                    data_edit_active_prices=True,
+                    cls="mt-5 gap-2",
+                ),
                 data_active_review_empty=True,
-                cls="text-center text-sm leading-6 text-muted-foreground",
+                cls="absolute inset-0 flex flex-col items-center justify-center px-4 py-8 text-center",
             ),
             *rows,
             data_active_review=True,
-            cls="hidden min-h-0" if hidden else "min-h-0",
+            cls="hidden min-h-full flex-1 flex-col" if hidden else "flex min-h-full flex-1 flex-col",
         )
 
     def _review_pair(self, index: int, layer: DraftLayerForm) -> Any:
@@ -3593,6 +3621,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       document.querySelectorAll('[data-active-review], [data-active-review-badge], [data-active-execute-control]').forEach((node) => {{
         node.classList.toggle('hidden', !showActive);
       }});
+      document.querySelector('[data-active-review]')?.classList.toggle('flex', showActive);
     }};
     const update = () => {{
       let changed = false, edited = false;
@@ -3648,6 +3677,12 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       window.ibkrProjection?.updateActive(outcomes, invalid);
     }};
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('input', update));
+    document.querySelectorAll('[data-edit-active-prices]').forEach((button) => button.addEventListener('click', () => {{
+      const firstPrice = form.querySelector('[data-active-input]:not(:disabled)');
+      if (!firstPrice) return;
+      firstPrice.scrollIntoView({{block: 'center', behavior: 'smooth'}});
+      firstPrice.focus({{preventScroll: true}});
+    }}));
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('change', update));
     document.querySelectorAll('[data-move-stops-to-be]').forEach((button) => button.addEventListener('click', () => {{
       form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{ input.value = '0'; }});
@@ -4347,51 +4382,78 @@ def _projection_script(configuration: dict[str, Any]) -> str:
 """
 
 
-def _toast_notice(message: str) -> _ToastNotice:
-    """Turn internal status detail into a short, actionable user notification."""
+def _toast_notice(message: str) -> _ToastNotice | None:
+    """Notify only when a problem needs attention; successes are explicit."""
     normalized = " ".join(message.split())
     lowered = normalized.lower()
     if "portfolio state is not ready" in lowered or "tws connection failed" in lowered:
         return _ToastNotice(
-            title="Could not connect to TWS",
-            description="Make sure TWS is open and try again.",
+            title="Couldn't connect to TWS",
+            description="Check that TWS is open, then try again.",
             variant="error",
         )
-    if any(
+    if not any(
         term in lowered
         for term in (
-            "blocked",
-            "failed",
-            "unavailable",
-            "unknown",
-            "disabled",
-            "invalid",
-            "not in the verified",
+            "blocked", "failed", "unavailable", "unknown", "disabled",
+            "invalid", "not in the verified", "could not", "needs attention",
+            "refresh required", "must be", "enter valid", "does not have a usable",
+            "select at least", "press execute", "start execution first",
+            "start a price update first", "state changed", "quote changes",
+            "earlier price amendment", "targets must",
         )
     ):
-        variant = "error"
-    elif any(
-        term in lowered
-        for term in (
-            "acknowledged",
-            "confirmed",
-            "reconciled",
-            "recovered",
-            "cancelled",
-            "verified",
+        return None
+    if "automatic tws refresh failed" in lowered or "tws refresh could not" in lowered:
+        return _ToastNotice(
+            "Couldn't verify the latest state",
+            "TWS received the action. Refresh before making another change.",
+            "error",
         )
-    ):
-        variant = "success"
-    else:
-        variant = "info"
-    title, separator, detail = normalized.partition(":")
-    if not separator:
-        title, detail = normalized, ""
-    if len(title) > 52:
-        title, detail = title[:49].rstrip() + "…", ""
-    if len(detail) > 150:
-        detail = detail[:147].rstrip() + "…"
-    return _ToastNotice(title=title, description=detail.strip(), variant=variant)
+    if "outcome is unknown" in lowered:
+        description = (
+            "Check TWS and refresh. Do not resend this draft."
+            if lowered.startswith("submission outcome is unknown")
+            else "Check TWS and refresh. Do not retry until the outcome is clear."
+        )
+        return _ToastNotice("Order status is uncertain", description, "error")
+    if "journal reconciliation blocked" in lowered:
+        return _ToastNotice(
+            "Couldn't reconcile orders",
+            "Refresh and check the app's orders in TWS.",
+            "error",
+        )
+    if "targets must" in lowered:
+        return _ToastNotice(
+            "Fix the layer prices",
+            "Target must be above 0%; stop must be between 0% and 100%.",
+            "error",
+        )
+    if "quote changes" in lowered:
+        return _ToastNotice(
+            "Check the changed quote",
+            "The price warning changed. Review it before confirming again.",
+            "error",
+        )
+    if "earlier price amendment" in lowered:
+        return _ToastNotice(
+            "Check the earlier price change",
+            "Inspect the order in TWS before retrying.",
+            "error",
+        )
+    prefix, separator, detail = normalized.partition(":")
+    titles = {
+        "Execution blocked": "Couldn't send bracket orders",
+        "Market exit blocked": "Couldn't send the market sell",
+        "Bracket cancellation blocked": "Couldn't cancel bracket orders",
+        "Price update blocked": "Couldn't change prices",
+        "Plan blocked by validation": "Plan needs attention",
+    }
+    title = titles.get(prefix, "Couldn't complete this action")
+    body = detail.strip() if separator else normalized
+    if len(body) > 160:
+        body = body[:157].rstrip() + "…"
+    return _ToastNotice(title, body, "error")
 
 
 def _busy_submit_script() -> str:
