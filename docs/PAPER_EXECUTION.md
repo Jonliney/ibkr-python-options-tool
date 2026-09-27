@@ -5,6 +5,17 @@ This is an explicit, paper-only milestone. It is enabled only with
 
 ## Execution contract
 
+Choosing an active-layer action (delete bracket, sell one layer, or sell all
+active layers) first builds its Action review from the selected position's
+already displayed snapshot. It does not contact TWS again or permit a write.
+Changing active target/stop prices, including Move to B/E, likewise updates the
+review before another broker read. **Execute paper order** then requests a fresh
+snapshot and verifies the reviewed account, contract, app-owned order IDs,
+quantities, prices, and OCA pairs. Only a matching result exposes **Confirm**.
+Confirmation requests another fresh snapshot before any paper write. A changed
+or incomplete snapshot blocks the write; cancellation and market-exit reviews
+must be staged again if their verified orders change.
+
 Immediately before either confirmation is armed or confirmed, the application
 requests a new TWS snapshot. Submission is allowed only when that snapshot
 proves all of the following:

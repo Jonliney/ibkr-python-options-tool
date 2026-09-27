@@ -87,10 +87,34 @@
   pointer-events: auto;
 }
 
+/* Server-rendered reviews arrive visible, so they need an entry animation. */
+.price-edit-reset[data-staged-cancel] {
+  animation: staged-cancel-in 160ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes staged-cancel-in {
+  from {
+    max-height: 0;
+    margin-bottom: 0;
+    opacity: 0;
+    transform: translateY(7px);
+  }
+  to {
+    max-height: 3rem;
+    margin-bottom: 0.75rem;
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .price-edit-reset {
     transform: none;
     transition: opacity 100ms ease-out;
+  }
+
+  .price-edit-reset[data-staged-cancel] {
+    animation: none;
   }
 }
 

@@ -3,6 +3,7 @@ import os
 import re
 from dataclasses import replace
 from decimal import Decimal
+from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
 
@@ -693,13 +694,13 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
         'aria-label="Sell all active layers"'
     ) < header.index('aria-label="Split draft layer quantities"')
     assert "data-reset-active-prices" in page.text
-    assert "Discard price edits" in page.text
+    assert "Cancel changes" in page.text
     active_form = page.text.split('id="active-form"', maxsplit=1)[1].split(
         "</form>", maxsplit=1
     )[0]
     assert 'data-reset-active-prices="true"' not in active_form
     review_footer = page.text.rsplit('data-reset-active-prices', maxsplit=1)[1]
-    assert review_footer.index('Discard price edits') < review_footer.index(
+    assert review_footer.index('Cancel changes') < review_footer.index(
         'data-active-execute'
     )
     assert "Update layers" not in page.text
@@ -891,7 +892,9 @@ def test_fully_allocated_position_keeps_active_outcome_visible() -> None:
     assert ">Cost basis<" not in page.text
     assert "How expected gain is calculated" in page.text
     assert "How max loss is calculated" in page.text
-    assert "Realized P&amp;L from sold layers is excluded." in page.text
+    assert "Realised P&amp;L plus projected gains from the current layer plan." in page.text
+    assert "Projected losses at the current layer stops; excludes realised P&amp;L." in page.text
+    assert "An up arrow" not in page.text
 
     workbench._state = replace(
         workbench._state,
@@ -1307,7 +1310,7 @@ def test_reset_active_prices_restores_target_and_stop_after_move_to_be() -> None
         'data-active-original="7.5" value="25">'
         '<button type="button" data-move-stops-to-be>Move stop to B/E</button>'
         '</form><div data-price-edit-reset data-reset-visible="false" aria-hidden="true">'
-        '<button type="button" data-reset-active-prices disabled>Discard price edits</button>'
+        '<button type="button" data-reset-active-prices disabled>Cancel changes</button>'
         '</div>'
         f"<script>{script}</script>"
     )
@@ -1341,6 +1344,37 @@ def test_reset_active_prices_restores_target_and_stop_after_move_to_be() -> None
     assert results == [
         '{"afterMove":["60","0",false,"true"],"afterReset":["50","25",true,"false"]}'
     ]
+
+
+def test_staged_cancel_uses_entry_animation_on_page_render() -> None:
+    QApplication.instance() or QApplication([])
+    workbench = _demo_workbench()
+    css = (
+        Path(__file__).resolve().parents[1]
+        / "src/ibkr_options_manager/app/web/static/layers.css"
+    ).read_text()
+    view = QWebEngineView()
+    loop = QEventLoop()
+    results: list[str] = []
+
+    def inspect(loaded: bool) -> None:
+        if not loaded:
+            loop.quit()
+            return
+        view.page().runJavaScript(
+            "getComputedStyle(document.querySelector('[data-staged-cancel]')).animationName",
+            lambda value: (results.append(value), loop.quit()),
+        )
+
+    view.loadFinished.connect(inspect)
+    view.setHtml(
+        f"<style>{css}</style>{workbench._cancel_changes_control(staged=True)}"
+    )
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    view.close()
+
+    assert results == ["staged-cancel-in"]
 
 
 def test_price_update_confirmation_uses_the_shared_cancel_confirm_bar() -> None:
@@ -1641,16 +1675,21 @@ def test_close_all_review_lists_pair_cancellations_then_one_market_order() -> No
     assert "15 contracts" in sidebar
     assert "Market exit price is unknown until filled." in sidebar
     assert workbench._projection_state()[1].expected_gain is None
-    assert ">Confirm<" in sidebar
-    assert ">Cancel<" in sidebar
+    assert 'value="active-action-execute"' in sidebar
+    assert ">Confirm<" not in sidebar
+    assert ">Cancel changes<" in sidebar
     assert "Wait for both cancellation confirmations" not in sidebar
     assert "Selected app-owned OCA layer" not in sidebar
     assert "GTC" in sidebar
 
-    cancelled = client.post(workbench.path + "action", data={"action": "cancel-staged"})
+    workbench._active_action_verified = True
+    assert ">Confirm<" in client.get(workbench.path).text
+
+    client.post(workbench.path + "action", data={"action": "cancel-staged"})
 
     assert workbench._armed_market_exits == ()
-    assert "Staged action cancelled. No orders were sent to TWS." in cancelled.text
+    assert workbench._status_message == "Staged action cancelled. No orders were sent to TWS."
+    assert workbench._toast is None
 
 
 def test_delete_active_layer_review_cancels_only_that_oca_bracket() -> None:
@@ -1678,8 +1717,99 @@ def test_delete_active_layer_review_cancels_only_that_oca_bracket() -> None:
     assert "CANCEL BRACKET" in sidebar
     assert "example/tranche-1" in sidebar
     assert "SELL MKT" not in sidebar
-    assert ">Confirm<" in sidebar
-    assert ">Cancel<" in sidebar
+    assert 'value="active-action-execute"' in sidebar
+    assert "Review the action above" not in sidebar
+    assert ">Confirm<" not in sidebar
+    assert ">Cancel changes<" in sidebar
+
+    workbench._active_action_verified = True
+    assert ">Confirm<" in TestClient(workbench.app).get(workbench.path).text
+
+
+@pytest.mark.parametrize(
+    ("review_action", "confirm_action", "layer_count"),
+    [
+        ("cancel-pair-arm:101", "cancel-pair-confirm", 1),
+        ("market-exit-arm:101", "market-exit-confirm", 1),
+        ("market-exit-selected", "market-exit-confirm", 2),
+    ],
+)
+def test_active_action_reviews_before_refresh_and_requires_execute(
+    monkeypatch, review_action: str, confirm_action: str, layer_count: int
+) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    candidates = tuple(
+        MarketExitCandidate(
+            account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id,
+            target_order_id=11 + index * 2,
+            target_perm_id=101 + index * 2,
+            client_id=17,
+            quantity=Decimal("2"),
+            tif="GTC",
+            oca_group=f"example/tranche-{index + 1}",
+            stop_order_id=12 + index * 2,
+            stop_perm_id=102 + index * 2,
+        )
+        for index in range(layer_count)
+    )
+    workbench._paper_execution = SimpleNamespace(  # type: ignore[assignment]
+        owned_perm_ids=lambda **_kwargs: frozenset(),
+        prepare_market_exit=lambda *_args, **_kwargs: candidates[0],
+        prepare_market_exits=lambda *_args, **_kwargs: candidates,
+    )
+    monkeypatch.setattr(workbench, "_active_target_perm_ids", lambda: (101, 103))
+    monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
+    refreshes: list[int] = []
+
+    def refresh_selected(con_id: int, _form: PlanForm) -> object:
+        refreshes.append(con_id)
+        return workbench._state
+
+    monkeypatch.setattr(workbench._view_model, "select_position", refresh_selected)
+    client = TestClient(workbench.app)
+
+    review = client.post(workbench.path + "action", data={"action": review_action})
+    assert refreshes == []
+    assert workbench._toast is None
+    assert "Review cancellation" not in review.text
+    assert 'value="active-action-execute"' in review.text
+    assert "Cancel changes" in review.text
+    assert "Review the action above" not in review.text
+    assert 'value="' + confirm_action + '"' not in review.text
+
+    client.post(workbench.path + "action", data={"action": confirm_action})
+    assert refreshes == []
+    assert not workbench._active_action_verified
+
+    execute = client.post(
+        workbench.path + "action", data={"action": "active-action-execute"}
+    )
+    assert refreshes == [snapshot.selected.con_id]
+    assert workbench._active_action_verified
+    assert 'value="' + confirm_action + '"' in execute.text
+
+    if review_action == "cancel-pair-arm:101":
+        workbench._paper_execution.prepare_market_exit = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: replace(candidates[0], quantity=Decimal("1"))
+        )
+        changed = client.post(
+            workbench.path + "action", data={"action": "active-action-execute"}
+        )
+        assert not workbench._active_action_verified
+        assert workbench._armed_cancellation is None
+        assert 'value="cancel-pair-confirm"' not in changed.text
+    elif review_action == "market-exit-selected":
+        monkeypatch.setattr(workbench, "_active_target_perm_ids", lambda: (101, 103, 105))
+        changed = client.post(
+            workbench.path + "action", data={"action": "active-action-execute"}
+        )
+        assert not workbench._active_action_verified
+        assert workbench._armed_market_exits == ()
+        assert 'value="market-exit-confirm"' not in changed.text
 
 
 def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() -> None:

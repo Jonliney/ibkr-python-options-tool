@@ -148,6 +148,8 @@ class StarUIWorkbench:
         self._armed_market_exit: MarketExitCandidate | None = None
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
         self._armed_cancellation: MarketExitCandidate | None = None
+        self._active_action_verified = False
+        self._review_all_active_exits = False
         self._armed_price_updates: tuple[PriceUpdateCandidate, ...] = ()
         self._warned_price_update_concerns: frozenset[tuple[int, str]] = frozenset()
         self._price_update_retry_required = False
@@ -341,13 +343,17 @@ class StarUIWorkbench:
                 self._arm_cancellation_locked(_positive_int(perm_id, 0))
             elif action == "market-exit-selected":
                 self._arm_selected_market_exit_locked(values)
+            elif action == "active-action-execute":
+                self._execute_active_action_locked()
             elif action == "market-exit-confirm":
                 self._confirm_market_exit_locked()
             elif action == "cancel-pair-confirm":
                 self._confirm_cancellation_locked()
             elif action == "cancel-staged":
                 self._disarm_execution_locked()
-                self._message = "Staged action cancelled. No orders were sent to TWS."
+                self._set_review_status_locked(
+                    "Staged action cancelled. No orders were sent to TWS."
+                )
             elif action == "active-update-arm":
                 self._arm_price_updates_locked(values)
             elif action == "price-update-confirm":
@@ -444,10 +450,17 @@ class StarUIWorkbench:
         self._armed_market_exit = None
         self._armed_market_exits = ()
         self._armed_cancellation = None
+        self._active_action_verified = False
+        self._review_all_active_exits = False
         self._armed_price_updates = ()
         self._warned_price_update_concerns = frozenset()
         self._price_update_retry_required = False
         self._armed_active_percentages = {}
+
+    def _set_review_status_locked(self, message: str) -> None:
+        """Keep routine review transitions out of the notification queue."""
+        self._status_message = message
+        self._toast = None
 
     def _arm_execution_locked(self) -> None:
         if self._paper_execution is None:
@@ -535,17 +548,10 @@ class StarUIWorkbench:
             self._message = "Paper order management is disabled for this launch."
             return
         self._disarm_execution_locked()
-        state = self._view_model.select_position(
-            self._selected_con_id,
-            self._plan_form(self._drafts.get(self._selected_con_id, ())),
-        )
-        self._apply_state_locked(state)
-        self._record_refresh_time_locked()
-        self._announce_reconciliation_locked()
         snapshot = self._view_model.latest_snapshot()
         if snapshot is None:
             self._message = (
-                "Market exit blocked: a fresh selected-position snapshot is required."
+                "Market exit blocked: select a position before reviewing its orders."
             )
             return
         try:
@@ -559,9 +565,9 @@ class StarUIWorkbench:
             return
         self._armed_market_exit = candidate
         self._armed_market_exits = (candidate,)
-        self._message = (
-            f"Fresh paper snapshot verified. Review the MKT exit for "
-            f"{candidate.quantity} contracts, then confirm."
+        self._set_review_status_locked(
+            f"Review the MKT exit for {candidate.quantity} contracts, then press "
+            "Execute paper order to verify a fresh snapshot."
         )
 
     def _arm_cancellation_locked(self, target_perm_id: int) -> None:
@@ -570,16 +576,9 @@ class StarUIWorkbench:
             self._message = "Paper order management is disabled for this launch."
             return
         self._disarm_execution_locked()
-        state = self._view_model.select_position(
-            self._selected_con_id,
-            self._plan_form(self._drafts.get(self._selected_con_id, ())),
-        )
-        self._apply_state_locked(state)
-        self._record_refresh_time_locked()
-        self._announce_reconciliation_locked()
         snapshot = self._view_model.latest_snapshot()
         if snapshot is None:
-            self._message = "Bracket cancellation blocked: a fresh selected-position snapshot is required."
+            self._message = "Bracket cancellation blocked: select a position before reviewing its orders."
             return
         try:
             candidate = self._paper_execution.prepare_market_exit(
@@ -591,9 +590,67 @@ class StarUIWorkbench:
             self._message = f"Bracket cancellation blocked: {error}"
             return
         self._armed_cancellation = candidate
-        self._message = (
-            f"Fresh paper snapshot verified. Review cancellation of OCA bracket "
-            f"{candidate.oca_group}; no replacement sell order will be sent."
+        self._set_review_status_locked(
+            f"Review cancellation of OCA bracket {candidate.oca_group}; no replacement "
+            "sell order will be sent. Press Execute paper order to verify a fresh snapshot."
+        )
+
+    def _execute_active_action_locked(self) -> None:
+        """Verify a reviewed cancellation or market exit before showing Confirm."""
+        market_exits = self._armed_market_exits or (
+            (self._armed_market_exit,) if self._armed_market_exit is not None else ()
+        )
+        cancellation = self._armed_cancellation
+        if (
+            self._paper_execution is None
+            or self._selected_con_id is None
+            or (not market_exits and cancellation is None)
+        ):
+            self._message = "Review an active-layer action before executing it."
+            return
+        self._active_action_verified = False
+        state = self._view_model.select_position(
+            self._selected_con_id,
+            self._plan_form(self._drafts.get(self._selected_con_id, ())),
+        )
+        self._apply_state_locked(state)
+        self._record_refresh_time_locked()
+        self._announce_reconciliation_locked()
+        snapshot = self._view_model.latest_snapshot()
+        if snapshot is None:
+            self._disarm_execution_locked()
+            self._message = "Execution blocked: the fresh snapshot is unavailable."
+            return
+        try:
+            if cancellation is not None:
+                refreshed = self._paper_execution.prepare_market_exit(
+                    snapshot,
+                    target_perm_id=cancellation.target_perm_id,
+                    expected_client_id=self._settings.client_id,
+                )
+                if refreshed != cancellation:
+                    raise ExecutionBlocked("the OCA bracket changed after review")
+            else:
+                if self._review_all_active_exits and set(
+                    self._active_target_perm_ids()
+                ) != {candidate.target_perm_id for candidate in market_exits}:
+                    raise ExecutionBlocked("the set of active OCA layers changed after review")
+                refreshed_exits = self._paper_execution.prepare_market_exits(
+                    snapshot,
+                    target_perm_ids=tuple(
+                        candidate.target_perm_id for candidate in market_exits
+                    ),
+                    expected_client_id=self._settings.client_id,
+                )
+                if refreshed_exits != market_exits:
+                    raise ExecutionBlocked("the OCA layers changed after review")
+        except ExecutionBlocked as error:
+            self._disarm_execution_locked()
+            self._message = f"Execution blocked: {error}. Review the latest state again."
+            return
+        self._active_action_verified = True
+        self._set_review_status_locked(
+            "Fresh paper snapshot verified. Review the action, then confirm."
         )
 
     def _confirm_cancellation_locked(self) -> None:
@@ -603,8 +660,9 @@ class StarUIWorkbench:
             self._paper_execution is None
             or candidate is None
             or self._selected_con_id is None
+            or not self._active_action_verified
         ):
-            self._message = "Start bracket cancellation first; every paper change needs a separate confirmation."
+            self._message = "Press Execute paper order before confirming bracket cancellation."
             return
         state = self._view_model.select_position(
             self._selected_con_id,
@@ -653,7 +711,7 @@ class StarUIWorkbench:
             self._disarm_execution_locked()
 
     def _arm_selected_market_exit_locked(self, values: dict[str, str]) -> None:
-        """Arm a verified all-selected-layer paper exit for second confirmation."""
+        """Review an all-active-layer exit from the displayed snapshot."""
         del values
         selected = self._active_target_perm_ids()
         if not selected:
@@ -665,13 +723,6 @@ class StarUIWorkbench:
             self._message = "Paper order management is disabled for this launch."
             return
         self._disarm_execution_locked()
-        state = self._view_model.select_position(
-            self._selected_con_id,
-            self._plan_form(self._drafts.get(self._selected_con_id, ())),
-        )
-        self._apply_state_locked(state)
-        self._record_refresh_time_locked()
-        self._announce_reconciliation_locked()
         snapshot = self._view_model.latest_snapshot()
         if snapshot is None:
             self._message = (
@@ -688,18 +739,24 @@ class StarUIWorkbench:
             self._message = f"Market exit blocked: {error}"
             return
         self._armed_market_exits = candidates
+        self._review_all_active_exits = True
         total = sum((candidate.quantity for candidate in candidates), Decimal("0"))
-        self._message = (
-            f"Fresh paper snapshot verified. Review cancellation of {len(candidates)} OCA "
-            f"layers and one MKT sell for {total} contracts, then confirm."
+        self._set_review_status_locked(
+            f"Review cancellation of {len(candidates)} OCA layers and one MKT sell "
+            f"for {total} contracts, then press Execute paper order."
         )
 
     def _confirm_market_exit_locked(self) -> None:
         armed = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
-        if self._paper_execution is None or not armed or self._selected_con_id is None:
-            self._message = "Start the market exit first; every paper change needs a separate confirmation."
+        if (
+            self._paper_execution is None
+            or not armed
+            or self._selected_con_id is None
+            or not self._active_action_verified
+        ):
+            self._message = "Press Execute paper order before confirming the market exit."
             return
         state = self._view_model.select_position(
             self._selected_con_id,
@@ -714,6 +771,10 @@ class StarUIWorkbench:
             self._message = "Market exit blocked: the fresh snapshot is unavailable."
             return
         try:
+            if self._review_all_active_exits and set(
+                self._active_target_perm_ids()
+            ) != {candidate.target_perm_id for candidate in armed}:
+                raise ExecutionBlocked("the set of active OCA layers changed after review")
             candidates = self._paper_execution.prepare_market_exits(
                 snapshot,
                 target_perm_ids=tuple(candidate.target_perm_id for candidate in armed),
@@ -2812,25 +2873,14 @@ class StarUIWorkbench:
                         _projection_gain_value(outcome.expected_gain, gain_delta),
                         "text-emerald-400",
                         live_key="gain",
-                        help_text=(
-                            "Realized P&L from sold app-owned layers, plus the "
-                            "projected result for held layers at their LMT targets. "
-                            "An up arrow means expected gain increased; a down "
-                            "arrow means it decreased against the loaded plan."
-                        ),
+                        help_text="Realised P&L plus projected gains from the current layer plan.",
                     ),
                     *_metric(
                         "Max loss",
                         _projection_loss_value(outcome.max_loss, loss_delta),
                         "text-rose-400",
                         live_key="loss",
-                        help_text=(
-                            "Projected result for held layers at their STP prices. "
-                            "Realized P&L from sold layers is excluded. "
-                            "An up arrow means more loss or a lower stop outcome; "
-                            "a down arrow means less loss or a higher stop outcome. "
-                            "The dollar change compares with the loaded plan."
-                        ),
+                        help_text="Projected losses at the current layer stops; excludes realised P&L.",
                     ),
                     cls="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] items-baseline gap-x-3 gap-y-3",
                 ),
@@ -2970,6 +3020,8 @@ class StarUIWorkbench:
         market_exits = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
+        if (self._armed_cancellation is not None or market_exits) and not self._active_action_verified:
+            return self._reviewed_active_action_controls()
         if self._armed_cancellation is not None:
             return self._staged_action_controls(
                 confirm_action="cancel-pair-confirm",
@@ -3017,21 +3069,7 @@ class StarUIWorkbench:
             and bool(self._current_layers())
         )
         return Div(
-            Div(
-                Button(
-                    "Discard price edits",
-                    variant="outline",
-                    size="sm",
-                    type="button",
-                    data_reset_active_prices=True,
-                    disabled=True,
-                    cls="w-full",
-                ),
-                cls="price-edit-reset w-full",
-                data_price_edit_reset=True,
-                data_reset_visible="false",
-                aria_hidden="true",
-            )
+            self._cancel_changes_control(staged=False)
             if self._active_oca_pairs()
             else None,
             Div(
@@ -3067,6 +3105,56 @@ class StarUIWorkbench:
             )
             if self._active_oca_pairs()
             else None,
+            cls="mx-4 mb-4 flex w-[calc(100%-2rem)] flex-col",
+        )
+
+    def _cancel_changes_control(self, *, staged: bool) -> Any:
+        """Share the cancel slot across local edits and staged paper actions."""
+        button_options = (
+            {"name": "action", "value": "cancel-staged"}
+            if staged
+            else {"data_reset_active_prices": True, "disabled": True}
+        )
+        slot_options = (
+            {"data_staged_cancel": True, "data_reset_visible": "true"}
+            if staged
+            else {
+                "data_price_edit_reset": True,
+                "data_reset_visible": "false",
+                "aria_hidden": "true",
+            }
+        )
+        return Div(
+            Button(
+                "Cancel changes",
+                variant="outline",
+                size="sm",
+                type="submit" if staged else "button",
+                cls="w-full",
+                **button_options,
+            ),
+            cls="price-edit-reset w-full",
+            **slot_options,
+        )
+
+    def _reviewed_active_action_controls(self) -> Any:
+        """Keep review separate from the fresh check and final confirmation."""
+        return Form(
+            self._cancel_changes_control(staged=True),
+            Div(
+                Button(
+                    "Execute paper order",
+                    variant="default",
+                    type="submit",
+                    name="action",
+                    value="active-action-execute",
+                    data_busy_text="Checking…",
+                    cls="w-full",
+                ),
+                cls="w-full",
+            ),
+            action=f"/{self.session_token}/action",
+            method="post",
             cls="mx-4 mb-4 flex w-[calc(100%-2rem)] flex-col",
         )
 
