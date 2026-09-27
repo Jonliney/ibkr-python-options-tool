@@ -949,6 +949,27 @@ def test_fully_allocated_position_keeps_active_outcome_visible() -> None:
     assert "Projected losses at the current layer stops; excludes realised P&amp;L." in page.text
     assert "An up arrow" not in page.text
 
+    workbench._armed_market_exit = MarketExitCandidate(
+        account="DU123",
+        con_id=selected,
+        target_order_id=11,
+        target_perm_id=101,
+        client_id=17,
+        quantity=Decimal("10"),
+        tif="GTC",
+        oca_group="test/tranche-1",
+        stop_order_id=12,
+        stop_perm_id=102,
+    )
+    _baseline, staged, _config = workbench._projection_state()
+    assert staged.expected_gain == Decimal("560")
+    assert staged.max_loss == Decimal("-680")
+    staged_page = TestClient(workbench.app).get(workbench.path).text
+    assert "+$560.00" in staged_page
+    assert "-$680.00" in staged_page
+    assert "Market exit price is unknown until filled." not in staged_page
+    workbench._armed_market_exit = None
+
     workbench._state = replace(
         workbench._state,
         validations=(ValidationLine("OCA_QUANTITY_MISMATCH", "Conflicting orders"),),
@@ -1726,8 +1747,10 @@ def test_close_all_review_lists_pair_cancellations_then_one_market_order() -> No
     assert "SELL MKT" in sidebar
     assert "text-emerald-400" in sidebar
     assert "15 contracts" in sidebar
-    assert "Market exit price is unknown until filled." in sidebar
-    assert workbench._projection_state()[1].expected_gain is None
+    assert "Market exit price is unknown until filled." not in sidebar
+    baseline, proposed, _ = workbench._projection_state()
+    assert proposed.expected_gain == baseline.expected_gain
+    assert proposed.max_loss == baseline.max_loss
     assert 'value="active-action-execute"' in sidebar
     assert ">Confirm<" not in sidebar
     assert ">Cancel changes<" in sidebar
@@ -1912,7 +1935,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     )
     assert "data-outcome-projection" in action_panel
     assert "— Incomplete" in action_panel
-    assert "Covered subtotal:" in action_panel
+    assert "Covered subtotal:" not in action_panel
     assert 'data-layer-state="draft"' in draft
     assert 'data-slot="card"' not in draft
     header = page.text.split('id="draft-form"', maxsplit=1)[0]

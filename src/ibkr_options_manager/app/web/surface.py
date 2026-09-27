@@ -476,7 +476,7 @@ class StarUIWorkbench:
             self._message = "Execution blocked: refresh and validation did not produce a sendable paper draft."
             return
         self._armed_execution = candidate
-        self._message = (
+        self._set_review_status_locked(
             "Fresh paper snapshot verified. Review the order plan, then confirm."
         )
 
@@ -949,7 +949,7 @@ class StarUIWorkbench:
                 "in TWS for a pending change, then confirm the check below before retrying."
             )
         else:
-            self._message = (
+            self._set_review_status_locked(
                 f"Fresh paper snapshot verified. Review {changed_legs} selected price "
                 "amendments, then confirm."
             )
@@ -2817,14 +2817,18 @@ class StarUIWorkbench:
             exits=tuple(observed),
             unresolved=unresolved,
         )
+        market_exit = bool(self._armed_market_exits or self._armed_market_exit)
         proposed_outcome = project_position_outcome(
             held_quantity=held,
             realized_pnl=realized,
             exits=tuple(proposed),
-            unresolved=unresolved
-            or bool(self._armed_market_exits or self._armed_market_exit),
+            unresolved=unresolved or market_exit,
         )
         baseline = self._projection_comparison or baseline
+        if market_exit:
+            # A staged market sell has no fill price. Keep the last verified
+            # layer projection visible for review; execution never uses it.
+            proposed_outcome = baseline
         return (
             baseline,
             proposed_outcome,
@@ -2832,7 +2836,7 @@ class StarUIWorkbench:
                 "held": format(held, "f"),
                 "realized": format(realized, "f"),
                 "unresolved": unresolved,
-                "marketExit": bool(self._armed_market_exits or self._armed_market_exit),
+                "marketExit": market_exit,
                 "removed": list(removed_ids),
                 "staged": bool(removed_ids or updates or self._armed_execution),
                 "active": active_config,
@@ -2889,12 +2893,6 @@ class StarUIWorkbench:
                     data_projection_status=True,
                     cls="mt-3 text-xs leading-5 text-muted-foreground"
                     + (" hidden" if not status else ""),
-                ),
-                P(
-                    f"Covered subtotal: {_money(outcome.covered_gain)} gain / {_money(outcome.covered_loss)} open loss",
-                    data_projection_subtotal=True,
-                    cls="mt-1 text-xs leading-5 text-muted-foreground"
-                    + (" hidden" if outcome.expected_gain is not None else ""),
                 ),
                 cls="px-4",
             ),
@@ -4266,7 +4264,7 @@ def _projection_status(
     outcome: PositionOutcome, unresolved: bool, market_exit: bool
 ) -> str:
     if market_exit:
-        return "Market exit price is unknown until filled."
+        return ""
     if unresolved:
         return "Broker or layer state needs verification before a whole-position total is available."
     if outcome.covered_quantity > outcome.held_quantity:
@@ -4318,20 +4316,15 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       const gain = Number(config.realized) + exits.reduce((total, item) => total + Number(item.gain), 0);
       const loss = exits.reduce((total, item) => total + Number(item.loss), 0);
       const uncovered = Math.max(0, Number(config.held) - covered);
-      const complete = !config.unresolved && !config.marketExit && !invalidDraft && !invalidActive && Number.isFinite(covered) && Math.abs(covered - Number(config.held)) < 1e-8;
+      const complete = config.marketExit || (!config.unresolved && !invalidDraft && !invalidActive && Number.isFinite(covered) && Math.abs(covered - Number(config.held)) < 1e-8);
       const gainNode = document.querySelector('[data-live-metric="gain"]');
       const lossNode = document.querySelector('[data-live-metric="loss"]');
-      updateMetric(gainNode, complete ? gain : null, config.baselineGain === null ? null : Number(config.baselineGain), 'gain');
-      updateMetric(lossNode, complete ? loss : null, config.baselineLoss === null ? null : Number(config.baselineLoss), 'loss');
+      updateMetric(gainNode, complete ? (config.marketExit ? (config.baselineGain === null ? null : Number(config.baselineGain)) : gain) : null, config.baselineGain === null ? null : Number(config.baselineGain), 'gain');
+      updateMetric(lossNode, complete ? (config.marketExit ? (config.baselineLoss === null ? null : Number(config.baselineLoss)) : loss) : null, config.baselineLoss === null ? null : Number(config.baselineLoss), 'loss');
       const status = document.querySelector('[data-projection-status]');
       if (status) {{
-        status.textContent = config.marketExit ? 'Market exit price is unknown until filled.' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : config.unresolved ? 'Broker or layer state needs verification before a whole-position total is available.' : covered > Number(config.held) ? 'Proposed exits exceed the held quantity.' : uncovered > 0 ? `${{uncovered}} held contract(s) have no verified target and stop scenario.` : '';
+        status.textContent = config.marketExit ? '' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : config.unresolved ? 'Broker or layer state needs verification before a whole-position total is available.' : covered > Number(config.held) ? 'Proposed exits exceed the held quantity.' : uncovered > 0 ? `${{uncovered}} held contract(s) have no verified target and stop scenario.` : '';
         status.classList.toggle('hidden', !status.textContent);
-      }}
-      const subtotal = document.querySelector('[data-projection-subtotal]');
-      if (subtotal) {{
-        subtotal.textContent = `Covered subtotal: ${{money(gain)}} gain / ${{money(loss)}} open loss`;
-        subtotal.classList.toggle('hidden', complete);
       }}
     }};
     window.ibkrProjection = {{
