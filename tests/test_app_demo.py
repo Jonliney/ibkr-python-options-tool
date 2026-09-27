@@ -129,9 +129,10 @@ def test_selected_contract_header_uses_verified_position_and_quote_values() -> N
 
     assert "MSTR Sep25'26 150 Call" in page
     assert 'data-header-status="Demo data ready"' in page
+    assert 'data-header-status="Test data"' in page
+    assert 'd="M2 2 22 22"' in page
     assert 'data-header-status="New layer ready"' in page
-    assert 'data-header-status="Market data: Frozen"' in page
-    assert page.index("Market data: Frozen") < page.index("MSTR Sep25'26 150 Call")
+    assert 'data-header-status="Market data: Frozen"' not in page
     assert "Active / total" in page
     assert ">10 / 10<" in page
     assert "Average price" in page
@@ -177,6 +178,43 @@ def test_header_distinguishes_a_blocked_layer_from_connection_status() -> None:
     assert 'data-header-status="New layer unavailable"' in page
     assert 'title="Target price is invalid"' in page
     assert ">BLOCKED<" not in page
+
+
+def test_header_omits_full_allocation_and_identifies_paper_account() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._demo_mode = False
+    workbench._paper_execution = _OwnedOrderService(set())
+    workbench._state = replace(
+        workbench._state,
+        status=UiStatus.BLOCKED,
+        available_quantity=0,
+        validations=(
+            ValidationLine("POSITION_FULLY_ALLOCATED", "Position fully allocated"),
+        ),
+    )
+
+    page = TestClient(workbench.app).get(workbench.path).text
+
+    assert 'data-header-status="TWS connected"' in page
+    assert 'data-header-status="Paper TWS account"' in page
+    assert 'data-header-status="No contracts available"' not in page
+    assert 'data-header-status="New layer unavailable"' not in page
+    assert 'd="M9 17H7A5' in page  # Bundled Lucide link icon.
+    assert 'text-cyan-400' in page
+    assert 'd="M12 22s8-4 8-10V5' in page  # Bundled Lucide shield icon.
+
+
+def test_header_warns_when_a_live_account_is_configured() -> None:
+    workbench = _demo_workbench()
+    workbench._demo_mode = False
+    workbench._settings = replace(workbench._settings, account="U1234567")
+
+    page = TestClient(workbench.app).get(workbench.path).text
+
+    assert 'data-header-status="Live TWS account"' in page
+    assert 'text-red-400' in page
+    assert 'd="M12 8v4"' in page  # Bundled Lucide shield alert icon.
 
 
 def test_launch_refresh_never_blocks_the_initial_workbench_page() -> None:
@@ -250,6 +288,7 @@ def test_settings_open_in_blocked_desktop_webview(launch_connection: str) -> Non
     interceptor = _LoopbackOnlyRequestInterceptor(view)
     view.page().profile().setUrlRequestInterceptor(interceptor)
     opened: list[bool] = []
+    backdrop: list[bool] = []
 
     def inspect() -> None:
         view.page().runJavaScript(
@@ -282,16 +321,36 @@ def test_settings_open_in_blocked_desktop_webview(launch_connection: str) -> Non
             )
             QTimer.singleShot(250, inspect)
 
-        view.page().runJavaScript(
-            """(() => {
+        def click_settings() -> None:
+            view.page().runJavaScript(
+                """(() => {
               const rect = document.querySelector('[aria-haspopup="dialog"]')
                 .getBoundingClientRect();
               return JSON.stringify([
                 rect.x + rect.width / 2, rect.y + rect.height / 2
               ]);
             })();""",
-            click,
-        )
+                click,
+            )
+
+        if launch_connection == "failed":
+            view.page().runJavaScript(
+                """(() => {
+                  const dialog = document.getElementById('launch_connection');
+                  const overlay = document.querySelector('[data-launch-backdrop]');
+                  if (!dialog?.open || dialog.matches(':modal') || !overlay) {
+                    return false;
+                  }
+                  const style = getComputedStyle(overlay);
+                  return style.pointerEvents === 'none'
+                    && style.backgroundColor !== 'transparent'
+                    && style.backgroundColor !== 'rgba(0, 0, 0, 0)'
+                    && overlay.getBoundingClientRect().width >= innerWidth;
+                })();""",
+                lambda result: (backdrop.append(bool(result)), click_settings()),
+            )
+        else:
+            click_settings()
 
     try:
         view.loadFinished.connect(loaded)
@@ -304,6 +363,8 @@ def test_settings_open_in_blocked_desktop_webview(launch_connection: str) -> Non
         server_thread.join(timeout=2)
 
     assert opened == [True]
+    if launch_connection == "failed":
+        assert backdrop == [True]
 
 
 def test_retry_connection_waits_for_one_terminal_refresh_response() -> None:
@@ -537,7 +598,14 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert 'data-layer-state="working"' in page.text
     assert "$26.20" in page.text
     assert "$16.40" in page.text
-    assert "Move stop to B/E" in page.text
+    header = page.text.split('id="active-form"', maxsplit=1)[0]
+    assert 'aria-label="Move all active stops to B/E"' in header
+    assert 'aria-label="Sell all active layers"' in header
+    assert 'data-orientation="vertical"' in header
+    assert 'form="active-form" name="action" value="market-exit-selected"' in header
+    assert header.index('aria-label="Move all active stops to B/E"') < header.index(
+        'aria-label="Sell all active layers"'
+    ) < header.index('aria-label="Split draft layer quantities"')
     assert "data-reset-active-prices" in page.text
     assert "Discard price edits" in page.text
     active_form = page.text.split('id="active-form"', maxsplit=1)[1].split(
@@ -549,7 +617,7 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
         'data-active-execute'
     )
     assert "Update layers" not in page.text
-    assert "Close working" in page.text
+    assert "Close working" not in page.text
     assert 'data-layer-state="draft"' in page.text
     assert 'name="active_target_101"' in page.text
     assert 'name="active_stop_101"' in page.text
@@ -925,7 +993,11 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
     assert "aaaaaaaaaaaa/tranche-2" in page.text
     assert 'data-slot="tooltip-content"' in page.text
     assert 'href="/layers.css"' in page.text
-    assert client.get("/layers.css").status_code == 200
+    layer_css = client.get("/layers.css")
+    assert layer_css.status_code == 200
+    assert ".oca-layer-list > [data-layer-state]:first-child" in layer_css.text
+    assert ".oca-layer-list > [data-layer-state]:last-child" in layer_css.text
+    assert "oca-layer-list" in page.text
     assert 'data-layer-state="working"' in page.text
     assert page.text.index('data-layer-state="sold"') < page.text.index(
         'data-layer-state="working"'
@@ -1544,6 +1616,8 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert "<dialog" in page.text
     assert "h-screen overflow-hidden" in page.text
     assert 'aria-label="Draft layer rows"' in page.text
+    assert "contracts allocated" not in page.text
+    assert 'data-live-allocation' not in page.text
     assert 'aria-label="OCA layers workspace"' in page.text
     assert 'aria-label="Planned order actions"' in page.text
     assert 'id="draft-form"' in page.text
@@ -1572,9 +1646,20 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert "Covered subtotal:" in action_panel
     assert 'data-layer-state="draft"' in draft
     assert 'data-slot="card"' not in draft
-    assert "Split all available" in draft
-    assert "Split assigned" in draft
-    assert "Add layer" in draft
+    header = page.text.split('id="draft-form"', maxsplit=1)[0]
+    assert header.index("Split all available") < header.index("Split assigned")
+    assert header.index("Split assigned") < header.index("Add Layer")
+    assert 'aria-label="Split draft layer quantities"' in header
+    split_trigger = re.search(
+        r'<button[^>]*aria-label="Split draft layer quantities"[^>]*>', header
+    )
+    assert split_trigger is not None and re.search(
+        r"\sdisabled(?:\s|>)", split_trigger.group()
+    )
+    assert 'aria-label="Create new OCA bracket"' in header
+    assert 'form="draft-form" name="action" value="add-layer"' in header
+    assert 'id="split-all-submit"' in draft
+    assert 'id="split-assigned-submit"' in draft
     assert "Execute paper order" not in draft
     assert 'name="action" value="save-draft"' not in draft
     assert "font-mono" not in draft
@@ -1599,8 +1684,6 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert 'aria-label="Draft layer rows"' in draft
     assert "overflow-x-auto overflow-y-hidden" in draft
 
-    assert "mt-5" in draft
-
     response = client.post(
         workbench.path + "action",
         data={
@@ -1618,6 +1701,13 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert [layer.quantity for layer in workbench._current_layers()] == ["3", "2"]
     assert workbench._current_layers()[0].tif == "DAY"
     assert "DRAFT 2" in response.text
+    split_trigger = re.search(
+        r'<button[^>]*aria-label="Split draft layer quantities"[^>]*>',
+        response.text,
+    )
+    assert split_trigger is not None and not re.search(
+        r"\sdisabled(?:\s|>)", split_trigger.group()
+    )
 
     response = client.post(
         workbench.path + "action",
@@ -1836,7 +1926,7 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
             finish("Settings did not open its Dialog")
             return
         click_button("Cancel")
-        QTimer.singleShot(100, lambda: click_button("Add layer"))
+        QTimer.singleShot(100, lambda: click_button("Add Layer"))
 
     def inspect_acknowledgement(visible: object) -> None:
         result["acknowledgement_visible"] = bool(visible)
@@ -1847,7 +1937,7 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
         body = str(text)
         if phase == 1:
             if "DRAFT 2" not in body:
-                finish("Add layer did not render a second layer")
+                finish("Add Layer did not render a second layer")
                 return
             result["add_layer"] = True
             phase = 2

@@ -49,8 +49,9 @@ visible plan and requires another refresh.
 The selected-contract header uses verified contract fields for its readable
 name and the latest selected snapshot for open quantity, average option price,
 bid, and ask. The app header separately identifies connection, new-layer
-availability, and IBKR market-data type, so a valid connection is not confused
-with a blocked order plan. The displayed total is the open quantity
+availability when relevant, and paper-execution mode. It does not show IBKR's
+market-data classification as a live-feed claim: prices are from the last
+verified snapshot. The displayed total is the open quantity
 plus fully reconciled app-recorded sold layers; it cannot reconstruct external
 or manual sales. Realised P&L includes only those app-recorded exits. A partial
 or uncertain outcome leaves the affected total or P&L unavailable rather than

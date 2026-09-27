@@ -78,6 +78,12 @@ from .components.ui.dialog import (
     DialogTitle,
     DialogTrigger,
 )
+from .components.ui.dropdown_menu import (
+    DropdownMenu,
+    DropdownMenuContent,
+    DropdownMenuItem,
+    DropdownMenuTrigger,
+)
 from .components.ui.input import Input
 from .components.ui.label import Label
 from .components.ui.scroll_area import ScrollArea
@@ -298,7 +304,10 @@ class StarUIWorkbench:
 
         with self._lock:
             draft_change = action in {
-                "add-layer", "equal-split", "equal-split-available", "equal-split-assigned"
+                "add-layer",
+                "equal-split",
+                "equal-split-available",
+                "equal-split-assigned",
             } or action.startswith("remove-layer:")
             if draft_change:
                 self._projection_comparison = self._projection_state()[1]
@@ -902,7 +911,9 @@ class StarUIWorkbench:
                 "price remains and no amendment is waiting for Transmit."
             )
             record_price_update_event(
-                "ui_result", outcome="blocked", reason="unknown amendment acknowledgement missing"
+                "ui_result",
+                outcome="blocked",
+                reason="unknown amendment acknowledgement missing",
             )
             return
         record_price_update_event(
@@ -913,9 +924,13 @@ class StarUIWorkbench:
             requested=[
                 {
                     "target_order_id": update.layer.target_order_id,
-                    "target_price": str(update.target_price) if update.target_price is not None else None,
+                    "target_price": str(update.target_price)
+                    if update.target_price is not None
+                    else None,
                     "stop_order_id": update.layer.stop_order_id,
-                    "stop_price": str(update.stop_price) if update.stop_price is not None else None,
+                    "stop_price": str(update.stop_price)
+                    if update.stop_price is not None
+                    else None,
                 }
                 for update in updates
             ],
@@ -943,7 +958,9 @@ class StarUIWorkbench:
                 "confirm again; no price amendment was sent."
             )
             record_price_update_event(
-                "ui_result", outcome="blocked", reason="new immediate-sell concern after refresh"
+                "ui_result",
+                outcome="blocked",
+                reason="new immediate-sell concern after refresh",
             )
             return
         try:
@@ -992,8 +1009,12 @@ class StarUIWorkbench:
                     {
                         "perm_id": order.perm_id,
                         "order_id": order.order_id,
-                        "limit_price": str(order.limit_price) if order.limit_price is not None else None,
-                        "stop_price": str(order.stop_price) if order.stop_price is not None else None,
+                        "limit_price": str(order.limit_price)
+                        if order.limit_price is not None
+                        else None,
+                        "stop_price": str(order.stop_price)
+                        if order.stop_price is not None
+                        else None,
                         "status": order.status,
                     }
                     for order in self._state.working_orders
@@ -1389,6 +1410,14 @@ class StarUIWorkbench:
                 )
             )
         return Div(
+            # show() has no native ::backdrop; this visual layer leaves Settings clickable.
+            Div(
+                cls="connection-failure-backdrop",
+                data_launch_backdrop=True,
+                aria_hidden="true",
+            )
+            if not connecting
+            else None,
             Dialog(
                 DialogContent(*content, show_close_button=False),
                 signal="launch_connection",
@@ -1445,19 +1474,19 @@ class StarUIWorkbench:
             for fact in state.connection
         )
         if self._launch_connection == "connecting":
-            connection = _header_status("Connecting to TWS", "arrow-right", "muted")
+            connection = _header_status("Connecting to TWS", "link-2", "muted")
         elif verified_data:
             connection = _header_status(
                 "Demo data ready" if self._demo_mode else "TWS connected",
-                "check",
+                "check" if self._demo_mode else "link-2",
                 "ready",
             )
         elif self._launch_connection == "failed":
-            connection = _header_status("TWS unavailable", "x", "warning")
+            connection = _header_status("TWS unavailable", "link-2", "warning")
         elif state.status is UiStatus.EMPTY:
-            connection = _header_status("Not connected", "x", "muted")
+            connection = _header_status("Not connected", "link-2", "muted")
         else:
-            connection = _header_status("Connection unverified", "x", "muted")
+            connection = _header_status("Connection unverified", "link-2", "muted")
         plan_status = None
         if self._selected_con_id is not None:
             if state.status is UiStatus.READY and selected_snapshot is not None:
@@ -1468,7 +1497,7 @@ class StarUIWorkbench:
                 validation.code == "POSITION_FULLY_ALLOCATED"
                 for validation in state.validations
             ):
-                plan_status = _header_status("No contracts available", "x", "muted")
+                plan_status = None
             else:
                 reason = next(
                     (
@@ -1481,31 +1510,18 @@ class StarUIWorkbench:
                 plan_status = _header_status(
                     "New layer unavailable", "x", "warning", title=reason
                 )
-        quote_status = (
-            _header_status(
-                f"Market data: {selected_snapshot.quote.market_data_type.title()}",
-                "activity",
-                "ready"
-                if selected_snapshot.quote.market_data_type == "LIVE"
-                else "muted",
-            )
-            if selected_snapshot is not None
-            else None
-        )
+        if self._demo_mode:
+            account_mode = _header_status("Test data", "shield-off", "muted")
+        elif self._settings.account.strip().upper().startswith("DU"):
+            account_mode = _header_status("Paper TWS account", "shield", "paper")
+        elif self._settings.account.strip().upper().startswith("U"):
+            account_mode = _header_status("Live TWS account", "shield-alert", "live")
+        else:
+            account_mode = _header_status("Account unverified", "shield-off", "muted")
         return Div(
             connection,
             plan_status,
-            quote_status,
-            Badge(
-                "SIMULATED EXECUTION"
-                if self._demo_mode and self._paper_execution is not None
-                else "SIMULATED DATA"
-                if self._demo_mode
-                else "PAPER EXECUTION"
-                if self._paper_execution is not None
-                else "READ-ONLY",
-                variant="outline",
-            ),
+            account_mode,
             Span(
                 f"Account {state.account or '—'}",
                 cls="text-xs text-muted-foreground",
@@ -1720,7 +1736,113 @@ class StarUIWorkbench:
                 realized += outcome.realized_pnl
         return Div(
             self._coverage_alert(coverage, app_order_count, order_count),
-            H1(title, cls="text-2xl font-semibold tracking-tight"),
+            Div(
+                H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
+                Div(
+                    Div(
+                        Tooltip(
+                            TooltipTrigger(
+                                Button(
+                                    Icon(
+                                        "lucide:equal", cls="size-4", aria_hidden="true"
+                                    ),
+                                    variant="outline",
+                                    size="icon",
+                                    data_move_stops_to_be=True,
+                                    aria_label="Move all active stops to B/E",
+                                    disabled=self._paper_execution is None
+                                    or bool(self._armed_price_updates),
+                                ),
+                                delay_duration=250,
+                            ),
+                            TooltipContent("Move all active stops to B/E"),
+                        ),
+                        Tooltip(
+                            TooltipTrigger(
+                                Button(
+                                    Icon(
+                                        "lucide:log-out", cls="size-4", aria_hidden="true"
+                                    ),
+                                    variant="outline",
+                                    size="icon",
+                                    type="submit",
+                                    form="active-form",
+                                    name="action",
+                                    value="market-exit-selected",
+                                    aria_label="Sell all active layers",
+                                    disabled=self._paper_execution is None
+                                    or bool(self._armed_price_updates),
+                                ),
+                                delay_duration=250,
+                            ),
+                            TooltipContent("Sell all active layers"),
+                        ),
+                        cls="flex items-center gap-2",
+                    )
+                    if active_pairs
+                    else None,
+                    Separator(orientation="vertical", cls="h-5 self-center")
+                    if active_pairs and not pending
+                    else None,
+                    Div(
+                        Tooltip(
+                            TooltipTrigger(
+                                DropdownMenu(
+                                    DropdownMenuTrigger(
+                                        Icon(
+                                            "lucide:split",
+                                            cls="size-4",
+                                            aria_hidden="true",
+                                        ),
+                                        size="icon",
+                                        aria_label="Split draft layer quantities",
+                                        disabled=len(self._current_layers()) < 2,
+                                    ),
+                                    DropdownMenuContent(
+                                        DropdownMenuItem(
+                                            "Split all available",
+                                            data_on_click="document.getElementById('split-all-submit').click()",
+                                        ),
+                                        DropdownMenuItem(
+                                            "Split assigned",
+                                            data_on_click="document.getElementById('split-assigned-submit').click()",
+                                        ),
+                                        align="end",
+                                    ),
+                                ),
+                                delay_duration=250,
+                            ),
+                            TooltipContent("Split draft layer quantities"),
+                        ),
+                        Tooltip(
+                            TooltipTrigger(
+                                Button(
+                                    Icon(
+                                        "lucide:plus", cls="size-4", aria_hidden="true"
+                                    ),
+                                    "Add Layer",
+                                    variant="secondary",
+                                    size="default",
+                                    type="submit",
+                                    form="draft-form",
+                                    name="action",
+                                    value="add-layer",
+                                    aria_label="Create new OCA bracket",
+                                    disabled=len(self._current_layers())
+                                    >= self._state.available_quantity,
+                                ),
+                                delay_duration=250,
+                            ),
+                            TooltipContent("Create new OCA bracket"),
+                        ),
+                        cls="flex items-center gap-2",
+                    )
+                    if not pending
+                    else None,
+                    cls="ml-auto flex flex-wrap items-center justify-end gap-2",
+                ),
+                cls="flex flex-wrap items-center gap-4",
+            ),
             Div(
                 _contract_header_metric(
                     "Active / total",
@@ -1935,9 +2057,8 @@ class StarUIWorkbench:
         recovered = None
         calculator = self._state.quote_calculator
         if (
-            (not layer.target_percentage or not layer.stop_percentage)
-            and calculator is not None
-        ):
+            not layer.target_percentage or not layer.stop_percentage
+        ) and calculator is not None:
             recovered = _recover_legacy_layer_percentages(
                 target_price=layer.target_price,
                 stop_price=layer.stop_price,
@@ -1949,7 +2070,9 @@ class StarUIWorkbench:
                 stop_presets=_parse_presets(self._stop_presets, maximum=Decimal("100"))
                 or (),
             )
-        target_percentage = layer.target_percentage or (recovered[0] if recovered else "")
+        target_percentage = layer.target_percentage or (
+            recovered[0] if recovered else ""
+        )
         stop_percentage = layer.stop_percentage or (recovered[1] if recovered else "")
         result = "P&L unavailable"
         if outcome.realized_pnl is not None:
@@ -2061,7 +2184,10 @@ class StarUIWorkbench:
                 else:
                     rows.append(self._closed_layer_row(number, entry, index, outcome))
             elif outcome.status in {
-                "PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE"
+                "PENDING",
+                "UNKNOWN",
+                "PARTIAL",
+                "NO_EXECUTION_EVIDENCE",
             }:
                 rows.append(self._pending_layer_row(number, entry, index, outcome))
                 if pair is not None:
@@ -2072,36 +2198,8 @@ class StarUIWorkbench:
                 working_count += 1
 
         return Form(
-            Div(
-                Button(
-                    "Move stop to B/E",
-                    variant="outline",
-                    size="sm",
-                    type="button",
-                    data_move_stops_to_be=True,
-                    disabled=(
-                        self._paper_execution is None
-                        or bool(self._armed_price_updates)
-                    ),
-                ),
-                Button(
-                    "Close working",
-                    variant="destructive",
-                    size="sm",
-                    type="submit",
-                    name="action",
-                    value="market-exit-selected",
-                    disabled=(
-                        self._paper_execution is None
-                        or bool(self._armed_price_updates)
-                    ),
-                ),
-                cls="mb-4 flex flex-wrap items-center justify-end gap-3",
-            )
-            if working_count
-            else None,
             ScrollArea(
-                Div(*rows, cls="w-full min-w-[41rem]"),
+                Div(*rows, cls="oca-layer-list w-full min-w-[41rem]"),
                 aria_label="Existing OCA layer rows",
                 orientation="horizontal",
                 cls="w-full",
@@ -2295,48 +2393,29 @@ class StarUIWorkbench:
                         self._draft_layer_row(index, layer, len(layers))
                         for index, layer in enumerate(layers, start=1)
                     ],
-                    Div(
-                        Span(
-                            f"{sum(_int_or_zero(layer.quantity) for layer in layers)} "
-                            f"of {self._state.available_quantity} contracts allocated",
-                            data_live_allocation=True,
-                            cls="text-xs text-muted-foreground",
-                        ),
-                        cls="mt-3 flex justify-end",
-                    ),
-                    cls="w-full min-w-[41rem]",
+                    cls="oca-layer-list w-full min-w-[41rem]",
                 ),
                 aria_label="Draft layer rows",
                 orientation="horizontal",
                 cls="w-full",
             ),
-            Div(
-                Button(
-                    "Split all available",
-                    variant="outline",
-                    size="sm",
-                    type="submit",
-                    name="action",
-                    value="equal-split-available",
-                ),
-                Button(
-                    "Split assigned",
-                    variant="outline",
-                    size="sm",
-                    type="submit",
-                    name="action",
-                    value="equal-split-assigned",
-                ),
-                Button(
-                    "Add layer",
-                    variant="secondary",
-                    size="sm",
-                    type="submit",
-                    name="action",
-                    value="add-layer",
-                    disabled=len(layers) >= self._state.available_quantity,
-                ),
-                cls="mt-5 flex flex-wrap items-center justify-end gap-3",
+            Button(
+                type="submit",
+                name="action",
+                value="equal-split-available",
+                id="split-all-submit",
+                cls="hidden",
+                tabindex="-1",
+                aria_hidden="true",
+            ),
+            Button(
+                type="submit",
+                name="action",
+                value="equal-split-assigned",
+                id="split-assigned-submit",
+                cls="hidden",
+                tabindex="-1",
+                aria_hidden="true",
             ),
             HTMLInput(type="hidden", name="target_presets", value=self._target_presets),
             HTMLInput(type="hidden", name="stop_presets", value=self._stop_presets),
@@ -2356,7 +2435,6 @@ class StarUIWorkbench:
         return {
             "basis": format(basis, "f"),
             "multiplier": format(multiplier, "f"),
-            "available": self._state.available_quantity,
             "bands": [
                 {
                     "low": format(band.low_edge, "f"),
@@ -2494,11 +2572,17 @@ class StarUIWorkbench:
             return "—", "—"
         return _money(gain), _money(loss)
 
-    def _projection_state(self) -> tuple[PositionOutcome, PositionOutcome, dict[str, Any]]:
+    def _projection_state(
+        self,
+    ) -> tuple[PositionOutcome, PositionOutcome, dict[str, Any]]:
         """Compare observed exits with the proposed whole-position exit plan."""
         basis, multiplier = self._state.unit_basis, self._state.multiplier
         position = next(
-            (item for item in self._state.positions if item.con_id == self._selected_con_id),
+            (
+                item
+                for item in self._state.positions
+                if item.con_id == self._selected_con_id
+            ),
             None,
         )
         try:
@@ -2514,12 +2598,9 @@ class StarUIWorkbench:
             for validation in self._state.validations
             if validation.blocking
         }
-        projection_status_usable = (
-            self._state.status is UiStatus.READY
-            or (
-                self._state.status is UiStatus.BLOCKED
-                and blocking_codes == {"POSITION_FULLY_ALLOCATED"}
-            )
+        projection_status_usable = self._state.status is UiStatus.READY or (
+            self._state.status is UiStatus.BLOCKED
+            and blocking_codes == {"POSITION_FULLY_ALLOCATED"}
         )
         unresolved = (
             not projection_status_usable
@@ -2546,8 +2627,7 @@ class StarUIWorkbench:
         proposed: list[ExitScenario] = []
         active_config: list[dict[str, Any]] = []
         removed_ids = {
-            candidate.target_perm_id
-            for candidate in self._armed_market_exits
+            candidate.target_perm_id for candidate in self._armed_market_exits
         }
         if self._armed_market_exit is not None:
             removed_ids.add(self._armed_market_exit.target_perm_id)
@@ -2566,7 +2646,12 @@ class StarUIWorkbench:
             if quantity <= 0 or quantity != stop_quantity:
                 unresolved = True
                 continue
-            if basis is None or multiplier is None or target.limit_price is None or stop.stop_price is None:
+            if (
+                basis is None
+                or multiplier is None
+                or target.limit_price is None
+                or stop.stop_price is None
+            ):
                 unresolved = True
                 continue
             current = ExitScenario(
@@ -2580,13 +2665,17 @@ class StarUIWorkbench:
             pending = self._pending_active_prices.get(target.perm_id)
             update = updates.get(target.perm_id)
             target_price = (
-                update.target_price if update is not None and update.target_price is not None
-                else pending[0] if pending is not None and pending[0] is not None
+                update.target_price
+                if update is not None and update.target_price is not None
+                else pending[0]
+                if pending is not None and pending[0] is not None
                 else target.limit_price
             )
             stop_price = (
-                update.stop_price if update is not None and update.stop_price is not None
-                else pending[2] if pending is not None and pending[2] is not None
+                update.stop_price
+                if update is not None and update.stop_price is not None
+                else pending[2]
+                if pending is not None and pending[2] is not None
                 else stop.stop_price
             )
             changed = ExitScenario(
@@ -2595,12 +2684,14 @@ class StarUIWorkbench:
                 (stop_price - basis) * multiplier * quantity,
             )
             proposed.append(changed)
-            active_config.append({
-                "id": target.perm_id,
-                "quantity": format(quantity, "f"),
-                "gain": format(changed.target_pnl, "f"),
-                "loss": format(changed.stop_pnl, "f"),
-            })
+            active_config.append(
+                {
+                    "id": target.perm_id,
+                    "quantity": format(quantity, "f"),
+                    "gain": format(changed.target_pnl, "f"),
+                    "loss": format(changed.stop_pnl, "f"),
+                }
+            )
         draft_config: list[dict[str, Any]] = []
         for layer in self._current_layers():
             try:
@@ -2620,11 +2711,13 @@ class StarUIWorkbench:
             )
             proposed.append(item)
             observed.append(item)
-            draft_config.append({
-                "quantity": format(quantity, "f"),
-                "gain": format(item.target_pnl, "f"),
-                "loss": format(item.stop_pnl, "f"),
-            })
+            draft_config.append(
+                {
+                    "quantity": format(quantity, "f"),
+                    "gain": format(item.target_pnl, "f"),
+                    "loss": format(item.stop_pnl, "f"),
+                }
+            )
         if basis is None or multiplier is None or self._pending_active_prices:
             unresolved = True
         baseline = project_position_outcome(
@@ -2637,21 +2730,30 @@ class StarUIWorkbench:
             held_quantity=held,
             realized_pnl=realized,
             exits=tuple(proposed),
-            unresolved=unresolved or bool(self._armed_market_exits or self._armed_market_exit),
+            unresolved=unresolved
+            or bool(self._armed_market_exits or self._armed_market_exit),
         )
         baseline = self._projection_comparison or baseline
-        return baseline, proposed_outcome, {
-            "held": format(held, "f"),
-            "realized": format(realized, "f"),
-            "unresolved": unresolved,
-            "marketExit": bool(self._armed_market_exits or self._armed_market_exit),
-            "removed": list(removed_ids),
-            "staged": bool(removed_ids or updates or self._armed_execution),
-            "active": active_config,
-            "draft": draft_config,
-            "baselineGain": format(baseline.expected_gain, "f") if baseline.expected_gain is not None else None,
-            "baselineLoss": format(baseline.max_loss, "f") if baseline.max_loss is not None else None,
-        }
+        return (
+            baseline,
+            proposed_outcome,
+            {
+                "held": format(held, "f"),
+                "realized": format(realized, "f"),
+                "unresolved": unresolved,
+                "marketExit": bool(self._armed_market_exits or self._armed_market_exit),
+                "removed": list(removed_ids),
+                "staged": bool(removed_ids or updates or self._armed_execution),
+                "active": active_config,
+                "draft": draft_config,
+                "baselineGain": format(baseline.expected_gain, "f")
+                if baseline.expected_gain is not None
+                else None,
+                "baselineLoss": format(baseline.max_loss, "f")
+                if baseline.max_loss is not None
+                else None,
+            },
+        )
 
     def _outcome_projection(
         self, projection: tuple[PositionOutcome, PositionOutcome, dict[str, Any]]
@@ -2705,12 +2807,14 @@ class StarUIWorkbench:
                 P(
                     status,
                     data_projection_status=True,
-                    cls="mt-3 text-xs leading-5 text-muted-foreground" + (" hidden" if not status else ""),
+                    cls="mt-3 text-xs leading-5 text-muted-foreground"
+                    + (" hidden" if not status else ""),
                 ),
                 P(
                     f"Covered subtotal: {_money(outcome.covered_gain)} gain / {_money(outcome.covered_loss)} open loss",
                     data_projection_subtotal=True,
-                    cls="mt-1 text-xs leading-5 text-muted-foreground" + (" hidden" if outcome.expected_gain is not None else ""),
+                    cls="mt-1 text-xs leading-5 text-muted-foreground"
+                    + (" hidden" if outcome.expected_gain is not None else ""),
                 ),
                 cls="px-4",
             ),
@@ -2954,7 +3058,9 @@ class StarUIWorkbench:
                     cls="space-y-1",
                 ),
                 cls="mb-3 border-amber-500/40 bg-amber-500/10 text-amber-100",
-            ) if impact else None,
+            )
+            if impact
+            else None,
             Label(
                 HTMLInput(
                     type="checkbox",
@@ -2964,7 +3070,9 @@ class StarUIWorkbench:
                 ),
                 "I checked TWS: the order still shows the old price and no amendment is waiting for Transmit.",
                 cls="mb-3 block text-xs leading-5 text-amber-300",
-            ) if retry_acknowledgement else None,
+            )
+            if retry_acknowledgement
+            else None,
             Div(
                 Button(
                     "Cancel",
@@ -3071,7 +3179,9 @@ class StarUIWorkbench:
                 self._review_order_line(
                     "SELL LMT",
                     Span(
-                        _sell_price_with_return(layer.target_price, self._state.unit_basis),
+                        _sell_price_with_return(
+                            layer.target_price, self._state.unit_basis
+                        ),
                         data_live_review_price=f"target-{index}",
                         aria_live="polite",
                         cls="text-sm font-semibold text-emerald-400",
@@ -3081,7 +3191,9 @@ class StarUIWorkbench:
                 self._review_order_line(
                     "SELL STP",
                     Span(
-                        _sell_price_with_return(layer.stop_price, self._state.unit_basis),
+                        _sell_price_with_return(
+                            layer.stop_price, self._state.unit_basis
+                        ),
                         data_live_review_price=f"stop-{index}",
                         aria_live="polite",
                         cls="text-sm font-semibold text-rose-400",
@@ -3284,12 +3396,10 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
     const update = () => {{
       const outcomes = [];
       let invalid = false;
-      let allocated = 0;
       form.querySelectorAll('[data-live-input="target"]').forEach((input) => {{
         const index = input.dataset.liveLayer;
         const target = value('target', index), stop = value('stop', index);
         const quantity = Math.trunc(value('quantity', index));
-        allocated += Number.isInteger(quantity) && quantity > 0 ? quantity : 0;
         const valid = Number.isFinite(target) && target > 0 && Number.isFinite(stop) && stop > 0 && stop <= 100 && Number.isInteger(quantity) && quantity > 0;
         const targetPrice = valid ? roundUp(basis * (1 + target / 100)) : NaN;
         const stopPrice = valid ? roundUp(basis * (1 - stop / 100)) : NaN;
@@ -3306,7 +3416,6 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         else invalid = true;
       }});
       window.ibkrProjection?.updateDraft(outcomes, invalid);
-      assigned('[data-live-allocation]', `${{allocated}} of ${{config.available}} contracts allocated`);
     }};
     form.querySelectorAll('[data-live-input]').forEach((input) => input.addEventListener('input', update));
     form.querySelectorAll('[data-live-input]').forEach((input) => input.addEventListener('change', update));
@@ -3415,7 +3524,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
     }};
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('input', update));
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('change', update));
-    form.querySelectorAll('[data-move-stops-to-be]').forEach((button) => button.addEventListener('click', () => {{
+    document.querySelectorAll('[data-move-stops-to-be]').forEach((button) => button.addEventListener('click', () => {{
       form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{ input.value = '0'; }});
       update();
     }}));
@@ -3666,12 +3775,7 @@ def _recover_legacy_layer_percentages(
     try:
         target = Decimal(target_price)
         stop = Decimal(stop_price)
-        if (
-            not target.is_finite()
-            or not stop.is_finite()
-            or target <= 0
-            or stop <= 0
-        ):
+        if not target.is_finite() or not stop.is_finite() or target <= 0 or stop <= 0:
             return None
         target_tick = max(
             (band for band in bands if band.low_edge <= target),
@@ -3883,6 +3987,8 @@ def _header_status(
         "ready": "text-emerald-400",
         "warning": "text-amber-300",
         "muted": "text-muted-foreground",
+        "paper": "text-cyan-400",
+        "live": "text-red-400",
     }[tone]
     return Div(
         Icon(f"lucide:{icon}", cls=f"size-4 shrink-0 {icon_color}", aria_hidden="true"),

@@ -1,3 +1,12 @@
+.connection-failure-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgb(0 0 0 / 50%);
+  backdrop-filter: blur(4px);
+  pointer-events: none;
+}
+
 .contract-header-facts {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
@@ -6,6 +15,14 @@
   padding: 0.75rem 0;
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
+}
+
+.oca-layer-list > [data-layer-state]:first-child {
+  border-top: 0;
+}
+
+.oca-layer-list > [data-layer-state]:last-child {
+  border-bottom: 0;
 }
 
 .price-edit-reset {
@@ -73,7 +90,7 @@
   position: absolute;
   inset: 0;
   z-index: 1;
-  background: rgba(10, 10, 10, 0.65);
+  background: rgba(10, 10, 10, 0.75);
   pointer-events: none;
   transition:
     opacity 160ms ease-out,
