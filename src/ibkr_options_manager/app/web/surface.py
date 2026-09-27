@@ -2957,7 +2957,7 @@ class StarUIWorkbench:
                     "PRICE UPDATE",
                     variant="outline",
                     data_active_review_badge=True,
-                    cls="hidden text-[10px]",
+                    cls="text-[10px]" if not draft_rows else "hidden text-[10px]",
                 )
                 if has_active_layers
                 else None,
@@ -2983,6 +2983,7 @@ class StarUIWorkbench:
                 Div(
                     *draft_rows,
                     data_draft_review=True,
+                    data_has_draft_rows="true" if draft_rows else "false",
                     cls="min-h-0" if draft_rows else "hidden min-h-0",
                 ),
                 self._live_active_review(hidden=bool(draft_rows))
@@ -3063,14 +3064,16 @@ class StarUIWorkbench:
             return self._staged_action_controls(
                 confirm_action="execute-confirm",
             )
+        has_active_layers = bool(self._active_oca_pairs())
+        has_draft_layers = bool(self._current_layers())
         can_execute_draft = (
             self._paper_execution is not None
             and self._state.available_quantity > 0
-            and bool(self._current_layers())
+            and has_draft_layers
         )
         return Div(
             self._cancel_changes_control(staged=False)
-            if self._active_oca_pairs()
+            if has_active_layers
             else None,
             Div(
                 Button(
@@ -3085,7 +3088,11 @@ class StarUIWorkbench:
                     cls="w-full",
                 ),
                 data_draft_execute=True,
-                cls="w-full",
+                cls=(
+                    "hidden w-full"
+                    if has_active_layers and not has_draft_layers
+                    else "w-full"
+                ),
             ),
             Div(
                 Button(
@@ -3101,9 +3108,9 @@ class StarUIWorkbench:
                     cls="w-full",
                 ),
                 data_active_execute_control=True,
-                cls="hidden w-full",
+                cls="hidden w-full" if has_draft_layers else "w-full",
             )
-            if self._active_oca_pairs()
+            if has_active_layers
             else None,
             cls="mx-4 mb-4 flex w-[calc(100%-2rem)] flex-col",
         )
@@ -3580,11 +3587,13 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       node.classList.toggle(display, !hidden);
     }};
     const setReviewMode = (active) => {{
+      const hasDraftRows = document.querySelector('[data-draft-review]')?.dataset.hasDraftRows === 'true';
+      const showActive = active || !hasDraftRows;
       document.querySelectorAll('[data-draft-review], [data-draft-review-badge], [data-draft-execute]').forEach((node) => {{
-        node.classList.toggle('hidden', active);
+        node.classList.toggle('hidden', showActive);
       }});
       document.querySelectorAll('[data-active-review], [data-active-review-badge], [data-active-execute-control]').forEach((node) => {{
-        node.classList.toggle('hidden', !active);
+        node.classList.toggle('hidden', !showActive);
       }});
     }};
     const update = () => {{

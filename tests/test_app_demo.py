@@ -790,6 +790,59 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert f'aria-label="Expected gain {direction} by ${abs(delta):,.2f}"' in added_page.text
 
 
+def test_cancelled_review_with_no_draft_keeps_active_empty_state_visible() -> None:
+    from ibkr_options_manager.app.view_model import WorkingOrderLine
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    workbench._paper_execution = _OwnedOrderService({101, 102})
+    workbench._drafts[con_id] = ()
+    workbench._state = replace(
+        workbench._state,
+        available_quantity=0,
+        working_orders=(
+            WorkingOrderLine(
+                perm_id=101, order_id=11, action="SELL", order_type="LMT",
+                remaining="2", status="Submitted", oca_group="test/tranche-1",
+                limit_price=Decimal("26.20"), tif="GTC",
+            ),
+            WorkingOrderLine(
+                perm_id=102, order_id=12, action="SELL", order_type="STP",
+                remaining="2", status="Submitted", oca_group="test/tranche-1",
+                stop_price=Decimal("16.40"), tif="GTC",
+            ),
+        ),
+    )
+    workbench._armed_cancellation = MarketExitCandidate(
+        account="DU123", con_id=con_id, target_order_id=11,
+        target_perm_id=101, client_id=17, quantity=Decimal("2"),
+        tif="GTC", oca_group="test/tranche-1", stop_order_id=12,
+        stop_perm_id=102,
+    )
+
+    page = TestClient(workbench.app).post(
+        workbench.path + "action", data={"action": "cancel-staged"}
+    ).text
+
+    assert 'data-has-draft-rows="false"' in page
+    active_badge = re.search(r'<span[^>]*data-active-review-badge[^>]*>', page)
+    active_review = re.search(r'<div[^>]*data-active-review(?:\s|>)[^>]*>', page)
+    assert active_badge is not None
+    assert active_review is not None
+    badge_classes = re.search(r'class="([^"]+)"', active_badge.group())
+    review_classes = re.search(r'class="([^"]+)"', active_review.group())
+    assert badge_classes is not None and 'hidden' not in badge_classes[1].split()
+    assert review_classes is not None and 'hidden' not in review_classes[1].split()
+    assert "Modify an active LMT or STP price to continue." in page
+    assert "const showActive = active || !hasDraftRows;" in _live_active_script(
+        {"basis": "1", "multiplier": "100", "bands": []}
+    )
+    assert 'data-draft-execute class="hidden w-full"' in page
+    assert 'data-active-execute-control class="w-full"' in page
+
+
 def test_max_loss_change_uses_unsigned_amount_and_directional_arrows() -> None:
     worse = str(_projection_loss_value(Decimal("-1282.56"), Decimal("-640")))
     better = str(_projection_loss_value(Decimal("-642.56"), Decimal("640")))
