@@ -39,6 +39,8 @@ class JournalLayer:
     stop_perm_id: int = 0
     target_percentage: str = ""
     stop_percentage: str = ""
+    cancelled: bool = False
+    hidden_from_workspace: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +74,7 @@ class JournalEntry:
     order_ids: tuple[int, ...] = ()
     perm_ids: tuple[int, ...] = ()
     snapshot_captured_at: str = ""
+    resolution_captured_at: str = ""
     layers: tuple[JournalLayer, ...] = ()
     fills: tuple[JournalFill, ...] = ()
 
@@ -133,6 +136,10 @@ def classify_journal_layer(
             realized_pnl=pnl,
             currency=next(iter(currencies)),
             exit_side=exit_side,
+        )
+    if layer.cancelled:
+        return LayerOutcome(
+            "UNKNOWN" if ids & (observed_perm_ids | active_perm_ids) else "CANCELLED"
         )
     if ids and ids.issubset(active_perm_ids):
         return LayerOutcome("ACTIVE")
@@ -344,6 +351,45 @@ class ExecutionJournal:
             }
         )
 
+    def dismiss_cancelled_layer(
+        self, snapshot: BrokerSnapshot, fingerprint: str, layer_index: int
+    ) -> JournalEntry:
+        """Hide a verified cancelled row without erasing its safety history."""
+        entries = list(self._entries())
+        matches = [
+            index for index, entry in enumerate(entries)
+            if entry.fingerprint == fingerprint
+            and entry.account == snapshot.selected.account
+            and entry.con_id == snapshot.selected.con_id
+        ]
+        if (
+            len(matches) != 1
+            or not snapshot.complete
+            or not snapshot.fresh
+            or not snapshot.executions_complete
+        ):
+            raise ExecutionBlocked("a fresh, exact cancelled bracket is required")
+        entry_index = matches[0]
+        entry = entries[entry_index]
+        if not 0 <= layer_index < len(entry.layers):
+            raise ExecutionBlocked("the cancelled layer is missing")
+        layer = entry.layers[layer_index]
+        group = f"{fingerprint[:12]}/tranche-{layer_index + 1}"
+        ids = {layer.target_perm_id, layer.stop_perm_id} - {0}
+        if (
+            not layer.cancelled
+            or any(order.oca_group == group or order.perm_id in ids
+                   for order in snapshot.working_orders)
+            or any(fill.perm_id in ids for fill in snapshot.executions)
+        ):
+            raise ExecutionBlocked("the bracket is not confirmed cancelled")
+        layers = list(entry.layers)
+        layers[layer_index] = replace(layer, hidden_from_workspace=True)
+        updated = replace(entry, layers=tuple(layers))
+        entries[entry_index] = updated
+        self._write(tuple(entries))
+        return updated
+
     def begin(self, snapshot: BrokerSnapshot, plan: PlanResult) -> JournalEntry:
         fingerprint = plan.fingerprint
         if plan.status is not PlanStatus.VALID or fingerprint is None:
@@ -373,18 +419,7 @@ class ExecutionJournal:
             # PREPARED and acknowledgement-unknown attempts intentionally
             # remain non-retryable: a timeout must never create duplicates.
             prior = entries[prior_index]
-            entries[prior_index] = JournalEntry(
-                fingerprint=prior.fingerprint,
-                account=prior.account,
-                con_id=prior.con_id,
-                state="SUPERSEDED",
-                expected_order_count=prior.expected_order_count,
-                order_ids=prior.order_ids,
-                perm_ids=prior.perm_ids,
-                snapshot_captured_at=prior.snapshot_captured_at,
-                layers=prior.layers,
-                fills=prior.fills,
-            )
+            entries[prior_index] = replace(prior, state="SUPERSEDED")
         entry = JournalEntry(
             fingerprint=fingerprint,
             account=snapshot.selected.account,
@@ -445,6 +480,40 @@ class ExecutionJournal:
             return False
         if entry.state == "SUBMISSION_UNKNOWN":
             return ExecutionJournal._cancelled_submission_attempt(entry, snapshot)
+        if entry.state == "CANCELLED_CONFIRMED":
+            try:
+                later = snapshot.captured_at > Decimal(entry.resolution_captured_at)
+            except (InvalidOperation, ValueError):
+                later = False
+            groups = {
+                f"{entry.fingerprint[:12]}/tranche-{number}"
+                for number in range(1, len(entry.layers) + 1)
+            }
+            return bool(
+                later
+                and snapshot.connected
+                and snapshot.paper_account_verified
+                and snapshot.complete
+                and snapshot.fresh
+                and snapshot.executions_complete
+                and snapshot.completed_orders_complete
+                and not ExecutionJournal._has_possible_entry_execution(
+                    entry, snapshot, groups, entries
+                )
+                and snapshot.position.quantity
+                >= sum(layer.quantity for layer in entry.layers)
+                and not any(
+                    order.oca_group in groups
+                    or order.order_id in entry.order_ids
+                    or order.perm_id in entry.perm_ids
+                    for order in snapshot.working_orders
+                )
+                and not any(
+                    order.oca_group in groups
+                    and order.status not in {"Cancelled", "ApiCancelled", "Inactive"}
+                    for order in snapshot.completed_orders
+                )
+            )
         if (
             entry.state not in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"}
             or not entry.perm_ids
@@ -466,6 +535,56 @@ class ExecutionJournal:
             and set(completed.order_ids) & set(entry.order_ids)
             for completed in entries
         )
+
+    @staticmethod
+    def _has_possible_entry_execution(
+        entry: JournalEntry,
+        snapshot: BrokerSnapshot,
+        groups: set[str],
+        entries: list[JournalEntry],
+    ) -> tuple[int, ...]:
+        """Treat fills as unrelated only when broker order identity proves it."""
+        entry_ids = {perm_id for perm_id in entry.perm_ids if perm_id > 0}
+        entry_ids.update(
+            perm_id
+            for layer in entry.layers
+            for perm_id in (layer.target_perm_id, layer.stop_perm_id)
+            if perm_id > 0
+        )
+        other_ids: set[int] = set()
+        for other in entries:
+            if (
+                other.fingerprint == entry.fingerprint
+                or other.account != entry.account
+                or other.con_id != entry.con_id
+            ):
+                continue
+            other_ids.update(perm_id for perm_id in other.perm_ids if perm_id > 0)
+            other_ids.update(
+                perm_id
+                for layer in other.layers
+                for perm_id in (layer.target_perm_id, layer.stop_perm_id)
+                if perm_id > 0
+            )
+        for order in snapshot.completed_orders:
+            if order.oca_group in groups or order.order_id in entry.order_ids:
+                entry_ids.add(order.perm_id)
+            elif order.perm_id > 0:
+                other_ids.add(order.perm_id)
+        for order in snapshot.working_orders:
+            if order.oca_group in groups or order.order_id in entry.order_ids:
+                entry_ids.add(order.perm_id)
+            elif order.perm_id > 0:
+                other_ids.add(order.perm_id)
+        return tuple(sorted({
+            fill.perm_id
+            for fill in snapshot.executions
+            if fill.perm_id in entry_ids
+            or (
+                fill.side.upper() not in {"BOT", "BUY"}
+                and fill.perm_id not in other_ids
+            )
+        }))
 
     @staticmethod
     def _cancelled_submission_attempt(
@@ -511,6 +630,85 @@ class ExecutionJournal:
             ):
                 return False
         return True
+
+    def confirm_cancelled_unknown(
+        self,
+        snapshot: BrokerSnapshot,
+        fingerprint: str,
+        *,
+        confirmed_in_tws: bool,
+    ) -> JournalEntry:
+        """Retire an indeterminate send after confirmation and a clean read."""
+        if not confirmed_in_tws:
+            raise ExecutionBlocked("confirm both bracket legs are cancelled in TWS")
+        entries = list(self._entries())
+        matches = [
+            index for index, entry in enumerate(entries)
+            if entry.fingerprint == fingerprint
+            and entry.account == snapshot.selected.account
+            and entry.con_id == snapshot.selected.con_id
+            and entry.state in {"SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED"}
+        ]
+        if len(matches) != 1:
+            raise ExecutionBlocked("the unresolved bracket is missing or ambiguous")
+        index = matches[0]
+        entry = entries[index]
+        if (
+            not snapshot.connected
+            or not snapshot.paper_account_verified
+            or not snapshot.complete
+            or not snapshot.fresh
+            or not snapshot.completed_orders_complete
+            or not snapshot.executions_complete
+            or not entry.layers
+            or entry.expected_order_count != len(entry.layers) * 2
+            or entry.fills
+            or snapshot.position.quantity
+            < sum(layer.quantity for layer in entry.layers)
+        ):
+            raise ExecutionBlocked(
+                "complete TWS order and execution evidence is required"
+            )
+        try:
+            later = snapshot.captured_at > Decimal(entry.snapshot_captured_at)
+        except (InvalidOperation, ValueError):
+            later = False
+        if not later:
+            raise ExecutionBlocked("a later TWS snapshot is required")
+        groups = {
+            f"{fingerprint[:12]}/tranche-{number}"
+            for number in range(1, len(entry.layers) + 1)
+        }
+        possible_fills = self._has_possible_entry_execution(
+            entry, snapshot, groups, entries
+        )
+        if possible_fills:
+            raise ExecutionBlocked(
+                "execution permanent ID(s) "
+                + ", ".join(str(perm_id) for perm_id in possible_fills)
+                + " may belong to this bracket; check the TWS trade log"
+            )
+        if any(
+            order.oca_group in groups
+            or order.order_id in entry.order_ids
+            or order.perm_id in entry.perm_ids
+            for order in snapshot.working_orders
+        ):
+            raise ExecutionBlocked("a bracket leg is still working in TWS")
+        if any(
+            order.oca_group in groups
+            and order.status not in {"Cancelled", "ApiCancelled", "Inactive"}
+            for order in snapshot.completed_orders
+        ):
+            raise ExecutionBlocked("TWS completion history conflicts with cancellation")
+        updated = replace(
+            entry,
+            state="CANCELLED_CONFIRMED",
+            resolution_captured_at=str(snapshot.captured_at),
+        )
+        entries[index] = updated
+        self._write(tuple(entries))
+        return updated
 
     def begin_market_exit(
         self, snapshot: BrokerSnapshot, candidate: MarketExitCandidate
@@ -624,6 +822,52 @@ class ExecutionJournal:
             "execution journal entry disappeared before acknowledgement"
         )
 
+    def record_pair_cancellation(
+        self, candidate: MarketExitCandidate
+    ) -> None:
+        """Retain confirmed cancellation on the exact app-owned source layer."""
+        entries = list(self._entries())
+        matches: list[tuple[int, int]] = []
+        for entry_index, entry in enumerate(entries):
+            if (
+                entry.account != candidate.account
+                or entry.con_id != candidate.con_id
+                or entry.state
+                not in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"}
+            ):
+                continue
+            for layer_index, layer in enumerate(entry.layers):
+                group = f"{entry.fingerprint[:12]}/tranche-{layer_index + 1}"
+                if group != candidate.oca_group:
+                    continue
+                target_id, stop_id = layer.target_perm_id, layer.stop_perm_id
+                if not target_id or not stop_id:
+                    pair_ids = entry.perm_ids[layer_index * 2 : layer_index * 2 + 2]
+                    if len(pair_ids) == 2:
+                        target_id, stop_id = pair_ids
+                if (
+                    (not target_id or not stop_id)
+                    and {candidate.target_perm_id, candidate.stop_perm_id}
+                    <= set(entry.perm_ids)
+                ):
+                    target_id, stop_id = (
+                        candidate.target_perm_id,
+                        candidate.stop_perm_id,
+                    )
+                if (
+                    target_id == candidate.target_perm_id
+                    and stop_id == candidate.stop_perm_id
+                ):
+                    matches.append((entry_index, layer_index))
+        if len(matches) != 1:
+            raise ExecutionBlocked("cancelled bracket source is missing or ambiguous")
+        entry_index, layer_index = matches[0]
+        entry = entries[entry_index]
+        layers = list(entry.layers)
+        layers[layer_index] = replace(layers[layer_index], cancelled=True)
+        entries[entry_index] = replace(entry, layers=tuple(layers))
+        self._write(tuple(entries))
+
     def mark_unknown(self, fingerprint: str) -> JournalEntry:
         """Record an indeterminate outcome; never retry it automatically."""
         return self.record_submission(fingerprint, order_ids=(), perm_ids=())
@@ -657,6 +901,7 @@ class ExecutionJournal:
 
     def record_completed_orders(self, snapshot: BrokerSnapshot) -> None:
         """Recover planned layer IDs from exact app OCA groups for display only."""
+        self._recover_confirmed_cancellations()
         entries = list(self._entries())
         changed = False
         for index, entry in enumerate(entries):
@@ -706,6 +951,40 @@ class ExecutionJournal:
             if tuple(layers) != entry.layers:
                 entries[index] = replace(entry, layers=tuple(layers))
                 changed = True
+        if changed:
+            self._write(tuple(entries))
+
+    def _recover_confirmed_cancellations(self) -> None:
+        """Apply earlier completed app cancellation receipts to their source layers."""
+        entries = list(self._entries())
+        changed = False
+        for receipt in entries:
+            if (
+                receipt.state != "COMPLETED"
+                or not receipt.fingerprint.startswith("cancel-bracket:")
+                or len(receipt.order_ids) != 2
+            ):
+                continue
+            matches = [
+                (entry_index, layer_index)
+                for entry_index, entry in enumerate(entries)
+                if entry.account == receipt.account
+                and entry.con_id == receipt.con_id
+                and len(entry.fingerprint) == 64
+                for layer_index in range(len(entry.layers))
+                if set(entry.order_ids[layer_index * 2 : layer_index * 2 + 2])
+                == set(receipt.order_ids)
+            ]
+            if len(matches) != 1:
+                continue
+            entry_index, layer_index = matches[0]
+            entry = entries[entry_index]
+            if entry.layers[layer_index].cancelled:
+                continue
+            layers = list(entry.layers)
+            layers[layer_index] = replace(layers[layer_index], cancelled=True)
+            entries[entry_index] = replace(entry, layers=tuple(layers))
+            changed = True
         if changed:
             self._write(tuple(entries))
 
@@ -849,6 +1128,7 @@ class ExecutionJournal:
                     order_ids=tuple(int(value) for value in item.get("order_ids", ())),
                     perm_ids=tuple(int(value) for value in item.get("perm_ids", ())),
                     snapshot_captured_at=str(item.get("snapshot_captured_at", "")),
+                    resolution_captured_at=str(item.get("resolution_captured_at", "")),
                     layers=tuple(
                         JournalLayer(
                             quantity=int(layer["quantity"]),
@@ -859,6 +1139,10 @@ class ExecutionJournal:
                             stop_perm_id=int(layer.get("stop_perm_id", 0)),
                             target_percentage=str(layer.get("target_percentage", "")),
                             stop_percentage=str(layer.get("stop_percentage", "")),
+                            cancelled=bool(layer.get("cancelled", False)),
+                            hidden_from_workspace=bool(
+                                layer.get("hidden_from_workspace", False)
+                            ),
                         )
                         for layer in item.get("layers", ())
                     ),
@@ -988,6 +1272,21 @@ class PaperExecutionService:
     def reconcile_snapshot(self, snapshot: BrokerSnapshot) -> tuple[JournalEntry, ...]:
         """Record broker-observed app OCA pairs after an interrupted send."""
         return self._journal.reconcile_snapshot(snapshot)
+
+    def confirm_cancelled_unknown(
+        self, snapshot: BrokerSnapshot, fingerprint: str, *, confirmed_in_tws: bool
+    ) -> JournalEntry:
+        """Release an unresolved draft only after operator and broker checks agree."""
+        return self._journal.confirm_cancelled_unknown(
+            snapshot, fingerprint, confirmed_in_tws=confirmed_in_tws
+        )
+
+    def dismiss_cancelled_layer(
+        self, snapshot: BrokerSnapshot, fingerprint: str, layer_index: int
+    ) -> JournalEntry:
+        return self._journal.dismiss_cancelled_layer(
+            snapshot, fingerprint, layer_index
+        )
 
     def record_completed_orders(self, snapshot: BrokerSnapshot) -> None:
         """Persist exact layer identifiers found in completed TWS orders."""
@@ -1316,12 +1615,12 @@ class PaperExecutionService:
         except Exception:
             self._journal.mark_unknown(entry.fingerprint)
             raise
-        return SubmissionReceipt(
-            self._journal.record_management_completion(
-                entry.fingerprint,
-                order_ids=order_ids,
-            )
+        completed = self._journal.record_management_completion(
+            entry.fingerprint,
+            order_ids=order_ids,
         )
+        self._journal.record_pair_cancellation(candidate)
+        return SubmissionReceipt(completed)
 
     def cancel_pair_then_submit_market(
         self,

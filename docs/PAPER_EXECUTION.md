@@ -186,6 +186,11 @@ can be attempted.
 When a selected position already has an OCA order group in the TWS snapshot,
 the workbench displays that exposure without creating a draft layer. The
 operator must use **Add layer** to plan additional uncommitted quantity.
+For an app-initiated bracket cancellation, the writer waits for both leg
+cancellation acknowledgements and rechecks its open orders. The workbench then
+refreshes the selected position and shows **Bracket cancelled** only when
+neither leg remains working. A conflicting or incomplete refresh stays
+unresolved and requires inspection in TWS before further action.
 
 If the operator cancels an unacknowledged bracket in TWS before the app
 reconciles it, a later fresh refresh can retire that unknown attempt only when
@@ -193,6 +198,26 @@ the broker reports a complete completed-order and execution snapshot showing
 both exact fingerprinted legs of every planned layer cancelled with nonzero
 permanent IDs, no matching fills, and no matching working order. If any of
 that evidence is missing, the attempt remains blocked against duplicate send.
+For a precaution-held or untransmitted leg that never appears in completed-order
+history, the workbench opens a blocking **Verify cancellation** dialog. The
+operator must first confirm in TWS that both LMT and STP are gone. The app then
+takes a fresh selected-contract snapshot and requires complete current and
+completed order reads, complete execution history, no matching working leg or
+execution, no conflicting completed status, and enough held quantity for the
+original plan. The dialog remains open if these checks fail. The journal records
+the confirmation and snapshot time. Sending
+the same draft again still requires a later clean snapshot; the confirmation
+alone never authorizes an order write.
+Executions on other tranches of the same contract do not block this recovery
+when their permanent order IDs map to different OCA groups in the broker order
+read or to another saved app submission. BUY executions cannot belong to the
+SELL bracket being cancelled. An unmatched SELL execution remains ambiguous and
+blocks recovery; the dialog reports its permanent order ID for checking in TWS.
+The workspace trash control on a confirmed cancelled layer only marks that row
+as hidden. It requires a fresh complete snapshot and complete execution read,
+and refuses a still-working leg or matching fill. The full journal entry,
+order IDs, and duplicate-submission history remain durable; a later conflicting
+broker outcome can make the layer visible again.
 
 ## Required paper validation
 

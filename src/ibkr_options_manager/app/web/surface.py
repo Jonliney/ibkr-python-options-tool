@@ -354,6 +354,10 @@ class StarUIWorkbench:
                 self._confirm_market_exit_locked()
             elif action == "cancel-pair-confirm":
                 self._confirm_cancellation_locked()
+            elif action == "resolve-cancelled-bracket":
+                self._resolve_cancelled_bracket_locked(values)
+            elif action.startswith("dismiss-cancelled:"):
+                self._dismiss_cancelled_layer_locked(action)
             elif action == "cancel-staged":
                 self._disarm_execution_locked()
                 self._set_review_status_locked(
@@ -722,13 +726,86 @@ class StarUIWorkbench:
             refreshed = self._refresh_after_acknowledged_write_locked(
                 "TWS confirmed both OCA legs were cancelled."
             )
-            if refreshed:
+            observed = self._view_model.latest_snapshot()
+            cancelled_ids = {candidate.target_perm_id, candidate.stop_perm_id}
+            if (
+                observed is not None
+                and observed.selected.account == candidate.account
+                and observed.selected.con_id == candidate.con_id
+                and observed.complete
+                and observed.fresh
+                and not any(
+                    order.perm_id in cancelled_ids
+                    for order in observed.working_orders
+                )
+            ):
                 self._show_success_toast_locked(
                     "Selected bracket orders cancelled",
                     "The position remains open.",
                 )
+            elif refreshed:
+                self._message = (
+                    "Bracket cancellation needs verification: the refreshed TWS "
+                    "snapshot still shows a selected order. Check TWS and refresh."
+                )
         finally:
             self._disarm_execution_locked()
+
+    def _resolve_cancelled_bracket_locked(self, values: dict[str, str]) -> None:
+        if self._paper_execution is None or self._selected_con_id is None:
+            self._message = "Cancellation verification requires a selected position."
+            return
+        if values.get("confirmed") != "yes":
+            self._message = "Confirm both bracket legs are cancelled in TWS first."
+            return
+        con_id = self._selected_con_id
+        state = self._view_model.select_position(con_id, self._plan_form(()))
+        self._apply_state_locked(state)
+        self._record_refresh_time_locked()
+        self._announce_reconciliation_locked()
+        snapshot = self._view_model.latest_snapshot()
+        if snapshot is None:
+            self._message = "Cancellation verification needs a fresh TWS snapshot."
+            return
+        try:
+            self._paper_execution.confirm_cancelled_unknown(
+                snapshot,
+                values.get("fingerprint", ""),
+                confirmed_in_tws=True,
+            )
+        except ExecutionBlocked as error:
+            self._message = f"Cancellation verification blocked: {error}"
+            return
+        self._drafts[con_id] = ()
+        self._show_success_toast_locked(
+            "Cancelled bracket cleared",
+            "You can add a new layer for the verified available quantity.",
+        )
+
+    def _dismiss_cancelled_layer_locked(self, action: str) -> None:
+        if self._paper_execution is None or self._selected_con_id is None:
+            self._message = "Select a position before removing a cancelled row."
+            return
+        _, _, identity = action.partition(":")
+        fingerprint, separator, index_text = identity.partition(":")
+        if not separator:
+            self._message = "Cancelled row identity is missing."
+            return
+        snapshot = self._view_model.latest_snapshot()
+        if snapshot is None or snapshot.selected.con_id != self._selected_con_id:
+            self._message = "Refresh the selected position before removing this row."
+            return
+        try:
+            self._paper_execution.dismiss_cancelled_layer(
+                snapshot, fingerprint, int(index_text)
+            )
+        except (ExecutionBlocked, ValueError) as error:
+            self._message = f"Cancelled row could not be removed: {error}"
+            return
+        self._show_success_toast_locked(
+            "Cancelled row removed",
+            "Its order history remains saved for duplicate protection.",
+        )
 
     def _arm_selected_market_exit_locked(self, values: dict[str, str]) -> None:
         """Review an all-active-layer exit from the displayed snapshot."""
@@ -1453,6 +1530,7 @@ class StarUIWorkbench:
     def _page(self) -> Any:
         state = self._state
         projection = self._projection_state()
+        recovery_dialog = self._cancelled_bracket_recovery(self._submission_outcomes())
         if state.status is UiStatus.READY and not state.positions:
             content = self._empty_positions()
         else:
@@ -1479,7 +1557,8 @@ class StarUIWorkbench:
             content,
             self._toast_component(),
             self._launch_connection_dialog(),
-            self._submission_review_dialog(),
+            self._submission_review_dialog() if recovery_dialog is None else None,
+            recovery_dialog,
             Script(_busy_submit_script()),
             cls="h-screen overflow-hidden bg-background text-foreground selection:bg-primary selection:text-primary-foreground",
         )
@@ -2118,9 +2197,7 @@ class StarUIWorkbench:
                             show_empty_state=not (active_pairs or outcomes)
                         ),
                         cls=(
-                            "mt-2 border-t border-border"
-                            if pending
-                            else "mt-9"
+                            "mt-2 border-t border-border pt-2"
                             if active_pairs or outcomes
                             else "h-full"
                             if not self._current_layers()
@@ -2136,6 +2213,107 @@ class StarUIWorkbench:
                 cls="mt-5 min-h-0 flex-1 overflow-hidden",
             ),
             cls="workspace-content flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6",
+        )
+
+    def _cancelled_bracket_recovery(
+        self, outcomes: tuple[tuple[JournalEntry, int, LayerOutcome], ...]
+    ) -> Any:
+        if not callable(getattr(self._paper_execution, "confirm_cancelled_unknown", None)):
+            return None
+        unresolved = {
+            entry.fingerprint: entry
+            for entry, _index, outcome in outcomes
+            if entry.state in {"SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED"}
+            and outcome.status in {"UNKNOWN", "NO_EXECUTION_EVIDENCE"}
+        }
+        if not unresolved:
+            return None
+        fingerprint = next(iter(unresolved))
+        entry = unresolved[fingerprint]
+        return Div(
+            Dialog(
+                DialogContent(
+                    DialogHeader(
+                        DialogTitle("Confirm bracket status in TWS"),
+                        DialogDescription(
+                            "Find the following tranche IDs in TWS and check that "
+                            "neither listed order remains."
+                        ),
+                    ),
+                    Div(
+                        *(
+                            Div(
+                                P("Tranche ID · OCA group", cls="text-xs text-muted-foreground"),
+                                P(
+                                    _journal_oca_group(entry, index),
+                                    cls="mt-1 break-all font-mono text-sm",
+                                ),
+                                Div(
+                                    Span("LMT target", cls="text-muted-foreground"),
+                                    Span(
+                                        f"{layer.target_price} · {layer.quantity} contracts",
+                                        cls="font-mono",
+                                    ),
+                                    cls="mt-3 flex justify-between gap-3 text-sm",
+                                ),
+                                Div(
+                                    Span("STP loss", cls="text-muted-foreground"),
+                                    Span(
+                                        f"{layer.stop_price} · {layer.quantity} contracts",
+                                        cls="font-mono",
+                                    ),
+                                    cls="mt-2 flex justify-between gap-3 text-sm",
+                                ),
+                                cls="rounded-md border border-border p-4",
+                            )
+                            for index, layer in enumerate(entry.layers)
+                        ),
+                        cls="grid max-h-[40vh] gap-3 overflow-y-auto",
+                    ),
+                    P(
+                        self._message,
+                        role="alert",
+                        cls="text-sm text-destructive",
+                    )
+                    if self._message.startswith("Cancellation verification blocked:")
+                    else None,
+                    Form(
+                        Label(
+                            HTMLInput(
+                                type="checkbox",
+                                name="confirmed",
+                                value="yes",
+                                required=True,
+                            ),
+                            "I confirmed the listed LMT and STP orders are gone in TWS",
+                            cls="flex items-center gap-2 text-sm",
+                        ),
+                        DialogFooter(
+                            Button(
+                                "Verify cancellation",
+                                type="submit",
+                                data_busy_text="Verifying…",
+                            ),
+                            cls="mt-6",
+                        ),
+                        HTMLInput(
+                            type="hidden", name="action", value="resolve-cancelled-bracket"
+                        ),
+                        HTMLInput(
+                            type="hidden", name="fingerprint", value=fingerprint
+                        ),
+                        action=f"/{self.session_token}/action",
+                        method="post",
+                        data_cancelled_bracket_recovery=True,
+                    ),
+                    show_close_button=False,
+                ),
+                signal="cancelled_bracket_recovery",
+                default_open=True,
+                dismissible=False,
+                size="md",
+            ),
+            data_cancelled_bracket_recovery_dialog=True,
         )
 
     def _header_quantity(
@@ -2222,19 +2400,38 @@ class StarUIWorkbench:
             }
         )
         observed_ids = frozenset(order.perm_id for order in self._state.working_orders)
+        snapshot = self._view_model.latest_snapshot()
+        verified = (
+            snapshot is not None
+            and snapshot.complete
+            and snapshot.fresh
+            and snapshot.selected.con_id == self._selected_con_id
+            and snapshot.selected.account == self._verified_selected_account()
+        )
+
+        def outcome_for(entry: JournalEntry, index: int) -> LayerOutcome:
+            outcome = classify_journal_layer(
+                entry,
+                index,
+                active_perm_ids=active_ids,
+                observed_perm_ids=observed_ids,
+            )
+            if outcome.status == "CANCELLED" and not verified:
+                return LayerOutcome("UNKNOWN")
+            return outcome
+
         return tuple(
             (
                 entry,
                 index,
-                classify_journal_layer(
-                    entry,
-                    index,
-                    active_perm_ids=active_ids,
-                    observed_perm_ids=observed_ids,
-                ),
+                outcome_for(entry, index),
             )
             for entry in entries
             for index in range(len(entry.layers))
+            if not (
+                entry.layers[index].hidden_from_workspace
+                and outcome_for(entry, index).status == "CANCELLED"
+            )
         )
 
     def _pending_submissions(
@@ -2274,6 +2471,7 @@ class StarUIWorkbench:
             "PARTIAL": "Partially filled",
             "NO_EXECUTION_EVIDENCE": "No fill evidence",
             "CONFLICT": "Fill and working order conflict",
+            "CANCELLED": "Bracket cancelled",
         }[outcome.status]
         detail = {
             "PENDING": "Check TWS for Transmit or a working order, then Refresh.",
@@ -2290,6 +2488,7 @@ class StarUIWorkbench:
                 "A fill is recorded, but TWS still shows the pair as working. "
                 "Inspect TWS before taking another action."
             ),
+            "CANCELLED": "Both OCA legs were confirmed cancelled; the position remains open.",
         }[outcome.status]
         return Div(
             Div(
@@ -2322,15 +2521,30 @@ class StarUIWorkbench:
                 Input(id=f"verify-tif-{number}", value=layer.tif, disabled=True),
                 input_id=f"verify-tif-{number}",
             ),
-            Div(cls="min-w-0"),
+            Button(
+                Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
+                variant="outline",
+                size="icon",
+                type="submit",
+                name="action",
+                value=f"dismiss-cancelled:{entry.fingerprint}:{index}",
+                aria_label=f"Remove cancelled layer {number} from view",
+                title="Remove cancelled row from view",
+                cls="relative z-[3] mt-5",
+            )
+            if outcome.status == "CANCELLED"
+            else Div(cls="min-w-0"),
             Div(
-                Span("VERIFY IN TWS", cls="sold-layer-status"),
+                Span(
+                    "CANCELLED" if outcome.status == "CANCELLED" else "VERIFY IN TWS",
+                    cls="sold-layer-status",
+                ),
                 Span(heading, cls="sold-layer-result"),
                 cls="sold-layer-badge",
                 title=detail,
             ),
-            data_layer_state="verify",
-            data_result_tone="verify",
+            data_layer_state="cancelled" if outcome.status == "CANCELLED" else "verify",
+            data_result_tone="cancelled" if outcome.status == "CANCELLED" else "verify",
             cls="sold-layer-row grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4",
         )
 
@@ -2472,6 +2686,7 @@ class StarUIWorkbench:
                 "UNKNOWN",
                 "PARTIAL",
                 "NO_EXECUTION_EVIDENCE",
+                "CANCELLED",
             }:
                 rows.append(self._pending_layer_row(number, entry, index, outcome))
                 if pair is not None:

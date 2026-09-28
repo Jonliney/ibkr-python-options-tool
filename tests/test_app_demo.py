@@ -53,6 +53,7 @@ from ibkr_options_manager.execution import (
     ExecutionJournal,
     ExecutionOutcomeUnknown,
     JournalEntry,
+    JournalLayer,
     JournalFill,
     JournalLayer,
     LayerOutcome,
@@ -713,6 +714,126 @@ def test_reconciled_app_orders_do_not_show_a_coverage_alert() -> None:
     assert "App-managed OCA coverage active" not in page.text
     assert "app-created orders were reconciled with TWS" not in page.text
     assert "Existing TWS exit orders" not in page.text
+
+
+def test_confirmed_cancelled_layer_does_not_request_tws_fill_verification(
+    tmp_path,
+) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    journal = ExecutionJournal(tmp_path / "paper-journal.json")
+    journal._write((
+        JournalEntry(
+            fingerprint="a" * 64,
+            account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id,
+            state="RECONCILED",
+            order_ids=(101, 102),
+            perm_ids=(201, 202),
+            layers=(JournalLayer(
+                quantity=2,
+                target_price="1.20",
+                stop_price="0.75",
+                tif="GTC",
+                target_perm_id=201,
+                stop_perm_id=202,
+                cancelled=True,
+            ),),
+        ),
+    ))
+    workbench._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(), journal
+    )
+
+    page = TestClient(workbench.app).get(workbench.path).text
+
+    assert "Bracket cancelled" in page
+    assert 'data-layer-state="cancelled"' in page
+    assert 'value="dismiss-cancelled:' in page
+    assert "No fill evidence" not in page
+    assert "mt-2 border-t border-border pt-2" in page
+
+    workbench._view_model._latest_snapshot = replace(
+        snapshot, executions_complete=True
+    )
+    removed = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={"action": f"dismiss-cancelled:{'a' * 64}:0"},
+    )
+    assert removed.status_code == 200
+    assert 'data-layer-state="cancelled"' not in removed.text
+    assert journal.find("a" * 64).layers[0].hidden_from_workspace
+
+
+def test_manual_tws_confirmation_clears_unknown_only_after_fresh_api_check(
+    tmp_path, monkeypatch
+) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    journal = ExecutionJournal(tmp_path / "paper-journal.json")
+    fingerprint = "b" * 64
+    journal._write((JournalEntry(
+        fingerprint=fingerprint,
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        state="SUBMISSION_UNKNOWN",
+        expected_order_count=2,
+        snapshot_captured_at="99",
+        layers=(JournalLayer(
+            quantity=2,
+            target_price="1.20",
+            stop_price="0.75",
+            tif="GTC",
+        ),),
+    ),))
+    workbench._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(), journal
+    )
+    client = TestClient(workbench.app)
+    recovery_page = client.get(workbench.path).text
+    assert "Verify cancellation" in recovery_page
+    assert 'id="cancelled_bracket_recovery"' in recovery_page
+    assert 'required' in recovery_page
+    assert f"{fingerprint[:12]}/tranche-1" in recovery_page
+    assert "LMT target" in recovery_page and "1.20 · 2 contracts" in recovery_page
+    assert "STP loss" in recovery_page and "0.75 · 2 contracts" in recovery_page
+
+    unconfirmed = client.post(
+        workbench.path + "action",
+        data={"action": "resolve-cancelled-bracket", "fingerprint": fingerprint},
+    )
+    assert 'id="cancelled_bracket_recovery"' in unconfirmed.text
+    assert journal.find(fingerprint).state == "SUBMISSION_UNKNOWN"
+
+    fresh = replace(
+        snapshot,
+        captured_at=Decimal("101"),
+        completed_orders_complete=True,
+        executions_complete=True,
+    )
+
+    def selected(*_args):
+        workbench._view_model._latest_snapshot = fresh
+        return workbench._state
+
+    monkeypatch.setattr(workbench._view_model, "select_position", selected)
+    response = client.post(
+        workbench.path + "action",
+        data={
+            "action": "resolve-cancelled-bracket",
+            "confirmed": "yes",
+            "fingerprint": fingerprint,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "Cancelled bracket cleared" in response.text
+    assert "Verify cancellation" not in response.text
+    assert journal.find(fingerprint).state == "CANCELLED_CONFIRMED"
 
 
 def test_refresh_replaces_a_draft_that_exceeds_newly_available_quantity() -> None:

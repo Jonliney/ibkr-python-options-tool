@@ -31,6 +31,8 @@ from ibkr_options_manager.execution import (
     ExecutionBlocked,
     ExecutionJournal,
     ExecutionOutcomeUnknown,
+    JournalEntry,
+    JournalLayer,
     MarketExitCandidate,
     PaperExecutionService,
     PriceUpdateCandidate,
@@ -797,6 +799,22 @@ def test_cancel_pair_removes_only_a_fresh_complete_app_owned_oca_bracket(
     assert receipt.entry.state == "COMPLETED"
     assert receipt.entry.order_ids == (101, 102)
     assert receipt.entry.perm_ids == ()
+    source = journal.submission_entries(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id
+    )[0]
+    assert source.layers[0].cancelled is True
+    assert classify_journal_layer(
+        source,
+        0,
+        active_perm_ids=frozenset(),
+        observed_perm_ids=frozenset(),
+    ).status == "CANCELLED"
+    assert classify_journal_layer(
+        source,
+        0,
+        active_perm_ids=frozenset(),
+        observed_perm_ids=frozenset({201}),
+    ).status == "UNKNOWN"
     with pytest.raises(ExecutionBlocked, match="already journaled"):
         service.cancel_pair(
             active_snapshot,
@@ -806,6 +824,35 @@ def test_cancel_pair_removes_only_a_fresh_complete_app_owned_oca_bracket(
             client_id=17,
             timeout_seconds=1,
         )
+
+
+def test_refresh_recovers_an_older_completed_bracket_cancellation(tmp_path) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.record_submission(
+        plan.fingerprint,
+        order_ids=(101, 102),
+        perm_ids=(201, 202),
+    )
+    attempt = journal.begin_management(
+        snapshot,
+        operation="cancel-bracket",
+        material=(101, 201, 102, 202),
+        expected_order_count=2,
+    )
+    journal.record_management_completion(attempt.fingerprint, order_ids=(101, 102))
+
+    journal.record_completed_orders(
+        replace(snapshot, captured_at=snapshot.captured_at + 1)
+    )
+
+    source = journal.submission_entries(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id
+    )[0]
+    assert source.layers[0].cancelled is True
 
 
 def test_market_exit_rejects_a_layer_that_is_not_journal_owned(tmp_path) -> None:
@@ -1454,6 +1501,255 @@ def test_unknown_bracket_without_cancel_evidence_stays_blocked(tmp_path) -> None
 
     with pytest.raises(ExecutionBlocked, match="already journaled"):
         journal.begin(replace(snapshot, captured_at=snapshot.captured_at + 1), plan)
+
+
+def test_operator_confirmed_unknown_bracket_requires_clean_fresh_tws_read(
+    tmp_path,
+) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.mark_unknown(plan.fingerprint)
+    clean = replace(
+        snapshot,
+        captured_at=snapshot.captured_at + 1,
+        completed_orders=(ObservedCompletedOrder(
+            account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id,
+            perm_id=201,
+            order_id=101,
+            client_id=17,
+            action="SELL",
+            order_type="LMT",
+            oca_group=f"{plan.fingerprint[:12]}/tranche-1",
+            status="Inactive",
+        ),),
+        completed_orders_complete=True,
+        executions_complete=True,
+    )
+
+    with pytest.raises(ExecutionBlocked, match="confirm both"):
+        journal.confirm_cancelled_unknown(
+            clean, plan.fingerprint, confirmed_in_tws=False
+        )
+    with pytest.raises(ExecutionBlocked, match="complete TWS"):
+        journal.confirm_cancelled_unknown(
+            replace(clean, executions_complete=False),
+            plan.fingerprint,
+            confirmed_in_tws=True,
+        )
+    working = WorkingOrder(
+        perm_id=0,
+        client_id=17,
+        order_id=101,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("2"),
+        status="PendingSubmit",
+        oca_group=f"{plan.fingerprint[:12]}/tranche-1",
+    )
+    with pytest.raises(ExecutionBlocked, match="still working"):
+        journal.confirm_cancelled_unknown(
+            replace(clean, working_orders=(working,)),
+            plan.fingerprint,
+            confirmed_in_tws=True,
+        )
+    fill = ObservedExecution(
+        exec_id="unknown.01",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=201,
+        side="SLD",
+        quantity=Decimal("1"),
+        price=Decimal("1.20"),
+        time="20260925 12:00:00",
+    )
+    with pytest.raises(ExecutionBlocked, match="201 may belong"):
+        journal.confirm_cancelled_unknown(
+            replace(clean, executions=(fill,)),
+            plan.fingerprint,
+            confirmed_in_tws=True,
+        )
+    with pytest.raises(ExecutionBlocked, match="999 may belong"):
+        journal.confirm_cancelled_unknown(
+            replace(clean, executions=(replace(fill, perm_id=999),)),
+            plan.fingerprint,
+            confirmed_in_tws=True,
+        )
+    with pytest.raises(ExecutionBlocked, match="conflicts"):
+        journal.confirm_cancelled_unknown(
+            replace(
+                clean,
+                completed_orders=(replace(clean.completed_orders[0], status="Filled"),),
+            ),
+            plan.fingerprint,
+            confirmed_in_tws=True,
+        )
+
+    resolved = journal.confirm_cancelled_unknown(
+        clean, plan.fingerprint, confirmed_in_tws=True
+    )
+
+    assert resolved.state == "CANCELLED_CONFIRMED"
+    assert resolved.resolution_captured_at == str(clean.captured_at)
+    assert journal.submission_entries(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id
+    ) == ()
+    with pytest.raises(ExecutionBlocked, match="already journaled"):
+        journal.begin(clean, plan)
+    assert journal.begin(
+        replace(clean, captured_at=clean.captured_at + 1), plan
+    ).state == "PREPARED"
+
+
+def test_cancelled_unknown_ignores_other_tranches_on_same_contract(tmp_path) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.mark_unknown(plan.fingerprint)
+    other_group = "other-tranche/tranche-1"
+    other_order = WorkingOrder(
+        perm_id=901,
+        client_id=17,
+        order_id=801,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="STP",
+        remaining=Decimal("2"),
+        status="Submitted",
+        oca_group=other_group,
+    )
+    other_fill = ObservedExecution(
+        exec_id="other.01",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=902,
+        side="SLD",
+        quantity=Decimal("1"),
+        price=Decimal("26.50"),
+        time="20260925 12:00:00",
+    )
+    refreshed = replace(
+        snapshot,
+        captured_at=snapshot.captured_at + 1,
+        working_orders=(other_order,),
+        executions=(other_fill,),
+        executions_complete=True,
+        completed_orders=(ObservedCompletedOrder(
+            account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id,
+            perm_id=902,
+            order_id=802,
+            client_id=17,
+            action="SELL",
+            order_type="STP",
+            oca_group=other_group,
+            status="Filled",
+        ),),
+        completed_orders_complete=True,
+    )
+
+    resolved = journal.confirm_cancelled_unknown(
+        refreshed, plan.fingerprint, confirmed_in_tws=True
+    )
+    assert resolved.state == "CANCELLED_CONFIRMED"
+    assert journal.begin(
+        replace(refreshed, captured_at=refreshed.captured_at + 1), plan
+    ).state == "PREPARED"
+
+
+def test_cancelled_unknown_uses_other_journal_ids_and_ignores_buy_fill(
+    tmp_path,
+) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.mark_unknown(plan.fingerprint)
+    journal._write((*journal._entries(), JournalEntry(
+        fingerprint="f" * 64,
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        state="SUBMITTED",
+        perm_ids=(902,),
+    )))
+    other_sell = ObservedExecution(
+        exec_id="other.01",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=902,
+        side="SLD",
+        quantity=Decimal("1"),
+        price=Decimal("26.50"),
+        time="20260925 12:00:00",
+    )
+    buy = replace(other_sell, exec_id="buy.01", perm_id=903, side="BOT")
+    refreshed = replace(
+        snapshot,
+        captured_at=snapshot.captured_at + 1,
+        executions=(other_sell, buy),
+        executions_complete=True,
+        completed_orders_complete=True,
+    )
+    assert journal.confirm_cancelled_unknown(
+        refreshed, plan.fingerprint, confirmed_in_tws=True
+    ).state == "CANCELLED_CONFIRMED"
+    assert journal.begin(
+        replace(refreshed, captured_at=refreshed.captured_at + 1), plan
+    ).state == "PREPARED"
+
+
+def test_dismiss_cancelled_layer_keeps_journal_and_rejects_working_leg(
+    tmp_path,
+) -> None:
+    snapshot = _snapshot()
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    fingerprint = "a" * 64
+    entry = JournalEntry(
+        fingerprint=fingerprint,
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        state="RECONCILED",
+        perm_ids=(201, 202),
+        layers=(JournalLayer(
+            quantity=2,
+            target_price="1.20",
+            stop_price="0.75",
+            tif="GTC",
+            target_perm_id=201,
+            stop_perm_id=202,
+            cancelled=True,
+        ),),
+    )
+    journal._write((entry,))
+    fresh = replace(snapshot, executions_complete=True)
+    with pytest.raises(ExecutionBlocked, match="fresh"):
+        journal.dismiss_cancelled_layer(snapshot, fingerprint, 0)
+    working = WorkingOrder(
+        perm_id=202,
+        client_id=17,
+        order_id=102,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="STP",
+        remaining=Decimal("2"),
+        status="Submitted",
+        oca_group=f"{fingerprint[:12]}/tranche-1",
+    )
+    with pytest.raises(ExecutionBlocked, match="not confirmed cancelled"):
+        journal.dismiss_cancelled_layer(
+            replace(fresh, working_orders=(working,)), fingerprint, 0
+        )
+    hidden = journal.dismiss_cancelled_layer(fresh, fingerprint, 0)
+    assert hidden.layers[0].hidden_from_workspace
+    assert journal.find(fingerprint) == hidden
+    assert hidden.perm_ids == entry.perm_ids
 
 
 def test_cancelled_bracket_with_a_fill_cannot_be_rebuilt(tmp_path) -> None:
