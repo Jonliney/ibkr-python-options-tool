@@ -178,6 +178,21 @@ bind those rows and can report API order ID `0`.
 If that exact recovery check does not pass, the outcome remains unknown: the
 application will not retry, adopt a partial pair, or modify anything. Inspect
 TWS and create a deliberately new draft only after resolving the state.
+After a submission, the workbench prompts the operator to check TWS for any
+required Transmit confirmation and refresh. This prompt confirms that order
+requests were sent to TWS; it does not claim that TWS accepted or transmitted
+every leg. The journal remains the authority for whether another submission
+can be attempted.
+When a selected position already has an OCA order group in the TWS snapshot,
+the workbench displays that exposure without creating a draft layer. The
+operator must use **Add layer** to plan additional uncommitted quantity.
+
+If the operator cancels an unacknowledged bracket in TWS before the app
+reconciles it, a later fresh refresh can retire that unknown attempt only when
+the broker reports a complete completed-order and execution snapshot showing
+both exact fingerprinted legs of every planned layer cancelled with nonzero
+permanent IDs, no matching fills, and no matching working order. If any of
+that evidence is missing, the attempt remains blocked against duplicate send.
 
 ## Required paper validation
 

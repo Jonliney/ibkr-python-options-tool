@@ -53,6 +53,7 @@ def Dialog(
     signal: str | Signal = "",
     modal: bool = True,
     default_open: bool = False,
+    dismissible: bool = True,
     size: DialogSize = "md",
     cls: str = "",
     **kwargs: Any,
@@ -80,8 +81,9 @@ def Dialog(
             data_ref=dialog_ref,
             data_on_close=open_state.set(False),
             data_on_click=(evt.target == evt.currentTarget) & seq(dialog_ref.close(), open_state.set(False))
-            if modal
+            if modal and dismissible
             else None,
+            data_on_cancel=evt.preventDefault() if not dismissible else None,
             data_dialog="",
             id=sig,
             aria_labelledby=f"{sig}-title",

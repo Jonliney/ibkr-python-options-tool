@@ -51,6 +51,7 @@ from ibkr_options_manager.broker.execution import PaperSubmission
 from ibkr_options_manager.domain import PriceBand, WorkingOrder
 from ibkr_options_manager.execution import (
     ExecutionJournal,
+    ExecutionOutcomeUnknown,
     JournalEntry,
     JournalFill,
     JournalLayer,
@@ -121,6 +122,32 @@ def test_demo_launch_populates_the_starui_workbench_without_a_tws_refresh() -> N
     assert workbench._state.selected_con_id is not None
     assert workbench._state.quote_calculator is not None
     assert workbench._state.available_quantity == 5
+
+
+def test_verified_empty_portfolio_shows_refresh_guidance_without_order_review() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._state = replace(workbench._state, positions=())
+    workbench._selected_con_id = None
+
+    page = TestClient(workbench.app).get(workbench.path).text
+
+    assert "No option positions detected" in page
+    assert "Buy a long option contract in TWS" in page
+    assert "Refresh positions" in page
+    assert 'data-empty-positions' in page
+    assert "ACTION REVIEW" not in page
+    assert "LONG POSITIONS" not in page
+    assert "Execute paper order" not in page
+
+
+def test_unverified_empty_portfolio_does_not_claim_no_positions() -> None:
+    workbench = _demo_workbench()
+    workbench._state = replace(workbench._state, status=UiStatus.BLOCKED)
+
+    page = TestClient(workbench.app).get(workbench.path).text
+
+    assert "No option positions detected" not in page
 
 
 def test_selected_contract_header_uses_verified_position_and_quote_values() -> None:
@@ -729,7 +756,7 @@ def test_refresh_replaces_a_draft_that_exceeds_newly_available_quantity() -> Non
     assert workbench._current_layers()[0].quantity == "4"
 
 
-def test_empty_draft_rehydrates_when_a_refresh_frees_contracts() -> None:
+def test_empty_draft_stays_empty_until_add_layer() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
     con_id = workbench._selected_con_id
@@ -738,8 +765,39 @@ def test_empty_draft_rehydrates_when_a_refresh_frees_contracts() -> None:
     workbench._drafts[con_id] = ()
     workbench._ensure_draft_locked()
 
+    assert workbench._current_layers() == ()
+
+    workbench._add_layer_locked()
+
     assert len(workbench._current_layers()) == 1
     assert workbench._current_layers()[0].quantity == "5"
+
+
+def test_existing_tws_bracket_waits_for_add_layer_before_creating_a_draft() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    assert workbench._state.working_orders
+    order = workbench._state.working_orders[0]
+    draft = workbench._current_layers()[0]
+    workbench._drafts.pop(con_id, None)
+    workbench._state = replace(
+        workbench._state,
+        working_orders=(replace(order, oca_group="existing-bracket"),),
+        bracket_form=PlanForm(layers=(draft,)),
+    )
+
+    workbench._ensure_draft_locked()
+
+    assert workbench._current_layers() == ()
+    page = TestClient(workbench.app).get(workbench.path).text
+    assert 'data-draft-empty-state' in page
+    assert 'value="add-layer"' in page
+
+    workbench._add_layer_locked()
+
+    assert len(workbench._current_layers()) == 1
 
 
 def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
@@ -2378,11 +2436,11 @@ def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
     )
 
     assert submitted.status_code == 200
-    assert "Bracket orders sent to TWS" in submitted.text
-    assert "Check TWS for any required Transmit." in submitted.text
-    assert workbench._toast is not None
-    assert workbench._toast.title == "Bracket orders sent to TWS"
-    assert workbench._toast.description == "Check TWS for any required Transmit."
+    assert "Orders sent to TWS" in submitted.text
+    assert "Check TWS or IBKR for any required Transmit confirmation." in submitted.text
+    assert "Check order status" in submitted.text
+    assert 'data-submission-review' in submitted.text
+    assert workbench._toast is None
     assert "Awaiting TWS verification" in submitted.text
     assert "VERIFY IN TWS" in submitted.text
     assert 'data-layer-state="verify"' in submitted.text
@@ -2400,6 +2458,9 @@ def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
     assert workbench._status_message.endswith("TWS state refreshed.")
     assert len(refresh_calls) == 1
 
+    refreshed = client.post(workbench.path + "action", data={"action": "refresh"})
+    assert 'data-submission-review' not in refreshed.text
+
     workbench._paper_execution = PaperExecutionService(
         DemoPaperExecutionTransport(),
         ExecutionJournal(tmp_path / "paper-journal.json"),
@@ -2414,6 +2475,80 @@ def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
     assert 'data-layer-state="verify"' in unknown.text
     assert "Outcome not confirmed" in unknown.text
     assert 'value="execute-arm"' not in unknown.text
+
+
+def test_unknown_submission_uses_guided_refresh_without_error_toast(
+    tmp_path, monkeypatch
+) -> None:
+    def clock() -> Decimal:
+        return Decimal("100")
+
+    broker = DemoReadOnlyBroker(clock=clock, paper_execution_enabled=True)
+    from ibkr_options_manager.app.view_model import PlannerViewModel
+
+    service = PaperExecutionService(
+        DemoPaperExecutionTransport(),
+        ExecutionJournal(tmp_path / "paper-journal.json"),
+    )
+    workbench = StarUIWorkbench(
+        PlannerViewModel(
+            SnapshotCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock),
+            portfolio=PortfolioCoordinator(
+                broker,
+                max_age_seconds=Decimal("15"),
+                clock=clock,
+                paper_execution_mode=True,
+            ),
+            clock=clock,
+        ),
+        initial_account=DEMO_ACCOUNT,
+        demo_mode=True,
+        paper_execution=service,
+    )
+    workbench.load_demo_data()
+    client = TestClient(workbench.app)
+    assert ">Confirm<" in client.post(
+        workbench.path + "action", data={"action": "execute-arm"}
+    ).text
+
+    def uncertain(*args, **kwargs):
+        raise ExecutionOutcomeUnknown("TWS did not acknowledge every order")
+
+    monkeypatch.setattr(service, "submit", uncertain)
+    response = client.post(
+        workbench.path + "action", data={"action": "execute-confirm"}
+    )
+
+    assert response.status_code == 200
+    assert "Orders sent to TWS" in response.text, workbench._status_message
+    assert 'data-submission-review' in response.text
+    assert workbench._toast is None
+
+
+def test_order_status_check_closes_dialog_even_when_planning_stays_blocked(
+    monkeypatch,
+) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._submission_review_required = True
+    calls = 0
+
+    def refreshed() -> None:
+        nonlocal calls
+        calls += 1
+        workbench._state = replace(workbench._state, status=UiStatus.BLOCKED)
+
+    monkeypatch.setattr(workbench, "_refresh_locked", refreshed)
+    client = TestClient(workbench.app)
+    prompt = client.get(workbench.path).text
+    assert "Check order status" in prompt
+    assert "If you cancel the bracket" not in prompt
+
+    response = client.post(workbench.path + "action", data={"action": "refresh"})
+
+    assert calls == 1
+    assert response.status_code == 200
+    assert 'data-submission-review' not in response.text
 
 
 def test_pending_three_contracts_leave_four_available_for_drafting(tmp_path) -> None:

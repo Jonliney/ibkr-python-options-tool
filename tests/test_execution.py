@@ -1405,3 +1405,98 @@ def test_recreates_a_cancelled_partially_reconciled_draft_fingerprint(tmp_path) 
     entries = journal._entries()
     assert entries[-2].state == "SUPERSEDED"
     assert journal.find(plan.fingerprint) == replacement
+
+
+def test_unknown_bracket_cancelled_in_tws_can_be_rebuilt(tmp_path) -> None:
+    snapshot = _snapshot()
+    plan = _two_pair_plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.mark_unknown(plan.fingerprint)
+    completed = tuple(
+        ObservedCompletedOrder(
+            account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id,
+            perm_id=201 + index * 2 + leg,
+            order_id=101 + index * 2 + leg,
+            client_id=17,
+            action="SELL",
+            order_type="LMT" if leg == 0 else "STP",
+            oca_group=f"{plan.fingerprint[:12]}/tranche-{index + 1}",
+            status="Cancelled",
+        )
+        for index in range(2)
+        for leg in range(2)
+    )
+    refreshed = replace(
+        snapshot,
+        captured_at=snapshot.captured_at + 1,
+        completed_orders=completed,
+        completed_orders_complete=True,
+        executions_complete=True,
+    )
+
+    assert journal.reconcile_snapshot(refreshed) == ()
+    assert journal.submission_entries(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id
+    ) == ()
+    assert journal.begin(refreshed, plan).state == "PREPARED"
+
+
+def test_unknown_bracket_without_cancel_evidence_stays_blocked(tmp_path) -> None:
+    snapshot = _snapshot()
+    plan = _two_pair_plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.mark_unknown(plan.fingerprint)
+
+    with pytest.raises(ExecutionBlocked, match="already journaled"):
+        journal.begin(replace(snapshot, captured_at=snapshot.captured_at + 1), plan)
+
+
+def test_cancelled_bracket_with_a_fill_cannot_be_rebuilt(tmp_path) -> None:
+    snapshot = _snapshot()
+    plan = _two_pair_plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.mark_unknown(plan.fingerprint)
+    completed = tuple(
+        ObservedCompletedOrder(
+            account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id,
+            perm_id=201 + index * 2 + leg,
+            order_id=101 + index * 2 + leg,
+            client_id=17,
+            action="SELL",
+            order_type="LMT" if leg == 0 else "STP",
+            oca_group=f"{plan.fingerprint[:12]}/tranche-{index + 1}",
+            status="Cancelled",
+        )
+        for index in range(2)
+        for leg in range(2)
+    )
+    fill = ObservedExecution(
+        exec_id="fill.01",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=201,
+        side="SLD",
+        quantity=Decimal("1"),
+        price=Decimal("1.20"),
+        time="20260925 12:00:00",
+    )
+    refreshed = replace(
+        snapshot,
+        captured_at=snapshot.captured_at + 1,
+        completed_orders=completed,
+        completed_orders_complete=True,
+        executions=(fill,),
+        executions_complete=True,
+    )
+
+    assert journal.reconcile_snapshot(refreshed) == ()
+    with pytest.raises(ExecutionBlocked, match="already journaled"):
+        journal.begin(refreshed, plan)

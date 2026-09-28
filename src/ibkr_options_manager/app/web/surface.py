@@ -178,6 +178,7 @@ class StarUIWorkbench:
         self._message = "Refresh and select a position to build a draft."
         self._launch_connection = "idle"
         self._launch_refresh_in_progress = False
+        self._submission_review_required = False
         self._lock = RLock()
         self.session_token = token_urlsafe(24)
         self.app, route = star_app(
@@ -334,6 +335,7 @@ class StarUIWorkbench:
                     ),
                 )
                 self._refresh_locked()
+                self._submission_review_required = False
             elif action == "select":
                 self._disarm_execution_locked()
                 self._save_form_locked(values)
@@ -538,6 +540,8 @@ class StarUIWorkbench:
                 "bracket, approve it there if required, then Refresh to reconcile it "
                 "into Active layers. Do not retry this draft."
             )
+            self._toast = None
+            self._submission_review_required = True
         except ExecutionBlocked as error:
             self._message = f"Execution blocked: {error}"
         except Exception as error:  # the isolated writer must never crash the UI
@@ -548,11 +552,9 @@ class StarUIWorkbench:
             refreshed = self._refresh_after_acknowledged_write_locked(
                 f"Paper submission acknowledged for {len(receipt.entry.order_ids)} orders."
             )
+            self._submission_review_required = True
             if refreshed:
-                self._show_success_toast_locked(
-                    "Bracket orders sent to TWS",
-                    "Check TWS for any required Transmit.",
-                )
+                self._toast = None
         finally:
             self._disarm_execution_locked()
 
@@ -1239,6 +1241,11 @@ class StarUIWorkbench:
         # replacement default layer on the next selection or refresh.
         if con_id in self._drafts:
             return
+        if any(order.oca_group for order in self._state.working_orders):
+            # Existing TWS OCA exposure is shown first. A new draft is an
+            # explicit choice through Add layer, even when quantity remains.
+            self._drafts[con_id] = ()
+            return
         if self._state.bracket_form.layers:
             self._drafts[con_id] = self._state.bracket_form.layers
             return
@@ -1446,30 +1453,96 @@ class StarUIWorkbench:
     def _page(self) -> Any:
         state = self._state
         projection = self._projection_state()
-        snapshot = self._view_model.latest_snapshot()
-        title = (
-            _contract_display_name(snapshot.contract)
-            if snapshot is not None
-            and snapshot.selected.con_id == self._selected_con_id
-            else (
-                state.position_title
-                if self._selected_con_id is not None
-                else "Select an option position"
+        if state.status is UiStatus.READY and not state.positions:
+            content = self._empty_positions()
+        else:
+            snapshot = self._view_model.latest_snapshot()
+            title = (
+                _contract_display_name(snapshot.contract)
+                if snapshot is not None
+                and snapshot.selected.con_id == self._selected_con_id
+                else (
+                    state.position_title
+                    if self._selected_con_id is not None
+                    else "Select an option position"
+                )
             )
-        )
-        return Div(
-            Script(_projection_script(projection[2])),
-            self._header(),
-            Div(
+            content = Div(
                 self._inventory(),
                 self._workspace(title),
                 self._review(projection),
                 cls="grid h-[calc(100vh-3.5rem)] min-h-0 grid-cols-[16rem_minmax(0,1fr)_19rem] overflow-hidden border-t border-border",
-            ),
+            )
+        return Div(
+            Script(_projection_script(projection[2])),
+            self._header(),
+            content,
             self._toast_component(),
             self._launch_connection_dialog(),
+            self._submission_review_dialog(),
             Script(_busy_submit_script()),
             cls="h-screen overflow-hidden bg-background text-foreground selection:bg-primary selection:text-primary-foreground",
+        )
+
+    def _submission_review_dialog(self) -> Any:
+        if not self._submission_review_required:
+            return None
+        return Div(
+            Dialog(
+                DialogContent(
+                    DialogHeader(
+                        DialogTitle("Orders sent to TWS"),
+                        DialogDescription(
+                            "Check TWS or IBKR for any required Transmit confirmation. "
+                            "Then check their latest status here."
+                        ),
+                    ),
+                    DialogFooter(
+                        Form(
+                            Button(
+                                "Check order status",
+                                type="submit",
+                                data_busy_text="Checking…",
+                            ),
+                            HTMLInput(type="hidden", name="action", value="refresh"),
+                            action=f"/{self.session_token}/action",
+                            method="post",
+                        )
+                    ),
+                    show_close_button=False,
+                ),
+                signal="submission_review",
+                default_open=True,
+                dismissible=False,
+                size="sm",
+            ),
+            data_submission_review=True,
+        )
+
+    def _empty_positions(self) -> Any:
+        return Div(
+            Div(
+                Icon("lucide:link-2", cls="size-7 text-primary", aria_hidden="true"),
+                H1("No option positions detected", cls="mt-6 text-2xl font-semibold tracking-tight"),
+                P(
+                    "Buy a long option contract in TWS, then refresh to load it here.",
+                    cls="mt-3 max-w-md text-sm leading-6 text-muted-foreground",
+                ),
+                Form(
+                    Button(
+                        "Refresh positions",
+                        type="submit",
+                        data_busy_text="Refreshing…",
+                    ),
+                    HTMLInput(type="hidden", name="action", value="refresh"),
+                    action=f"/{self.session_token}/action",
+                    method="post",
+                    cls="mt-9",
+                ),
+                cls="max-w-lg",
+            ),
+            data_empty_positions=True,
+            cls="flex h-[calc(100vh-3.5rem)] items-center justify-center border-t border-border px-6",
         )
 
     def _toast_component(self) -> Any:

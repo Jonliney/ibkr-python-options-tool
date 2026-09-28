@@ -357,8 +357,12 @@ class ExecutionJournal:
             ),
             None,
         )
-        if prior_index is not None and not self._may_replace_absent_attempt(
-            entries[prior_index], snapshot, entries
+        if (
+            prior_index is not None
+            and entries[prior_index].state != "CANCELLED"
+            and not self._may_replace_absent_attempt(
+                entries[prior_index], snapshot, entries
+            )
         ):
             raise ExecutionBlocked(
                 "this plan fingerprint is already journaled; no retry is automatic"
@@ -431,14 +435,19 @@ class ExecutionJournal:
         a later fresh snapshot for the same account and contract with none of
         those orders still working. Older journal entries without a capture
         time need a completed app cancellation for the same broker orders.
-        An unknown outcome has no such proof and stays blocked forever pending
-        manual investigation.
+        An unknown outcome can only be retired if a later complete broker
+        snapshot shows every exact fingerprinted leg cancelled without fills.
         """
+        if (
+            entry.account != snapshot.selected.account
+            or entry.con_id != snapshot.selected.con_id
+        ):
+            return False
+        if entry.state == "SUBMISSION_UNKNOWN":
+            return ExecutionJournal._cancelled_submission_attempt(entry, snapshot)
         if (
             entry.state not in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"}
             or not entry.perm_ids
-            or entry.account != snapshot.selected.account
-            or entry.con_id != snapshot.selected.con_id
         ):
             return False
         prior_perm_ids = frozenset(entry.perm_ids)
@@ -457,6 +466,51 @@ class ExecutionJournal:
             and set(completed.order_ids) & set(entry.order_ids)
             for completed in entries
         )
+
+    @staticmethod
+    def _cancelled_submission_attempt(
+        entry: JournalEntry, snapshot: BrokerSnapshot
+    ) -> bool:
+        if (
+            not snapshot.complete
+            or not snapshot.fresh
+            or not snapshot.completed_orders_complete
+            or not snapshot.executions_complete
+            or entry.expected_order_count != len(entry.layers) * 2
+            or not entry.layers
+            or entry.fills
+            or snapshot.captured_at <= Decimal(entry.snapshot_captured_at)
+        ):
+            return False
+        prefix = entry.fingerprint[:12]
+        for index in range(len(entry.layers)):
+            group = f"{prefix}/tranche-{index + 1}"
+            if any(order.oca_group == group for order in snapshot.working_orders):
+                return False
+            legs = [
+                order
+                for order in snapshot.completed_orders
+                if order.account == entry.account
+                and order.con_id == entry.con_id
+                and order.oca_group == group
+            ]
+            if (
+                len(legs) != 2
+                or {leg.order_type for leg in legs} != {"LMT", "STP"}
+                or any(
+                    leg.action != "SELL"
+                    or leg.status not in {"Cancelled", "ApiCancelled"}
+                    or leg.perm_id <= 0
+                    for leg in legs
+                )
+                or len({leg.perm_id for leg in legs}) != 2
+                or any(
+                    fill.perm_id in {leg.perm_id for leg in legs}
+                    for fill in snapshot.executions
+                )
+            ):
+                return False
+        return True
 
     def begin_market_exit(
         self, snapshot: BrokerSnapshot, candidate: MarketExitCandidate
@@ -727,6 +781,7 @@ class ExecutionJournal:
         """
         entries = list(self._entries())
         reconciled: list[JournalEntry] = []
+        changed = False
         for index, entry in enumerate(entries):
             if (
                 entry.state
@@ -739,6 +794,10 @@ class ExecutionJournal:
                 or entry.account != snapshot.selected.account
                 or entry.con_id != snapshot.selected.con_id
             ):
+                continue
+            if self._cancelled_submission_attempt(entry, snapshot):
+                entries[index] = replace(entry, state="CANCELLED")
+                changed = True
                 continue
             observed = _complete_app_oca_orders(snapshot, entry)
             if not observed:
@@ -763,7 +822,8 @@ class ExecutionJournal:
             )
             entries[index] = updated
             reconciled.append(updated)
-        if reconciled:
+            changed = True
+        if changed:
             self._write(tuple(entries))
         return tuple(reconciled)
 
