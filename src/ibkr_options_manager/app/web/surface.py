@@ -1530,7 +1530,11 @@ class StarUIWorkbench:
     def _page(self) -> Any:
         state = self._state
         projection = self._projection_state()
-        recovery_dialog = self._cancelled_bracket_recovery(self._submission_outcomes())
+        recovery_dialog = (
+            None
+            if self._submission_review_required
+            else self._cancelled_bracket_recovery(self._submission_outcomes())
+        )
         if state.status is UiStatus.READY and not state.positions:
             content = self._empty_positions()
         else:
@@ -1557,7 +1561,7 @@ class StarUIWorkbench:
             content,
             self._toast_component(),
             self._launch_connection_dialog(),
-            self._submission_review_dialog() if recovery_dialog is None else None,
+            self._submission_review_dialog(),
             recovery_dialog,
             Script(_busy_submit_script()),
             cls="h-screen overflow-hidden bg-background text-foreground selection:bg-primary selection:text-primary-foreground",
@@ -1572,14 +1576,14 @@ class StarUIWorkbench:
                     DialogHeader(
                         DialogTitle("Orders sent to TWS"),
                         DialogDescription(
-                            "Check TWS or IBKR for any required Transmit confirmation. "
-                            "Then check their latest status here."
+                            "The orders were sent to TWS. Confirm or transmit them "
+                            "there if prompted, then refresh their status here."
                         ),
                     ),
                     DialogFooter(
                         Form(
                             Button(
-                                "Check order status",
+                                "Refresh order status",
                                 type="submit",
                                 data_busy_text="Checking…",
                             ),
@@ -2220,11 +2224,27 @@ class StarUIWorkbench:
     ) -> Any:
         if not callable(getattr(self._paper_execution, "confirm_cancelled_unknown", None)):
             return None
+        snapshot = self._view_model.latest_snapshot()
+        working = snapshot.working_orders if snapshot is not None else ()
+
+        def has_working_leg(entry: JournalEntry) -> bool:
+            groups = {
+                _journal_oca_group(entry, index)
+                for index in range(len(entry.layers))
+            }
+            return any(
+                order.oca_group in groups
+                or order.order_id in entry.order_ids
+                or (order.perm_id > 0 and order.perm_id in entry.perm_ids)
+                for order in working
+            )
+
         unresolved = {
             entry.fingerprint: entry
             for entry, _index, outcome in outcomes
             if entry.state in {"SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED"}
             and outcome.status in {"UNKNOWN", "NO_EXECUTION_EVIDENCE"}
+            and not has_working_leg(entry)
         }
         if not unresolved:
             return None

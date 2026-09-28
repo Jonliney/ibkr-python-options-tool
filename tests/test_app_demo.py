@@ -794,6 +794,29 @@ def test_manual_tws_confirmation_clears_unknown_only_after_fresh_api_check(
         DemoPaperExecutionTransport(), journal
     )
     client = TestClient(workbench.app)
+    workbench._submission_review_required = True
+    sent_page = client.get(workbench.path).text
+    assert 'data-submission-review' in sent_page
+    assert 'data-cancelled-bracket-recovery-dialog' not in sent_page
+    workbench._submission_review_required = False
+    workbench._view_model._latest_snapshot = replace(
+        snapshot,
+        working_orders=(WorkingOrder(
+            perm_id=301,
+            client_id=17,
+            order_id=201,
+            key=snapshot.selected,
+            action="SELL",
+            order_type="LMT",
+            remaining=Decimal("2"),
+            status="PreSubmitted",
+            oca_group=f"{fingerprint[:12]}/tranche-1",
+        ),),
+    )
+    assert 'data-cancelled-bracket-recovery-dialog' not in client.get(
+        workbench.path
+    ).text
+    workbench._view_model._latest_snapshot = snapshot
     recovery_page = client.get(workbench.path).text
     assert "Verify cancellation" in recovery_page
     assert 'id="cancelled_bracket_recovery"' in recovery_page
@@ -2558,9 +2581,11 @@ def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
 
     assert submitted.status_code == 200
     assert "Orders sent to TWS" in submitted.text
-    assert "Check TWS or IBKR for any required Transmit confirmation." in submitted.text
-    assert "Check order status" in submitted.text
+    assert "The orders were sent to TWS." in submitted.text
+    assert "Confirm or transmit them" in submitted.text
+    assert "Refresh order status" in submitted.text
     assert 'data-submission-review' in submitted.text
+    assert 'data-cancelled-bracket-recovery-dialog' not in submitted.text
     assert workbench._toast is None
     assert "Awaiting TWS verification" in submitted.text
     assert "VERIFY IN TWS" in submitted.text
@@ -2643,6 +2668,7 @@ def test_unknown_submission_uses_guided_refresh_without_error_toast(
     assert response.status_code == 200
     assert "Orders sent to TWS" in response.text, workbench._status_message
     assert 'data-submission-review' in response.text
+    assert 'data-cancelled-bracket-recovery-dialog' not in response.text
     assert workbench._toast is None
 
 
@@ -2662,7 +2688,7 @@ def test_order_status_check_closes_dialog_even_when_planning_stays_blocked(
     monkeypatch.setattr(workbench, "_refresh_locked", refreshed)
     client = TestClient(workbench.app)
     prompt = client.get(workbench.path).text
-    assert "Check order status" in prompt
+    assert "Refresh order status" in prompt
     assert "If you cancel the bracket" not in prompt
 
     response = client.post(workbench.path + "action", data={"action": "refresh"})
