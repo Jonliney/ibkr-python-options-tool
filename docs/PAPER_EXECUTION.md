@@ -67,9 +67,11 @@ active layers.
 
 When adding a draft below pending rows, its default LMT target uses the lowest
 configured preset whose rounded sell price is above all pending and current
-draft LMT prices. If no such preset exists, Add Layer asks for a higher target
-preset rather than silently duplicating a pending price. The stop preset
-selection is unchanged; these defaults do not authorize submission.
+draft LMT prices. If no such preset exists, Add Layer repeats the final
+configured LMT preset. It can therefore share a target price with a pending
+row. The stop preset also repeats its final value when the list is exhausted.
+These defaults do not authorize submission; pending brackets still require
+TWS verification before another draft can be submitted.
 
 ## Closed bracket history
 

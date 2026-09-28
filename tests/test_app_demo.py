@@ -2349,6 +2349,16 @@ def test_pending_three_contracts_leave_four_available_for_drafting(tmp_path) -> 
     assert [layer.target_percentage for layer in workbench._current_layers()] == [
         "40", "60"
     ]
+    client.post(workbench.path + "action", data={"action": "add-layer"})
+    repeated = client.post(workbench.path + "action", data={"action": "add-layer"})
+    assert repeated.status_code == 200
+    assert [layer.target_percentage for layer in workbench._current_layers()] == [
+        "40", "60", "100", "100"
+    ]
+    assert [layer.stop_percentage for layer in workbench._current_layers()] == [
+        "25", "25", "25", "25"
+    ]
+    assert "add a higher LMT target preset" not in repeated.text
 
     blocked = client.post(
         workbench.path + "action", data={"action": "execute-arm"}

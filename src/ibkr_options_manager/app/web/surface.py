@@ -1348,18 +1348,16 @@ class StarUIWorkbench:
             if any(not price.is_finite() or price <= 0 for price in previous_targets):
                 self._message = "A pending target price is invalid; review TWS and Refresh."
                 return
-            target = _next_target_preset_above(
+            target_presets = _parse_presets(
+                self._target_presets, maximum=Decimal("1000")
+            ) or ()
+            higher_target = _next_target_preset_above(
                 previous_targets,
                 basis=basis,
                 bands=calculator.bands,
-                presets=_parse_presets(self._target_presets, maximum=Decimal("1000")) or (),
+                presets=target_presets,
             )
-            if target is None:
-                self._message = (
-                    "Add Layer blocked: add a higher LMT target preset in Settings before adding "
-                    "another layer."
-                )
-                return
+            target = higher_target if higher_target is not None else target_presets[-1]
         try:
             prices = preview_reference_prices(basis, target, stop, calculator.bands)
         except ValueError:
