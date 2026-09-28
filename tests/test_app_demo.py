@@ -2010,6 +2010,69 @@ def test_active_action_reviews_before_refresh_and_requires_execute(
         assert 'value="market-exit-confirm"' not in changed.text
 
 
+def test_draft_allocation_rejects_out_of_range_quantity() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    client = TestClient(workbench.app)
+    form = {
+        "action": "save-draft",
+        "target_1": "20",
+        "stop_1": "25",
+        "quantity_1": "2",
+    }
+
+    response = client.post(workbench.path + "action", data=form)
+    assert response.status_code == 200
+    assert workbench._current_layers()[0].quantity == "2"
+    assert 'data-live-allocation-bar' not in response.text
+
+    for invalid in ("0", "6", "2.5"):
+        response = client.post(
+            workbench.path + "action", data={**form, "quantity_1": invalid}
+        )
+        assert workbench._current_layers()[0].quantity == "2"
+        assert "Draft quantities must be whole contracts from 1 to 5" in response.text
+
+    workbench._add_layer_locked()
+    before = tuple(layer.quantity for layer in workbench._current_layers())
+    response = client.post(
+        workbench.path + "action",
+        data={
+            **form,
+            "action": "add-layer",
+            "quantity_1": "4",
+            "quantity_2": "4",
+        },
+    )
+    assert tuple(layer.quantity for layer in workbench._current_layers()) == before
+    assert "no more than 5 assigned in total" in response.text
+
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    workbench._drafts[con_id] = (replace(workbench._current_layers()[0], quantity="6"),)
+    overallocated = client.get(workbench.path)
+    assert 'data-live-allocation-bar' not in overallocated.text
+
+    workbench._paper_execution = _OwnedOrderService(set())
+    blocked = client.get(workbench.path).text
+    assert "6 contracts drafted; 5 available." in blocked
+    assert "Reduce a layer" in blocked
+    assert blocked.index("6 contracts drafted") < blocked.index("Outcome projection")
+    alert = re.search(r'<div[^>]*data-draft-quantity-alert[^>]*>', blocked)
+    assert alert is not None
+    assert "bg-destructive" in alert.group()
+    assert "border-destructive/70" in alert.group()
+    assert "text-white" in alert.group()
+    css = client.get("/layers.css").text
+    assert ".draft-quantity-alert" not in css
+    library_css = client.get("/starui.css").text
+    assert ".bg-destructive{" in library_css
+    assert ".border-destructive\\/70{" in library_css
+    assert ".text-white{" in library_css
+    execute = re.search(r'<button[^>]*value="execute-arm"[^>]*>', blocked)
+    assert execute is not None and re.search(r"\sdisabled(?:\s|>)", execute.group())
+
+
 def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -2029,9 +2092,14 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert "Connection &amp; layer defaults" in page.text
     assert "<dialog" in page.text
     assert "h-screen overflow-hidden" in page.text
+    assert 'class="workspace-content flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6"' in page.text
+    layout_css = client.get("/layers.css").text
+    assert ".workspace-content {" in layout_css
+    assert "max-width: 80rem;" in layout_css
+    assert "margin-inline: auto;" in layout_css
     assert 'aria-label="Draft layer rows"' in page.text
-    assert "contracts allocated" not in page.text
-    assert 'data-live-allocation' not in page.text
+    assert 'aria-label="Draft contracts allocated"' not in page.text
+    assert 'data-live-allocation-text' not in page.text
     assert 'aria-label="OCA layers workspace"' in page.text
     assert 'aria-label="Planned order actions"' in page.text
     assert 'id="draft-form"' in page.text
@@ -2062,6 +2130,8 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert 'data-layer-state="draft"' in draft
     assert 'data-slot="card"' not in draft
     header = page.text.split('id="draft-form"', maxsplit=1)[0]
+    assert 'data-live-allocation-bar' not in header
+    assert 'data-live-allocation-text' not in header
     assert header.index("Split all available") < header.index("Split assigned")
     assert header.index("Split assigned") < header.index("Add Layer")
     assert 'aria-label="Split draft layer quantities"' in header
@@ -2088,6 +2158,10 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert 'id="stop_1"' in draft
     assert 'for="quantity_1"' in draft
     assert 'id="quantity_1"' in draft
+    quantity_input = re.search(r'<input[^>]*id="quantity_1"[^>]*>', draft)
+    assert quantity_input is not None
+    assert 'min="1"' in quantity_input.group()
+    assert 'max="5"' in quantity_input.group()
     assert 'for="tif_1"' in draft
     assert 'id="tif_1"' in draft
     assert "w-full min-w-[41rem]" in draft
@@ -2189,6 +2263,10 @@ def test_paper_execution_control_submits_the_current_draft_form() -> None:
     assert 'id="draft-form"' in page.text
     assert 'form="draft-form"' in page.text
     assert 'name="action" value="execute-arm"' in page.text
+    execute = re.search(r'<button[^>]*value="execute-arm"[^>]*>', page.text)
+    assert execute is not None and not re.search(
+        r"\sdisabled(?:\s|>)", execute.group()
+    )
     assert "Add a layer or modify an existing one to continue." not in page.text
 
 
@@ -2267,7 +2345,7 @@ def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
     assert pending_projection.covered_gain is not None
     assert _money(pending_projection.covered_gain) in submitted.text
     assert _money(pending_projection.covered_loss) in submitted.text
-    assert "The other 5 have existing orders" in submitted.text
+    assert "The other 5 have existing orders" not in submitted.text
     assert workbench._status_message.endswith("TWS state refreshed.")
     assert len(refresh_calls) == 1
 
@@ -2328,7 +2406,8 @@ def test_pending_three_contracts_leave_four_available_for_drafting(tmp_path) -> 
     assert submitted.status_code == 200
     assert workbench._planning_available_quantity() == 4
     assert workbench._current_layers() == ()
-    assert "Available to plan" in submitted.text
+    assert "Available" in submitted.text
+    assert "Available to plan" not in submitted.text
     assert "VERIFY IN TWS" in submitted.text
     assert 'id="verify-quantity-1"' in submitted.text
     assert 'value="cancel-pair-arm:' not in submitted.text

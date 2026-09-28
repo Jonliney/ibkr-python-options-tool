@@ -364,7 +364,8 @@ class StarUIWorkbench:
             else:
                 if action not in {"execute-arm", "execute-confirm"}:
                     self._disarm_execution_locked()
-                self._save_form_locked(values)
+                if not self._save_form_locked(values):
+                    return self._page()
                 if action == "add-layer":
                     self._add_layer_locked()
                 elif action.startswith("remove-layer:"):
@@ -1276,11 +1277,32 @@ class StarUIWorkbench:
             return ()
         return self._drafts.get(self._selected_con_id, ())
 
-    def _save_form_locked(self, values: dict[str, str]) -> None:
+    def _save_form_locked(self, values: dict[str, str]) -> bool:
         self._target_presets = values.get("target_presets", self._target_presets)
         self._stop_presets = values.get("stop_presets", self._stop_presets)
         if self._selected_con_id is None:
-            return
+            return True
+        available = self._planning_available_quantity()
+        quantities = [
+            values.get(f"quantity_{index}", previous.quantity)
+            for index, previous in enumerate(self._current_layers(), start=1)
+        ]
+        try:
+            parsed = [Decimal(quantity) for quantity in quantities]
+        except InvalidOperation:
+            parsed = []
+        if (
+            len(parsed) != len(quantities)
+            or any(
+                not quantity.is_finite()
+                or quantity != quantity.to_integral_value()
+                or not 1 <= quantity <= available
+                for quantity in parsed
+            )
+            or sum(parsed) > available
+        ):
+            self._message = f"Draft quantities must be whole contracts from 1 to {available}, with no more than {available} assigned in total."
+            return False
         layers: list[DraftLayerForm] = []
         for index, previous in enumerate(self._current_layers(), start=1):
             target = values.get(f"target_{index}", previous.target_percentage)
@@ -1301,7 +1323,7 @@ class StarUIWorkbench:
                 self._message = (
                     "Targets must be above 0%; stops must be between 0% and 100%."
                 )
-                return
+                return False
             layers.append(
                 DraftLayerForm(
                     quantity=quantity,
@@ -1313,6 +1335,7 @@ class StarUIWorkbench:
                 )
             )
         self._drafts[self._selected_con_id] = tuple(layers)
+        return True
 
     def _add_layer_locked(self) -> None:
         layers = list(self._current_layers())
@@ -1994,8 +2017,7 @@ class StarUIWorkbench:
                     self._header_quantity(outcomes, selected_snapshot),
                 ),
                 _contract_header_metric(
-                    "Available to plan" if pending else "Available",
-                    f"{planning_available:g}" if draft_allowed else "—",
+                    "Available", f"{planning_available:g}" if draft_allowed else "—"
                 ),
                 _contract_header_metric(
                     "Average price", _header_price(basis, currency)
@@ -2034,7 +2056,7 @@ class StarUIWorkbench:
                 ),
                 cls="mt-5 min-h-0 flex-1 overflow-hidden",
             ),
-            cls="flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6",
+            cls="workspace-content flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6",
         )
 
     def _header_quantity(
@@ -2629,6 +2651,7 @@ class StarUIWorkbench:
         return {
             "basis": format(basis, "f"),
             "multiplier": format(multiplier, "f"),
+            "available": self._planning_available_quantity(),
             "bands": [
                 {
                     "low": format(band.low_edge, "f"),
@@ -2717,6 +2740,7 @@ class StarUIWorkbench:
                     type="number",
                     value=layer.quantity,
                     min="1",
+                    max=str(self._planning_available_quantity()),
                     step="1",
                     data_live_input="quantity",
                     data_live_layer=index,
@@ -3186,9 +3210,30 @@ class StarUIWorkbench:
                 ),
                 cls="flex min-h-0 flex-1 items-center justify-center px-6",
             ),
+            Div(self._draft_quantity_alert(), cls="mx-4 mb-3 min-w-0")
+            if draft_rows and not has_staged_action
+            else None,
             Div(self._outcome_projection(projection), cls="mx-4 mb-3"),
             self._execution_control(),
             cls="flex min-h-0 flex-col overflow-hidden border-l border-border bg-card/30",
+        )
+
+    def _draft_quantity_alert(self) -> Any:
+        available = self._planning_available_quantity()
+        drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
+        return Alert(
+            AlertDescription(
+                f"{drafted} contracts drafted; {available} available. "
+                "Reduce a layer's quantity.",
+                data_draft_quantity_message=True,
+            ),
+            data_draft_quantity_alert=True,
+            live=True,
+            cls=(
+                "min-w-0 break-words border-destructive/70 "
+                "bg-destructive text-white"
+                + ("" if drafted > available else " hidden")
+            ),
         )
 
     def _execution_control(self) -> Any:
@@ -3242,9 +3287,12 @@ class StarUIWorkbench:
             )
         has_active_layers = bool(self._active_oca_pairs())
         has_draft_layers = bool(self._current_layers())
+        available = self._planning_available_quantity()
+        drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
+        quantity_exceeded = drafted > available
         can_execute_draft = (
             self._paper_execution is not None
-            and self._state.available_quantity > 0
+            and available > 0
             and has_draft_layers
         )
         return Div(
@@ -3260,7 +3308,8 @@ class StarUIWorkbench:
                     value="execute-arm",
                     form="draft-form",
                     data_busy_text="Checking…",
-                    disabled=not can_execute_draft,
+                    data_execute_enabled=str(can_execute_draft).lower(),
+                    disabled=not can_execute_draft or quantity_exceeded,
                     cls="w-full",
                 ),
                 data_draft_execute=True,
@@ -3716,12 +3765,17 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
     const update = () => {{
       const outcomes = [];
       let invalid = false;
+      let assignedQuantity = 0;
+      let quantitiesValid = true;
       form.querySelectorAll('[data-live-input="target"]').forEach((input) => {{
         const index = input.dataset.liveLayer;
         const stopInput = form.elements[`stop_${{index}}`];
         const target = value('target', index), stop = value('stop', index);
-        const quantity = Math.trunc(value('quantity', index));
-        const valid = Number.isFinite(target) && target > 0 && Number.isFinite(stop) && stop > 0 && stop <= 100 && Number.isInteger(quantity) && quantity > 0;
+        const quantity = value('quantity', index);
+        const quantityValid = Number.isInteger(quantity) && quantity >= 1 && quantity <= config.available;
+        if (Number.isInteger(quantity) && quantity > 0) assignedQuantity += quantity;
+        else quantitiesValid = false;
+        const valid = Number.isFinite(target) && target > 0 && Number.isFinite(stop) && stop > 0 && stop <= 100 && quantityValid;
         const targetPrice = valid ? (target === Number(input.dataset.liveInitial) ? Number(input.dataset.liveOriginal) : roundUp(basis * (1 + target / 100))) : NaN;
         const stopPrice = valid ? (stop === Number(stopInput?.dataset.liveInitial) ? Number(stopInput?.dataset.liveOriginal) : roundUp(basis * (1 - stop / 100))) : NaN;
         const gain = valid && Number.isFinite(targetPrice) ? (targetPrice - basis) * multiplier * quantity : NaN;
@@ -3732,10 +3786,19 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         assigned(`[data-live-review-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? sellPriceText(stopPrice, stop === Number(stopInput?.dataset.liveInitial) ? `$${{stopInput.dataset.liveOriginal}}` : priceText(stopPrice)) : '—');
         assigned(`[data-live-outcome="target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
         assigned(`[data-live-outcome="stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} max loss` : '— max loss');
-        assigned(`[data-live-review-quantity="${{index}}"]`, `${{Number.isInteger(quantity) && quantity > 0 ? quantity : '—'}} contracts · ${{form.elements[`tif_${{index}}`]?.value || 'GTC'}}`);
+        assigned(`[data-live-review-quantity="${{index}}"]`, `${{quantityValid ? quantity : '—'}} contracts · ${{form.elements[`tif_${{index}}`]?.value || 'GTC'}}`);
         if (Number.isFinite(gain) && Number.isFinite(loss)) outcomes.push({{ quantity, gain, loss }});
         else invalid = true;
       }});
+      const over = assignedQuantity > config.available;
+      const quantityAlert = document.querySelector('[data-draft-quantity-alert]');
+      if (quantityAlert) {{
+        quantityAlert.classList.toggle('hidden', !over);
+        if (over) quantityAlert.querySelector('[data-draft-quantity-message]').textContent = `${{assignedQuantity}} contracts drafted; ${{config.available}} available. Reduce a layer's quantity.`;
+      }}
+      const executeButton = document.querySelector('[data-draft-execute] [data-execute-enabled]');
+      if (executeButton) executeButton.disabled = executeButton.dataset.executeEnabled !== 'true' || over;
+      invalid = invalid || !quantitiesValid || over;
       window.ibkrProjection?.updateDraft(outcomes, invalid);
     }};
     form.querySelectorAll('[data-live-input]').forEach((input) => input.addEventListener('input', update));

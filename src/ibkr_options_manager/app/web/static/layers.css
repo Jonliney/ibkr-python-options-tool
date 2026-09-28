@@ -7,6 +7,12 @@
   pointer-events: none;
 }
 
+.workspace-content {
+  width: 100%;
+  max-width: 80rem;
+  margin-inline: auto;
+}
+
 .contract-header-facts {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
