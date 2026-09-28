@@ -145,10 +145,7 @@ def test_selected_contract_header_uses_verified_position_and_quote_values() -> N
     assert "Max loss" in page
     assert "+$280.00" in page
     assert "-$340.00" in page
-    assert (
-        "Projection covers 5 held contracts. The other 5 have existing orders; "
-        "their outcome is not included."
-    ) in page
+    assert "Projection covers 5 held contracts" not in page
     assert "Average price" in page
     assert ">$2.74<" in page
     assert "Last bid" in page
@@ -1404,6 +1401,24 @@ def test_active_layer_prefers_configured_percentage_over_rounded_inverse() -> No
     assert percentage == "20"
 
 
+def test_draft_prices_stay_fixed_when_an_action_keeps_percentages() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    original = workbench._current_layers()[0]
+    changed_basis = (workbench._state.unit_basis or Decimal("1")) + Decimal("0.01")
+    workbench._state = replace(workbench._state, unit_basis=changed_basis)
+
+    workbench._save_form_locked({"quantity_1": original.quantity})
+    saved = workbench._current_layers()[0]
+    assert saved.target_price == original.target_price
+    assert saved.stop_price == original.stop_price
+
+    workbench._save_form_locked({"target_1": "40"})
+    edited = workbench._current_layers()[0]
+    assert edited.target_price != original.target_price
+    assert edited.stop_price == original.stop_price
+
+
 def test_active_layer_keeps_an_acknowledged_stop_display_until_tws_refreshes_it() -> (
     None
 ):
@@ -2326,7 +2341,7 @@ def test_pending_three_contracts_leave_four_available_for_drafting(tmp_path) -> 
     assert config["pendingQuantity"] == "3"
     assert pending_projection.covered_quantity == 3
     assert pending_projection.covered_gain is not None
-    assert "Includes 3 contracts awaiting TWS verification" in submitted.text
+    assert "Includes 3 contracts awaiting TWS verification" not in submitted.text
 
     client.post(workbench.path + "action", data={"action": "add-layer"})
     assert [layer.quantity for layer in workbench._current_layers()] == ["4"]
@@ -2340,10 +2355,7 @@ def test_pending_three_contracts_leave_four_available_for_drafting(tmp_path) -> 
     projected_page = client.get(workbench.path).text
     assert _money(projected.expected_gain) in projected_page
     assert _money(projected.max_loss) in projected_page
-    assert (
-        "Includes 3 contracts awaiting TWS verification"
-        in projected_page
-    )
+    assert "Includes 3 contracts awaiting TWS verification" not in projected_page
     client.post(workbench.path + "action", data={"action": "add-layer"})
     assert [layer.quantity for layer in workbench._current_layers()] == ["2", "2"]
     assert [layer.target_percentage for layer in workbench._current_layers()] == [

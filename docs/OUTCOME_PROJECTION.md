@@ -19,12 +19,11 @@ remove its contracts from the held position.
 Whole-position totals require scenarios for every held contract and resolved
 broker, fill, and price data. When some contracts have existing orders outside
 the app, the projection shows the verified draft and active-layer subtotal
-under the Expected gain and Max loss labels, with a sentence identifying how
-many held contracts are excluded. A fully acknowledged layer awaiting TWS
+under the Expected gain and Max loss labels. A fully acknowledged layer awaiting TWS
 verification contributes its submitted target and stop prices as an
-illustrative scenario. The status sentence names the pending quantity and
-states that those exits may not yet be working in TWS. Pending scenarios do
-not count as verified protection or permit another submission.
+illustrative scenario. Its tooltip explains that the submitted exits may not
+yet be working in TWS. Pending scenarios do not count as verified protection
+or permit another submission.
 Unknown sold P&L, uncertain or partial layers, invalid inputs, and market
 exits with unknown fill prices remain incomplete.
 An overallocated plan is also incomplete.
@@ -42,8 +41,8 @@ outcome worsened; a down arrow means it improved. The browser updates this
 illustrative preview while editing; the server recomputes it with Decimal
 arithmetic when rendering an action. A new snapshot establishes a new
 comparison baseline. A market exit cannot have a deterministic P&L before its
-fill is observed. The complete-position status sentence is omitted; status
-text appears only when a projection needs explanation. Both comparisons use
+fill is observed. Routine coverage and pending-order status text is omitted;
+status text appears only for invalid or unresolved projections. Both comparisons use
 neutral grey on a dedicated line; an unchanged or unavailable comparison shows
 `(—)` to keep the metric height stable.
 

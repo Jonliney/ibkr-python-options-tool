@@ -1288,10 +1288,11 @@ class StarUIWorkbench:
             quantity = values.get(f"quantity_{index}", previous.quantity)
             tif = values.get(f"tif_{index}", previous.tif)
             try:
+                target_value, stop_value = Decimal(target), Decimal(stop)
                 prices = preview_reference_prices(
                     self._state.unit_basis or Decimal("0"),
-                    Decimal(target),
-                    Decimal(stop),
+                    target_value,
+                    stop_value,
                     self._state.quote_calculator.bands
                     if self._state.quote_calculator is not None
                     else (),
@@ -1304,10 +1305,10 @@ class StarUIWorkbench:
             layers.append(
                 DraftLayerForm(
                     quantity=quantity,
-                    target_price=format(prices.target_price, "f"),
-                    stop_price=format(prices.stop_price, "f"),
-                    target_percentage=format(Decimal(target), "f"),
-                    stop_percentage=format(Decimal(stop), "f"),
+                    target_price=(previous.target_price if target_value == Decimal(previous.target_percentage) else format(prices.target_price, "f")),
+                    stop_price=(previous.stop_price if stop_value == Decimal(previous.stop_percentage) else format(prices.stop_price, "f")),
+                    target_percentage=format(target_value, "f"),
+                    stop_percentage=format(stop_value, "f"),
                     tif=tif if tif in {"GTC", "DAY"} else previous.tif,
                 )
             )
@@ -2672,6 +2673,8 @@ class StarUIWorkbench:
                     step="0.1",
                     data_live_input="target",
                     data_live_layer=index,
+                    data_live_initial=layer.target_percentage,
+                    data_live_original=layer.target_price,
                     cls="pr-8",
                 ),
                 input_id=f"target_{index}",
@@ -2694,6 +2697,8 @@ class StarUIWorkbench:
                     step="0.1",
                     data_live_input="stop",
                     data_live_layer=index,
+                    data_live_initial=layer.stop_percentage,
+                    data_live_original=layer.stop_price,
                     cls="pr-8",
                 ),
                 input_id=f"stop_{index}",
@@ -2974,7 +2979,6 @@ class StarUIWorkbench:
             baseline,
             proposed_outcome,
             {
-                "externalOrders": self._order_coverage()[0] in {"external", "mixed"},
                 "held": format(held, "f"),
                 "realized": format(realized, "f"),
                 "unresolved": unresolved,
@@ -3025,7 +3029,6 @@ class StarUIWorkbench:
         )
         status = _projection_status(
             outcome, config["unresolved"], config["marketExit"],
-            config["externalOrders"], Decimal(config["pendingQuantity"]),
         )
         return Card(
             CardHeader(
@@ -3694,7 +3697,7 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
     const value = (name, index) => Number(form.elements[`${{name}}_${{index}}`]?.value);
     const assigned = (selector, text) => document.querySelectorAll(selector).forEach((node) => {{ node.textContent = text; }});
     const priceText = (number) => `$${{Number(number.toFixed(6)).toString()}}`;
-    const sellPriceText = (number) => `${{priceText(number)}} (${{((number / basis - 1) * 100) >= 0 ? '+' : ''}}${{((number / basis - 1) * 100).toFixed(1)}}%)`;
+    const sellPriceText = (number, display = priceText(number)) => `${{display}} (${{((number / basis - 1) * 100) >= 0 ? '+' : ''}}${{((number / basis - 1) * 100).toFixed(1)}}%)`;
     const money = (number) => `${{number >= 0 ? '+' : '-'}}$${{Math.abs(number).toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})}}`;
     const roundUp = (number) => {{
       let candidate = number;
@@ -3715,17 +3718,18 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
       let invalid = false;
       form.querySelectorAll('[data-live-input="target"]').forEach((input) => {{
         const index = input.dataset.liveLayer;
+        const stopInput = form.elements[`stop_${{index}}`];
         const target = value('target', index), stop = value('stop', index);
         const quantity = Math.trunc(value('quantity', index));
         const valid = Number.isFinite(target) && target > 0 && Number.isFinite(stop) && stop > 0 && stop <= 100 && Number.isInteger(quantity) && quantity > 0;
-        const targetPrice = valid ? roundUp(basis * (1 + target / 100)) : NaN;
-        const stopPrice = valid ? roundUp(basis * (1 - stop / 100)) : NaN;
+        const targetPrice = valid ? (target === Number(input.dataset.liveInitial) ? Number(input.dataset.liveOriginal) : roundUp(basis * (1 + target / 100))) : NaN;
+        const stopPrice = valid ? (stop === Number(stopInput?.dataset.liveInitial) ? Number(stopInput?.dataset.liveOriginal) : roundUp(basis * (1 - stop / 100))) : NaN;
         const gain = valid && Number.isFinite(targetPrice) ? (targetPrice - basis) * multiplier * quantity : NaN;
         const loss = valid && Number.isFinite(stopPrice) ? (stopPrice - basis) * multiplier * quantity : NaN;
-        assigned(`[data-live-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? priceText(targetPrice) : '—');
-        assigned(`[data-live-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? priceText(stopPrice) : '—');
-        assigned(`[data-live-review-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? sellPriceText(targetPrice) : '—');
-        assigned(`[data-live-review-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? sellPriceText(stopPrice) : '—');
+        assigned(`[data-live-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? (target === Number(input.dataset.liveInitial) ? `$${{input.dataset.liveOriginal}}` : priceText(targetPrice)) : '—');
+        assigned(`[data-live-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? (stop === Number(stopInput?.dataset.liveInitial) ? `$${{stopInput.dataset.liveOriginal}}` : priceText(stopPrice)) : '—');
+        assigned(`[data-live-review-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? sellPriceText(targetPrice, target === Number(input.dataset.liveInitial) ? `$${{input.dataset.liveOriginal}}` : priceText(targetPrice)) : '—');
+        assigned(`[data-live-review-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? sellPriceText(stopPrice, stop === Number(stopInput?.dataset.liveInitial) ? `$${{stopInput.dataset.liveOriginal}}` : priceText(stopPrice)) : '—');
         assigned(`[data-live-outcome="target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
         assigned(`[data-live-outcome="stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} max loss` : '— max loss');
         assigned(`[data-live-review-quantity="${{index}}"]`, `${{Number.isInteger(quantity) && quantity > 0 ? quantity : '—'}} contracts · ${{form.elements[`tif_${{index}}`]?.value || 'GTC'}}`);
@@ -3799,14 +3803,14 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         const index = targetInput.dataset.liveLayer;
         const target = Number(targetInput.value), stop = Number(stopInput?.value);
         const quantity = Number(form.querySelector(`[data-active-quantity="${{permId}}"]`)?.value);
-        const targetPrice = Number.isFinite(target) && target > 0 ? roundUp(basis * (1 + target / 100)) : NaN;
-        const stopPrice = Number.isFinite(stop) && stop >= 0 && stop <= 100 ? roundUp(basis * (1 - stop / 100)) : NaN;
+        const targetPrice = Number.isFinite(target) && target > 0 ? (target === Number(targetInput.dataset.activeInitial) ? Number(targetInput.dataset.activeOriginal) : roundUp(basis * (1 + target / 100))) : NaN;
+        const stopPrice = Number.isFinite(stop) && stop >= 0 && stop <= 100 ? (stop === Number(stopInput?.dataset.activeInitial) ? Number(stopInput?.dataset.activeOriginal) : roundUp(basis * (1 - stop / 100))) : NaN;
         const gain = Number.isFinite(targetPrice) && Number.isFinite(quantity) ? (targetPrice - basis) * multiplier * quantity : NaN;
         const loss = Number.isFinite(stopPrice) && Number.isFinite(quantity) ? (stopPrice - basis) * multiplier * quantity : NaN;
         if (Number.isFinite(gain) && Number.isFinite(loss) && quantity > 0) outcomes.push({{ id: Number(permId), quantity, gain, loss }});
         else invalid = true;
-        assigned(`[data-live-price="active-target-${{index}}"]`, Number.isFinite(targetPrice) ? priceText(targetPrice) : '—');
-        assigned(`[data-live-price="active-stop-${{index}}"]`, Number.isFinite(stopPrice) ? priceText(stopPrice) : '—');
+        assigned(`[data-live-price="active-target-${{index}}"]`, Number.isFinite(targetPrice) ? (target === Number(targetInput.dataset.activeInitial) ? `$${{targetInput.dataset.activeOriginal}}` : priceText(targetPrice)) : '—');
+        assigned(`[data-live-price="active-stop-${{index}}"]`, Number.isFinite(stopPrice) ? (stop === Number(stopInput?.dataset.activeInitial) ? `$${{stopInput.dataset.activeOriginal}}` : priceText(stopPrice)) : '—');
         assigned(`[data-live-outcome="active-target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
         assigned(`[data-live-outcome="active-stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} max loss` : '— max loss');
         const originalTarget = Number(targetInput.dataset.activeOriginal);
@@ -4489,8 +4493,6 @@ def _projection_status(
     outcome: PositionOutcome,
     unresolved: bool,
     market_exit: bool,
-    external_orders: bool,
-    pending_quantity: Decimal = Decimal("0"),
 ) -> str:
     if market_exit:
         return ""
@@ -4500,27 +4502,7 @@ def _projection_status(
         return "Broker or layer state needs verification before a whole-position total is available."
     if outcome.covered_quantity > outcome.held_quantity:
         return "Proposed exits exceed the held quantity."
-    pending_status = (
-        f"Includes {format(pending_quantity, 'f')} contracts awaiting TWS "
-        "verification; their submitted exits may not be working."
-        if pending_quantity
-        else ""
-    )
-    if outcome.uncovered_quantity:
-        covered = format(outcome.covered_quantity, "f")
-        uncovered = format(outcome.uncovered_quantity, "f")
-        if external_orders:
-            coverage = (
-                f"Projection covers {covered} held contracts. The other {uncovered} "
-                "have existing orders; their outcome is not included."
-            )
-        else:
-            coverage = (
-                f"Projection covers {covered} held contracts. The other {uncovered} "
-                "have no target and stop in this plan."
-            )
-        return f"{coverage} {pending_status}".strip()
-    return pending_status
+    return ""
 
 
 def _projection_script(configuration: dict[str, Any]) -> str:
@@ -4563,8 +4545,6 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       const covered = exits.reduce((total, item) => total + Number(item.quantity), 0);
       const gain = Number(config.realized) + exits.reduce((total, item) => total + Number(item.gain), 0);
       const loss = exits.reduce((total, item) => total + Number(item.loss), 0);
-      const uncovered = Math.max(0, Number(config.held) - covered);
-      const pending = Number(config.pendingQuantity);
       const overallocated = covered > Number(config.held) + 1e-8;
       const complete = config.marketExit || (!config.unresolved && !invalidDraft && !invalidActive && !overallocated && Number.isFinite(covered) && Math.abs(covered - Number(config.held)) < 1e-8);
       const partial = !config.marketExit && !config.unresolved && !invalidDraft && !invalidActive && !overallocated && covered > 0 && covered < Number(config.held);
@@ -4578,12 +4558,7 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       updateMetric(lossNode, projected ? (config.marketExit ? (config.baselineLoss === null ? null : Number(config.baselineLoss)) : loss) : null, lossBaseline, 'loss');
       const status = document.querySelector('[data-projection-status]');
       if (status) {{
-        const pendingStatus = pending > 0 ? `Includes ${{pending}} contracts awaiting TWS verification; their submitted exits may not be working.` : '';
-        const coverageStatus = uncovered > 0 ? config.externalOrders
-          ? `Projection covers ${{covered}} held contracts. The other ${{uncovered}} have existing orders; their outcome is not included.`
-          : `Projection covers ${{covered}} held contracts. The other ${{uncovered}} have no target and stop in this plan.`
-          : '';
-        status.textContent = config.marketExit ? '' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : overallocated ? 'Proposed exits exceed the held quantity.' : config.unresolved ? 'Broker or layer state needs verification before a whole-position total is available.' : [coverageStatus, pendingStatus].filter(Boolean).join(' ');
+        status.textContent = config.marketExit ? '' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : overallocated ? 'Proposed exits exceed the held quantity.' : config.unresolved ? 'Broker or layer state needs verification before a whole-position total is available.' : '';
         status.classList.toggle('hidden', !status.textContent);
       }}
     }};
