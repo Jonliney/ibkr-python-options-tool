@@ -352,37 +352,55 @@ class ExecutionJournal:
         )
 
     def dismiss_cancelled_layer(
-        self, snapshot: BrokerSnapshot, fingerprint: str, layer_index: int
+        self,
+        snapshot: BrokerSnapshot,
+        fingerprint: str,
+        attempt_captured_at: str,
+        layer_index: int,
     ) -> JournalEntry:
         """Hide a verified cancelled row without erasing its safety history."""
         entries = list(self._entries())
         matches = [
             index for index, entry in enumerate(entries)
             if entry.fingerprint == fingerprint
+            and entry.snapshot_captured_at == attempt_captured_at
             and entry.account == snapshot.selected.account
             and entry.con_id == snapshot.selected.con_id
+            and 0 <= layer_index < len(entry.layers)
+            and entry.layers[layer_index].cancelled
         ]
-        if (
-            len(matches) != 1
-            or not snapshot.complete
-            or not snapshot.fresh
-            or not snapshot.executions_complete
-        ):
-            raise ExecutionBlocked("a fresh, exact cancelled bracket is required")
+        if len(matches) != 1:
+            raise ExecutionBlocked(
+                "the cancelled bracket record is missing or ambiguous"
+            )
         entry_index = matches[0]
         entry = entries[entry_index]
-        if not 0 <= layer_index < len(entry.layers):
-            raise ExecutionBlocked("the cancelled layer is missing")
         layer = entry.layers[layer_index]
         group = f"{fingerprint[:12]}/tranche-{layer_index + 1}"
-        ids = {layer.target_perm_id, layer.stop_perm_id} - {0}
+        layer_perm_ids = (
+            entry.perm_ids[layer_index * 2 : layer_index * 2 + 2]
+            if len(entry.perm_ids) == len(entry.layers) * 2
+            else entry.perm_ids if len(entry.layers) == 1 else ()
+        )
+        ids = {
+            *layer_perm_ids,
+            layer.target_perm_id,
+            layer.stop_perm_id,
+        } - {0}
+        order_ids = set(entry.order_ids[layer_index * 2 : layer_index * 2 + 2])
+        if len(entry.layers) == 1:
+            order_ids.update(entry.order_ids)
         if (
-            not layer.cancelled
-            or any(order.oca_group == group or order.perm_id in ids
-                   for order in snapshot.working_orders)
+            any(fill.perm_id in ids for fill in entry.fills)
+            or any(
+                order.perm_id in ids
+                or order.order_id in order_ids
+                or (not ids and not order_ids and order.oca_group == group)
+                for order in snapshot.working_orders
+            )
             or any(fill.perm_id in ids for fill in snapshot.executions)
         ):
-            raise ExecutionBlocked("the bracket is not confirmed cancelled")
+            raise ExecutionBlocked("a working leg or fill is still recorded")
         layers = list(entry.layers)
         layers[layer_index] = replace(layer, hidden_from_workspace=True)
         updated = replace(entry, layers=tuple(layers))
@@ -1282,10 +1300,14 @@ class PaperExecutionService:
         )
 
     def dismiss_cancelled_layer(
-        self, snapshot: BrokerSnapshot, fingerprint: str, layer_index: int
+        self,
+        snapshot: BrokerSnapshot,
+        fingerprint: str,
+        attempt_captured_at: str,
+        layer_index: int,
     ) -> JournalEntry:
         return self._journal.dismiss_cancelled_layer(
-            snapshot, fingerprint, layer_index
+            snapshot, fingerprint, attempt_captured_at, layer_index
         )
 
     def record_completed_orders(self, snapshot: BrokerSnapshot) -> None:

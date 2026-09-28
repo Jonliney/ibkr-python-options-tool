@@ -787,17 +787,18 @@ class StarUIWorkbench:
             self._message = "Select a position before removing a cancelled row."
             return
         _, _, identity = action.partition(":")
-        fingerprint, separator, index_text = identity.partition(":")
-        if not separator:
+        parts = identity.rsplit(":", 2)
+        if len(parts) != 3:
             self._message = "Cancelled row identity is missing."
             return
+        fingerprint, attempt_captured_at, index_text = parts
         snapshot = self._view_model.latest_snapshot()
         if snapshot is None or snapshot.selected.con_id != self._selected_con_id:
             self._message = "Refresh the selected position before removing this row."
             return
         try:
             self._paper_execution.dismiss_cancelled_layer(
-                snapshot, fingerprint, int(index_text)
+                snapshot, fingerprint, attempt_captured_at, int(index_text)
             )
         except (ExecutionBlocked, ValueError) as error:
             self._message = f"Cancelled row could not be removed: {error}"
@@ -2450,7 +2451,12 @@ class StarUIWorkbench:
             for index in range(len(entry.layers))
             if not (
                 entry.layers[index].hidden_from_workspace
-                and outcome_for(entry, index).status == "CANCELLED"
+                and classify_journal_layer(
+                    entry,
+                    index,
+                    active_perm_ids=active_ids,
+                    observed_perm_ids=observed_ids,
+                ).status == "CANCELLED"
             )
         )
 
@@ -2547,7 +2553,10 @@ class StarUIWorkbench:
                 size="icon",
                 type="submit",
                 name="action",
-                value=f"dismiss-cancelled:{entry.fingerprint}:{index}",
+                value=(
+                    f"dismiss-cancelled:{entry.fingerprint}:"
+                    f"{entry.snapshot_captured_at}:{index}"
+                ),
                 aria_label=f"Remove cancelled layer {number} from view",
                 title="Remove cancelled row from view",
                 cls="relative z-[3] mt-5",
@@ -3481,13 +3490,11 @@ class StarUIWorkbench:
                     cls="text-[10px]" if draft_rows else "hidden text-[10px]",
                 ),
                 Badge(
-                    "PRICE UPDATE",
+                    "NEXT STEP",
                     variant="outline",
                     data_active_review_badge=True,
                     cls="text-[10px]" if not draft_rows else "hidden text-[10px]",
-                )
-                if has_active_layers
-                else None,
+                ),
                 cls="flex items-center",
             )
         )
@@ -3523,6 +3530,8 @@ class StarUIWorkbench:
                 cls="min-h-0 flex-1 px-4",
             )
             if draft_rows or has_active_layers
+            else self._new_layer_review_empty(overlay=False)
+            if draft_allowed and self._planning_available_quantity() > 0
             else Div(
                 P(
                     "Add a layer or modify an existing one to continue.",
@@ -3838,7 +3847,9 @@ class StarUIWorkbench:
                 )
             )
         return Div(
-            Div(
+            self._new_layer_review_empty()
+            if self._planning_available_quantity() > 0
+            else Div(
                 Div(
                     Icon("lucide:equal", cls="size-7", aria_hidden="true"),
                     cls="mb-5 flex size-14 items-center justify-center rounded-2xl border border-border bg-muted/40 text-foreground",
@@ -3865,6 +3876,39 @@ class StarUIWorkbench:
             *rows,
             data_active_review=True,
             cls="hidden min-h-full flex-1 flex-col" if hidden else "flex min-h-full flex-1 flex-col",
+        )
+
+    def _new_layer_review_empty(self, *, overlay: bool = True) -> Any:
+        available = self._planning_available_quantity()
+        return Div(
+            Div(
+                Icon("lucide:plus", cls="size-7", aria_hidden="true"),
+                cls="mb-5 flex size-14 items-center justify-center rounded-2xl border border-border bg-muted/40 text-foreground",
+            ),
+            H3(
+                "Contracts still need protection",
+                cls="text-base font-semibold tracking-tight text-foreground",
+            ),
+            P(
+                f"{available} {'contract is' if available == 1 else 'contracts are'} available for a new exit layer.",
+                cls="mt-2 max-w-64 text-center text-sm leading-6 text-muted-foreground",
+            ),
+            Button(
+                "Add a layer",
+                Icon("lucide:arrow-right", cls="size-4", aria_hidden="true"),
+                variant="outline",
+                type="submit",
+                form="draft-form",
+                name="action",
+                value="add-layer",
+                cls="mt-5 gap-2",
+            ),
+            data_active_review_empty=True,
+            cls=(
+                "absolute inset-0 flex flex-col items-center justify-center px-4 py-8 text-center"
+                if overlay
+                else "flex min-h-0 flex-1 flex-col items-center justify-center px-4 py-8 text-center"
+            ),
         )
 
     def _review_pair(self, index: int, layer: DraftLayerForm) -> Any:
@@ -4182,6 +4226,9 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       }});
       document.querySelectorAll('[data-active-review], [data-active-review-badge], [data-active-execute-control]').forEach((node) => {{
         node.classList.toggle('hidden', !showActive);
+      }});
+      document.querySelectorAll('[data-active-review-badge]').forEach((badge) => {{
+        badge.textContent = active ? 'PRICE UPDATE' : 'NEXT STEP';
       }});
       document.querySelector('[data-active-review]')?.classList.toggle('flex', showActive);
     }};

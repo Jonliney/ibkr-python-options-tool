@@ -1716,6 +1716,7 @@ def test_dismiss_cancelled_layer_keeps_journal_and_rejects_working_leg(
         account=snapshot.selected.account,
         con_id=snapshot.selected.con_id,
         state="RECONCILED",
+        snapshot_captured_at="101",
         perm_ids=(201, 202),
         layers=(JournalLayer(
             quantity=2,
@@ -1727,10 +1728,18 @@ def test_dismiss_cancelled_layer_keeps_journal_and_rejects_working_leg(
             cancelled=True,
         ),),
     )
-    journal._write((entry,))
-    fresh = replace(snapshot, executions_complete=True)
-    with pytest.raises(ExecutionBlocked, match="fresh"):
-        journal.dismiss_cancelled_layer(snapshot, fingerprint, 0)
+    earlier = replace(
+        entry,
+        state="SUPERSEDED",
+        snapshot_captured_at="100",
+        order_ids=(301, 302),
+        perm_ids=(401, 402),
+        layers=(replace(
+            entry.layers[0], target_perm_id=401, stop_perm_id=402
+        ),),
+    )
+    journal._write((earlier, entry))
+    stale = replace(snapshot, complete=False, fresh=False)
     working = WorkingOrder(
         perm_id=202,
         client_id=17,
@@ -1742,14 +1751,21 @@ def test_dismiss_cancelled_layer_keeps_journal_and_rejects_working_leg(
         status="Submitted",
         oca_group=f"{fingerprint[:12]}/tranche-1",
     )
-    with pytest.raises(ExecutionBlocked, match="not confirmed cancelled"):
+    with pytest.raises(ExecutionBlocked, match="working leg or fill"):
         journal.dismiss_cancelled_layer(
-            replace(fresh, working_orders=(working,)), fingerprint, 0
+            replace(stale, working_orders=(working,)), fingerprint, "101", 0
         )
-    hidden = journal.dismiss_cancelled_layer(fresh, fingerprint, 0)
+    newer_attempt_order = replace(working, perm_id=999, order_id=999)
+    hidden = journal.dismiss_cancelled_layer(
+        replace(stale, working_orders=(newer_attempt_order,)),
+        fingerprint,
+        "101",
+        0,
+    )
     assert hidden.layers[0].hidden_from_workspace
     assert journal.find(fingerprint) == hidden
     assert hidden.perm_ids == entry.perm_ids
+    assert not journal._entries()[0].layers[0].hidden_from_workspace
 
 
 def test_cancelled_bracket_with_a_fill_cannot_be_rebuilt(tmp_path) -> None:

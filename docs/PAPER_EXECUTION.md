@@ -214,8 +214,12 @@ read or to another saved app submission. BUY executions cannot belong to the
 SELL bracket being cancelled. An unmatched SELL execution remains ambiguous and
 blocks recovery; the dialog reports its permanent order ID for checking in TWS.
 The workspace trash control on a confirmed cancelled layer only marks that row
-as hidden. It requires a fresh complete snapshot and complete execution read,
-and refuses a still-working leg or matching fill. The full journal entry,
+as hidden. It uses the exact saved cancellation record and refuses a working
+leg or matching fill already visible in the current snapshot or journal. It
+does not require a new complete execution-history read for this display-only
+action. Repeated plans can share a fingerprint and OCA group, so the row action
+also carries the saved attempt capture time and checks that attempt's order IDs.
+The full journal entry,
 order IDs, and duplicate-submission history remain durable; a later conflicting
 broker outcome can make the layer visible again.
 

@@ -756,11 +756,11 @@ def test_confirmed_cancelled_layer_does_not_request_tws_fill_verification(
     assert "mt-2 border-t border-border pt-2" in page
 
     workbench._view_model._latest_snapshot = replace(
-        snapshot, executions_complete=True
+        snapshot, complete=False, fresh=False
     )
     removed = TestClient(workbench.app).post(
         workbench.path + "action",
-        data={"action": f"dismiss-cancelled:{'a' * 64}:0"},
+        data={"action": f"dismiss-cancelled:{'a' * 64}::0"},
     )
     assert removed.status_code == 200
     assert 'data-layer-state="cancelled"' not in removed.text
@@ -1095,7 +1095,10 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert f'aria-label="Expected gain {direction} by ${abs(delta):,.2f}"' in added_page.text
 
 
-def test_cancelled_review_with_no_draft_keeps_active_empty_state_visible() -> None:
+@pytest.mark.parametrize("available_quantity", [0, 1])
+def test_cancelled_review_with_no_draft_prioritises_unprotected_contracts(
+    available_quantity: int,
+) -> None:
     from ibkr_options_manager.app.view_model import WorkingOrderLine
 
     workbench = _demo_workbench()
@@ -1106,7 +1109,7 @@ def test_cancelled_review_with_no_draft_keeps_active_empty_state_visible() -> No
     workbench._drafts[con_id] = ()
     workbench._state = replace(
         workbench._state,
-        available_quantity=0,
+        available_quantity=available_quantity,
         working_orders=(
             WorkingOrderLine(
                 perm_id=101, order_id=11, action="SELL", order_type="LMT",
@@ -1136,17 +1139,27 @@ def test_cancelled_review_with_no_draft_keeps_active_empty_state_visible() -> No
     active_review = re.search(r'<div[^>]*data-active-review(?:\s|>)[^>]*>', page)
     assert active_badge is not None
     assert active_review is not None
+    assert "NEXT STEP" in page
     badge_classes = re.search(r'class="([^"]+)"', active_badge.group())
     review_classes = re.search(r'class="([^"]+)"', active_review.group())
     assert badge_classes is not None and 'hidden' not in badge_classes[1].split()
     assert review_classes is not None and 'hidden' not in review_classes[1].split()
-    assert "Ready to adjust a price?" in page
-    assert "Change a target or stop in an active layer to preview the update here." in page
-    assert 'data-edit-active-prices' in page
+    if available_quantity:
+        assert "Contracts still need protection" in page
+        assert "1 contract is available for a new exit layer." in page
+        assert 'form="draft-form" name="action" value="add-layer"' in page
+        assert "Ready to adjust a price?" not in page
+    else:
+        assert "Ready to adjust a price?" in page
+        assert "Change a target or stop in an active layer to preview the update here." in page
+        assert 'data-edit-active-prices' in page
     assert "firstPrice.scrollIntoView" in page
     assert re.search(r'data-active-review-empty class="absolute inset-0 flex', page)
     assert "const showActive = active || !hasDraftRows;" in _live_active_script(
         {"basis": "1", "multiplier": "100", "bands": []}
+    )
+    assert "badge.textContent = active ? 'PRICE UPDATE' : 'NEXT STEP';" in (
+        _live_active_script({"basis": "1", "multiplier": "100", "bands": []})
     )
     assert 'data-draft-execute class="hidden w-full"' in page
     assert 'data-active-execute-control class="w-full"' in page
@@ -2473,8 +2486,8 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert "Add a new layer" in response.text
     assert "Start a draft exit bracket for the available contracts." in response.text
     assert 'name="action" value="add-layer"' in response.text
-    assert response.text.count('name="action" value="add-layer"') == 2
-    assert "Add a layer or modify an existing one to continue." in response.text
+    assert response.text.count('name="action" value="add-layer"') == 3
+    assert "Contracts still need protection" in response.text
     execute = re.search(r'<button[^>]*value="execute-arm"[^>]*>', response.text)
     assert execute is not None and re.search(r"\sdisabled(?:\s|>)", execute.group())
 
@@ -2751,7 +2764,7 @@ def test_pending_three_contracts_leave_four_available_for_drafting(tmp_path) -> 
         submitted.text,
     )
     assert pending_execute is not None
-    assert "Add a layer or modify an existing one to continue." in submitted.text
+    assert "Contracts still need protection" in submitted.text
     assert "One or more brackets need review in TWS" not in submitted.text
     _baseline, pending_projection, config = workbench._projection_state()
     assert config["unresolved"] is False
