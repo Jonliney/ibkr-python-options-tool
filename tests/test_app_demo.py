@@ -138,9 +138,12 @@ def test_selected_contract_header_uses_verified_position_and_quote_values() -> N
     assert "Held / total" in page
     assert ">10 / 10<" in page
     assert "Available" in page
-    assert "5 of 10 held contracts available to bracket." in page
-    assert "Existing orders reserve 5." in page
-    assert "External orders are view-only; new brackets use only" in page
+    assert "Existing TWS exit orders" in page
+    assert "5 contracts already have exit orders in TWS." in page
+    assert "5 remain available for new brackets." in page
+    assert "Orders placed outside this app are view-only here." in page
+    assert page.index("Realised P&amp;L") < page.index("Existing TWS exit orders")
+    assert page.index("Existing TWS exit orders") < page.index("DRAFT 1")
     assert "Expected gain" in page
     assert "Max loss" in page
     assert "+$280.00" in page
@@ -682,7 +685,7 @@ def test_reconciled_app_orders_do_not_show_a_coverage_alert() -> None:
 
     assert "App-managed OCA coverage active" not in page.text
     assert "app-created orders were reconciled with TWS" not in page.text
-    assert "External orders are view-only; new brackets use only" not in page.text
+    assert "Existing TWS exit orders" not in page.text
 
 
 def test_refresh_replaces_a_draft_that_exceeds_newly_available_quantity() -> None:
@@ -2252,6 +2255,41 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert response.status_code == 200
     assert [layer.quantity for layer in workbench._current_layers()] == ["2"]
 
+    response = client.post(
+        workbench.path + "action",
+        data={
+            "action": "remove-layer:1",
+            "target_1": "40",
+            "stop_1": "25",
+            "quantity_1": "2",
+        },
+    )
+    assert response.status_code == 200
+    assert workbench._current_layers() == ()
+    assert 'aria-label="Remove layer 1"' not in response.text
+    assert 'data-draft-empty-state' in response.text
+    assert "Add a new layer" in response.text
+    assert "Start a draft exit bracket for the available contracts." in response.text
+    assert 'name="action" value="add-layer"' in response.text
+    assert response.text.count('name="action" value="add-layer"') == 2
+    assert "Add a layer or modify an existing one to continue." in response.text
+    execute = re.search(r'<button[^>]*value="execute-arm"[^>]*>', response.text)
+    assert execute is not None and re.search(r"\sdisabled(?:\s|>)", execute.group())
+
+    selected = workbench._selected_con_id
+    assert selected is not None
+    client.post(
+        workbench.path + "action",
+        data={"action": "select", "con_id": str(selected)},
+    )
+    assert workbench._current_layers() == ()
+
+    restored = client.post(workbench.path + "action", data={"action": "add-layer"})
+    assert restored.status_code == 200
+    assert len(workbench._current_layers()) == 1
+    assert 'aria-label="Remove layer 1"' in restored.text
+    assert 'data-draft-empty-state' not in restored.text
+
 
 def test_paper_execution_control_submits_the_current_draft_form() -> None:
     workbench = _demo_workbench()
@@ -2268,6 +2306,19 @@ def test_paper_execution_control_submits_the_current_draft_form() -> None:
         r"\sdisabled(?:\s|>)", execute.group()
     )
     assert "Add a layer or modify an existing one to continue." not in page.text
+
+    emptied = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={
+            "action": "remove-layer:1",
+            "target_1": "20",
+            "stop_1": "25",
+            "quantity_1": "5",
+        },
+    )
+    assert workbench._current_layers() == ()
+    execute = re.search(r'<button[^>]*value="execute-arm"[^>]*>', emptied.text)
+    assert execute is not None and re.search(r"\sdisabled(?:\s|>)", execute.group())
 
 
 def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
@@ -2413,6 +2464,11 @@ def test_pending_three_contracts_leave_four_available_for_drafting(tmp_path) -> 
     assert 'value="cancel-pair-arm:' not in submitted.text
     assert 'value="add-layer"' in submitted.text
     assert 'value="execute-arm"' not in submitted.text
+    pending_execute = re.search(
+        r'<button[^>]*disabled[^>]*>\s*Execute paper order\s*</button>',
+        submitted.text,
+    )
+    assert pending_execute is not None
     assert "Add a layer or modify an existing one to continue." in submitted.text
     assert "One or more brackets need review in TWS" not in submitted.text
     _baseline, pending_projection, config = workbench._projection_state()

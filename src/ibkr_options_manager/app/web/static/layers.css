@@ -13,6 +13,17 @@
   margin-inline: auto;
 }
 
+.draft-empty-state {
+  display: flex;
+  min-height: 20rem;
+  height: 100%;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  text-align: center;
+}
+
 .contract-header-facts {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));

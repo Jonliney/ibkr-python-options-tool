@@ -1235,10 +1235,12 @@ class StarUIWorkbench:
         con_id = self._selected_con_id
         if con_id is None:
             return
+        # An empty saved draft is an intentional reset, not a request for a
+        # replacement default layer on the next selection or refresh.
+        if con_id in self._drafts:
+            return
         if self._state.bracket_form.layers:
             self._drafts[con_id] = self._state.bracket_form.layers
-            return
-        if self._drafts.get(con_id):
             return
         if self._pending_submissions():
             # A pending send has no automatically restored draft. Let the user
@@ -1410,7 +1412,7 @@ class StarUIWorkbench:
     def _remove_layer_locked(self, index: int) -> None:
         layers = list(self._current_layers())
         con_id = self._selected_con_id
-        if len(layers) <= 1 or not 1 <= index <= len(layers):
+        if not 1 <= index <= len(layers):
             return
         if con_id is None:
             return
@@ -1852,7 +1854,7 @@ class StarUIWorkbench:
         )
 
     def _workspace(self, title: str) -> Any:
-        coverage, app_order_count, order_count = self._order_coverage()
+        coverage, _, _ = self._order_coverage()
         active_pairs = self._active_oca_pairs()
         outcomes = self._submission_outcomes()
         active_target_ids = {target.perm_id for _group, target, _stop in active_pairs}
@@ -1901,9 +1903,6 @@ class StarUIWorkbench:
             if realized is not None:
                 realized += outcome.realized_pnl
         return Div(
-            self._coverage_alert(
-                coverage, app_order_count, order_count, selected_snapshot
-            ),
             Div(
                 H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
                 Div(
@@ -2035,17 +2034,24 @@ class StarUIWorkbench:
             )
             if selected_snapshot is not None
             else None,
+            self._coverage_alert(coverage, selected_snapshot),
             Div(
                 ScrollArea(
                     self._existing_layers_panel(active_pairs, outcomes)
                     if active_pairs or outcomes
                     else None,
                     Div(
-                        self._draft_panel(),
+                        self._draft_panel(
+                            show_empty_state=not (active_pairs or outcomes)
+                        ),
                         cls=(
                             "mt-2 border-t border-border"
                             if pending
-                            else "mt-9" if active_pairs or outcomes else ""
+                            else "mt-9"
+                            if active_pairs or outcomes
+                            else "h-full"
+                            if not self._current_layers()
+                            else ""
                         ),
                     )
                     if draft_allowed and planning_available > 0
@@ -2566,47 +2572,53 @@ class StarUIWorkbench:
     def _coverage_alert(
         self,
         coverage: str,
-        app_order_count: int,
-        order_count: int,
         snapshot: BrokerSnapshot | None,
     ) -> Any:
         held = snapshot.position.quantity if snapshot is not None else None
         available = self._state.available_quantity
         reserved = held - available if held is not None else None
-        quantity_message = (
-            f"{available:g} of {held:g} held contracts available to bracket. "
-            f"Existing orders reserve {reserved:g}. "
+        message = (
+            f"{reserved:g} {'contract already has' if reserved == 1 else 'contracts already have'} exit orders in TWS. "
+            f"{available:g} {'remains' if available == 1 else 'remain'} available for new brackets. "
             if reserved is not None and reserved >= 0
-            else f"{available:g} contracts available to bracket. "
+            else f"{available:g} {'contract remains' if available == 1 else 'contracts remain'} available for new brackets. "
         )
-        if coverage == "mixed":
+        if coverage in {"mixed", "external"}:
             return Alert(
-                AlertTitle("Existing orders reserve contracts"),
+                AlertTitle("Existing TWS exit orders"),
                 AlertDescription(
-                    quantity_message
-                    + f"{app_order_count} of {order_count} related orders are app-managed. "
-                    "External orders are view-only; new brackets use only the available contracts."
+                    message + "Orders placed outside this app are view-only here."
                 ),
-                cls="mb-5 border-amber-500/40 bg-amber-500/10 text-amber-100",
-            )
-        if coverage == "external":
-            return Alert(
-                AlertTitle("Existing orders reserve contracts"),
-                AlertDescription(
-                    quantity_message
-                    + "External orders are view-only; new brackets use only the available contracts."
-                ),
-                cls="mb-5 border-amber-500/40 bg-amber-500/10 text-amber-100",
+                cls="mt-5 border-amber-500/40 bg-amber-500/10 text-amber-100",
             )
         return Div(cls="hidden")
 
-    def _draft_panel(self) -> Any:
+    def _draft_panel(self, *, show_empty_state: bool = False) -> Any:
         layers = self._current_layers()
         return Form(
-            ScrollArea(
+            Div(
+                H3("Add a new layer", cls="text-lg font-semibold"),
+                P(
+                    "Start a draft exit bracket for the available contracts. "
+                    "You can adjust its target, stop, and quantity before reviewing the order.",
+                    cls="mt-2 max-w-md text-sm leading-6 text-muted-foreground",
+                ),
+                Button(
+                    Icon("lucide:plus", cls="size-4", aria_hidden="true"),
+                    "Add Layer",
+                    type="submit",
+                    name="action",
+                    value="add-layer",
+                    cls="mt-5",
+                ),
+                data_draft_empty_state=True,
+                cls="draft-empty-state",
+            )
+            if show_empty_state and not layers
+            else ScrollArea(
                 Div(
                     *[
-                        self._draft_layer_row(index, layer, len(layers))
+                        self._draft_layer_row(index, layer)
                         for index, layer in enumerate(layers, start=1)
                     ],
                     cls="oca-layer-list w-full min-w-[41rem]",
@@ -2639,6 +2651,7 @@ class StarUIWorkbench:
             id="draft-form",
             action=f"/{self.session_token}/action",
             method="post",
+            cls="h-full" if show_empty_state and not layers else "",
         )
 
     def _live_draft_configuration(self) -> dict[str, Any] | None:
@@ -2679,7 +2692,7 @@ class StarUIWorkbench:
             ],
         }
 
-    def _draft_layer_row(self, index: int, layer: DraftLayerForm, count: int) -> Any:
+    def _draft_layer_row(self, index: int, layer: DraftLayerForm) -> Any:
         tif_signal = Signal(f"tif_{index}_value", _ref_only=True)
         gain, loss = self._layer_projection(layer)
         return _layer_row_layout(
@@ -2775,7 +2788,6 @@ class StarUIWorkbench:
                 type="submit",
                 name="action",
                 value=f"remove-layer:{index}",
-                disabled=count <= 1,
                 aria_label=f"Remove layer {index}",
                 cls="mt-5",
             ),
@@ -3238,7 +3250,16 @@ class StarUIWorkbench:
 
     def _execution_control(self) -> Any:
         if self._pending_submissions():
-            return None
+            return Div(
+                Button(
+                    "Execute paper order",
+                    variant="default",
+                    type="button",
+                    disabled=True,
+                    cls="w-full",
+                ),
+                cls="mx-4 mb-4 w-[calc(100%-2rem)]",
+            )
         market_exits = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
