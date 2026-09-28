@@ -34,6 +34,7 @@ from ibkr_options_manager.app.web.surface import (
     _contract_display_name,
     _live_active_script,
     _money,
+    _next_target_preset_above,
     _position_identity,
     _price_update_impact,
     _projection_gain_value,
@@ -139,7 +140,7 @@ def test_selected_contract_header_uses_verified_position_and_quote_values() -> N
     assert "Available" in page
     assert "5 of 10 held contracts available to bracket." in page
     assert "Existing orders reserve 5." in page
-    assert "External orders are view-only and block paper execution" in page
+    assert "External orders are view-only; new brackets use only" in page
     assert "Expected gain" in page
     assert "Max loss" in page
     assert "+$280.00" in page
@@ -684,7 +685,7 @@ def test_reconciled_app_orders_do_not_show_a_coverage_alert() -> None:
 
     assert "App-managed OCA coverage active" not in page.text
     assert "app-created orders were reconciled with TWS" not in page.text
-    assert "External orders are view-only and block paper execution" not in page.text
+    assert "External orders are view-only; new brackets use only" not in page.text
 
 
 def test_refresh_replaces_a_draft_that_exceeds_newly_available_quantity() -> None:
@@ -2176,7 +2177,7 @@ def test_paper_execution_control_submits_the_current_draft_form() -> None:
     assert "Add a layer or modify an existing one to continue." not in page.text
 
 
-def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
+def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
     tmp_path,
 ) -> None:
     def clock() -> Decimal:
@@ -2203,7 +2204,10 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
         ),
     )
     workbench.load_demo_data()
-    workbench._select_locked(1_002_100_161)  # NVDA has no associated demo order.
+    selected = 1_001_500_251  # MSTR has an external SELL for 5 of 10 contracts.
+    workbench._add_layer_locked()
+    workbench._add_layer_locked()
+    assert [layer.quantity for layer in workbench._current_layers()] == ["2", "2", "1"]
     client = TestClient(workbench.app)
     original_refresh = workbench._view_model.refresh_portfolio
     refresh_calls: list[object] = []
@@ -2236,9 +2240,19 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
     assert workbench._toast.title == "Bracket orders sent to TWS"
     assert workbench._toast.description == "Check TWS for any required Transmit."
     assert "Awaiting TWS verification" in submitted.text
-    assert "SELL LMT" in submitted.text
-    assert "Waiting for TWS" in submitted.text
+    assert "VERIFY IN TWS" in submitted.text
+    assert 'data-layer-state="verify"' in submitted.text
+    assert "Waiting for TWS" not in submitted.text
+    assert "One or more brackets need review in TWS" not in submitted.text
     assert 'value="execute-arm"' not in submitted.text
+    _baseline, pending_projection, projection_config = workbench._projection_state()
+    assert projection_config["unresolved"] is False
+    assert projection_config["pendingQuantity"] == "5"
+    assert pending_projection.covered_quantity == 5
+    assert pending_projection.covered_gain is not None
+    assert _money(pending_projection.covered_gain) in submitted.text
+    assert _money(pending_projection.covered_loss) in submitted.text
+    assert "The other 5 have existing orders" in submitted.text
     assert workbench._status_message.endswith("TWS state refreshed.")
     assert len(refresh_calls) == 1
 
@@ -2248,12 +2262,167 @@ def test_demo_execution_uses_the_same_two_click_flow_without_contacting_tws(
     )
     assert "Awaiting TWS verification" in client.get(workbench.path).text
 
-    entry = journal.submission_entries(account=DEMO_ACCOUNT, con_id=1_002_100_161)[0]
+    entry = journal.submission_entries(account=DEMO_ACCOUNT, con_id=selected)[0]
+    assert len(entry.layers) == 3
+    assert sum(layer.quantity for layer in entry.layers) == 5
     journal.mark_unknown(entry.fingerprint)
     unknown = client.get(workbench.path)
     assert 'data-layer-state="verify"' in unknown.text
     assert "Outcome not confirmed" in unknown.text
     assert 'value="execute-arm"' not in unknown.text
+
+
+def test_pending_three_contracts_leave_four_available_for_drafting(tmp_path) -> None:
+    def clock() -> Decimal:
+        return Decimal("100")
+
+    broker = DemoReadOnlyBroker(clock=clock, paper_execution_enabled=True)
+    snapshots = SnapshotCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock)
+    portfolio = PortfolioCoordinator(
+        broker,
+        max_age_seconds=Decimal("15"),
+        clock=clock,
+        paper_execution_mode=True,
+    )
+    from ibkr_options_manager.app.view_model import PlannerViewModel
+
+    workbench = StarUIWorkbench(
+        PlannerViewModel(snapshots, portfolio=portfolio, clock=clock),
+        initial_account=DEMO_ACCOUNT,
+        demo_mode=True,
+        paper_execution=PaperExecutionService(
+            DemoPaperExecutionTransport(),
+            ExecutionJournal(tmp_path / "paper-journal.json"),
+        ),
+    )
+    workbench.load_demo_data()
+    selected = 1_002_100_161  # NVDA has 7 held and no related demo order.
+    workbench._select_locked(selected)
+    workbench._drafts[selected] = (
+        replace(workbench._current_layers()[0], quantity="3"),
+    )
+    client = TestClient(workbench.app)
+
+    assert ">Confirm<" in client.post(
+        workbench.path + "action", data={"action": "execute-arm"}
+    ).text
+    submitted = client.post(
+        workbench.path + "action", data={"action": "execute-confirm"}
+    )
+
+    assert submitted.status_code == 200
+    assert workbench._planning_available_quantity() == 4
+    assert workbench._current_layers() == ()
+    assert "Available to plan" in submitted.text
+    assert "VERIFY IN TWS" in submitted.text
+    assert 'id="verify-quantity-1"' in submitted.text
+    assert 'value="cancel-pair-arm:' not in submitted.text
+    assert 'value="add-layer"' in submitted.text
+    assert 'value="execute-arm"' not in submitted.text
+    assert "Add a layer or modify an existing one to continue." in submitted.text
+    assert "One or more brackets need review in TWS" not in submitted.text
+    _baseline, pending_projection, config = workbench._projection_state()
+    assert config["unresolved"] is False
+    assert config["pendingQuantity"] == "3"
+    assert pending_projection.covered_quantity == 3
+    assert pending_projection.covered_gain is not None
+    assert "Includes 3 contracts awaiting TWS verification" in submitted.text
+
+    client.post(workbench.path + "action", data={"action": "add-layer"})
+    assert [layer.quantity for layer in workbench._current_layers()] == ["4"]
+    assert [layer.target_percentage for layer in workbench._current_layers()] == ["40"]
+    _baseline, projected, config = workbench._projection_state()
+    assert config["unresolved"] is False
+    assert config["pendingQuantity"] == "3"
+    assert projected.covered_quantity == 7
+    assert projected.expected_gain is not None
+    assert projected.max_loss is not None
+    projected_page = client.get(workbench.path).text
+    assert _money(projected.expected_gain) in projected_page
+    assert _money(projected.max_loss) in projected_page
+    assert (
+        "Includes 3 contracts awaiting TWS verification"
+        in projected_page
+    )
+    client.post(workbench.path + "action", data={"action": "add-layer"})
+    assert [layer.quantity for layer in workbench._current_layers()] == ["2", "2"]
+    assert [layer.target_percentage for layer in workbench._current_layers()] == [
+        "40", "60"
+    ]
+
+    blocked = client.post(
+        workbench.path + "action", data={"action": "execute-arm"}
+    )
+    assert blocked.status_code == 200
+    assert workbench._message.startswith("Review pending brackets in TWS and Refresh")
+    assert workbench._armed_execution is None
+
+
+def test_next_draft_target_uses_pending_limit_price() -> None:
+    bands = (PriceBand(Decimal("0"), Decimal("0.05")),)
+    presets = (Decimal("20"), Decimal("40"), Decimal("60"))
+    assert _next_target_preset_above(
+        (Decimal("5.90"),),
+        basis=Decimal("4.20"),
+        bands=bands,
+        presets=presets,
+    ) == Decimal("60")
+    assert _next_target_preset_above(
+        (Decimal("6.75"),), basis=Decimal("4.20"), bands=bands, presets=presets
+    ) is None
+
+
+@pytest.mark.parametrize("new_remaining", ["4", "6"])
+def test_external_order_change_before_confirmation_blocks_demo_submission(
+    tmp_path, new_remaining: str,
+) -> None:
+    def clock() -> Decimal:
+        return Decimal("100")
+
+    broker = DemoReadOnlyBroker(clock=clock, paper_execution_enabled=True)
+    snapshots = SnapshotCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock)
+    portfolio = PortfolioCoordinator(
+        broker,
+        max_age_seconds=Decimal("15"),
+        clock=clock,
+        paper_execution_mode=True,
+    )
+    from ibkr_options_manager.app.view_model import PlannerViewModel
+
+    journal = ExecutionJournal(tmp_path / "paper-journal.json")
+    workbench = StarUIWorkbench(
+        PlannerViewModel(snapshots, portfolio=portfolio, clock=clock),
+        initial_account=DEMO_ACCOUNT,
+        demo_mode=True,
+        paper_execution=PaperExecutionService(DemoPaperExecutionTransport(), journal),
+    )
+    workbench.load_demo_data()
+    client = TestClient(workbench.app)
+    armed = client.post(workbench.path + "action", data={"action": "execute-arm"})
+    assert ">Confirm<" in armed.text
+
+    original_capture = broker.capture
+
+    def changed_capture(request):
+        capture = original_capture(request)
+        return replace(
+            capture,
+            orders=tuple(
+                replace(order, remaining=Decimal(new_remaining))
+                for order in capture.orders
+            ),
+        )
+
+    broker.capture = changed_capture  # type: ignore[method-assign]
+    confirmed = client.post(
+        workbench.path + "action", data={"action": "execute-confirm"}
+    )
+
+    assert any(
+        word in (workbench._message or "").lower()
+        for word in ("blocked", "changed")
+    ), workbench._message
+    assert journal.submission_entries(account=DEMO_ACCOUNT, con_id=1_001_500_251) == ()
 
 
 def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(

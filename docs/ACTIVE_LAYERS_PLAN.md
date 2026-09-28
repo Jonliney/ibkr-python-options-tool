@@ -20,7 +20,7 @@ still produce inspectable plans only.
 - Retains the current editable layer rows, equal split modes, outcome
   projection, and preview-only action review.
 - Shows only contracts verified as available for new brackets.
-- Remains blocked when external orders cover the position.
+- Remains blocked when existing orders reserve the whole position.
 
 ### Active layers
 

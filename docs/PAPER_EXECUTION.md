@@ -28,10 +28,19 @@ proves all of the following:
 - the exact option identity agrees on account, `conId`, security type, expiry,
   strike, right, multiplier, currency, trading class, exchange, and local
   symbol;
-- every existing selected-option order is either a complete, journal-proven
-  app-owned OCA pair (whose remaining quantity is reserved) or absent; and
+- every existing selected-option closing order has a coherent, verified
+  reservation; ungrouped SELL orders reserve their remaining quantity and
+  complete target/stop OCA pairs reserve one pair quantity, regardless of who
+  created them; the new plan fits the unreserved balance; and
 - the new snapshot produces the same deterministic plan fingerprint the user
   armed on the first click.
+
+External orders remain inspect-only. The app does not modify, cancel, or take
+ownership of them. Their identity, status, and remaining quantities are part
+of the plan fingerprint, so a change between review and confirmation blocks
+submission. A concurrent manual change after the final snapshot is still
+possible; the snapshot is not an atomic reservation at TWS. Paper trading and
+TWS order precautions remain necessary checks before any later live milestone.
 
 The application transmits new app-owned SELL limit/stop OCA pairs. For each
 pair, it submits the limit order with `transmit=False`, followed by the stop
@@ -45,13 +54,22 @@ an **Orders sent to TWS** toast and journal-backed **Pending TWS verification**
 rows until a fresh snapshot verifies the orders as working.
 These rows show the recorded plan, not permission to modify the orders. A
 timeout or incomplete acknowledgement is labelled **Outcome not confirmed**;
-the UI does not claim that TWS accepted those orders. While either state is
-unresolved, the same draft is hidden and another submission is not offered.
-The broker snapshot's available quantity is not treated as available for a new
-draft while pending orders may be absent from that snapshot. Pending rows are
-restored from the journal after an app restart. Only complete, broker-observed,
+the UI does not claim that TWS accepted those orders. Another submission is
+not offered while any bracket needs verification. A fully acknowledged but
+unverified bracket reserves its journal quantity for draft planning even when
+the broker snapshot omits the orders. The remaining quantity can be drafted,
+but cannot be submitted until TWS is refreshed and the pending bracket is
+reconciled. Unknown, partial, or missing-execution states continue to hide the
+draft. Pending rows are restored from the journal after an app restart. Only
+complete, broker-observed,
 journal-proven pairs in `Submitted` or `PreSubmitted` status appear as manageable
 active layers.
+
+When adding a draft below pending rows, its default LMT target uses the lowest
+configured preset whose rounded sell price is above all pending and current
+draft LMT prices. If no such preset exists, Add Layer asks for a higher target
+preset rather than silently duplicating a pending price. The stop preset
+selection is unchanged; these defaults do not authorize submission.
 
 ## Closed bracket history
 

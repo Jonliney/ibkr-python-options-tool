@@ -31,7 +31,7 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
     )
     if state_validations:
         return _blocked(state_validations)
-    allocated, allocation_validations = _allocated_quantity(snapshot)
+    allocated, allocation_validations = closing_order_allocation(snapshot)
     position_quantity = _positive_whole(snapshot.position.quantity) or 0
     available = position_quantity - allocated
     validations = (
@@ -280,7 +280,7 @@ def _validate_contract_position(
     return tuple(failures)
 
 
-def _allocated_quantity(
+def closing_order_allocation(
     snapshot: BrokerSnapshot,
 ) -> tuple[int, tuple[Validation, ...]]:
     """Return contracts reserved by coherent closing orders for this position."""

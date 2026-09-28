@@ -629,6 +629,52 @@ def test_paper_execution_requires_read_only_api_to_have_been_explicitly_disabled
         require_paper_execution_snapshot(snapshot, plan)
 
 
+@pytest.mark.parametrize("oca_pair", [False, True])
+def test_paper_execution_accepts_verified_external_reservation(
+    oca_pair: bool,
+) -> None:
+    original = _snapshot()
+    external = WorkingOrder(
+        perm_id=501,
+        client_id=0,
+        order_id=0,
+        key=original.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("1"),
+        status="Submitted",
+        oca_group="manual/pair" if oca_pair else None,
+    )
+    orders = (
+        (
+            external,
+            replace(external, perm_id=502, order_type="STP"),
+        )
+        if oca_pair
+        else (external,)
+    )
+    snapshot = replace(
+        original,
+        position=replace(original.position, quantity=Decimal("3")),
+        working_orders=orders,
+    )
+    plan = _plan(snapshot)
+
+    assert plan.allocated_quantity == 1
+    assert plan.available_quantity == 2
+    require_paper_execution_snapshot(snapshot, plan)
+
+    changed = replace(
+        snapshot,
+        working_orders=tuple(
+            replace(order, remaining=Decimal("2")) for order in orders
+        ),
+    )
+    assert _plan(changed).status is not plan.status
+    with pytest.raises(ExecutionBlocked, match="reservations changed"):
+        require_paper_execution_snapshot(changed, plan)
+
+
 def test_market_exit_cancels_only_a_fresh_complete_app_owned_oca_pair_then_submits_mkt(
     tmp_path,
 ) -> None:

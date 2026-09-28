@@ -17,6 +17,7 @@ from .domain import (
     PlanResult,
     PlanStatus,
     WorkingOrder,
+    closing_order_allocation,
 )
 
 
@@ -851,20 +852,22 @@ def require_paper_management_snapshot(snapshot: BrokerSnapshot) -> None:
 def require_paper_execution_snapshot(
     snapshot: BrokerSnapshot,
     plan: PlanResult,
-    *,
-    owned_perm_ids: frozenset[int] = frozenset(),
 ) -> None:
-    """Validate the stricter write preconditions before opening a TWS writer."""
+    """Validate a fresh, quantity-safe plan before opening a TWS writer."""
     if plan.status is not PlanStatus.VALID or plan.fingerprint is None:
         raise ExecutionBlocked("the refreshed plan is not valid")
     require_paper_management_snapshot(snapshot)
-    external = [
-        order
-        for order in snapshot.working_orders
-        if order.key == snapshot.selected and order.perm_id not in owned_perm_ids
-    ]
-    if external:
-        raise ExecutionBlocked("external related orders block a new paper submission")
+    reserved, failures = closing_order_allocation(snapshot)
+    if failures or reserved != plan.allocated_quantity:
+        raise ExecutionBlocked("existing order reservations changed or are ambiguous")
+    if (
+        Decimal(plan.available_quantity) != snapshot.position.quantity - reserved
+        or plan.planned_quantity > plan.available_quantity
+        or sum(pair.quantity for pair in plan.pairs) != plan.planned_quantity
+    ):
+        raise ExecutionBlocked(
+            "the refreshed plan exceeds verified available contracts"
+        )
 
 
 class PaperExecutionService:
@@ -896,10 +899,6 @@ class PaperExecutionService:
         require_paper_execution_snapshot(
             snapshot,
             plan,
-            owned_perm_ids=self.owned_perm_ids(
-                account=snapshot.selected.account,
-                con_id=snapshot.selected.con_id,
-            ),
         )
         entry = self._journal.begin(snapshot, plan)
         try:

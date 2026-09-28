@@ -16,12 +16,18 @@ contribute observed prices until edited; staged amendments use their proposed
 prices. A staged bracket deletion removes its exit scenarios but does not
 remove its contracts from the held position.
 
-The headline totals appear only when the scenario quantity equals the whole
-currently held position and all relevant broker, fill, and price data are
-resolved. Uncovered contracts, external orders, unknown sold P&L, pending or
-partial layers, invalid inputs, and market exits with unknown fill prices make
-the headline incomplete. A labelled covered subtotal remains visible for
-inspection. An overallocated plan is also incomplete.
+Whole-position totals require scenarios for every held contract and resolved
+broker, fill, and price data. When some contracts have existing orders outside
+the app, the projection shows the verified draft and active-layer subtotal
+under the Expected gain and Max loss labels, with a sentence identifying how
+many held contracts are excluded. A fully acknowledged layer awaiting TWS
+verification contributes its submitted target and stop prices as an
+illustrative scenario. The status sentence names the pending quantity and
+states that those exits may not yet be working in TWS. Pending scenarios do
+not count as verified protection or permit another submission.
+Unknown sold P&L, uncertain or partial layers, invalid inputs, and market
+exits with unknown fill prices remain incomplete.
+An overallocated plan is also incomplete.
 
 `POSITION_FULLY_ALLOCATED` blocks creating a new draft because existing orders
 already cover the held position. When it is the only blocking validation and

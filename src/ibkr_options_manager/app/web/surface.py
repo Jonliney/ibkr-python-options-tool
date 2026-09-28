@@ -472,6 +472,9 @@ class StarUIWorkbench:
         self._toast = _ToastNotice(title, description, "success")
 
     def _arm_execution_locked(self) -> None:
+        if self._pending_submissions():
+            self._message = "Review pending brackets in TWS and Refresh before submitting another draft."
+            return
         if self._paper_execution is None:
             self._message = "Paper transmission is disabled for this launch."
             return
@@ -490,6 +493,10 @@ class StarUIWorkbench:
         )
 
     def _confirm_execution_locked(self) -> None:
+        if self._pending_submissions():
+            self._disarm_execution_locked()
+            self._message = "Review pending brackets in TWS and Refresh before submitting another draft."
+            return
         armed = self._armed_execution
         if (
             self._paper_execution is None
@@ -1232,13 +1239,18 @@ class StarUIWorkbench:
             return
         if self._drafts.get(con_id):
             return
+        if self._pending_submissions():
+            # A pending send has no automatically restored draft. Let the user
+            # start a new one explicitly from the uncommitted balance.
+            self._drafts[con_id] = ()
+            return
         basis = self._state.unit_basis
         calculator = self._state.quote_calculator
         presets = self._preset_for_index(0)
         if (
             basis is None
             or calculator is None
-            or self._state.available_quantity <= 0
+            or self._planning_available_quantity() <= 0
             or presets is None
         ):
             self._drafts[con_id] = ()
@@ -1251,7 +1263,7 @@ class StarUIWorkbench:
             return
         self._drafts[con_id] = (
             DraftLayerForm(
-                quantity=str(self._state.available_quantity),
+                quantity=str(self._planning_available_quantity()),
                 target_price=format(prices.target_price, "f"),
                 stop_price=format(prices.stop_price, "f"),
                 target_percentage=format(target, "f"),
@@ -1304,7 +1316,7 @@ class StarUIWorkbench:
     def _add_layer_locked(self) -> None:
         layers = list(self._current_layers())
         con_id = self._selected_con_id
-        if not layers or len(layers) >= self._state.available_quantity:
+        if len(layers) >= self._planning_available_quantity():
             return
         if con_id is None:
             return
@@ -1317,6 +1329,37 @@ class StarUIWorkbench:
             )
             return
         target, stop = presets
+        pending = self._pending_submissions()
+        if pending:
+            if any(outcome.status != "PENDING" for _entry, _index, outcome in pending):
+                self._message = (
+                    "Add Layer blocked: review unresolved brackets in TWS "
+                    "before adding a draft."
+                )
+                return
+            try:
+                previous_targets = tuple(
+                    Decimal(entry.layers[index].target_price)
+                    for entry, index, _outcome in pending
+                ) + tuple(Decimal(layer.target_price) for layer in layers)
+            except InvalidOperation:
+                self._message = "A pending target price is invalid; review TWS and Refresh."
+                return
+            if any(not price.is_finite() or price <= 0 for price in previous_targets):
+                self._message = "A pending target price is invalid; review TWS and Refresh."
+                return
+            target = _next_target_preset_above(
+                previous_targets,
+                basis=basis,
+                bands=calculator.bands,
+                presets=_parse_presets(self._target_presets, maximum=Decimal("1000")) or (),
+            )
+            if target is None:
+                self._message = (
+                    "Add Layer blocked: add a higher LMT target preset in Settings before adding "
+                    "another layer."
+                )
+                return
         try:
             prices = preview_reference_prices(basis, target, stop, calculator.bands)
         except ValueError:
@@ -1337,7 +1380,7 @@ class StarUIWorkbench:
             replace(layer, quantity=str(quantity))
             for layer, quantity in zip(
                 layers,
-                _split_quantity(self._state.available_quantity, len(layers)),
+                _split_quantity(self._planning_available_quantity(), len(layers)),
                 strict=True,
             )
         )
@@ -1358,7 +1401,7 @@ class StarUIWorkbench:
         if not layers or con_id is None:
             return
         total_quantity = (
-            self._state.available_quantity
+            self._planning_available_quantity()
             if use_available_quantity
             else sum(_int_or_zero(layer.quantity) for layer in layers)
         )
@@ -1801,6 +1844,10 @@ class StarUIWorkbench:
                 and _journal_target_perm_id(item[0], item[1]) in active_target_ids
             )
         )
+        draft_allowed = not pending or all(
+            outcome.status == "PENDING" for _entry, _index, outcome in pending
+        )
+        planning_available = self._planning_available_quantity()
         snapshot = self._view_model.latest_snapshot()
         selected_snapshot = (
             snapshot
@@ -1881,7 +1928,7 @@ class StarUIWorkbench:
                     if active_pairs
                     else None,
                     Separator(orientation="vertical", cls="h-5 self-center")
-                    if active_pairs and not pending
+                    if active_pairs and draft_allowed
                     else None,
                     Div(
                         Tooltip(
@@ -1928,7 +1975,7 @@ class StarUIWorkbench:
                                     value="add-layer",
                                     aria_label="Create new OCA bracket",
                                     disabled=len(self._current_layers())
-                                    >= self._state.available_quantity,
+                                    >= planning_available,
                                 ),
                                 delay_duration=250,
                             ),
@@ -1936,7 +1983,7 @@ class StarUIWorkbench:
                         ),
                         cls="flex items-center gap-2",
                     )
-                    if not pending
+                    if draft_allowed and planning_available > 0
                     else None,
                     cls="ml-auto flex flex-wrap items-center justify-end gap-2",
                 ),
@@ -1948,8 +1995,8 @@ class StarUIWorkbench:
                     self._header_quantity(outcomes, selected_snapshot),
                 ),
                 _contract_header_metric(
-                    "Available",
-                    f"{self._state.available_quantity:g}",
+                    "Available to plan" if pending else "Available",
+                    f"{planning_available:g}" if draft_allowed else "—",
                 ),
                 _contract_header_metric(
                     "Average price", _header_price(basis, currency)
@@ -1967,12 +2014,6 @@ class StarUIWorkbench:
             )
             if selected_snapshot is not None
             else None,
-            P(
-                "TWS orders are pending verification. The broker snapshot may not yet include them.",
-                cls="mt-3 text-sm font-medium text-amber-300",
-            )
-            if pending
-            else None,
             Div(
                 ScrollArea(
                     self._existing_layers_panel(active_pairs, outcomes)
@@ -1980,9 +2021,13 @@ class StarUIWorkbench:
                     else None,
                     Div(
                         self._draft_panel(),
-                        cls="mt-9" if active_pairs or outcomes else "",
+                        cls=(
+                            "mt-2 border-t border-border"
+                            if pending
+                            else "mt-9" if active_pairs or outcomes else ""
+                        ),
                     )
-                    if not pending
+                    if draft_allowed and planning_available > 0
                     else None,
                     aria_label="OCA layers workspace",
                     orientation="vertical",
@@ -2102,6 +2147,23 @@ class StarUIWorkbench:
             in {"PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE"}
         )
 
+    def _planning_available_quantity(self) -> int:
+        """Reserve journal-backed exits absent from the broker's order snapshot."""
+        observed_ids = {order.perm_id for order in self._state.working_orders}
+        unobserved = 0
+        for entry, index, outcome in self._pending_submissions():
+            layer = entry.layers[index]
+            ids = {layer.target_perm_id, layer.stop_perm_id} - {0}
+            if ids & observed_ids:
+                # The broker's available quantity already reserves this leg.
+                continue
+            remaining = layer.quantity - outcome.filled_quantity
+            if remaining != remaining.to_integral_value():
+                return 0
+            if remaining > 0:
+                unobserved += int(remaining)
+        return max(0, self._state.available_quantity - unobserved)
+
     def _pending_layer_row(
         self, number: int, entry: JournalEntry, index: int, outcome: LayerOutcome
     ) -> Any:
@@ -2132,25 +2194,44 @@ class StarUIWorkbench:
         return Div(
             Div(
                 _oca_layer_label(number, _journal_oca_group(entry, index)),
-                P("VERIFY", cls="mt-2 text-xs font-semibold text-amber-300"),
                 cls="min-w-20",
             ),
+            _sold_percentage_price_field(
+                "LMT target",
+                value=layer.target_percentage,
+                price=layer.target_price,
+                input_id=f"verify-target-{number}",
+            ),
+            _sold_percentage_price_field(
+                "STP loss",
+                value=layer.stop_percentage,
+                price=layer.stop_price,
+                input_id=f"verify-stop-{number}",
+            ),
+            _field(
+                "Quantity",
+                Input(
+                    id=f"verify-quantity-{number}",
+                    value=str(layer.quantity),
+                    disabled=True,
+                ),
+                input_id=f"verify-quantity-{number}",
+            ),
+            _field(
+                "TIF",
+                Input(id=f"verify-tif-{number}", value=layer.tif, disabled=True),
+                input_id=f"verify-tif-{number}",
+            ),
+            Div(cls="min-w-0"),
             Div(
-                Div(
-                    Span(heading, cls="text-sm font-semibold text-amber-300"),
-                    Badge("VERIFY IN TWS", variant="outline"),
-                    cls="flex items-center gap-3",
-                ),
-                P(detail, cls="mt-2 text-xs leading-5 text-muted-foreground"),
-                P(
-                    f"{layer.quantity} contracts · SELL LMT ${layer.target_price} "
-                    f"/ SELL STP ${layer.stop_price} · {layer.tif}",
-                    cls="mt-2 font-mono text-xs",
-                ),
-                cls="min-w-0",
+                Span("VERIFY IN TWS", cls="sold-layer-status"),
+                Span(heading, cls="sold-layer-result"),
+                cls="sold-layer-badge",
+                title=detail,
             ),
             data_layer_state="verify",
-            cls="flex gap-3 border-t border-amber-500/40 bg-amber-500/5 py-4",
+            data_result_tone="verify",
+            cls="sold-layer-row grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4",
         )
 
     def _closed_layer_row(
@@ -2479,20 +2560,20 @@ class StarUIWorkbench:
         )
         if coverage == "mixed":
             return Alert(
-                AlertTitle("Existing orders limit new brackets"),
+                AlertTitle("Existing orders reserve contracts"),
                 AlertDescription(
                     quantity_message
                     + f"{app_order_count} of {order_count} related orders are app-managed. "
-                    "External orders are view-only and block paper execution for this position."
+                    "External orders are view-only; new brackets use only the available contracts."
                 ),
                 cls="mb-5 border-amber-500/40 bg-amber-500/10 text-amber-100",
             )
         if coverage == "external":
             return Alert(
-                AlertTitle("Existing orders limit new brackets"),
+                AlertTitle("Existing orders reserve contracts"),
                 AlertDescription(
                     quantity_message
-                    + "External orders are view-only and block paper execution for this position."
+                    + "External orders are view-only; new brackets use only the available contracts."
                 ),
                 cls="mb-5 border-amber-500/40 bg-amber-500/10 text-amber-100",
             )
@@ -2707,6 +2788,10 @@ class StarUIWorkbench:
         snapshot = self._view_model.latest_snapshot()
         currency = snapshot.contract.currency if snapshot is not None else None
         realized = Decimal("0")
+        pending_quantity = Decimal("0")
+        observed: list[ExitScenario] = []
+        proposed: list[ExitScenario] = []
+        pending_config: list[dict[str, Any]] = []
         blocking_codes = {
             validation.code
             for validation in self._state.validations
@@ -2735,10 +2820,43 @@ class StarUIWorkbench:
                     unresolved = True
                 else:
                     realized += outcome.realized_pnl
+            elif outcome.status == "PENDING":
+                layer = _entry.layers[_index]
+                quantity = Decimal(layer.quantity)
+                pending_quantity += quantity
+                if basis is None or multiplier is None or quantity <= 0:
+                    unresolved = True
+                    continue
+                try:
+                    target_price = Decimal(layer.target_price)
+                    stop_price = Decimal(layer.stop_price)
+                except InvalidOperation:
+                    unresolved = True
+                    continue
+                if (
+                    not target_price.is_finite()
+                    or not stop_price.is_finite()
+                    or target_price <= 0
+                    or stop_price <= 0
+                ):
+                    unresolved = True
+                    continue
+                scenario = ExitScenario(
+                    quantity,
+                    (target_price - basis) * multiplier * quantity,
+                    (stop_price - basis) * multiplier * quantity,
+                )
+                observed.append(scenario)
+                proposed.append(scenario)
+                pending_config.append(
+                    {
+                        "quantity": format(quantity, "f"),
+                        "gain": format(scenario.target_pnl, "f"),
+                        "loss": format(scenario.stop_pnl, "f"),
+                    }
+                )
             elif outcome.status != "ACTIVE":
                 unresolved = True
-        observed: list[ExitScenario] = []
-        proposed: list[ExitScenario] = []
         active_config: list[dict[str, Any]] = []
         removed_ids = {
             candidate.target_perm_id for candidate in self._armed_market_exits
@@ -2834,6 +2952,8 @@ class StarUIWorkbench:
             )
         if basis is None or multiplier is None or self._pending_active_prices:
             unresolved = True
+        if sum((item.quantity for item in proposed), Decimal("0")) > held:
+            unresolved = True
         baseline = project_position_outcome(
             held_quantity=held,
             realized_pnl=realized,
@@ -2856,14 +2976,16 @@ class StarUIWorkbench:
             baseline,
             proposed_outcome,
             {
-                "externalOrders": self._order_coverage()[0] == "external",
+                "externalOrders": self._order_coverage()[0] in {"external", "mixed"},
                 "held": format(held, "f"),
                 "realized": format(realized, "f"),
                 "unresolved": unresolved,
+                "pendingQuantity": format(pending_quantity, "f"),
                 "marketExit": market_exit,
                 "removed": list(removed_ids),
                 "staged": bool(removed_ids or updates or self._armed_execution),
                 "active": active_config,
+                "pending": pending_config,
                 "draft": draft_config,
                 "baselineGain": format(baseline.expected_gain, "f")
                 if baseline.expected_gain is not None
@@ -2905,7 +3027,7 @@ class StarUIWorkbench:
         )
         status = _projection_status(
             outcome, config["unresolved"], config["marketExit"],
-            config["externalOrders"],
+            config["externalOrders"], Decimal(config["pendingQuantity"]),
         )
         return Card(
             CardHeader(
@@ -2920,6 +3042,10 @@ class StarUIWorkbench:
                         "text-emerald-400",
                         live_key="gain",
                         help_text=(
+                            "Realised P&L plus projected target results from shown "
+                            "layers. Pending bracket prices assume TWS accepts "
+                            "the submitted exits; other contracts are excluded."
+                            if Decimal(config["pendingQuantity"]) else
                             "Realised P&L plus projected gains from the shown layers. "
                             "Excludes contracts without a verified target and stop."
                             if partial else
@@ -2932,6 +3058,9 @@ class StarUIWorkbench:
                         "text-rose-400",
                         live_key="loss",
                         help_text=(
+                            "Projected stop results from shown layers; excludes "
+                            "realised P&L. Pending stops may not be working in TWS."
+                            if Decimal(config["pendingQuantity"]) else
                             "Projected result at the shown layer stops; excludes "
                             "realised P&L and contracts without a verified target and stop."
                             if partial else
@@ -2977,12 +3106,15 @@ class StarUIWorkbench:
                 self._review_pair(index, layer)
                 for index, layer in enumerate(self._current_layers(), start=1)
             ]
+        draft_allowed = not pending or all(
+            outcome.status == "PENDING" for _entry, _index, outcome in pending
+        )
         draft_rows = (
             [
                 self._review_pair(index, layer)
                 for index, layer in enumerate(self._current_layers(), start=1)
             ]
-            if not pending
+            if draft_allowed
             else []
         )
         has_active_layers = bool(self._active_oca_pairs())
@@ -3048,9 +3180,7 @@ class StarUIWorkbench:
             if draft_rows or has_active_layers
             else Div(
                 P(
-                    "Pending TWS orders are shown in Active layers. Refresh after reviewing them in TWS."
-                    if pending
-                    else "Add a layer or modify an existing one to continue.",
+                    "Add a layer or modify an existing one to continue.",
                     cls="text-center text-sm leading-6 text-muted-foreground",
                 ),
                 cls="flex min-h-0 flex-1 items-center justify-center px-6",
@@ -3062,15 +3192,7 @@ class StarUIWorkbench:
 
     def _execution_control(self) -> Any:
         if self._pending_submissions():
-            return Div(
-                P("Waiting for TWS", cls="text-sm font-semibold"),
-                P(
-                    "Review pending orders in TWS and use Refresh to verify their state. "
-                    "Do not resubmit this draft.",
-                    cls="mt-2 text-xs leading-5 text-muted-foreground",
-                ),
-                cls="mx-4 mb-4 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4",
-            )
+            return None
         market_exits = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
@@ -4240,6 +4362,30 @@ def _parse_presets(raw: str, *, maximum: Decimal) -> tuple[Decimal, ...] | None:
     return tuple(values) if values else None
 
 
+def _next_target_preset_above(
+    prices: tuple[Decimal, ...],
+    *,
+    basis: Decimal,
+    bands: tuple[Any, ...],
+    presets: tuple[Decimal, ...],
+) -> Decimal | None:
+    """Choose the closest configured target above existing planned LMT prices."""
+    if not prices or basis <= 0:
+        return None
+    highest = max(prices)
+    candidates: list[tuple[Decimal, Decimal]] = []
+    for percentage in presets:
+        try:
+            rounded = round_up_price(
+                basis * (Decimal("1") + percentage / Decimal("100")), bands
+            )
+        except ValueError:
+            return None
+        if rounded > highest:
+            candidates.append((rounded, percentage))
+    return min(candidates)[1] if candidates else None
+
+
 def _split_quantity(total: int, count: int) -> tuple[int, ...]:
     if total <= 0 or count <= 0:
         return ()
@@ -4346,26 +4492,37 @@ def _projection_status(
     unresolved: bool,
     market_exit: bool,
     external_orders: bool,
+    pending_quantity: Decimal = Decimal("0"),
 ) -> str:
     if market_exit:
         return ""
     if unresolved:
+        if outcome.covered_quantity > outcome.held_quantity:
+            return "Proposed exits exceed the held quantity."
         return "Broker or layer state needs verification before a whole-position total is available."
     if outcome.covered_quantity > outcome.held_quantity:
         return "Proposed exits exceed the held quantity."
+    pending_status = (
+        f"Includes {format(pending_quantity, 'f')} contracts awaiting TWS "
+        "verification; their submitted exits may not be working."
+        if pending_quantity
+        else ""
+    )
     if outcome.uncovered_quantity:
         covered = format(outcome.covered_quantity, "f")
         uncovered = format(outcome.uncovered_quantity, "f")
         if external_orders:
-            return (
+            coverage = (
                 f"Projection covers {covered} held contracts. The other {uncovered} "
                 "have existing orders; their outcome is not included."
             )
-        return (
-            f"Projection covers {covered} held contracts. The other {uncovered} "
-            "have no verified target and stop here."
-        )
-    return ""
+        else:
+            coverage = (
+                f"Projection covers {covered} held contracts. The other {uncovered} "
+                "have no target and stop in this plan."
+            )
+        return f"{coverage} {pending_status}".strip()
+    return pending_status
 
 
 def _projection_script(configuration: dict[str, Any]) -> str:
@@ -4404,13 +4561,15 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       change.setAttribute('aria-label', `${{direction}} by ${{amount}}`);
     }};
     const render = () => {{
-      const exits = [...active.values()].filter((item) => !config.removed.includes(item.id)).concat(draft);
+      const exits = [...active.values()].filter((item) => !config.removed.includes(item.id)).concat(config.pending, draft);
       const covered = exits.reduce((total, item) => total + Number(item.quantity), 0);
       const gain = Number(config.realized) + exits.reduce((total, item) => total + Number(item.gain), 0);
       const loss = exits.reduce((total, item) => total + Number(item.loss), 0);
       const uncovered = Math.max(0, Number(config.held) - covered);
-      const complete = config.marketExit || (!config.unresolved && !invalidDraft && !invalidActive && Number.isFinite(covered) && Math.abs(covered - Number(config.held)) < 1e-8);
-      const partial = !config.marketExit && !config.unresolved && !invalidDraft && !invalidActive && covered > 0 && covered < Number(config.held);
+      const pending = Number(config.pendingQuantity);
+      const overallocated = covered > Number(config.held) + 1e-8;
+      const complete = config.marketExit || (!config.unresolved && !invalidDraft && !invalidActive && !overallocated && Number.isFinite(covered) && Math.abs(covered - Number(config.held)) < 1e-8);
+      const partial = !config.marketExit && !config.unresolved && !invalidDraft && !invalidActive && !overallocated && covered > 0 && covered < Number(config.held);
       const projected = complete || partial;
       const gainNode = document.querySelector('[data-live-metric="gain"]');
       const lossNode = document.querySelector('[data-live-metric="loss"]');
@@ -4421,7 +4580,12 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       updateMetric(lossNode, projected ? (config.marketExit ? (config.baselineLoss === null ? null : Number(config.baselineLoss)) : loss) : null, lossBaseline, 'loss');
       const status = document.querySelector('[data-projection-status]');
       if (status) {{
-        status.textContent = config.marketExit ? '' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : config.unresolved ? 'Broker or layer state needs verification before a whole-position total is available.' : covered > Number(config.held) ? 'Proposed exits exceed the held quantity.' : uncovered > 0 ? config.externalOrders ? `Projection covers ${{covered}} held contracts. The other ${{uncovered}} have existing orders; their outcome is not included.` : `Projection covers ${{covered}} held contracts. The other ${{uncovered}} have no verified target and stop here.` : '';
+        const pendingStatus = pending > 0 ? `Includes ${{pending}} contracts awaiting TWS verification; their submitted exits may not be working.` : '';
+        const coverageStatus = uncovered > 0 ? config.externalOrders
+          ? `Projection covers ${{covered}} held contracts. The other ${{uncovered}} have existing orders; their outcome is not included.`
+          : `Projection covers ${{covered}} held contracts. The other ${{uncovered}} have no target and stop in this plan.`
+          : '';
+        status.textContent = config.marketExit ? '' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : overallocated ? 'Proposed exits exceed the held quantity.' : config.unresolved ? 'Broker or layer state needs verification before a whole-position total is available.' : [coverageStatus, pendingStatus].filter(Boolean).join(' ');
         status.classList.toggle('hidden', !status.textContent);
       }}
     }};

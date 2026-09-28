@@ -204,6 +204,19 @@
   color: #fb7185;
 }
 
+.sold-layer-row[data-result-tone="verify"] .sold-layer-badge {
+  border-color: rgb(245 158 11 / 45%);
+  background: #20190d;
+}
+
+.sold-layer-row[data-result-tone="verify"] .sold-layer-status {
+  color: #fcd34d;
+}
+
+.sold-layer-row[data-result-tone="verify"] .sold-layer-result {
+  color: #fef3c7;
+}
+
 .sold-layer-row:hover::after,
 .sold-layer-row:hover .sold-layer-badge,
 .sold-layer-row:has(.oca-layer-trigger:focus-visible)::after,

@@ -6,9 +6,8 @@ Interactive Brokers Trader Workstation (TWS).
 
 The default mode is deliberately non-trading: connect to TWS in read-only mode,
 display exact positions and working orders, and preview a validated laddered
-OCA bracket plan for an open position. Open app-owned pairs reserve their
-remaining quantity; external or ambiguous orders block a new bracket
-submission.
+OCA bracket plan for an open position. Coherent closing orders reserve their
+remaining quantity regardless of origin; ambiguous orders block submission.
 
 See [docs/PROJECT_BRIEF.md](docs/PROJECT_BRIEF.md) for the current requirements
 and safety constraints. The reviewed architecture, safety gates, delivery
@@ -57,10 +56,12 @@ control, launch with:
 
 New bracket submission is intentionally blocked unless the fresh pre-send snapshot proves a
 `DU` account, a loopback TWS connection, a complete/fresh position/contract/
-quote/tick/order snapshot, API read-only mode explicitly **disabled**, and no
-external or ambiguous existing orders for the selected option. Complete,
-journal-proven app-owned OCA pairs reserve their quantity while leaving any
-unreserved contracts eligible for a new SELL LMT + SELL STP OCA pair. For
+quote/tick/order snapshot, API read-only mode explicitly **disabled**, and
+coherent reservations for all existing selected-option closing orders.
+Ungrouped SELL orders and complete target/stop OCA pairs reserve their verified
+remaining quantity, including orders created outside this app. Only the
+unreserved balance is eligible for new SELL LMT + SELL STP OCA pairs; changed
+orders invalidate confirmation. For
 journal-proven app-owned, complete active OCA pairs, **Sell now
 (MKT)** is available as a separate two-confirmation paper-only experiment; it
 cancels that layer's app-owned LMT/STP pair, verifies the cancellation, then
