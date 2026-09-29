@@ -17,6 +17,7 @@ from PySide6.QtCore import QEventLoop, QPoint, Qt, QTimer, QUrl
 from PySide6.QtTest import QTest
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication
+from starhtml import to_xml
 from starlette.testclient import TestClient
 
 from ibkr_options_manager.app.demo import (
@@ -1852,6 +1853,48 @@ def test_price_update_confirmation_uses_the_shared_cancel_confirm_bar() -> None:
     assert ">Cancel<" in sidebar
     assert ">Confirm<" in sidebar
     assert "Click to confirm" not in sidebar
+
+
+@pytest.mark.parametrize(
+    ("kind", "confirm_action"),
+    (
+        ("draft", "execute-confirm"),
+        ("price", "price-update-confirm"),
+        ("cancel", "cancel-pair-confirm"),
+        ("exit", "market-exit-confirm"),
+    ),
+)
+def test_every_paper_write_uses_the_same_final_confirmation(
+    kind: str, confirm_action: str,
+) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    layer = MarketExitCandidate(
+        account=DEMO_ACCOUNT, con_id=workbench._selected_con_id or 0,
+        target_order_id=11, target_perm_id=101, client_id=17,
+        quantity=Decimal("1"), tif="GTC", oca_group="example/tranche-1",
+        stop_order_id=12, stop_perm_id=102,
+    )
+    if kind == "draft":
+        workbench._armed_execution = object()  # type: ignore[assignment]
+    elif kind == "price":
+        workbench._armed_price_updates = (
+            PriceUpdateCandidate(layer=layer, stop_price=Decimal("2.74")),
+        )
+    elif kind == "cancel":
+        workbench._armed_cancellation = layer
+        workbench._active_action_verified = True
+    else:
+        workbench._armed_market_exits = (layer,)
+        workbench._active_action_verified = True
+
+    html = to_xml(workbench._execution_control())
+    confirm = re.search(r'<button[^>]*data-paper-confirm[^>]*>', html)
+    assert confirm is not None
+    assert f'value="{confirm_action}"' in confirm.group()
+    assert "bg-destructive" in confirm.group()
+    assert 'value="cancel-staged"' in html
+    assert html.index('value="cancel-staged"') < html.index(f'value="{confirm_action}"')
 
 
 def test_stop_above_latest_ask_warns_before_price_update_and_quote_change_rearms(

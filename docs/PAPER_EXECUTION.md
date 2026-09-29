@@ -16,6 +16,15 @@ Confirmation requests another fresh snapshot before any paper write. A changed
 or incomplete snapshot blocks the write; cancellation and market-exit reviews
 must be staged again if their verified orders change.
 
+Draft submission, active price updates, bracket cancellation, and market exits
+share the same visible sequence: inspect the action review, choose **Execute
+paper order** to verify a fresh snapshot, then choose **Cancel** or the red
+**Confirm** action. Confirm always performs another fresh broker-state check
+before a paper write. The active-layer action icons create the initial review;
+draft and price edits update that review as their fields change. A recovery
+dialog that verifies a prior unknown cancellation is a separate read/verify
+workflow and does not submit a new order.
+
 For active stop amendments, the editor uses signed return from verified entry
 cost. A positive value places the proposed stop above entry; 0% is B/E. The
 global **Set all active stops** dialog applies one tick-rounded price to every

@@ -62,7 +62,7 @@ from ..view_model import (
 )
 from .components.ui.alert import Alert, AlertDescription, AlertTitle
 from .components.ui.badge import Badge
-from .components.ui.button import Button, ButtonVariant
+from .components.ui.button import Button
 from .components.ui.card import (
     Card,
     CardContent,
@@ -3664,7 +3664,6 @@ class StarUIWorkbench:
         if self._armed_cancellation is not None:
             return self._staged_action_controls(
                 confirm_action="cancel-pair-confirm",
-                confirm_variant="destructive",
                 busy_text="Cancelling…",
                 impact=(
                     "Bracket will close",
@@ -3678,7 +3677,6 @@ class StarUIWorkbench:
         if market_exits:
             return self._staged_action_controls(
                 confirm_action="market-exit-confirm",
-                confirm_variant="destructive",
                 impact=(
                     "Sell and close bracket",
                     (
@@ -3701,6 +3699,13 @@ class StarUIWorkbench:
         if self._armed_execution is not None:
             return self._staged_action_controls(
                 confirm_action="execute-confirm",
+                impact=(
+                    "Submit paper brackets",
+                    (
+                        "Confirm sends the reviewed OCA target and stop orders to TWS. "
+                        "Check the listed prices and quantities before submitting.",
+                    ),
+                ),
             )
         has_active_layers = bool(self._active_oca_pairs())
         has_draft_layers = bool(self._current_layers())
@@ -3811,7 +3816,6 @@ class StarUIWorkbench:
         self,
         *,
         confirm_action: str,
-        confirm_variant: ButtonVariant = "default",
         busy_text: str = "Submitting…",
         retry_acknowledgement: bool = False,
         impact: tuple[str, tuple[str, ...]] | None = None,
@@ -3851,11 +3855,12 @@ class StarUIWorkbench:
                 ),
                 Button(
                     "Confirm",
-                    variant=confirm_variant,
+                    variant="destructive",
                     type="submit",
                     name="action",
                     value=confirm_action,
                     data_busy_text=busy_text,
+                    data_paper_confirm=True,
                     cls="flex-[2]",
                 ),
                 cls="flex gap-2",
