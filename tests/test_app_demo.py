@@ -517,8 +517,10 @@ def test_unverified_projection_shows_layer_estimate_without_enabling_review() ->
     assert config["unresolved"] is True
     assert outcome.expected_gain is None
     assert "Estimate from shown layers. Refresh TWS before reviewing an order." in page
-    assert "Estimated gain" in page
-    assert "Estimated stop result" in page
+    assert "Expected gain" in page
+    assert "Max loss" in page
+    assert "Estimated gain" not in page
+    assert "Estimated stop result" not in page
     assert _money(outcome.covered_gain) in page
 
 
@@ -1555,7 +1557,7 @@ def test_manual_tws_confirmation_clears_unknown_only_after_fresh_api_check(
 
 
 def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
-    tmp_path,
+    tmp_path, monkeypatch,
 ) -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -1588,6 +1590,9 @@ def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
     assert 'aria-label="Verify cancellation of layer 1 in TWS"' in page
     assert ">Verify</button>" not in page
     assert 'data-cancelled-bracket-recovery-dialog' not in page
+    # A blocked plan refresh may clear the view model's snapshot. The explicit
+    # Verify action must still open; confirmation obtains a new TWS read.
+    workbench._view_model._latest_snapshot = None
     requested = TestClient(workbench.app).post(
         workbench.path + "action",
         data={"action": "verify-cancelled-bracket:" + fingerprint},
@@ -1602,10 +1607,21 @@ def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
         journal.confirm_cancelled_unknown(
             clean, fingerprint, confirmed_in_tws=False,
         )
-    resolved = journal.confirm_cancelled_unknown(
-        clean, fingerprint, confirmed_in_tws=True,
+    def refreshed(*_args):
+        workbench._view_model._latest_snapshot = clean
+        return workbench._state
+
+    monkeypatch.setattr(workbench._view_model, "select_position", refreshed)
+    resolved_page = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={
+            "action": "resolve-cancelled-bracket",
+            "confirmed": "yes",
+            "fingerprint": fingerprint,
+        },
     )
-    assert resolved.state == "CANCELLED_CONFIRMED"
+    assert "Cancelled bracket cleared" in resolved_page.text
+    assert journal.find(fingerprint).state == "CANCELLED_CONFIRMED"
 
 
 def test_old_missing_bracket_does_not_interrupt_new_active_brackets(tmp_path) -> None:
@@ -1715,6 +1731,25 @@ def test_stale_paper_bracket_confirmation_expires_before_any_send(monkeypatch) -
     assert "expired" in workbench._message.lower()
     assert workbench._toast is not None
     assert workbench._toast.variant == "warning"
+
+
+def test_paper_bracket_confirm_button_counts_down_to_server_deadline(monkeypatch) -> None:
+    from ibkr_options_manager.app.web import surface
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._armed_execution = object()  # type: ignore[assignment]
+    workbench._armed_execution_deadline = 1010.0
+    monkeypatch.setattr(surface, "monotonic", lambda: 1000.0)
+    page = TestClient(workbench.app).get(workbench.path).text
+    assert "Confirm (10s)" in page
+    assert 'data-confirm-countdown-ms="10000"' in page
+    assert "performance.now()" in page
+
+    monkeypatch.setattr(surface, "monotonic", lambda: 1006.2)
+    later = TestClient(workbench.app).get(workbench.path).text
+    assert "Confirm (4s)" in later
+    assert 'data-confirm-countdown-ms="3800"' in later
 
 
 def test_refresh_replaces_a_draft_that_exceeds_newly_available_quantity() -> None:

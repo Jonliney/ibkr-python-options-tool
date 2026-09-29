@@ -235,7 +235,10 @@ history, the workbench opens a blocking **Verify cancellation** dialog. A
 previously reconciled bracket whose legs disappear without a matching fill
 shows a **Verify** action on its row instead. This avoids opening an old
 cancellation dialog over a newly working bracket; an unresolved old layer
-still reserves its quantity until verified. The
+still reserves its quantity until verified. An explicit **Verify** click opens
+the dialog even if a malformed order group made the last planning snapshot
+unavailable; opening the dialog does not clear the journal or authorize an
+order. The
 operator must first confirm in TWS that both LMT and STP are gone. The app then
 takes a fresh selected-contract snapshot and requires complete current and
 completed order reads, complete execution history, no matching working leg or
@@ -246,7 +249,9 @@ the same draft again still requires a later clean snapshot; the confirmation
 alone never authorizes an order write.
 The final paper bracket confirmation expires after 10 seconds. An expired
 confirmation never sends orders; the operator must press Execute again for a
-fresh plan and another review.
+fresh plan and another review. The Confirm button shows the remaining seconds;
+its browser countdown is informational, while the server deadline controls
+whether submission is allowed.
 Recreating a verified cancelled plan keeps its fingerprint for duplicate
 suppression but persists a new OCA group prefix for the new attempt. Journal
 reconciliation uses that prefix rather than attributing an earlier order to

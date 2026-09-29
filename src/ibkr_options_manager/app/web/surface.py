@@ -2242,6 +2242,7 @@ class StarUIWorkbench:
             self._submission_review_dialog(),
             recovery_dialog,
             Script(_busy_submit_script()),
+            Script(_paper_confirmation_countdown_script()),
             cls="h-screen overflow-hidden bg-background text-foreground selection:bg-primary selection:text-primary-foreground",
         )
 
@@ -3114,15 +3115,32 @@ class StarUIWorkbench:
     ) -> Any:
         if not callable(getattr(self._paper_execution, "confirm_cancelled_unknown", None)):
             return None
+        requested = self._recovery_requested_fingerprint
+        requested_entries = {
+            entry.fingerprint: entry
+            for entry, _index, outcome in outcomes
+            if entry.fingerprint == requested
+            and entry.state in {
+                "SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED", "SUBMITTED", "RECONCILED"
+            }
+            and outcome.status in {"UNKNOWN", "NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"}
+        }
         snapshot = self._view_model.latest_snapshot()
-        if (
-            snapshot is None
-            or not snapshot.complete
-            or not snapshot.fresh
-            or snapshot.selected.account != self._verified_selected_account()
-            or snapshot.selected.con_id != self._selected_con_id
-        ):
-            return None
+        if requested in requested_entries:
+            entry = requested_entries[requested]
+            fingerprint = requested
+        else:
+            if requested is not None:
+                self._recovery_requested_fingerprint = None
+            if (
+                snapshot is None
+                or not snapshot.complete
+                or not snapshot.fresh
+                or snapshot.selected.account != self._verified_selected_account()
+                or snapshot.selected.con_id != self._selected_con_id
+            ):
+                return None
+            entry = None
         working = snapshot.working_orders if snapshot is not None else ()
 
         def has_working_leg(entry: JournalEntry) -> bool:
@@ -3138,6 +3156,8 @@ class StarUIWorkbench:
             )
 
         def observed_later(entry: JournalEntry) -> bool:
+            if snapshot is None:
+                return False
             try:
                 return snapshot.captured_at > Decimal(entry.snapshot_captured_at)
             except (InvalidOperation, ValueError):
@@ -3153,10 +3173,8 @@ class StarUIWorkbench:
             and not has_working_leg(entry)
             and observed_later(entry)
         }
-        if not unresolved:
-            self._recovery_requested_fingerprint = None
+        if entry is None and not unresolved:
             return None
-        requested = self._recovery_requested_fingerprint
         collision_fingerprints = {
             entry.fingerprint
             for entry, _index, outcome in outcomes
@@ -3166,9 +3184,7 @@ class StarUIWorkbench:
             order.key == snapshot.selected and order.oca_group
             for order in working
         ) if snapshot is not None else False
-        if requested in unresolved:
-            fingerprint = requested
-        else:
+        if entry is None:
             automatic = {
                 fingerprint: entry
                 for fingerprint, entry in unresolved.items()
@@ -3182,7 +3198,7 @@ class StarUIWorkbench:
             ):
                 return None
             fingerprint = next(iter(automatic))
-        entry = unresolved[fingerprint]
+            entry = unresolved[fingerprint]
         return Div(
             Dialog(
                 DialogContent(
@@ -4512,7 +4528,7 @@ class StarUIWorkbench:
             CardContent(
                 Div(
                     *_metric(
-                        "Estimated gain" if estimate else "Expected gain",
+                        "Expected gain",
                         _projection_gain_value(gain_value, gain_delta),
                         "text-emerald-400",
                         live_key="gain",
@@ -4528,7 +4544,7 @@ class StarUIWorkbench:
                         ),
                     ),
                     *_metric(
-                        "Estimated stop result" if estimate else "Max loss",
+                        "Max loss",
                         _projection_loss_value(loss_value, loss_delta),
                         "text-rose-400",
                         live_key="loss",
@@ -4876,6 +4892,12 @@ class StarUIWorkbench:
         impact: tuple[str, tuple[str, ...]] | None = None,
     ) -> Any:
         """One deliberate Cancel / Confirm bar for every staged order change."""
+        countdown_ms = (
+            max(0, round((self._armed_execution_deadline - monotonic()) * 1000))
+            if confirm_action == "execute-confirm"
+            and self._armed_execution_deadline is not None
+            else None
+        )
         return Form(
             Alert(
                 AlertTitle(impact[0]),
@@ -4909,13 +4931,15 @@ class StarUIWorkbench:
                     cls="flex-1",
                 ),
                 Button(
-                    "Confirm",
+                    f"Confirm ({(countdown_ms + 999) // 1000}s)"
+                    if countdown_ms is not None else "Confirm",
                     variant="destructive",
                     type="submit",
                     name="action",
                     value=confirm_action,
                     data_busy_text=busy_text,
                     data_paper_confirm=True,
+                    data_confirm_countdown_ms=countdown_ms,
                     cls="flex-[2]",
                 ),
                 cls="flex gap-2",
@@ -6362,6 +6386,29 @@ def _toast_notice(message: str) -> _ToastNotice | None:
     if len(body) > 160:
         body = body[:157].rstrip() + "…"
     return _ToastNotice(title, body, "error")
+
+
+def _paper_confirmation_countdown_script() -> str:
+    """Display the remaining review window; the server enforces the deadline."""
+    return """
+    (() => {
+      const button = document.querySelector('[data-confirm-countdown-ms]');
+      if (!(button instanceof HTMLButtonElement)) return;
+      const duration = Number(button.dataset.confirmCountdownMs);
+      if (!Number.isFinite(duration)) return;
+      const deadline = performance.now() + Math.max(0, duration);
+      const render = () => {
+        if (!button.isConnected || button.getAttribute('aria-busy') === 'true') return false;
+        const seconds = Math.ceil(Math.max(0, deadline - performance.now()) / 1000);
+        button.textContent = `Confirm (${seconds}s)`;
+        return seconds > 0;
+      };
+      if (!render()) return;
+      const interval = window.setInterval(() => {
+        if (!render()) window.clearInterval(interval);
+      }, 100);
+    })();
+    """
 
 
 def _busy_submit_script() -> str:
