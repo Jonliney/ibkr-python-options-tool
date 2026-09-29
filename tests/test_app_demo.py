@@ -1013,6 +1013,57 @@ def test_price_update_fill_requires_fresh_exact_complete_execution() -> None:
     )
 
 
+def test_immediate_price_update_fill_records_edited_values(monkeypatch) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    layer = MarketExitCandidate(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
+        target_order_id=101, target_perm_id=201, client_id=17,
+        quantity=Decimal("1"), tif="GTC", oca_group="app/tranche-1",
+        stop_order_id=102, stop_perm_id=202,
+    )
+    update = PriceUpdateCandidate(layer=layer, target_price=Decimal("12.10"))
+    fill = ObservedExecution(
+        exec_id="immediate-fill", account=layer.account, con_id=layer.con_id,
+        perm_id=layer.target_perm_id, side="SLD", quantity=Decimal("1"),
+        price=Decimal("12.40"), time="now",
+    )
+    initial = replace(
+        snapshot, connected=True, complete=True, fresh=True,
+        executions_complete=True,
+    )
+    refreshed = replace(initial, executions=(fill,))
+    current = [initial]
+    recorded = []
+
+    class PriceService:
+        def prepare_price_updates(self, _snapshot, *, updates, **_kwargs):
+            return updates
+
+        def modify_prices(self, *_args, **_kwargs):
+            raise ExecutionBlocked("IBKR error code=202: Order Canceled")
+
+        def record_verified_price_updates(self, _snapshot, updates, percentages):
+            recorded.append((updates, percentages))
+
+    workbench._paper_execution = PriceService()  # type: ignore[assignment]
+    workbench._armed_price_updates = (update,)
+    workbench._armed_active_percentages = {201: ("2", "-25")}
+    workbench._warned_price_update_concerns = _price_update_impact(initial, (update,)).concerns
+    monkeypatch.setattr(workbench._view_model, "select_position", lambda *_: workbench._state)
+    monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: current[0])
+    monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
+    monkeypatch.setattr(workbench, "_refresh_locked", lambda: current.__setitem__(0, refreshed))
+
+    workbench._confirm_price_updates_locked({})
+
+    assert recorded == [((update,), {201: ("2", "-25")})]
+    assert workbench._toast is not None
+    assert workbench._toast.title == "Exit filled in TWS"
+
+
 @pytest.mark.parametrize(
     ("message", "title", "body"),
     (
@@ -2664,6 +2715,10 @@ def test_arming_price_update_preserves_edited_percentage_in_active_input(
                 expected_order_count=2,
                 order_ids=(101, 102),
                 perm_ids=(201, 202),
+                layers=(JournalLayer(
+                    2, "29.10", "18.20", "GTC", 201, 202,
+                    target_percentage="20", stop_percentage="-25",
+                ),),
             ),
         )
     )
@@ -2740,6 +2795,15 @@ def test_arming_price_update_preserves_edited_percentage_in_active_input(
     ), workbench._status_message
     assert workbench._toast_revision > arm_toast_revision
     assert "Price update sent to TWS" in confirmed.text
+    source = journal.find(fingerprint)
+    assert source is not None
+    assert source.layers[0].target_percentage == "30"
+    assert source.layers[0].target_price == "31.50"
+    sold = str(workbench._closed_layer_row(
+        1, source, 0, LayerOutcome("CLOSED_PNL_UNKNOWN", filled_quantity=Decimal("2"))
+    ))
+    assert re.search(r'value="30"[^>]*id="sold-target-1"', sold)
+    assert "$31.50" in sold
     events = [json.loads(line) for line in trace_path.read_text().splitlines()]
     requested = next(
         event for event in events if event["event"] == "ui_confirm_requested"

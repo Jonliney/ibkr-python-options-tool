@@ -840,6 +840,46 @@ class ExecutionJournal:
             "execution journal entry disappeared before acknowledgement"
         )
 
+    def record_verified_price_updates(
+        self,
+        snapshot: BrokerSnapshot,
+        updates: tuple[PriceUpdateCandidate, ...],
+        percentages: dict[int, tuple[str, str]],
+    ) -> None:
+        """Persist verified amended display values on exact app-owned layers."""
+        entries = list(self._entries())
+        replacements: list[tuple[int, int, JournalLayer]] = []
+        for update in updates:
+            matches = [
+                (entry_index, layer_index)
+                for entry_index, entry in enumerate(entries)
+                if entry.account == snapshot.selected.account
+                and entry.con_id == snapshot.selected.con_id
+                and len(entry.fingerprint) == 64
+                and entry.state in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"}
+                for layer_index, layer in enumerate(entry.layers)
+                if layer.target_perm_id == update.layer.target_perm_id
+                and layer.stop_perm_id == update.layer.stop_perm_id
+            ]
+            if len(matches) != 1 or update.layer.target_perm_id not in percentages:
+                raise ExecutionBlocked("amended OCA layer has no unique journal record")
+            entry_index, layer_index = matches[0]
+            layer = entries[entry_index].layers[layer_index]
+            target_percent, stop_percent = percentages[update.layer.target_perm_id]
+            replacements.append((entry_index, layer_index, replace(
+                layer,
+                target_price=format(update.target_price, "f") if update.target_price is not None else layer.target_price,
+                stop_price=format(update.stop_price, "f") if update.stop_price is not None else layer.stop_price,
+                target_percentage=target_percent if update.target_price is not None else layer.target_percentage,
+                stop_percentage=stop_percent if update.stop_price is not None else layer.stop_percentage,
+            )))
+        for entry_index, layer_index, replacement in replacements:
+            layers = list(entries[entry_index].layers)
+            layers[layer_index] = replacement
+            entries[entry_index] = replace(entries[entry_index], layers=tuple(layers))
+        if replacements:
+            self._write(tuple(entries))
+
     def record_pair_cancellation(
         self, candidate: MarketExitCandidate
     ) -> None:
@@ -1317,6 +1357,14 @@ class PaperExecutionService:
     def record_executions(self, snapshot: BrokerSnapshot) -> None:
         """Persist read-only fill and realized P&L observations."""
         self._journal.record_executions(snapshot)
+
+    def record_verified_price_updates(
+        self,
+        snapshot: BrokerSnapshot,
+        updates: tuple[PriceUpdateCandidate, ...],
+        percentages: dict[int, tuple[str, str]],
+    ) -> None:
+        self._journal.record_verified_price_updates(snapshot, updates, percentages)
 
     def owned_perm_ids(self, *, account: str, con_id: int) -> frozenset[int]:
         """Return only journal-proven app-owned broker order IDs."""

@@ -1551,6 +1551,7 @@ class StarUIWorkbench:
             )
             return
         prior_execution_ids = {fill.exec_id for fill in snapshot.executions}
+        edited_percentages = dict(self._armed_active_percentages)
         submitted = False
         try:
             confirmed = self._paper_execution.prepare_price_updates(
@@ -1586,6 +1587,13 @@ class StarUIWorkbench:
             if snapshot.executions_complete and _price_update_fills_verified(
                 refreshed, updates, prior_execution_ids
             ):
+                try:
+                    self._paper_execution.record_verified_price_updates(
+                        snapshot, updates, edited_percentages
+                    )
+                except ExecutionBlocked as journal_error:
+                    self._message = f"Price update outcome is unknown: {journal_error}. Check TWS and refresh."
+                    return
                 self._message = "Price update filled: the selected exit sold in TWS."
                 self._show_success_toast_locked(
                     "Exit filled in TWS", "The selected exit sold. Position and layers refreshed."
@@ -1598,6 +1606,16 @@ class StarUIWorkbench:
                 )
                 record_price_update_event("ui_result", outcome="unknown", reason=str(error))
         else:
+            try:
+                self._paper_execution.record_verified_price_updates(
+                    snapshot, updates, edited_percentages
+                )
+            except ExecutionBlocked as journal_error:
+                self._message = (
+                    f"Price update acknowledged, but layer history could not be updated: "
+                    f"{journal_error}. Refresh and check TWS."
+                )
+                return
             for update in updates:
                 self._remember_pending_active_prices_locked(
                     target_perm_id=update.layer.target_perm_id,
