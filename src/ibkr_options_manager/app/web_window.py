@@ -41,6 +41,8 @@ class StarUIPlannerWindow(QMainWindow):
         initial_con_id: int | None = None,
         demo_mode: bool = False,
         paper_execution: PaperExecutionService | None = None,
+        observe_positions: bool = False,
+        observer_client_id: int = 18,
     ) -> None:
         super().__init__()
         self._demo_mode = demo_mode
@@ -50,6 +52,8 @@ class StarUIPlannerWindow(QMainWindow):
             initial_con_id=initial_con_id,
             demo_mode=demo_mode,
             paper_execution=paper_execution,
+            observe_positions=observe_positions,
+            observer_client_id=observer_client_id,
         )
         self._server, self._thread, port = _start_local_server(self._surface.app)
         self._url = QUrl(f"http://127.0.0.1:{port}{self._surface.path}")
@@ -79,6 +83,7 @@ class StarUIPlannerWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._closed = True
+        self._surface.close()
         self._server.should_exit = True
         self._thread.join(timeout=2)
         super().closeEvent(event)

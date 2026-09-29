@@ -36,6 +36,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--con-id", type=int, help="option conId to prefill")
     parser.add_argument("--max-age", type=float, default=15.0)
     parser.add_argument(
+        "--observer-client-id", type=int, default=18,
+        help="dedicated nonzero TWS client ID for position observation",
+    )
+    parser.add_argument(
         "--demo-data",
         action="store_true",
         help="launch with deterministic simulated data; never contacts TWS",
@@ -107,6 +111,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         initial_con_id=args.con_id,
         demo_mode=args.demo_data,
         paper_execution=paper_execution,
+        observe_positions=not args.demo_data,
+        observer_client_id=args.observer_client_id,
     )
     window.refresh_on_launch()
     window.show()

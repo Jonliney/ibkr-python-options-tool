@@ -69,7 +69,7 @@ def capture() -> BrokerCapture:
                 parent_id=0,
             ),
         ),
-        contract_details=(),
+        contract_details=(long_contract, short_contract),
         quote=None,
         market_rule=None,
         completed=PORTFOLIO_COMPLETIONS,
@@ -145,6 +145,40 @@ def test_portfolio_preserves_the_received_position_order() -> None:
 
     assert result.snapshot is not None
     assert [position.key.con_id for position in result.snapshot.positions] == [102, 101]
+
+
+def test_portfolio_does_not_offer_an_unresolved_option_for_planning() -> None:
+    received = capture()
+    broker = FakePortfolioBroker(replace(received, contract_details=()))
+    coordinator = PortfolioCoordinator(
+        broker, max_age_seconds=Decimal("5"), clock=lambda: Decimal("101")
+    )
+
+    result = coordinator.refresh(request())
+
+    assert result.snapshot is not None
+    assert result.snapshot.positions[0].eligible is False
+    assert result.snapshot.positions[0].eligibility == "Unverified contract"
+
+
+def test_portfolio_rejects_conflicting_contract_details() -> None:
+    received = capture()
+    conflicting = replace(received.contract_details[0], strike=Decimal("7001"))
+    broker = FakePortfolioBroker(
+        replace(
+            received,
+            contract_details=(conflicting, *received.contract_details[1:]),
+        )
+    )
+    coordinator = PortfolioCoordinator(
+        broker, max_age_seconds=Decimal("5"), clock=lambda: Decimal("101")
+    )
+
+    result = coordinator.refresh(request())
+
+    assert result.snapshot is not None
+    assert result.snapshot.positions[0].eligible is False
+    assert result.snapshot.positions[0].eligibility == "Unverified contract"
 
 
 def test_portfolio_fails_closed_when_safety_evidence_is_missing() -> None:

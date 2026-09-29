@@ -126,6 +126,188 @@ def test_demo_launch_populates_the_starui_workbench_without_a_tws_refresh() -> N
     assert workbench._state.available_quantity == 5
 
 
+def test_observed_new_position_updates_sidebar_without_changing_selection() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    original_selection = workbench._selected_con_id
+    original_drafts = dict(workbench._drafts)
+    new_position = replace(
+        workbench._state.positions[0],
+        con_id=987654321,
+        local_symbol="NEW  261016C07000000",
+    )
+    workbench._observe_positions = True
+    workbench._observer_generation = 1
+
+    def refresh(*, auto_select: bool = True) -> None:
+        del auto_select
+        state = replace(
+            workbench._state,
+            positions=(*workbench._state.positions, new_position),
+        )
+        workbench._record_verified_positions_locked(state)
+        workbench._state = state
+
+    workbench._refresh_locked = refresh  # type: ignore[method-assign]
+    worker = Thread(target=workbench._observation_loop, daemon=True)
+    worker.start()
+    try:
+        workbench._position_hint(0)
+        assert workbench._pending_observation is False
+        workbench._position_hint(1)
+        for _ in range(100):
+            if 987654321 in workbench._new_position_ids:
+                break
+            Event().wait(0.01)
+        assert 987654321 in workbench._new_position_ids
+        assert workbench._selected_con_id == original_selection
+        assert workbench._drafts == original_drafts
+        assert workbench._observation_requires_reload is False
+        fragment = TestClient(workbench.app).get(
+            workbench.path + "inventory-fragment"
+        )
+        assert fragment.status_code == 200
+        assert "NEW" in fragment.text
+        assert 'data-position-name class="flex min-w-0 items-center gap-1.5"' in fragment.text
+        assert "data-new-position" in fragment.text
+        assert "new-position-badge" in fragment.text
+        assert "color: #f2c14e" in TestClient(workbench.app).get("/layers.css").text
+        assert fragment.headers["X-Selected-Changed"] == "0"
+    finally:
+        workbench.close()
+        worker.join(timeout=1)
+
+
+def test_position_becomes_new_when_contract_verification_completes() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._observe_positions = True
+    workbench._observer_generation = 1
+    verified = replace(
+        workbench._state.positions[0],
+        con_id=987654321,
+        local_symbol="SPX  261016P07000000",
+    )
+    unresolved = replace(
+        verified, eligible=False, eligibility="Unverified contract"
+    )
+    updates = [unresolved, verified]
+
+    def refresh(*, auto_select: bool = True) -> None:
+        del auto_select
+        update = updates.pop(0)
+        positions = [
+            position
+            for position in workbench._state.positions
+            if position.con_id != update.con_id
+        ]
+        positions.insert(1, update)
+        state = replace(workbench._state, positions=tuple(positions))
+        workbench._record_verified_positions_locked(state)
+        workbench._state = state
+
+    workbench._refresh_locked = refresh  # type: ignore[method-assign]
+    worker = Thread(target=workbench._observation_loop, daemon=True)
+    worker.start()
+    try:
+        for expected_revision in (1, 2):
+            workbench._position_hint(1)
+            for _ in range(100):
+                if workbench._inventory_revision >= expected_revision:
+                    break
+                Event().wait(0.01)
+            assert workbench._inventory_revision >= expected_revision
+        assert 987654321 in workbench._new_position_ids
+    finally:
+        workbench.close()
+        worker.join(timeout=1)
+
+
+def test_reconnect_does_not_hide_a_new_verified_position() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._observe_positions = True
+    workbench._observer_generation = 1
+    workbench._observer_health = "disconnected"
+    workbench._observer_retry_at = float("inf")
+    new_position = replace(
+        workbench._state.positions[0],
+        con_id=987654321,
+        local_symbol="SPX  261016P07000000",
+    )
+
+    def refresh(*, auto_select: bool = True) -> None:
+        del auto_select
+        state = replace(
+            workbench._state,
+            positions=(*workbench._state.positions, new_position),
+        )
+        workbench._record_verified_positions_locked(state)
+        workbench._state = state
+
+    workbench._refresh_locked = refresh  # type: ignore[method-assign]
+    worker = Thread(target=workbench._observation_loop, daemon=True)
+    worker.start()
+    try:
+        workbench._position_hint(1)
+        for _ in range(100):
+            if workbench._inventory_revision:
+                break
+            Event().wait(0.01)
+        assert workbench._inventory_revision > 0
+        assert 987654321 in workbench._new_position_ids
+    finally:
+        workbench.close()
+        worker.join(timeout=1)
+
+
+def test_manual_refresh_marks_a_new_verified_position() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    original = workbench._state
+    new_position = replace(
+        original.positions[0],
+        con_id=987654321,
+        local_symbol="SPX  261016P07000000",
+    )
+    positions = (*original.positions, new_position)
+    workbench._view_model.refresh_portfolio = (  # type: ignore[method-assign]
+        lambda _settings: replace(original, positions=positions, selected_con_id=None)
+    )
+    workbench._view_model.select_position = (  # type: ignore[method-assign]
+        lambda con_id, _form: replace(
+            original, positions=positions, selected_con_id=con_id
+        )
+    )
+
+    response = TestClient(workbench.app).post(
+        workbench.path + "action", data={"action": "refresh"}
+    )
+
+    assert response.status_code == 200
+    assert 987654321 in workbench._new_position_ids
+    assert "data-new-position" in response.text
+    assert re.search(
+        r'<div data-position-name[^>]*>\s*<span[^>]*>SPX</span><span data-new-position',
+        response.text,
+    )
+
+
+def test_lost_position_observer_blocks_paper_order_review() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._observe_positions = True
+    workbench._observer_health = "disconnected"
+
+    response = TestClient(workbench.app).post(
+        workbench.path + "action", data={"action": "execute-arm"}
+    )
+
+    assert response.status_code == 200
+    assert workbench._armed_execution is None
+    assert "TWS observation is unavailable" in workbench._status_message
+
+
 def test_verified_empty_portfolio_shows_refresh_guidance_without_order_review() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -246,6 +428,9 @@ def test_header_omits_full_allocation_and_identifies_paper_account() -> None:
     assert 'd="M9 17H7A5' in page  # Bundled Lucide link icon.
     assert 'text-cyan-400' in page
     assert 'd="M12 22s8-4 8-10V5' in page  # Bundled Lucide shield icon.
+    for label in ("Split draft layer quantities", "Create new OCA bracket"):
+        button = re.search(rf'<button[^>]*aria-label="{label}"[^>]*>', page)
+        assert button is not None and re.search(r"\sdisabled(?:\s|>)", button.group())
 
 
 def test_header_warns_when_a_live_account_is_configured() -> None:
@@ -1017,10 +1202,14 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert header.index('data-stop-preset="-35"') < header.rindex('Active layers')
     assert "Apply to active layers" in header
     assert 'aria-label="Move all active stops to B/E"' in header
+    assert 'aria-label="Delete all active layers"' in header
     assert 'aria-label="Sell all active layers"' in header
     assert 'data-orientation="vertical"' in header
     assert 'form="active-form" name="action" value="market-exit-selected"' in header
+    assert 'form="active-form" name="action" value="cancel-all-active"' in header
     assert header.index('aria-label="Move all active stops to B/E"') < header.index(
+        'aria-label="Delete all active layers"'
+    ) < header.index(
         'aria-label="Sell all active layers"'
     ) < header.index('aria-label="Split draft layer quantities"')
     assert header.index('aria-label="Set all active stops"') < header.index(
@@ -2283,6 +2472,122 @@ def test_delete_active_layer_review_cancels_only_that_oca_bracket() -> None:
     assert ">Confirm<" in TestClient(workbench.app).get(workbench.path).text
 
 
+def test_delete_all_active_layers_reviews_every_bracket_and_blocks_changed_set(
+    monkeypatch,
+) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    candidates = tuple(
+        MarketExitCandidate(
+            account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id,
+            target_order_id=11 + index * 2,
+            target_perm_id=101 + index * 2,
+            client_id=17,
+            quantity=Decimal("2"),
+            tif="GTC",
+            oca_group=f"example/tranche-{index + 1}",
+            stop_order_id=12 + index * 2,
+            stop_perm_id=102 + index * 2,
+        )
+        for index in range(2)
+    )
+    workbench._paper_execution = SimpleNamespace(  # type: ignore[assignment]
+        owned_perm_ids=lambda **_kwargs: frozenset(),
+        prepare_market_exits=lambda *_args, **_kwargs: candidates,
+    )
+    active_ids = (101, 103)
+    monkeypatch.setattr(workbench, "_active_target_perm_ids", lambda: active_ids)
+    monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
+    monkeypatch.setattr(
+        workbench._view_model, "select_position", lambda _con_id, _form: workbench._state
+    )
+    client = TestClient(workbench.app)
+
+    review = client.post(workbench.path + "action", data={"action": "cancel-all-active"})
+    assert review.status_code == 200
+    assert workbench._armed_cancellations == candidates
+    assert "example/tranche-1" in review.text
+    assert "example/tranche-2" in review.text
+    assert "SELL MKT" not in review.text.split("ACTION REVIEW", 1)[1]
+    assert 'value="active-action-execute"' in review.text
+    assert 'value="cancel-all-confirm"' not in review.text
+
+    client.post(workbench.path + "action", data={"action": "cancel-all-confirm"})
+    assert not workbench._active_action_verified
+    execute = client.post(
+        workbench.path + "action", data={"action": "active-action-execute"}
+    )
+    assert workbench._active_action_verified
+    assert 'value="cancel-all-confirm"' in execute.text
+    assert "Confirm requests cancellation of every reviewed active OCA bracket." in execute.text
+    assert re.search(r"<p>Confirm requests cancellation of every reviewed active OCA bracket\.", execute.text)
+
+    active_ids = (101, 103, 105)
+    changed = client.post(
+        workbench.path + "action", data={"action": "active-action-execute"}
+    )
+    assert not workbench._active_action_verified
+    assert workbench._armed_cancellations == ()
+    assert 'value="cancel-all-confirm"' not in changed.text
+
+
+def test_delete_all_active_layers_stops_after_a_failed_pair(monkeypatch) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    candidates = tuple(
+        MarketExitCandidate(
+            account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id,
+            target_order_id=11 + index * 2,
+            target_perm_id=101 + index * 2,
+            client_id=17,
+            quantity=Decimal("2"),
+            tif="GTC",
+            oca_group=f"example/tranche-{index + 1}",
+            stop_order_id=12 + index * 2,
+            stop_perm_id=102 + index * 2,
+        )
+        for index in range(3)
+    )
+    attempts: list[int] = []
+
+    def cancel_pair(_snapshot, candidate, **_kwargs) -> None:
+        attempts.append(candidate.target_perm_id)
+        if len(attempts) == 2:
+            raise ExecutionOutcomeUnknown("TWS acknowledgement incomplete")
+
+    workbench._paper_execution = SimpleNamespace(  # type: ignore[assignment]
+        prepare_market_exits=lambda _snapshot, *, target_perm_ids, **_kwargs: tuple(
+            candidate for candidate in candidates if candidate.target_perm_id in target_perm_ids
+        ),
+        cancel_pair=cancel_pair,
+    )
+    workbench._armed_cancellations = candidates
+    workbench._active_action_verified = True
+    monkeypatch.setattr(
+        workbench,
+        "_active_target_perm_ids",
+        lambda: tuple(
+            candidate.target_perm_id for candidate in candidates[len(attempts):]
+        ),
+    )
+    monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
+    monkeypatch.setattr(
+        workbench._view_model, "select_position", lambda _con_id, _form: workbench._state
+    )
+
+    workbench._confirm_all_cancellations_locked()
+
+    assert attempts == [101, 103]
+    assert "Cancelled 1 of 3 brackets" in workbench._status_message
+    assert workbench._armed_cancellations == ()
+
+
 @pytest.mark.parametrize(
     ("review_action", "confirm_action", "layer_count"),
     [
@@ -3095,7 +3400,7 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
 
     def inspect_acknowledgement(visible: object) -> None:
         result["acknowledgement_visible"] = bool(visible)
-        click_button("Refresh")
+        click_button("Refresh order status")
 
     def inspect_page(text: object) -> None:
         nonlocal phase
@@ -3114,7 +3419,7 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
             phase = 3
             click_button("Confirm")
         elif phase == 3:
-            if "Bracket orders sent to TWS" not in body:
+            if "The orders were sent to TWS" not in body:
                 finish("Paper execution did not render its acknowledgement")
                 return
             result["execute_arm"] = True
@@ -3122,11 +3427,9 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
             result["execute_confirm"] = True
             javascript(
                 """(() => {
-                  const toast = Array.from(document.querySelectorAll('[role="status"]'))
-                    .find((node) => node.textContent.includes('Bracket orders sent to TWS')
-                      && node.getBoundingClientRect().height > 0
-                      && getComputedStyle(node).display !== 'none');
-                  return !!toast;
+                  const dialog = document.querySelector('[data-submission-review] dialog');
+                  return !!dialog && dialog.open
+                    && dialog.getBoundingClientRect().height > 0;
                 })();""",
                 inspect_acknowledgement,
             )

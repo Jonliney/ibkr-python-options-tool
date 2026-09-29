@@ -5,7 +5,8 @@ This is an explicit, paper-only milestone. It is enabled only with
 
 ## Execution contract
 
-Choosing an active-layer action (delete bracket, sell one layer, or sell all
+Choosing an active-layer action (delete bracket, delete all active brackets,
+sell one layer, or sell all
 active layers) first builds its Action review from the selected position's
 already displayed snapshot. It does not contact TWS again or permit a write.
 Changing active target/stop prices, including Move to B/E, likewise updates the
@@ -24,6 +25,15 @@ before a paper write. The active-layer action icons create the initial review;
 draft and price edits update that review as their fields change. A recovery
 dialog that verifies a prior unknown cancellation is a separate read/verify
 workflow and does not submit a new order.
+
+**Delete all active layers** stages every currently reconciled, app-owned OCA
+pair for the selected position. Confirmation cancels pairs sequentially, using
+the existing two-leg cancellation and journal receipt for each pair. It reads
+TWS again before each cancellation and stops if the remaining set changes, a
+pair no longer matches the review, or an acknowledgement is incomplete. An
+earlier pair may already be cancelled when a later pair fails; the status
+reports the confirmed count and requires a fresh TWS review before another
+action. No market sell is sent, so the position remains open.
 
 For active stop amendments, the editor uses signed return from verified entry
 cost. A positive value places the proposed stop above entry; 0% is B/E. The

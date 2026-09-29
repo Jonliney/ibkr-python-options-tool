@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 # ruff: noqa: E501
+import asyncio
 import json
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from secrets import token_urlsafe
-from threading import RLock, Thread
+from threading import Event, RLock, Thread
+from time import monotonic
 from typing import Any
 
 from starhtml import (
@@ -22,15 +24,16 @@ from starhtml import (
     Signal,
     Span,
     star_app,
+    to_xml,
 )
 from starhtml import (
     Input as HTMLInput,
 )
+from starhtml.datastar import evt
 from starhtml.icons import resolver
 from starhtml.plugins import Plugin
-from starhtml.datastar import evt
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from ...domain import (
     BrokerSnapshot,
@@ -49,6 +52,7 @@ from ...execution import (
     PriceUpdateCandidate,
     classify_journal_layer,
 )
+from ...observation import ObservationSettings, PositionObserver
 from ...price_update_trace import record_price_update_event
 from ..view_model import (
     ConnectionSettings,
@@ -140,15 +144,34 @@ class StarUIWorkbench:
         initial_con_id: int | None = None,
         demo_mode: bool = False,
         paper_execution: PaperExecutionService | None = None,
+        observe_positions: bool = False,
+        observer_client_id: int = 18,
     ) -> None:
         _register_bundled_icons()
         self._view_model = view_model
         self._demo_mode = demo_mode
         self._paper_execution = paper_execution
+        self._observe_positions = observe_positions and not demo_mode
+        self._observer_client_id = observer_client_id
+        self._observer: PositionObserver | None = None
+        self._observer_generation = 0
+        self._observer_signal = Event()
+        self._observer_health = "idle"
+        self._queued_observer_health: str | None = None
+        self._pending_observation = False
+        self._observation_thread: Thread | None = None
+        self._closed = False
+        self._inventory_revision = 0
+        self._new_position_ids: set[int] = set()
+        self._observation_requires_reload = False
+        self._verified_position_ids: set[int] = set()
+        self._verified_position_account: str | None = None
+        self._observer_retry_at = 0.0
         self._armed_execution: PaperExecutionCandidate | None = None
         self._armed_market_exit: MarketExitCandidate | None = None
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
         self._armed_cancellation: MarketExitCandidate | None = None
+        self._armed_cancellations: tuple[MarketExitCandidate, ...] = ()
         self._active_action_verified = False
         self._review_all_active_exits = False
         self._armed_price_updates: tuple[PriceUpdateCandidate, ...] = ()
@@ -201,6 +224,8 @@ class StarUIWorkbench:
         self.app.register(_LOCAL_POSITION_PLUGIN)
         route(f"/{self.session_token}/")(self._home)
         route(f"/{self.session_token}/connection-status")(self._connection_status)
+        route(f"/{self.session_token}/inventory-events")(self._inventory_events)
+        route(f"/{self.session_token}/inventory-fragment")(self._inventory_fragment)
         route(f"/{self.session_token}/action", methods=["POST"])(self._action)
         self._notifications_enabled = True
 
@@ -259,6 +284,8 @@ class StarUIWorkbench:
                 "success" if state.status is UiStatus.READY else "failed"
             )
             self._suppress_toasts = False
+            if state.status is UiStatus.READY:
+                self._start_observer_locked()
 
     def start_launch_refresh(self) -> None:
         """Run the launch refresh in the background so the first page is immediate."""
@@ -292,6 +319,141 @@ class StarUIWorkbench:
         with self._lock:
             return JSONResponse({"state": self._launch_connection})
 
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            observer = self._observer
+            self._observer = None
+            self._observer_signal.set()
+        if observer is not None:
+            observer.stop()
+        if self._observation_thread is not None:
+            self._observation_thread.join(timeout=1)
+
+    async def _inventory_events(self, request: Request) -> StreamingResponse:
+        async def stream() -> Any:
+            with self._lock:
+                last = self._inventory_revision
+            yield f"data: {last}\n\n"
+            while not self._closed and not await request.is_disconnected():
+                await asyncio.sleep(0.4)
+                with self._lock:
+                    revision = self._inventory_revision
+                if revision != last:
+                    last = revision
+                    yield f"data: {revision}\n\n"
+
+        return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
+
+    def _inventory_fragment(self) -> HTMLResponse:
+        with self._lock:
+            return HTMLResponse(
+                to_xml(self._inventory()),
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-Selected-Changed": "1" if self._observation_requires_reload else "0",
+                },
+            )
+
+    def _start_observer_locked(self) -> None:
+        if not self._observe_positions or self._closed:
+            return
+        try:
+            settings = ObservationSettings(
+                account=self._settings.account,
+                port=self._settings.port,
+                client_id=self._observer_client_id,
+                capture_client_id=self._settings.client_id,
+                timeout_seconds=self._settings.timeout_seconds,
+            )
+        except ValueError:
+            self._observer_health = "error"
+            self._disarm_execution_locked()
+            self._state = replace(
+                self._state,
+                status=UiStatus.STALE,
+                can_preview=False,
+                fingerprint=None,
+            )
+            self._inventory_revision += 1
+            return
+        if self._observer is None:
+            self._observer = PositionObserver(self._position_hint, self._position_health)
+        self._observer_generation = -1
+        self._observer.start(
+            settings,
+            on_generation=lambda generation: setattr(
+                self, "_observer_generation", generation
+            ),
+        )
+        self._observer_health = "connecting"
+        self._observer_retry_at = monotonic() + 5
+        if self._observation_thread is None:
+            self._observation_thread = Thread(target=self._observation_loop, name="ibkr-observation-reconcile", daemon=True)
+            self._observation_thread.start()
+
+    def _position_hint(self, generation: int) -> None:
+        if generation != self._observer_generation or self._closed:
+            return
+        self._pending_observation = True
+        self._observer_signal.set()
+
+    def _position_health(self, generation: int, health: str) -> None:
+        if generation != self._observer_generation or self._closed:
+            return
+        self._queued_observer_health = health
+        self._observer_signal.set()
+
+    def _observation_loop(self) -> None:
+        while not self._closed:
+            self._observer_signal.wait(1)
+            self._observer_signal.clear()
+            with self._lock:
+                if self._closed:
+                    return
+                if self._queued_observer_health is not None:
+                    self._observer_health = self._queued_observer_health
+                    self._queued_observer_health = None
+                    if self._observer_health != "connected":
+                        self._disarm_execution_locked()
+                        self._state = replace(
+                            self._state,
+                            status=UiStatus.STALE,
+                            can_preview=False,
+                            fingerprint=None,
+                        )
+                        self._observation_requires_reload = True
+                        self._observer_retry_at = monotonic() + 5
+                    self._inventory_revision += 1
+                if (
+                    self._observer_health in {"error", "disconnected"}
+                    and monotonic() >= self._observer_retry_at
+                ):
+                    self._start_observer_locked()
+                if not self._pending_observation:
+                    continue
+                self._pending_observation = False
+                previous_selected = self._selected_con_id
+                self._suppress_toasts = True
+                try:
+                    self._refresh_locked(auto_select=False)
+                    if self._state.status is UiStatus.READY:
+                        self._observation_requires_reload = previous_selected != self._selected_con_id
+                    else:
+                        self._observation_requires_reload = True
+                except Exception:
+                    self._disarm_execution_locked()
+                    self._state = replace(
+                        self._state,
+                        status=UiStatus.STALE,
+                        can_preview=False,
+                        fingerprint=None,
+                    )
+                    self._observation_requires_reload = True
+                finally:
+                    self._suppress_toasts = False
+                    self._inventory_revision += 1
+
     async def _action(self, request: Request) -> Any:
         form = await request.form()
         values = {str(key): str(value) for key, value in form.items()}
@@ -310,6 +472,30 @@ class StarUIWorkbench:
         with self._lock:
             # Each response carries only feedback produced by this action.
             self._toast = None
+            trading_actions = {
+                "market-exit-selected",
+                "cancel-all-active",
+                "cancel-all-confirm",
+                "active-action-execute",
+                "market-exit-confirm",
+                "cancel-pair-confirm",
+                "active-update-arm",
+                "price-update-confirm",
+                "execute-arm",
+                "execute-confirm",
+            }
+            if (
+                self._observe_positions
+                and self._observer_health != "connected"
+                and (
+                    action in trading_actions
+                    or action.startswith("market-exit-arm:")
+                    or action.startswith("cancel-pair-arm:")
+                )
+            ):
+                self._disarm_execution_locked()
+                self._message = "TWS observation is unavailable. Refresh and wait for reconnection before reviewing an order."
+                return self._page()
             draft_change = action in {
                 "add-layer",
                 "equal-split",
@@ -336,6 +522,7 @@ class StarUIWorkbench:
                     ),
                 )
                 self._refresh_locked()
+                self._start_observer_locked()
                 self._submission_review_required = False
             elif action == "select":
                 self._disarm_execution_locked()
@@ -349,12 +536,16 @@ class StarUIWorkbench:
                 self._arm_cancellation_locked(_positive_int(perm_id, 0))
             elif action == "market-exit-selected":
                 self._arm_selected_market_exit_locked(values)
+            elif action == "cancel-all-active":
+                self._arm_all_cancellations_locked()
             elif action == "active-action-execute":
                 self._execute_active_action_locked()
             elif action == "market-exit-confirm":
                 self._confirm_market_exit_locked()
             elif action == "cancel-pair-confirm":
                 self._confirm_cancellation_locked()
+            elif action == "cancel-all-confirm":
+                self._confirm_all_cancellations_locked()
             elif action == "resolve-cancelled-bracket":
                 self._resolve_cancelled_bracket_locked(values)
             elif action.startswith("dismiss-cancelled:"):
@@ -388,11 +579,11 @@ class StarUIWorkbench:
                     self._confirm_execution_locked()
             return self._page()
 
-    def _refresh_locked(self) -> None:
+    def _refresh_locked(self, *, auto_select: bool = True) -> None:
         self._projection_comparison = None
         self._disarm_execution_locked()
         state = self._view_model.refresh_portfolio(self._settings)
-        self._apply_refreshed_portfolio_locked(state)
+        self._apply_refreshed_portfolio_locked(state, auto_select=auto_select)
 
     def _refresh_after_acknowledged_write_locked(self, acknowledgement: str) -> bool:
         """Replace optimistic post-write UI state with a fresh broker snapshot."""
@@ -414,8 +605,11 @@ class StarUIWorkbench:
             )
             return False
 
-    def _apply_refreshed_portfolio_locked(self, state: ViewState) -> None:
+    def _apply_refreshed_portfolio_locked(
+        self, state: ViewState, *, auto_select: bool = True
+    ) -> None:
         """Apply an already-read portfolio snapshot while holding the UI lock."""
+        self._record_verified_positions_locked(state)
         previous_con_id = self._selected_con_id
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
@@ -424,17 +618,34 @@ class StarUIWorkbench:
             target = previous_con_id
         available_con_ids = {position.con_id for position in state.positions}
         if target not in available_con_ids:
-            target = state.positions[0].con_id if state.positions else None
+            target = state.positions[0].con_id if auto_select and state.positions else None
         self._preferred_con_id = None
         if target is None:
             return
         self._select_locked(target)
+
+    def _record_verified_positions_locked(self, state: ViewState) -> None:
+        if state.status is not UiStatus.READY:
+            return
+        verified_ids = {
+            position.con_id for position in state.positions if position.eligible
+        }
+        if self._verified_position_account == state.account:
+            self._new_position_ids.update(
+                verified_ids - self._verified_position_ids
+            )
+        else:
+            self._new_position_ids.clear()
+        self._new_position_ids.intersection_update(verified_ids)
+        self._verified_position_ids = verified_ids
+        self._verified_position_account = state.account
 
     def _select_locked(self, con_id: int) -> None:
         if con_id not in {position.con_id for position in self._state.positions}:
             self._message = "The selected contract is not in the verified portfolio."
             return
         self._selected_con_id = con_id
+        self._new_position_ids.discard(con_id)
         state = self._view_model.select_position(
             con_id, self._plan_form(self._drafts.get(con_id, ()))
         )
@@ -463,6 +674,7 @@ class StarUIWorkbench:
         self._armed_market_exit = None
         self._armed_market_exits = ()
         self._armed_cancellation = None
+        self._armed_cancellations = ()
         self._active_action_verified = False
         self._review_all_active_exits = False
         self._armed_price_updates = ()
@@ -615,16 +827,43 @@ class StarUIWorkbench:
             "sell order will be sent. Press Execute paper order to verify a fresh snapshot."
         )
 
+    def _arm_all_cancellations_locked(self) -> None:
+        """Stage every active, journal-proven OCA pair on this position."""
+        self._disarm_execution_locked()
+        if self._paper_execution is None or self._selected_con_id is None:
+            self._message = "Paper order management is disabled for this launch."
+            return
+        target_ids = self._active_target_perm_ids()
+        snapshot = self._view_model.latest_snapshot()
+        if not target_ids or snapshot is None:
+            self._message = "Bracket cancellation blocked: no active layers are available."
+            return
+        try:
+            candidates = self._paper_execution.prepare_market_exits(
+                snapshot,
+                target_perm_ids=target_ids,
+                expected_client_id=self._settings.client_id,
+            )
+        except ExecutionBlocked as error:
+            self._message = f"Bracket cancellation blocked: {error}"
+            return
+        self._armed_cancellations = candidates
+        self._set_review_status_locked(
+            f"Review cancellation of {len(candidates)} active OCA brackets. "
+            "The position will remain open. Press Execute paper order to verify a fresh snapshot."
+        )
+
     def _execute_active_action_locked(self) -> None:
         """Verify a reviewed cancellation or market exit before showing Confirm."""
         market_exits = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
         cancellation = self._armed_cancellation
+        cancellations = self._armed_cancellations
         if (
             self._paper_execution is None
             or self._selected_con_id is None
-            or (not market_exits and cancellation is None)
+            or (not market_exits and cancellation is None and not cancellations)
         ):
             self._message = "Review an active-layer action before executing it."
             return
@@ -642,7 +881,19 @@ class StarUIWorkbench:
             self._message = "Execution blocked: the fresh snapshot is unavailable."
             return
         try:
-            if cancellation is not None:
+            if cancellations:
+                if set(self._active_target_perm_ids()) != {
+                    candidate.target_perm_id for candidate in cancellations
+                }:
+                    raise ExecutionBlocked("the set of active OCA layers changed after review")
+                refreshed = self._paper_execution.prepare_market_exits(
+                    snapshot,
+                    target_perm_ids=tuple(candidate.target_perm_id for candidate in cancellations),
+                    expected_client_id=self._settings.client_id,
+                )
+                if refreshed != cancellations:
+                    raise ExecutionBlocked("the OCA layers changed after review")
+            elif cancellation is not None:
                 refreshed = self._paper_execution.prepare_market_exit(
                     snapshot,
                     target_perm_id=cancellation.target_perm_id,
@@ -749,6 +1000,93 @@ class StarUIWorkbench:
                     "Bracket cancellation needs verification: the refreshed TWS "
                     "snapshot still shows a selected order. Check TWS and refresh."
                 )
+        finally:
+            self._disarm_execution_locked()
+
+    def _confirm_all_cancellations_locked(self) -> None:
+        """Cancel reviewed pairs one at a time, verifying TWS between writes."""
+        candidates = self._armed_cancellations
+        if (
+            self._paper_execution is None
+            or self._selected_con_id is None
+            or not candidates
+            or not self._active_action_verified
+        ):
+            self._message = "Press Execute paper order before confirming bracket cancellation."
+            return
+        cancelled = 0
+        try:
+            for index, candidate in enumerate(candidates):
+                state = self._view_model.select_position(
+                    self._selected_con_id,
+                    self._plan_form(self._drafts.get(self._selected_con_id, ())),
+                )
+                self._apply_state_locked(state)
+                self._record_refresh_time_locked()
+                self._announce_reconciliation_locked()
+                snapshot = self._view_model.latest_snapshot()
+                if snapshot is None:
+                    raise ExecutionBlocked("the fresh snapshot is unavailable")
+                remaining = candidates[index:]
+                if set(self._active_target_perm_ids()) != {
+                    item.target_perm_id for item in remaining
+                }:
+                    raise ExecutionBlocked("the set of active OCA layers changed")
+                refreshed = self._paper_execution.prepare_market_exits(
+                    snapshot,
+                    target_perm_ids=tuple(item.target_perm_id for item in remaining),
+                    expected_client_id=self._settings.client_id,
+                )
+                if refreshed != remaining:
+                    raise ExecutionBlocked("an OCA layer changed after review")
+                self._paper_execution.cancel_pair(
+                    snapshot,
+                    candidate,
+                    host="127.0.0.1",
+                    port=self._settings.port,
+                    client_id=self._settings.client_id,
+                    timeout_seconds=self._settings.timeout_seconds,
+                )
+                cancelled += 1
+        except (ExecutionBlocked, ExecutionOutcomeUnknown) as error:
+            self._message = (
+                f"Cancelled {cancelled} of {len(candidates)} brackets. Stopped: {error}. "
+                "Refresh TWS before another action."
+            )
+        except Exception as error:
+            self._message = (
+                f"Cancelled {cancelled} of {len(candidates)} brackets. Outcome is unknown: "
+                f"{error}. Refresh TWS before another action."
+            )
+        else:
+            if self._refresh_after_acknowledged_write_locked(
+                f"TWS confirmed cancellation of {cancelled} active OCA brackets."
+            ):
+                observed = self._view_model.latest_snapshot()
+                cancelled_ids = {
+                    perm_id
+                    for candidate in candidates
+                    for perm_id in (candidate.target_perm_id, candidate.stop_perm_id)
+                }
+                if (
+                    observed is not None
+                    and observed.selected.account == candidates[0].account
+                    and observed.selected.con_id == candidates[0].con_id
+                    and observed.complete
+                    and observed.fresh
+                    and not any(
+                        order.perm_id in cancelled_ids
+                        for order in observed.working_orders
+                    )
+                ):
+                    self._show_success_toast_locked(
+                        "Active brackets cancelled", "The position remains open."
+                    )
+                else:
+                    self._message = (
+                        "Bracket cancellation needs verification: refreshed TWS still "
+                        "shows a selected order. Check TWS and refresh."
+                    )
         finally:
             self._disarm_execution_locked()
 
@@ -1542,13 +1880,34 @@ class StarUIWorkbench:
                 )
             )
             content = Div(
-                self._inventory(),
+                Div(self._inventory(), id="position-inventory"),
                 self._workspace(title),
                 self._review(projection),
                 cls="grid h-[calc(100vh-3.5rem)] min-h-0 grid-cols-[16rem_minmax(0,1fr)_19rem] overflow-hidden border-t border-border",
             )
         return Div(
             Script(_projection_script(projection[2])),
+            Script(
+                f"""(() => {{
+                  const stream = new EventSource('/{self.session_token}/inventory-events');
+                  let seen = null;
+                  stream.onmessage = async (event) => {{
+                    if (seen === null) {{ seen = event.data; return; }}
+                    if (event.data === seen) return;
+                    seen = event.data;
+                    try {{
+                      const response = await fetch('/{self.session_token}/inventory-fragment', {{cache:'no-store'}});
+                      if (!response.ok) return;
+                      if (response.headers.get('X-Selected-Changed') === '1') {{
+                        window.location.reload(); return;
+                      }}
+                      const slot = document.getElementById('position-inventory');
+                      if (!slot) {{ window.location.reload(); return; }}
+                      slot.innerHTML = await response.text();
+                    }} catch (_) {{ /* The stream reconnects automatically. */ }}
+                  }};
+                }})();"""
+            ) if self._observe_positions else None,
             self._header(),
             content,
             self._toast_component(),
@@ -1773,6 +2132,13 @@ class StarUIWorkbench:
             connection = _header_status("TWS not connected", "link-2", "muted")
         elif self._launch_connection == "connecting":
             connection = _header_status("Connecting to TWS", "link-2", "muted")
+        elif self._observe_positions and self._observer_health in {"error", "disconnected", "client-id-in-use"}:
+            label = (
+                "Observer client ID in use"
+                if self._observer_health == "client-id-in-use"
+                else "TWS observation unavailable"
+            )
+            connection = _header_status(label, "link-2", "warning")
         elif verified_data:
             connection = _header_status("TWS connected", "link-2", "ready")
         elif self._launch_connection == "failed":
@@ -1858,7 +2224,19 @@ class StarUIWorkbench:
                 Form(
                     Button(
                         Div(
-                            Span(symbol, cls="text-sm font-semibold"),
+                            Div(
+                                Span(symbol, cls="text-sm font-semibold"),
+                                Badge(
+                                    "NEW",
+                                    variant="outline",
+                                    cls="new-position-badge",
+                                    data_new_position=True,
+                                )
+                                if position.con_id in self._new_position_ids
+                                else None,
+                                cls="flex min-w-0 items-center gap-1.5",
+                                data_position_name=True,
+                            ),
                             Badge(
                                 Span(position.quantity, data_position_count=True),
                                 Span(
@@ -2078,9 +2456,25 @@ class StarUIWorkbench:
                         Tooltip(
                             TooltipTrigger(
                                 Button(
-                                    Icon(
-                                        "lucide:log-out", cls="size-4", aria_hidden="true"
-                                    ),
+                                    Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
+                                    variant="outline",
+                                    size="icon",
+                                    type="submit",
+                                    form="active-form",
+                                    name="action",
+                                    value="cancel-all-active",
+                                    aria_label="Delete all active layers",
+                                    disabled=self._paper_execution is None
+                                    or bool(self._armed_price_updates),
+                                ),
+                                delay_duration=250,
+                            ),
+                            TooltipContent("Delete all active layers"),
+                        ),
+                        Tooltip(
+                            TooltipTrigger(
+                                Button(
+                                    Icon("lucide:log-out", cls="size-4", aria_hidden="true"),
                                     variant="outline",
                                     size="icon",
                                     type="submit",
@@ -2114,7 +2508,9 @@ class StarUIWorkbench:
                                         ),
                                         size="icon",
                                         aria_label="Split draft layer quantities",
-                                        disabled=len(self._current_layers()) < 2,
+                                        disabled=not draft_allowed
+                                        or planning_available <= 0
+                                        or len(self._current_layers()) < 2,
                                     ),
                                     DropdownMenuContent(
                                         DropdownMenuItem(
@@ -2146,7 +2542,9 @@ class StarUIWorkbench:
                                     name="action",
                                     value="add-layer",
                                     aria_label="Create new OCA bracket",
-                                    disabled=len(self._current_layers())
+                                    disabled=not draft_allowed
+                                    or planning_available <= 0
+                                    or len(self._current_layers())
                                     >= planning_available,
                                 ),
                                 delay_duration=250,
@@ -2154,9 +2552,7 @@ class StarUIWorkbench:
                             TooltipContent("Create new OCA bracket"),
                         ),
                         cls="flex items-center gap-2",
-                    )
-                    if draft_allowed and planning_available > 0
-                    else None,
+                    ),
                     cls="ml-auto flex flex-wrap items-center justify-end gap-2",
                 ),
                 cls="flex flex-wrap items-center gap-4",
@@ -3300,6 +3696,9 @@ class StarUIWorkbench:
             removed_ids.add(self._armed_market_exit.target_perm_id)
         if self._armed_cancellation is not None:
             removed_ids.add(self._armed_cancellation.target_perm_id)
+        removed_ids.update(
+            candidate.target_perm_id for candidate in self._armed_cancellations
+        )
         updates = {
             update.layer.target_perm_id: update for update in self._armed_price_updates
         }
@@ -3522,6 +3921,7 @@ class StarUIWorkbench:
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
         cancellation = self._armed_cancellation
+        cancellations = self._armed_cancellations
         price_updates = self._armed_price_updates
         armed_execution = self._armed_execution
         action_rows: list[Any] = []
@@ -3529,6 +3929,11 @@ class StarUIWorkbench:
             action_rows = self._review_market_exit_plan(market_exits)
         elif cancellation is not None:
             action_rows = [self._review_cancellation_plan(cancellation)]
+        elif cancellations:
+            action_rows = [
+                self._review_cancellation_plan(candidate, index=index)
+                for index, candidate in enumerate(cancellations, start=1)
+            ]
         elif price_updates:
             action_rows = [
                 self._review_price_update(index, update)
@@ -3556,7 +3961,7 @@ class StarUIWorkbench:
             Badge("MKT EXIT", variant="outline", cls="text-[10px]")
             if market_exits
             else Badge("CANCEL", variant="outline", cls="text-[10px]")
-            if cancellation is not None
+            if cancellation is not None or cancellations
             else Badge("PRICE UPDATE", variant="outline", cls="text-[10px]")
             if price_updates
             else Badge("DRAFT", variant="outline", cls="text-[10px]")
@@ -3659,8 +4064,20 @@ class StarUIWorkbench:
         market_exits = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
-        if (self._armed_cancellation is not None or market_exits) and not self._active_action_verified:
+        if (self._armed_cancellation is not None or self._armed_cancellations or market_exits) and not self._active_action_verified:
             return self._reviewed_active_action_controls()
+        if self._armed_cancellations:
+            return self._staged_action_controls(
+                confirm_action="cancel-all-confirm",
+                busy_text="Cancelling…",
+                impact=(
+                    "All active brackets will close",
+                    (
+                        "Confirm requests cancellation of every reviewed active OCA bracket. "
+                        "The position remains open without those brackets' protection.",
+                    ),
+                ),
+            )
         if self._armed_cancellation is not None:
             return self._staged_action_controls(
                 confirm_action="cancel-pair-confirm",
@@ -4166,10 +4583,12 @@ class StarUIWorkbench:
         )
         return rows
 
-    def _review_cancellation_plan(self, candidate: MarketExitCandidate) -> Any:
+    def _review_cancellation_plan(
+        self, candidate: MarketExitCandidate, *, index: int = 1
+    ) -> Any:
         """Show the complete pair that will be removed, with no replacement leg."""
         return self._review_oca_pair(
-            index=1,
+            index=index,
             quantity=format(candidate.quantity, "f"),
             tif=candidate.tif,
             lines=(

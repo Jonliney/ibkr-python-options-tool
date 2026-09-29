@@ -16,6 +16,7 @@ from .broker import (
 from .broker.observations import working_orders_from_capture
 from .domain import ContractKey, WorkingOrder
 from .redaction import redact_accounts
+from .snapshot import _same_required_identity
 
 
 class PortfolioStatus(StrEnum):
@@ -183,7 +184,16 @@ def _position(position: CapturedPosition, capture: BrokerCapture) -> PortfolioPo
     unit_basis = (
         average_cost / multiplier if multiplier.is_finite() and multiplier > 0 else None
     )
+    details = [
+        detail
+        for detail in capture.contract_details
+        if detail.con_id == contract.con_id
+    ]
     eligibility = _eligibility(contract, quantity, unit_basis)
+    if eligibility == "Eligible" and (
+        len(details) != 1 or not _same_required_identity(contract, details[0])
+    ):
+        eligibility = "Unverified contract"
     key = ContractKey(account, contract.con_id)
     orders = working_orders_from_capture(capture, selected=key)
     return PortfolioPosition(
@@ -203,7 +213,19 @@ def _eligibility(
     quantity: Decimal,
     unit_basis: Decimal | None,
 ) -> str:
-    if contract.con_id <= 0 or not contract.local_symbol.strip():
+    if (
+        contract.con_id <= 0
+        or contract.sec_type != "OPT"
+        or not contract.local_symbol.strip()
+        or not contract.expiry.strip()
+        or not contract.strike.is_finite()
+        or contract.strike <= 0
+        or contract.right not in {"C", "P"}
+        or not contract.multiplier.is_finite()
+        or contract.multiplier <= 0
+        or not contract.currency.strip()
+        or not contract.trading_class.strip()
+    ):
         return "Incomplete identity"
     if not quantity.is_finite() or quantity != quantity.to_integral_value():
         return "Fractional quantity"

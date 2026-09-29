@@ -131,6 +131,29 @@ class IbkrSnapshotBroker:
                 "TWS configuration request timed out",
             )
 
+            if isinstance(request, PortfolioRequest):
+                option_ids = sorted(
+                    {
+                        position.contract.con_id
+                        for position in app.positions
+                        if position.account == request.expected_account
+                        and position.contract.sec_type == "OPT"
+                        and position.quantity != 0
+                    }
+                )
+                for con_id in option_ids:
+                    app.events["contract_details"].clear()
+                    contract = imports.Contract()
+                    contract.conId = con_id
+                    contract.secType = "OPT"
+                    app.reqContractDetails(app.contract_request_id, contract)
+                    _await(
+                        app,
+                        "contract_details",
+                        deadline,
+                        "option contract details timed out",
+                    )
+
             if isinstance(request, SnapshotRequest):
                 try:
                     app.reqCompletedOrders(True)

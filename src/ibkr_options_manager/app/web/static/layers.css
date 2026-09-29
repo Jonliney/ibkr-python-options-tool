@@ -259,3 +259,14 @@
     transition: none;
   }
 }
+
+.new-position-badge {
+  border-color: rgb(242 193 78 / 60%);
+  background: rgb(242 193 78 / 16%);
+  color: #f2c14e;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.625rem;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: 0.04em;
+}
