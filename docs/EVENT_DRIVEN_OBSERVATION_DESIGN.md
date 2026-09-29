@@ -118,6 +118,12 @@ No UI request should wait on the observer's socket. Publish state changes to
 the local StarUI page through a loopback-only Server-Sent Events endpoint (or
 the framework's equivalent push channel). The event contains a revision and
 minimal change description; the browser fetches the latest rendered state.
+The header uses one TWS-updates indicator. It combines the browser's receipt of
+periodic SSE heartbeats with the position observer's reported health. A green
+indicator means the local event stream is responsive and the observer reports
+an open TWS socket; it does not prove future callbacks will arrive, mean a
+broker snapshot is fresh, or authorize an order. A missing heartbeat or observer
+disconnect must show a warning, even when no positions have changed.
 Reconnect the page stream without replaying old toast alerts. Re-rendering
 must preserve unsubmitted form inputs and drafts; a broker update that changes
 their validity disarms any pending confirmation and asks for review. Close the

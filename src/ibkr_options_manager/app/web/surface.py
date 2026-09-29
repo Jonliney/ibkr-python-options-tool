@@ -334,16 +334,18 @@ class StarUIWorkbench:
 
     async def _inventory_events(self, request: Request) -> StreamingResponse:
         async def stream() -> Any:
-            with self._lock:
-                last = self._inventory_revision
-            yield f"data: {last}\n\n"
             while not self._closed and not await request.is_disconnected():
-                await asyncio.sleep(0.4)
                 with self._lock:
-                    revision = self._inventory_revision
-                if revision != last:
-                    last = revision
-                    yield f"data: {revision}\n\n"
+                    payload = json.dumps(
+                        {
+                            "revision": self._inventory_revision,
+                            "observer": self._observer_health,
+                        }
+                    )
+                # A quiet position subscription still needs a visible liveness
+                # signal. The browser treats missed heartbeats as a lost stream.
+                yield f"data: {payload}\n\n"
+                await asyncio.sleep(2)
 
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
 
@@ -503,6 +505,7 @@ class StarUIWorkbench:
                 return self._page()
             draft_change = action in {
                 "add-layer",
+                "build-draft",
                 "equal-split",
                 "equal-split-available",
                 "equal-split-assigned",
@@ -577,10 +580,15 @@ class StarUIWorkbench:
                     if action.startswith("remove-layer:")
                     else None
                 )
+                if action == "build-draft" and self._current_layers():
+                    self._message = "A draft already exists. Edit its layers or remove them first."
+                    return self._page()
                 if not self._save_form_locked(values, removing_index=removing_index):
                     return self._page()
                 if action == "add-layer":
                     self._add_layer_locked()
+                elif action == "build-draft":
+                    self._build_draft_locked()
                 elif action in {"equal-split", "equal-split-available"}:
                     self._equal_split_locked(use_available_quantity=True)
                 elif action == "equal-split-assigned":
@@ -1736,40 +1744,9 @@ class StarUIWorkbench:
             # explicit choice through Add layer, even when quantity remains.
             self._drafts[con_id] = ()
             return
-        if self._state.bracket_form.layers:
-            self._drafts[con_id] = self._state.bracket_form.layers
-            return
-        if self._pending_submissions():
-            # A pending send has no automatically restored draft. Let the user
-            # start a new one explicitly from the uncommitted balance.
-            self._drafts[con_id] = ()
-            return
-        basis = self._state.unit_basis
-        calculator = self._state.quote_calculator
-        presets = self._preset_for_index(0)
-        if (
-            basis is None
-            or calculator is None
-            or self._planning_available_quantity() <= 0
-            or presets is None
-        ):
-            self._drafts[con_id] = ()
-            return
-        target, stop = presets
-        try:
-            prices = preview_reference_prices(basis, target, stop, calculator.bands)
-        except ValueError:
-            self._drafts[con_id] = ()
-            return
-        self._drafts[con_id] = (
-            DraftLayerForm(
-                quantity=str(self._planning_available_quantity()),
-                target_price=format(prices.target_price, "f"),
-                stop_price=format(prices.stop_price, "f"),
-                target_percentage=format(target, "f"),
-                stop_percentage=format(stop, "f"),
-            ),
-        )
+        # A position starts without a draft. Creating one requires Add Layer
+        # or Build Draft, so the empty state is visible on first selection.
+        self._drafts[con_id] = ()
 
     def _current_layers(self) -> tuple[DraftLayerForm, ...]:
         if self._selected_con_id is None:
@@ -1911,6 +1888,55 @@ class StarUIWorkbench:
             )
         )
 
+    def _build_draft_locked(self) -> None:
+        """Create a full draft from LMT defaults without changing existing rows."""
+        con_id = self._selected_con_id
+        available = self._planning_available_quantity()
+        if con_id is None or self._state.status is not UiStatus.READY or available <= 0:
+            self._message = "Refresh a position with available contracts before building a draft."
+            return
+        if self._current_layers():
+            self._message = "A draft already exists. Edit its layers or remove them first."
+            return
+        if any(
+            outcome.status != "PENDING"
+            for _entry, _index, outcome in self._pending_submissions()
+        ):
+            self._message = (
+                "Build Draft blocked: review unresolved brackets in TWS "
+                "before building a draft."
+            )
+            return
+        targets = _parse_presets(self._target_presets, maximum=Decimal("1000"))
+        stops = _parse_presets(self._stop_presets, maximum=Decimal("100"))
+        basis = self._state.unit_basis
+        calculator = self._state.quote_calculator
+        if targets is None or stops is None or basis is None or calculator is None:
+            self._message = "Enter valid LMT and STP defaults before building a draft."
+            return
+        count = min(available, len(targets))
+        quantities = _split_quantity(available, count)
+        layers: list[DraftLayerForm] = []
+        try:
+            for index, (target, quantity) in enumerate(
+                zip(targets[:count], quantities, strict=True)
+            ):
+                stop = stops[min(index, len(stops) - 1)]
+                prices = preview_reference_prices(basis, target, stop, calculator.bands)
+                layers.append(
+                    DraftLayerForm(
+                        quantity=str(quantity),
+                        target_price=format(prices.target_price, "f"),
+                        stop_price=format(prices.stop_price, "f"),
+                        target_percentage=format(target, "f"),
+                        stop_percentage=format(stop, "f"),
+                    )
+                )
+        except ValueError:
+            self._message = "The selected position does not have a usable price increment."
+            return
+        self._drafts[con_id] = tuple(layers)
+
     def _remove_layer_locked(self, index: int) -> None:
         layers = list(self._current_layers())
         con_id = self._selected_con_id
@@ -2016,15 +2042,45 @@ class StarUIWorkbench:
                   document.addEventListener('click', event => {{
                     if (event.target.closest('#position-change-update')) saveDraft();
                   }});
-                  const stream = new EventSource('/{self.session_token}/inventory-events');
                   let seen = '{self._inventory_revision}';
-                  stream.onmessage = async (event) => {{
-                    if (event.data === seen) return;
-                    seen = event.data;
+                  const setEventStatus = (state, label) => {{
+                    const status = document.getElementById('tws-updates-status');
+                    const statusText = document.getElementById('tws-updates-label');
+                    if (!status || !statusText) return;
+                    status.dataset.connectionState = state;
+                    status.dataset.headerStatus = label;
+                    statusText.textContent = label;
+                  }};
+                  let stream;
+                  let lastHeartbeat = 0;
+                  let fetching = false;
+                  const connectStream = () => {{
+                    lastHeartbeat = Date.now();
+                    stream = new EventSource('/{self.session_token}/inventory-events');
+                    stream.onerror = () => setEventStatus('warning', 'TWS updates reconnecting');
+                    stream.onmessage = async (event) => {{
+                    let update;
+                    try {{ update = JSON.parse(event.data); }} catch (_) {{
+                      setEventStatus('warning', 'TWS updates unavailable');
+                      return;
+                    }}
+                    lastHeartbeat = Date.now();
+                    setEventStatus(
+                      update.observer === 'connected' ? 'ready' :
+                        update.observer === 'connecting' ? 'starting' : 'warning',
+                      update.observer === 'connected' ? 'TWS connected' :
+                        update.observer === 'connecting' ? 'Connecting to TWS' :
+                        update.observer === 'client-id-in-use' ? 'TWS observer ID in use' :
+                        'TWS updates unavailable'
+                    );
+                    const revision = String(update.revision);
+                    if (revision === seen || fetching) return;
+                    fetching = true;
                     try {{
                       const response = await fetch('/{self.session_token}/inventory-fragment', {{cache:'no-store'}});
                       if (!response.ok) return;
-                      if (response.headers.get('X-Inventory-Revision') !== seen) return;
+                      if (response.headers.get('X-Inventory-Revision') !== revision) return;
+                      seen = revision;
                       if (response.headers.get('X-Selected-Changed') === '1') {{
                         saveDraft();
                         window.location.reload(); return;
@@ -2042,8 +2098,17 @@ class StarUIWorkbench:
                           ? `${{count}} new ${{count === 1 ? 'contract was' : 'contracts were'}} added to this position in TWS. Update this view to plan brackets for the latest quantity.`
                           : `${{count}} ${{count === 1 ? 'contract was' : 'contracts were'}} removed from this position in TWS. Update this view to review the remaining protection and draft quantities.`;
                       }}
-                    }} catch (_) {{ /* The stream reconnects automatically. */ }}
+                    }} catch (_) {{ /* The next heartbeat retries this revision. */ }}
+                    finally {{ fetching = false; }}
+                    }};
                   }};
+                  connectStream();
+                  window.setInterval(() => {{
+                    if (Date.now() - lastHeartbeat <= 7000) return;
+                    setEventStatus('warning', 'TWS updates delayed');
+                    stream.close();
+                    connectStream();
+                  }}, 2000);
                 }})();"""
             ) if self._observe_positions else None,
             self._header(),
@@ -2314,6 +2379,25 @@ class StarUIWorkbench:
             account_mode = _header_status("Live TWS account", "shield-alert", "live")
         else:
             account_mode = _header_status("Account unverified", "shield-off", "muted")
+        if self._observe_positions:
+            if self._observer_health in {"error", "disconnected", "client-id-in-use"} or self._launch_connection == "failed":
+                initial_label = "TWS updates unavailable"
+                initial_state = "warning"
+            elif self._launch_connection == "connecting" or self._observer_health == "connecting":
+                initial_label = "Connecting to TWS"
+                initial_state = "starting"
+            else:
+                initial_label = "Checking TWS updates"
+                initial_state = "starting"
+            connection = Div(
+                Icon("lucide:radio", cls="size-4 shrink-0 tws-updates-icon", aria_hidden="true"),
+                Span(initial_label, id="tws-updates-label", cls="text-xs font-medium whitespace-nowrap", aria_live="polite"),
+                id="tws-updates-status",
+                cls="flex shrink-0 items-center gap-1.5",
+                data_connection_state=initial_state,
+                data_header_status=initial_label,
+                title="TWS position observer and window event stream; a fresh broker snapshot is still required for order review",
+            )
         return Div(
             connection,
             plan_status,
@@ -2765,9 +2849,7 @@ class StarUIWorkbench:
                     if active_pairs or outcomes
                     else None,
                     Div(
-                        self._draft_panel(
-                            show_empty_state=not (active_pairs or outcomes)
-                        ),
+                        self._draft_panel(),
                         cls=(
                             "mt-2 border-t border-border pt-2"
                             if active_pairs or outcomes
@@ -3562,28 +3644,38 @@ class StarUIWorkbench:
             )
         return Div(cls="hidden")
 
-    def _draft_panel(self, *, show_empty_state: bool = False) -> Any:
+    def _draft_panel(self) -> Any:
         layers = self._current_layers()
         return Form(
             Div(
-                H3("Add a new layer", cls="text-lg font-semibold"),
+                H3("Build your exit draft", cls="text-lg font-semibold"),
                 P(
-                    "Start a draft exit bracket for the available contracts. "
-                    "You can adjust its target, stop, and quantity before reviewing the order.",
+                    "Use your LMT targets to split the available contracts into layers, "
+                    "then adjust prices and quantities before reviewing any order.",
                     cls="mt-2 max-w-md text-sm leading-6 text-muted-foreground",
                 ),
-                Button(
-                    Icon("lucide:plus", cls="size-4", aria_hidden="true"),
-                    "Add Layer",
-                    type="submit",
-                    name="action",
-                    value="add-layer",
-                    cls="mt-5",
+                Div(
+                    Button(
+                        "Build Draft",
+                        type="submit",
+                        name="action",
+                        value="build-draft",
+                        cls="draft-build-button",
+                    ),
+                    Button(
+                        Icon("lucide:plus", cls="size-4", aria_hidden="true"),
+                        "Add Layer",
+                        variant="outline",
+                        type="submit",
+                        name="action",
+                        value="add-layer",
+                    ),
+                    cls="mt-5 flex flex-wrap items-center justify-center gap-3",
                 ),
                 data_draft_empty_state=True,
                 cls="draft-empty-state",
             )
-            if show_empty_state and not layers
+            if not layers
             else ScrollArea(
                 Div(
                     *[
@@ -3620,7 +3712,7 @@ class StarUIWorkbench:
             id="draft-form",
             action=f"/{self.session_token}/action",
             method="post",
-            cls="h-full" if show_empty_state and not layers else "",
+            cls="h-full" if not layers else "",
         )
 
     def _live_draft_configuration(self) -> dict[str, Any] | None:
@@ -3716,16 +3808,33 @@ class StarUIWorkbench:
             ),
             quantity_field=_field(
                 "Quantity",
-                Input(
-                    name=f"quantity_{index}",
-                    id=f"quantity_{index}",
-                    type="number",
-                    value=layer.quantity,
-                    min="1",
-                    max=str(self._planning_available_quantity()),
-                    step="1",
-                    data_live_input="quantity",
-                    data_live_layer=index,
+                Div(
+                    Input(
+                        name=f"quantity_{index}",
+                        id=f"quantity_{index}",
+                        type="number",
+                        value=layer.quantity,
+                        min="1",
+                        max=str(self._planning_available_quantity()),
+                        step="1",
+                        data_live_input="quantity",
+                        data_live_layer=index,
+                        aria_describedby=f"quantity_share_{index}",
+                        cls="pr-12",
+                    ),
+                    Span(
+                        cls="draft-quantity-ring",
+                        data_quantity_ring=index,
+                        style=f"--quantity-share: {min(100, 100 * _int_or_zero(layer.quantity) / max(1, self._planning_available_quantity())):.4f}%",
+                        aria_hidden="true",
+                    ),
+                    Span(
+                        f"{layer.quantity} of {self._planning_available_quantity()} available contracts",
+                        id=f"quantity_share_{index}",
+                        cls="sr-only",
+                        data_quantity_share=index,
+                    ),
+                    cls="draft-quantity-control",
                 ),
                 input_id=f"quantity_{index}",
             ),
@@ -4834,6 +4943,10 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         const target = value('target', index), stop = value('stop', index);
         const quantity = value('quantity', index);
         const quantityValid = Number.isInteger(quantity) && quantity >= 1 && quantity <= config.available;
+        const ring = form.querySelector(`[data-quantity-ring="${{index}}"]`);
+        const share = form.querySelector(`[data-quantity-share="${{index}}"]`);
+        if (ring) ring.style.setProperty('--quantity-share', `${{quantityValid ? Math.min(100, quantity / config.available * 100) : 0}}%`);
+        if (share) share.textContent = quantityValid ? `${{quantity}} of ${{config.available}} available contracts (${{Math.round(quantity / config.available * 100)}}%)` : `Enter 1 to ${{config.available}} available contracts`;
         if (Number.isInteger(quantity) && quantity > 0) assignedQuantity += quantity;
         else quantitiesValid = false;
         const valid = Number.isFinite(target) && target > 0 && Number.isFinite(stop) && stop > 0 && stop <= 100 && quantityValid;

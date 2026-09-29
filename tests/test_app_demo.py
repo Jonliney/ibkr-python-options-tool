@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -436,6 +437,86 @@ def test_lost_position_observer_blocks_paper_order_review() -> None:
     assert response.status_code == 200
     assert workbench._armed_execution is None
     assert "TWS observation is unavailable" in workbench._status_message
+
+
+def test_single_tws_header_and_heartbeat_report_observer_health() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._observe_positions = True
+    page = TestClient(workbench.app).get(workbench.path).text
+
+    assert 'id="tws-updates-status"' in page
+    assert page.count('id="tws-updates-status"') == 1
+    assert 'data-header-status="Checking TWS updates"' in page
+    assert 'data-header-status="TWS not connected"' not in page
+    assert "TWS updates reconnecting" in page
+    assert "TWS updates delayed" in page
+
+    async def read_heartbeats() -> tuple[dict[str, object], dict[str, object]]:
+        request = SimpleNamespace(
+            is_disconnected=lambda: asyncio.sleep(0, result=False)
+        )
+        response = await workbench._inventory_events(request)
+        events = response.body_iterator
+        first = await events.__anext__()
+        workbench._observer_health = "disconnected"
+        second = await asyncio.wait_for(events.__anext__(), timeout=3)
+        await events.aclose()
+        return (
+            json.loads(first.removeprefix("data: ").strip()),
+            json.loads(second.removeprefix("data: ").strip()),
+        )
+
+    first, second = asyncio.run(read_heartbeats())
+    assert first == {"revision": workbench._inventory_revision, "observer": "idle"}
+    assert second == {
+        "revision": workbench._inventory_revision,
+        "observer": "disconnected",
+    }
+    workbench.close()
+
+
+def test_embedded_tws_indicator_tracks_observer_disconnect() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._observe_positions = True
+    workbench._observer_health = "connected"
+    server, server_thread, port = _start_local_server(workbench.app)
+    application = QApplication.instance() or QApplication([])
+    view = QWebEngineView()
+    view.resize(1200, 800)
+    view.show()
+    observed: list[str] = []
+
+    def inspect() -> None:
+        view.page().runJavaScript(
+            "document.getElementById('tws-updates-status')?.dataset.headerStatus",
+            record,
+        )
+
+    def record(label: object) -> None:
+        if label == "TWS connected" and not observed:
+            observed.append(str(label))
+            with workbench._lock:
+                workbench._observer_health = "disconnected"
+        elif label == "TWS updates unavailable" and observed:
+            observed.append(str(label))
+            application.quit()
+            return
+        QTimer.singleShot(150, inspect)
+
+    try:
+        view.loadFinished.connect(lambda ok: inspect() if ok else application.quit())
+        view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
+        QTimer.singleShot(8_000, application.quit)
+        application.exec()
+    finally:
+        view.close()
+        server.should_exit = True
+        server_thread.join(timeout=2)
+        workbench.close()
+
+    assert observed == ["TWS connected", "TWS updates unavailable"]
 
 
 def test_verified_empty_portfolio_shows_refresh_guidance_without_order_review() -> None:
@@ -1222,7 +1303,8 @@ def test_empty_draft_stays_empty_until_add_layer() -> None:
     con_id = workbench._selected_con_id
     assert con_id is not None
 
-    workbench._drafts[con_id] = ()
+    assert workbench._current_layers() == ()
+    assert 'data-draft-empty-state' in TestClient(workbench.app).get(workbench.path).text
     workbench._ensure_draft_locked()
 
     assert workbench._current_layers() == ()
@@ -1231,6 +1313,89 @@ def test_empty_draft_stays_empty_until_add_layer() -> None:
 
     assert len(workbench._current_layers()) == 1
     assert workbench._current_layers()[0].quantity == "5"
+
+
+def test_empty_draft_state_shows_beside_existing_exits() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._drafts[workbench._selected_con_id] = ()
+    workbench._paper_execution = _OwnedOrderService({101, 102})
+
+    page = TestClient(workbench.app).get(workbench.path).text
+
+    assert 'data-draft-empty-state' in page
+    assert 'value="build-draft"' in page
+
+
+@pytest.mark.parametrize(
+    ("available", "targets", "quantities"),
+    [
+        (5, ("20", "40", "60", "100"), ("2", "1", "1", "1")),
+        (3, ("20", "40", "60"), ("1", "1", "1")),
+    ],
+)
+def test_build_draft_uses_lmt_defaults_and_available_contracts(
+    available: int, targets: tuple[str, ...], quantities: tuple[str, ...]
+) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    workbench._drafts[con_id] = ()
+    workbench._state = replace(workbench._state, available_quantity=available)
+    client = TestClient(workbench.app)
+
+    empty = client.get(workbench.path).text
+    assert 'data-draft-empty-state' in empty
+    assert 'value="build-draft"' in empty
+    assert 'value="add-layer"' in empty
+    assert 'draft-build-button' in empty
+    css = client.get("/layers.css").text
+    assert ".draft-build-button {" in css
+    assert "background: #fff;" in css
+
+    response = client.post(workbench.path + "action", data={"action": "build-draft"})
+
+    assert response.status_code == 200
+    layers = workbench._current_layers()
+    assert tuple(layer.target_percentage for layer in layers) == targets
+    assert tuple(layer.quantity for layer in layers) == quantities
+    assert all(layer.stop_percentage == "25" for layer in layers)
+    assert all(Decimal(layer.target_price) > 0 for layer in layers)
+    assert 'data-draft-empty-state' not in response.text
+    assert 'data-quantity-ring="1"' in response.text
+    assert f'--quantity-share: {100 * int(quantities[0]) / available:.4f}%' in response.text
+    assert f'{quantities[0]} of {available} available contracts' in response.text
+
+
+def test_build_draft_preserves_existing_rows_and_fails_closed_on_bad_defaults() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    client = TestClient(workbench.app)
+    existing = workbench._current_layers()
+
+    client.post(
+        workbench.path + "action",
+        data={"action": "build-draft", "quantity_1": "1", "target_1": "100"},
+    )
+    assert workbench._current_layers() == existing
+
+    workbench._drafts[con_id] = ()
+    workbench._target_presets = "20, invalid, 60"
+    response = client.post(workbench.path + "action", data={"action": "build-draft"})
+    assert workbench._current_layers() == ()
+    assert "Enter valid LMT and STP defaults" in response.text
+
+    workbench._target_presets = "20, 40, 60, 100"
+    workbench._state = replace(workbench._state, available_quantity=0)
+    response = client.post(workbench.path + "action", data={"action": "build-draft"})
+    assert workbench._current_layers() == ()
+    assert response.status_code == 200
+    assert workbench._message == (
+        "Refresh a position with available contracts before building a draft."
+    )
 
 
 def test_existing_tws_bracket_waits_for_add_layer_before_creating_a_draft() -> None:
@@ -3102,8 +3267,8 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert workbench._current_layers() == ()
     assert 'aria-label="Remove layer 1"' not in response.text
     assert 'data-draft-empty-state' in response.text
-    assert "Add a new layer" in response.text
-    assert "Start a draft exit bracket for the available contracts." in response.text
+    assert "Build your exit draft" in response.text
+    assert "Use your LMT targets to split the available contracts into layers" in response.text
     assert 'name="action" value="add-layer"' in response.text
     assert response.text.count('name="action" value="add-layer"') == 3
     assert "Contracts still need protection" in response.text

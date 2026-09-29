@@ -18,6 +18,18 @@
   pointer-events: none;
 }
 
+#tws-updates-status .tws-updates-icon {
+  color: var(--muted-foreground);
+}
+
+#tws-updates-status[data-connection-state="ready"] .tws-updates-icon {
+  color: #34d399;
+}
+
+#tws-updates-status[data-connection-state="warning"] .tws-updates-icon {
+  color: #fcd34d;
+}
+
 .workspace-content {
   width: 100%;
   max-width: 80rem;
@@ -48,6 +60,38 @@
   justify-content: center;
   padding: 2rem;
   text-align: center;
+}
+
+.draft-build-button {
+  background: #fff;
+  color: #071a2b;
+}
+
+.draft-build-button:hover {
+  background: #eaf1f2;
+}
+
+.draft-quantity-control {
+  position: relative;
+  width: 100%;
+}
+
+.draft-quantity-control input {
+  width: 100%;
+}
+
+.draft-quantity-ring {
+  position: absolute;
+  top: 50%;
+  right: 0.75rem;
+  width: 1.25rem;
+  height: 1.25rem;
+  border-radius: 50%;
+  background: conic-gradient(#fff var(--quantity-share), #404040 0);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+  mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 2px));
+  transform: translateY(-50%);
+  pointer-events: none;
 }
 
 .contract-header-facts {

@@ -17,8 +17,15 @@ still produce inspectable plans only.
 
 ### Draft layers
 
+- A newly selected position starts with no draft layer. The empty state offers
+  Build Draft and Add Layer; neither action sends an order to TWS.
 - Retains the current editable layer rows, equal split modes, outcome
   projection, and preview-only action review.
+- When the draft is empty, Build Draft creates at most one row per configured
+  LMT target, capped by the verified available contract count. It assigns all
+  available contracts with the remainder on earlier rows, repeats the final
+  STP default as needed, and requires valid prices for every row before saving
+  any of them. An existing draft is never replaced by this action.
 - Shows only contracts verified as available for new brackets.
 - Remains blocked when existing orders reserve the whole position.
 
