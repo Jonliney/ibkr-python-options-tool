@@ -231,7 +231,9 @@ both exact fingerprinted legs of every planned layer cancelled with nonzero
 permanent IDs, no matching fills, and no matching working order. If any of
 that evidence is missing, the attempt remains blocked against duplicate send.
 For a precaution-held or untransmitted leg that never appears in completed-order
-history, the workbench opens a blocking **Verify cancellation** dialog. The
+history, or a previously acknowledged or reconciled app bracket whose legs
+disappear from working orders without a matching fill, the workbench opens a
+blocking **Verify cancellation** dialog. The
 operator must first confirm in TWS that both LMT and STP are gone. The app then
 takes a fresh selected-contract snapshot and requires complete current and
 completed order reads, complete execution history, no matching working leg or

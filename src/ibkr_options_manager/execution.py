@@ -666,7 +666,9 @@ class ExecutionJournal:
             if entry.fingerprint == fingerprint
             and entry.account == snapshot.selected.account
             and entry.con_id == snapshot.selected.con_id
-            and entry.state in {"SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED"}
+            and entry.state in {
+                "SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED", "SUBMITTED", "RECONCILED"
+            }
         ]
         if len(matches) != 1:
             raise ExecutionBlocked("the unresolved bracket is missing or ambiguous")

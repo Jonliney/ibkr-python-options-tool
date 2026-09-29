@@ -54,12 +54,12 @@ from ibkr_options_manager.broker import PortfolioRequest, SnapshotRequest
 from ibkr_options_manager.broker.execution import PaperSubmission
 from ibkr_options_manager.domain import ObservedExecution, PriceBand, WorkingOrder
 from ibkr_options_manager.execution import (
+    ExecutionBlocked,
     ExecutionJournal,
     ExecutionOutcomeUnknown,
     JournalEntry,
     JournalLayer,
     JournalFill,
-    JournalLayer,
     LayerOutcome,
     MarketExitCandidate,
     PaperExecutionService,
@@ -1547,6 +1547,52 @@ def test_manual_tws_confirmation_clears_unknown_only_after_fresh_api_check(
     assert journal.find(fingerprint).state == "CANCELLED_CONFIRMED"
 
 
+def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
+    tmp_path,
+) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    fingerprint = "c" * 64
+    journal = ExecutionJournal(tmp_path / "paper-journal.json")
+    journal._write((JournalEntry(
+        fingerprint=fingerprint,
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        state="RECONCILED",
+        expected_order_count=2,
+        order_ids=(101, 102),
+        perm_ids=(201, 202),
+        snapshot_captured_at="99",
+        layers=(JournalLayer(
+            quantity=2, target_price="1.20", stop_price="0.75", tif="GTC",
+            target_perm_id=201, stop_perm_id=202,
+        ),),
+    ),))
+    workbench._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(), journal
+    )
+
+    page = TestClient(workbench.app).get(workbench.path).text
+
+    assert "No fill evidence" in page
+    assert "Verify cancellation" in page
+    assert 'data-cancelled-bracket-recovery-dialog' in page
+    clean = replace(
+        snapshot, captured_at=Decimal("101"),
+        completed_orders_complete=True, executions_complete=True,
+    )
+    with pytest.raises(ExecutionBlocked, match="confirm both"):
+        journal.confirm_cancelled_unknown(
+            clean, fingerprint, confirmed_in_tws=False,
+        )
+    resolved = journal.confirm_cancelled_unknown(
+        clean, fingerprint, confirmed_in_tws=True,
+    )
+    assert resolved.state == "CANCELLED_CONFIRMED"
+
+
 def test_refresh_replaces_a_draft_that_exceeds_newly_available_quantity() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -2676,7 +2722,8 @@ def test_every_paper_write_uses_the_same_final_confirmation(
     assert 'value="cancel-staged"' in html
     assert html.index('value="cancel-staged"') < html.index(f'value="{confirm_action}"')
     if kind == "draft":
-        assert "Outside RTH is enabled for both legs" in html
+        assert "Submit paper brackets" not in html
+        assert "Outside RTH" not in html
 
 
 def test_stop_above_latest_ask_warns_before_price_update_and_quote_change_rearms(

@@ -3102,7 +3102,9 @@ class StarUIWorkbench:
         unresolved = {
             entry.fingerprint: entry
             for entry, _index, outcome in outcomes
-            if entry.state in {"SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED"}
+            if entry.state in {
+                "SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED", "SUBMITTED", "RECONCILED"
+            }
             and outcome.status in {"UNKNOWN", "NO_EXECUTION_EVIDENCE"}
             and not has_working_leg(entry)
         }
@@ -3126,13 +3128,12 @@ class StarUIWorkbench:
                                 P("Tranche ID · OCA group", cls="text-xs text-muted-foreground"),
                                 P(
                                     _journal_oca_group(entry, index),
-                                    cls="mt-1 break-all font-mono text-sm",
+                                    cls="mt-1 break-all text-sm",
                                 ),
                                 Div(
                                     Span("LMT target", cls="text-muted-foreground"),
                                     Span(
                                         f"{layer.target_price} · {layer.quantity} contracts",
-                                        cls="font-mono",
                                     ),
                                     cls="mt-3 flex justify-between gap-3 text-sm",
                                 ),
@@ -3140,7 +3141,6 @@ class StarUIWorkbench:
                                     Span("STP loss", cls="text-muted-foreground"),
                                     Span(
                                         f"{layer.stop_price} · {layer.quantity} contracts",
-                                        cls="font-mono",
                                     ),
                                     cls="mt-2 flex justify-between gap-3 text-sm",
                                 ),
@@ -4626,21 +4626,8 @@ class StarUIWorkbench:
                 impact=(impact.title, impact.details),
             )
         if self._armed_execution is not None:
-            extended = all(
-                pair.target.outside_rth and pair.stop.outside_rth
-                for pair in self._armed_execution.plan.pairs
-            )
             return self._staged_action_controls(
                 confirm_action="execute-confirm",
-                impact=(
-                    "Submit paper brackets",
-                    (
-                        "Confirm sends the reviewed OCA target and stop orders to TWS. "
-                        "Check the listed prices and quantities before submitting.",
-                        "Outside RTH is enabled for both legs where IBKR supports this index option."
-                        if extended else "Outside RTH is not enabled for this contract.",
-                    ),
-                ),
             )
         has_active_layers = bool(self._active_oca_pairs())
         has_draft_layers = bool(self._current_layers())
