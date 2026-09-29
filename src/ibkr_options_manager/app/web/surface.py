@@ -3842,7 +3842,7 @@ class StarUIWorkbench:
                 "TIF",
                 Div(
                     Select(
-                        SelectTrigger(SelectValue(), id=f"tif_{index}"),
+                        SelectTrigger(SelectValue(), id=f"tif_{index}_trigger"),
                         SelectContent(
                             SelectItem("GTC", value="GTC"),
                             SelectItem("DAY", value="DAY"),
@@ -3857,7 +3857,7 @@ class StarUIWorkbench:
                         data_bind=tif_signal,
                     ),
                 ),
-                input_id=f"tif_{index}",
+                input_id=f"tif_{index}_trigger",
             ),
             action_field=Button(
                 Icon("lucide:trash-2"),

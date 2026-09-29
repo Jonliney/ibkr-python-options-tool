@@ -1366,6 +1366,8 @@ def test_build_draft_uses_lmt_defaults_and_available_contracts(
     assert 'data-quantity-ring="1"' in response.text
     assert f'--quantity-share: {100 * int(quantities[0]) / available:.4f}%' in response.text
     assert f'{quantities[0]} of {available} available contracts' in response.text
+    assert 'id="tif_1_trigger"' in response.text
+    assert 'data-position:tif_1_trigger__' in response.text
 
 
 def test_build_draft_preserves_existing_rows_and_fails_closed_on_bad_defaults() -> None:
@@ -3164,8 +3166,8 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert quantity_input is not None
     assert 'min="1"' in quantity_input.group()
     assert 'max="5"' in quantity_input.group()
-    assert 'for="tif_1"' in draft
-    assert 'id="tif_1"' in draft
+    assert 'for="tif_1_trigger"' in draft
+    assert 'id="tif_1_trigger"' in draft
     assert "w-full min-w-[41rem]" in draft
     assert "items-start gap-3" in draft
     assert (
