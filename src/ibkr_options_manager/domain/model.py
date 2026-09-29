@@ -180,6 +180,7 @@ class OrderIntent:
     tif: str
     logical_oca_group: str
     oca_type: int
+    outside_rth: bool = False
 
 
 @dataclass(frozen=True, slots=True)

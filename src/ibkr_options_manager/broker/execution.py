@@ -9,7 +9,7 @@ from time import monotonic, sleep
 from typing import Any
 from uuid import uuid4
 
-from ..domain import BrokerSnapshot, PlanResult
+from ..domain import BrokerSnapshot, PlanResult, supports_outside_rth
 from ..execution import (
     ExecutionBlocked,
     ExecutionOutcomeUnknown,
@@ -51,6 +51,13 @@ class IbkrPaperExecutionBroker:
             or plan.fingerprint is None
         ):
             raise ExecutionBlocked("a fingerprinted paper-account plan is required")
+        outside_rth = supports_outside_rth(snapshot)
+        if any(
+            pair.target.outside_rth != outside_rth
+            or pair.stop.outside_rth != outside_rth
+            for pair in plan.pairs
+        ):
+            raise ExecutionBlocked("the bracket Outside RTH setting does not match the verified contract")
         imports = _load_ibapi()
         from ibapi.order import Order
 
@@ -112,6 +119,7 @@ class IbkrPaperExecutionBroker:
                     order.tif = intent.tif
                     order.ocaGroup = intent.logical_oca_group
                     order.ocaType = intent.oca_type
+                    order.outsideRth = intent.outside_rth
                     order.transmit = transmit
                     if intent.order_type == "LMT":
                         order.lmtPrice = float(intent.rounded_price)
@@ -668,6 +676,7 @@ class IbkrPaperExecutionBroker:
         imports = _load_ibapi()
 
         expected: dict[int, tuple[str, Decimal, int]] = {}
+        from ibapi.const import UNSET_DOUBLE, UNSET_INTEGER
         for candidate in candidates:
             if candidate.target_price is not None:
                 expected[candidate.layer.target_order_id] = (
@@ -846,6 +855,11 @@ class IbkrPaperExecutionBroker:
                     order.lmtPrice = float(price)
                 else:
                     order.auxPrice = float(price)
+                # TWS may populate VOL-only fields on an openOrder callback
+                # even for a plain app-owned LMT/STP. Re-sending those values
+                # makes placeOrder fail validation with code 321.
+                order.volatility = UNSET_DOUBLE
+                order.volatilityType = UNSET_INTEGER
                 # The target was originally staged with transmit=False while
                 # its OCA stop transmitted the pair. An amendment of that
                 # target must itself be sent through TWS precautions.

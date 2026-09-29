@@ -1,0 +1,7 @@
+# Outside RTH on paper exit brackets
+
+New paper OCA brackets enable IBKR's `outsideRth` flag on both the SELL LMT target and SELL STP protection leg by default when the verified contract is a USD option in the documented Cboe global-trading-hours family: SPX, SPXW, SPXPM, VIX, or XSP, routed through SMART or CBOE. The plan remains pure and records the same setting on both legs. Other contracts retain `outsideRth=False` because product and destination support is not established by this app.
+
+The flag permits activation, triggering, or filling outside *regular* hours where IBKR and the destination support it; it does not make an option tradable while its exchange is closed. IBKR can reject an invalid flag with error 411. TWS precautions remain enabled, and a rejected or incompletely acknowledged bracket remains an uncertain submission requiring reconciliation. Existing working orders are not changed automatically. Paper testing during an eligible extended session is required before relying on stop behavior; paper success does not establish live behavior.
+
+Sources: [IBKR order field reference](https://www.interactivebrokers.com/docs/tws-api/ref/order), [IBKR outside RTH order type and eligible products](https://www.interactivebrokers.com/en/trading/ordertypes.php), [IBKR Cboe options extended trading lesson](https://www.interactivebrokers.com/campus/trading-lessons/overnight-trading-cboe/), [IBKR API error 411](https://interactivebrokers.github.io/tws-api/message_codes.html).

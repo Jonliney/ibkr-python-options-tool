@@ -126,6 +126,99 @@ def _plan(snapshot: BrokerSnapshot):
     )
 
 
+def test_outside_rth_defaults_on_only_for_documented_index_options() -> None:
+    supported = _plan(_snapshot())
+    assert supported.status.value == "VALID"
+    assert all(pair.target.outside_rth and pair.stop.outside_rth for pair in supported.pairs)
+
+    for changes in (
+        {"trading_class": "AAPL"}, {"exchange": "ISE"}, {"currency": "EUR"},
+    ):
+        snapshot = _snapshot()
+        contract = replace(snapshot.contract, **changes)
+        unsupported = _plan(replace(
+            snapshot, contract=contract,
+            market_rule=replace(snapshot.market_rule, exchange=contract.exchange),
+        ))
+        assert unsupported.status.value == "VALID"
+        assert all(
+            not pair.target.outside_rth and not pair.stop.outside_rth
+            for pair in unsupported.pairs
+        )
+
+
+def test_mismatched_outside_rth_pair_is_blocked_before_any_tws_write() -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    pair = plan.pairs[0]
+    inconsistent = replace(plan, pairs=(replace(
+        pair, stop=replace(pair.stop, outside_rth=False)
+    ),))
+
+    with pytest.raises(ExecutionBlocked, match="Outside RTH"):
+        require_paper_execution_snapshot(snapshot, inconsistent)
+    with pytest.raises(ExecutionBlocked, match="Outside RTH"):
+        IbkrPaperExecutionBroker().submit(
+            snapshot, inconsistent, host="127.0.0.1", port=7497,
+            client_id=17, timeout_seconds=1,
+        )
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_paper_bracket_writer_sends_matching_outside_rth_flags(
+    monkeypatch, supported: bool,
+) -> None:
+    from ibkr_options_manager.broker import execution as broker_execution
+
+    snapshot = _snapshot()
+    if not supported:
+        snapshot = replace(
+            snapshot, contract=replace(snapshot.contract, trading_class="AAPL"),
+        )
+    plan = _plan(snapshot)
+    sent = []
+
+    class FakeWrapper:
+        def __init__(self) -> None:
+            pass
+
+    class FakeClient:
+        def __init__(self, wrapper) -> None:
+            self.wrapper = wrapper
+            self.connected = False
+
+        def connect(self, *_args) -> None:
+            self.connected = True
+            self.wrapper.nextValidId(500)
+
+        def run(self) -> None:
+            pass
+
+        def isConnected(self) -> bool:
+            return self.connected
+
+        def disconnect(self) -> None:
+            self.connected = False
+
+        def placeOrder(self, order_id, _contract, order) -> None:
+            sent.append((order.orderType, order.outsideRth, order.transmit))
+            order.permId = order_id + 1000
+            self.wrapper.openOrder(order_id, None, order, None)
+
+    monkeypatch.setattr(
+        broker_execution, "_load_ibapi",
+        lambda: _IbapiImports(FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace),
+    )
+
+    result = IbkrPaperExecutionBroker().submit(
+        snapshot, plan, host="127.0.0.1", port=7497,
+        client_id=17, timeout_seconds=1,
+    )
+
+    assert result.order_ids == (500, 501)
+    assert sent == [("LMT", supported, False), ("STP", supported, True)]
+
+
 def _two_pair_plan(snapshot: BrokerSnapshot):
     return build_exit_plan(
         replace(
@@ -1230,15 +1323,21 @@ def test_price_update_requires_fresh_post_write_order_price(
                     orderType="LMT",
                     lmtPrice=observed_price,
                     transmit=False,
+                    volatility=0.0,
+                    volatilityType=1,
                 ),
                 SimpleNamespace(status="Submitted"),
             )
             self.wrapper.openOrderEnd()
 
         def placeOrder(self, order_id, _contract, order) -> None:
+            from ibapi.const import UNSET_DOUBLE, UNSET_INTEGER
+
             assert order_id == 101
             assert order.lmtPrice == 31.5
             assert order.transmit is True
+            assert order.volatility == UNSET_DOUBLE
+            assert order.volatilityType == UNSET_INTEGER
             if rejected:
                 self.wrapper.error(order_id, 109, "TWS price precaution")
                 return

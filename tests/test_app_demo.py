@@ -32,6 +32,7 @@ from ibkr_options_manager.app.view_model import PlanForm, UiStatus, ValidationLi
 from ibkr_options_manager.app.web import StarUIWorkbench
 from ibkr_options_manager.app.web.surface import (
     _active_percentage_for_price,
+    _edited_active_price,
     _busy_submit_script,
     _contract_display_name,
     _live_active_script,
@@ -74,6 +75,54 @@ def test_demo_flag_is_explicit_and_does_not_require_account_input() -> None:
     assert args.demo_data is True
     assert args.account == ""
     assert args.con_id is None
+
+
+def test_closed_position_remains_read_only_for_current_session() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    closed_id = workbench._selected_con_id
+    assert closed_id is not None
+    assert len(workbench._state.positions) > 1
+    remaining = tuple(p for p in workbench._state.positions if p.con_id != closed_id)
+    workbench._apply_refreshed_portfolio_locked(
+        replace(workbench._state, positions=remaining, selected_con_id=None)
+    )
+
+    assert workbench._selected_closed_con_id == closed_id
+    page = to_xml(workbench._page())
+    assert "CLOSED THIS SESSION" in page
+    assert "Closed this session" in page
+    assert 'grid-cols-[16rem_minmax(0,1fr)_19rem]' in page
+    assert "Held / total" in page
+    assert "ACTION REVIEW" in page
+    assert "Execute paper order" in page
+    assert re.search(r'<button[^>]*disabled[^>]*>Execute paper order</button>', page)
+    assert "data-closed-session" in page
+    assert 'value="select-session-closed"' in page
+    assert 'value="price-update-confirm"' not in page
+
+    class History:
+        def submission_entries(self, **_kwargs):
+            return (JournalEntry(
+                fingerprint="a" * 64, account=workbench._settings.account,
+                con_id=closed_id, state="RECONCILED",
+                layers=(JournalLayer(
+                    1, "12.10", "8.80", "GTC", 201, 202,
+                    target_percentage="2", stop_percentage="-25",
+                ),),
+            ),)
+
+    workbench._paper_execution = History()  # type: ignore[assignment]
+    history_page = to_xml(workbench._page())
+    assert "VERIFY IN TWS" in history_page
+    assert "$12.10" in history_page
+    assert 'value="2"' in history_page
+
+    workbench._settings = replace(workbench._settings, account="DU_OTHER")
+    workbench._record_verified_positions_locked(
+        replace(workbench._state, positions=remaining)
+    )
+    assert not workbench._session_closed_positions
 
 
 def test_demo_broker_exercises_inventory_and_reserved_quantity_without_tws() -> None:
@@ -966,15 +1015,17 @@ def test_routine_statuses_do_not_create_toasts(message: str) -> None:
     assert _toast_notice(message) is None
 
 
-def test_problem_toast_has_actionable_title_and_body() -> None:
-    notice = _toast_notice(
-        "Paper submission acknowledged. Automatic TWS refresh failed; use Refresh before another action."
-    )
+@pytest.mark.parametrize("message", [
+    "Paper submission acknowledged. Automatic TWS refresh failed; use Refresh before another action.",
+    "TWS acknowledged the amendment. TWS refresh could not verify the new state; use Refresh before another action.",
+])
+def test_acknowledged_action_with_unverified_refresh_is_a_warning(message: str) -> None:
+    notice = _toast_notice(message)
 
     assert notice is not None
-    assert notice.title == "Couldn't verify the latest state"
-    assert notice.description == "TWS received the action. Refresh before making another change."
-    assert notice.variant == "error"
+    assert notice.title == "Action acknowledged by TWS"
+    assert notice.description == "Refresh to verify the latest orders and position before another change."
+    assert notice.variant == "warning"
 
 
 def test_price_update_fill_requires_fresh_exact_complete_execution() -> None:
@@ -1011,6 +1062,124 @@ def test_price_update_fill_requires_fresh_exact_complete_execution() -> None:
     assert not _price_update_fills_verified(
         replace(observed, executions_complete=False), (update,), set(),
     )
+
+
+def test_unchanged_active_percentage_keeps_exact_working_stop_price() -> None:
+    working = Decimal("18.50")
+    shown = Decimal("-23.6")
+    calculated = Decimal("18.60")  # inverse rounding of the displayed percentage
+
+    assert _edited_active_price(working, calculated, shown, shown) is None
+    assert _edited_active_price(working, calculated, Decimal("-23.2"), shown) == calculated
+
+
+def test_arming_target_only_does_not_reprice_untouched_stop(monkeypatch) -> None:
+    from ibkr_options_manager.app.view_model import WorkingOrderLine
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    target = WorkingOrder(
+        perm_id=201, client_id=17, order_id=101, key=snapshot.selected,
+        action="SELL", order_type="LMT", remaining=Decimal("1"),
+        status="Submitted", oca_group="owned/tranche-1",
+        limit_price=Decimal("29.50"), tif="GTC",
+    )
+    stop = replace(
+        target, perm_id=202, order_id=102, order_type="STP",
+        limit_price=None, stop_price=Decimal("18.50"),
+    )
+    current = replace(
+        snapshot, read_only_api=False,
+        position=replace(snapshot.position, unit_basis=Decimal("24.22")),
+        working_orders=(target, stop),
+    )
+    workbench._state = replace(
+        workbench._state, unit_basis=Decimal("24.22"),
+        working_orders=(
+            WorkingOrderLine(201, "SELL", "LMT", "1", "Submitted", 101,
+                             "owned/tranche-1", Decimal("29.50"), None, "GTC"),
+            WorkingOrderLine(202, "SELL", "STP", "1", "Submitted", 102,
+                             "owned/tranche-1", None, Decimal("18.50"), "GTC"),
+        ),
+    )
+    candidate = MarketExitCandidate(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
+        target_order_id=101, target_perm_id=201, client_id=17,
+        quantity=Decimal("1"), tif="GTC", oca_group="owned/tranche-1",
+        stop_order_id=102, stop_perm_id=202,
+    )
+
+    class PriceService:
+        def owned_perm_ids(self, **_kwargs):
+            return frozenset({201, 202})
+
+        def prepare_market_exits(self, *_args, **_kwargs):
+            return (candidate,)
+
+        def prepare_price_updates(self, _snapshot, *, updates, **_kwargs):
+            return updates
+
+        def price_update_attempt_state(self, *_args):
+            return None
+
+    workbench._paper_execution = PriceService()  # type: ignore[assignment]
+    monkeypatch.setattr(workbench._view_model, "select_position", lambda *_: workbench._state)
+    monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: current)
+    monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
+
+    workbench._arm_price_updates_locked({
+        "active_target_201": "1", "active_stop_201": "-23.6",
+    })
+
+    assert len(workbench._armed_price_updates) == 1
+    assert workbench._armed_price_updates[0].target_price is not None
+    assert workbench._armed_price_updates[0].stop_price is None
+
+
+def test_quote_movement_without_new_sell_risk_still_sends_amendment(monkeypatch) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    layer = MarketExitCandidate(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
+        target_order_id=101, target_perm_id=201, client_id=17,
+        quantity=Decimal("1"), tif="GTC", oca_group="owned/tranche-1",
+        stop_order_id=102, stop_perm_id=202,
+    )
+    update = PriceUpdateCandidate(layer=layer, target_price=Decimal("12.10"))
+    before = replace(snapshot, quote=replace(
+        snapshot.quote, bid=Decimal("11.50"), ask=Decimal("11.70"),
+        market_data_type="LIVE", fresh=True,
+    ))
+    after = replace(before, quote=replace(before.quote, bid=Decimal("11.60")))
+    sent = []
+
+    class PriceService:
+        def prepare_price_updates(self, _snapshot, *, updates, **_kwargs):
+            return updates
+
+        def modify_prices(self, _snapshot, updates, **_kwargs):
+            sent.extend(updates)
+            return SimpleNamespace(entry=SimpleNamespace(order_ids=(101,)))
+
+        def record_verified_price_updates(self, *_args):
+            pass
+
+    workbench._paper_execution = PriceService()  # type: ignore[assignment]
+    workbench._armed_price_updates = (update,)
+    workbench._armed_active_percentages = {201: ("1", "-25")}
+    workbench._warned_price_update_concerns = _price_update_impact(before, (update,)).concerns
+    monkeypatch.setattr(workbench._view_model, "select_position", lambda *_: workbench._state)
+    monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: after)
+    monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
+    monkeypatch.setattr(workbench, "_refresh_after_acknowledged_write_locked", lambda *_: True)
+
+    workbench._confirm_price_updates_locked({})
+
+    assert sent == [update]
 
 
 def test_immediate_price_update_fill_records_edited_values(monkeypatch) -> None:
@@ -1121,8 +1290,8 @@ def test_failed_post_write_refresh_does_not_show_a_success_toast() -> None:
         "Paper submission acknowledged."
     )
     assert workbench._toast is not None
-    assert workbench._toast.title == "Couldn't verify the latest state"
-    assert workbench._toast.variant == "error"
+    assert workbench._toast.title == "Action acknowledged by TWS"
+    assert workbench._toast.variant == "warning"
 
 
 def test_busy_submit_only_applies_to_explicitly_async_controls() -> None:
@@ -2484,7 +2653,10 @@ def test_every_paper_write_uses_the_same_final_confirmation(
         stop_order_id=12, stop_perm_id=102,
     )
     if kind == "draft":
-        workbench._armed_execution = object()  # type: ignore[assignment]
+        leg = SimpleNamespace(outside_rth=True)
+        workbench._armed_execution = SimpleNamespace(
+            plan=SimpleNamespace(pairs=(SimpleNamespace(target=leg, stop=leg),))
+        )  # type: ignore[assignment]
     elif kind == "price":
         workbench._armed_price_updates = (
             PriceUpdateCandidate(layer=layer, stop_price=Decimal("2.74")),
@@ -2503,6 +2675,8 @@ def test_every_paper_write_uses_the_same_final_confirmation(
     assert "bg-destructive" in confirm.group()
     assert 'value="cancel-staged"' in html
     assert html.index('value="cancel-staged"') < html.index(f'value="{confirm_action}"')
+    if kind == "draft":
+        assert "Outside RTH is enabled for both legs" in html
 
 
 def test_stop_above_latest_ask_warns_before_price_update_and_quote_change_rearms(

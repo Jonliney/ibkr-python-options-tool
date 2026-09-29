@@ -61,6 +61,7 @@ from ..view_model import (
     PaperExecutionCandidate,
     PlanForm,
     PlannerViewModel,
+    PortfolioPositionLine,
     UiStatus,
     ViewState,
 )
@@ -189,6 +190,10 @@ class StarUIWorkbench:
         ] = {}
         self._preferred_con_id = initial_con_id
         self._selected_con_id: int | None = None
+        self._selected_closed_con_id: int | None = None
+        self._session_position_account = initial_account
+        self._session_seen_positions: dict[int, PortfolioPositionLine] = {}
+        self._session_closed_positions: dict[int, PortfolioPositionLine] = {}
         self._state = view_model.empty()
         self._drafts: dict[int, tuple[DraftLayerForm, ...]] = {}
         self._projection_comparison: PositionOutcome | None = None
@@ -539,6 +544,14 @@ class StarUIWorkbench:
                 self._save_form_locked(values)
                 self._selected_quantity_change = None
                 self._select_locked(_positive_int(values.get("con_id"), 0))
+            elif action == "select-session-closed":
+                self._disarm_execution_locked()
+                con_id = _positive_int(values.get("con_id"), 0)
+                if con_id in self._session_closed_positions:
+                    self._selected_closed_con_id = con_id
+                    self._selected_con_id = None
+                else:
+                    self._message = "This contract is no longer in session history."
             elif action == "acknowledge-position-change":
                 self._disarm_execution_locked()
                 self._selected_quantity_change = None
@@ -603,6 +616,11 @@ class StarUIWorkbench:
     def _refresh_locked(
         self, *, auto_select: bool = True, preserve_invalid_drafts: bool = False
     ) -> None:
+        if self._session_position_account != self._settings.account:
+            self._session_seen_positions.clear()
+            self._session_closed_positions.clear()
+            self._selected_closed_con_id = None
+            self._session_position_account = self._settings.account
         self._projection_comparison = None
         self._disarm_execution_locked()
         state = self._view_model.refresh_portfolio(self._settings)
@@ -644,6 +662,12 @@ class StarUIWorkbench:
         previous_con_id = self._selected_con_id
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
+        if self._selected_closed_con_id in self._session_closed_positions:
+            return
+        self._selected_closed_con_id = None
+        if previous_con_id in self._session_closed_positions:
+            self._selected_closed_con_id = previous_con_id
+            return
         target = self._preferred_con_id
         if target is None:
             target = previous_con_id
@@ -695,6 +719,18 @@ class StarUIWorkbench:
     def _record_verified_positions_locked(self, state: ViewState) -> None:
         if state.status is not UiStatus.READY:
             return
+        if self._session_position_account != self._settings.account:
+            self._session_seen_positions.clear()
+            self._session_closed_positions.clear()
+            self._selected_closed_con_id = None
+            self._session_position_account = self._settings.account
+        current = {position.con_id: position for position in state.positions}
+        for con_id, position in self._session_seen_positions.items():
+            if con_id not in current:
+                self._session_closed_positions[con_id] = position
+        for con_id, position in current.items():
+            self._session_seen_positions[con_id] = position
+            self._session_closed_positions.pop(con_id, None)
         quantities: dict[int, int] = {}
         for position in state.positions:
             if not position.eligible:
@@ -728,6 +764,7 @@ class StarUIWorkbench:
             self._message = "The selected contract is not in the verified portfolio."
             return
         self._selected_con_id = con_id
+        self._selected_closed_con_id = None
         self._new_position_ids.discard(con_id)
         state = self._view_model.select_position(
             con_id, self._plan_form(self._drafts.get(con_id, ()))
@@ -1419,17 +1456,30 @@ class StarUIWorkbench:
                     basis * (Decimal("1") + stop_percentage / Decimal("100")),
                     calculator.bands,
                 )
+                shown_target = _decimal_value(_active_percentage_for_price(
+                    target.limit_price, basis, target=True,
+                    bands=calculator.bands,
+                    presets=_parse_presets(self._target_presets, maximum=Decimal("1000")) or (),
+                ))
+                shown_stop = _decimal_value(_active_percentage_for_price(
+                    stop.stop_price, basis, target=True,
+                    bands=calculator.bands,
+                    presets=_parse_presets(self._stop_presets, maximum=Decimal("100")) or (),
+                ))
                 updates.append(
                     PriceUpdateCandidate(
                         layer=layer,
                         target_price=(
-                            desired_target
-                            if desired_target is not None
-                            and desired_target != target.limit_price
-                            else None
+                            _edited_active_price(
+                                target.limit_price, desired_target,
+                                target_percentage, shown_target,
+                            )
                         ),
                         stop_price=(
-                            desired_stop if desired_stop != stop.stop_price else None
+                            _edited_active_price(
+                                stop.stop_price, desired_stop,
+                                stop_percentage, shown_stop,
+                            )
                         ),
                         prior_target_price=target.limit_price,
                         prior_stop_price=stop.stop_price,
@@ -2021,7 +2071,17 @@ class StarUIWorkbench:
             if self._submission_review_required
             else self._cancelled_bracket_recovery(self._submission_outcomes())
         )
-        if state.status is UiStatus.READY and not state.positions:
+        if self._selected_closed_con_id in self._session_closed_positions:
+            closed_workspace, closed_review = self._closed_session_workspace(
+                self._selected_closed_con_id
+            )
+            content = Div(
+                Div(self._inventory(), id="position-inventory"),
+                closed_workspace,
+                closed_review,
+                cls="grid h-[calc(100vh-3.5rem)] min-h-0 grid-cols-[16rem_minmax(0,1fr)_19rem] overflow-hidden border-t border-border",
+            )
+        elif state.status is UiStatus.READY and not state.positions and not self._session_closed_positions:
             content = self._empty_positions()
         else:
             snapshot = self._view_model.latest_snapshot()
@@ -2481,6 +2541,79 @@ class StarUIWorkbench:
             cls="flex h-14 items-center gap-3 px-4",
         )
 
+    def _closed_session_workspace(self, con_id: int) -> Any:
+        position = self._session_closed_positions[con_id]
+        reader = getattr(self._paper_execution, "submission_entries", None)
+        entries = reader(account=self._settings.account, con_id=con_id) if callable(reader) else ()
+        rows = []
+        realized = Decimal("0")
+        pnl_verified = True
+        for entry in entries:
+            for index in range(len(entry.layers)):
+                outcome = classify_journal_layer(
+                    entry, index, active_perm_ids=frozenset(),
+                    observed_perm_ids=frozenset(),
+                )
+                if outcome.status.startswith("CLOSED_"):
+                    rows.append(self._closed_layer_row(
+                        len(rows) + 1, entry, index, outcome,
+                        recover_legacy=False,
+                    ))
+                    if outcome.realized_pnl is not None and outcome.currency == "USD":
+                        realized += outcome.realized_pnl
+                    else:
+                        pnl_verified = False
+                else:
+                    pnl_verified = False
+                    rows.append(self._pending_layer_row(
+                        len(rows) + 1, entry, index, outcome, read_only=True,
+                    ))
+        symbol, contract_detail = _position_identity(position.local_symbol)
+        title = f"{symbol} {contract_detail}".strip()
+        result = _header_pnl(realized, "USD") if pnl_verified and rows else "—"
+        center = Div(
+            Div(
+                H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
+                Badge("Closed this session", variant="secondary"),
+                cls="flex flex-wrap items-center justify-between gap-3",
+            ),
+            Div(
+                _contract_header_metric("Held / total", "0 / 0"),
+                _contract_header_metric("Available", "0"),
+                _contract_header_metric("Average price", "—"),
+                _contract_header_metric("Last bid", "—"),
+                _contract_header_metric("Last ask", "—"),
+                _contract_header_metric("Realised P&L", result),
+                cls="contract-header-facts",
+            ),
+            ScrollArea(
+                Div(*rows, cls="mt-2") if rows else P(
+                    "No app-owned layer history is available for this contract.",
+                    cls="pt-8 text-sm text-muted-foreground",
+                ),
+                cls="min-h-0 flex-1",
+            ),
+            data_closed_session=True,
+            cls="flex min-h-0 min-w-0 flex-col gap-5 overflow-hidden px-8 py-8",
+        )
+        review = Div(
+            Div(
+                Span("ACTION REVIEW", cls="text-xs font-semibold tracking-wide text-muted-foreground"),
+                cls="flex items-center justify-between px-4 py-4",
+            ),
+            Div(
+                P("Closed position", cls="mt-4 text-base font-semibold"),
+                P(
+                    "This session view is read-only. Check TWS for any layer that still needs verification.",
+                    cls="mt-2 text-center text-sm leading-6 text-muted-foreground",
+                ),
+                cls="flex min-h-0 flex-1 flex-col items-center justify-center px-6",
+            ),
+            Div(Button("Execute paper order", disabled=True, cls="w-full"), cls="mx-4 mb-4"),
+            cls="flex min-h-0 flex-col overflow-hidden border-l border-border bg-card/30",
+        )
+        return center, review
+
     def _inventory(self) -> Any:
         rows = []
         for position in self._state.positions:
@@ -2550,6 +2683,32 @@ class StarUIWorkbench:
                     method="post",
                 )
             )
+        closed_rows = []
+        for position in self._session_closed_positions.values():
+            symbol, contract_detail = _position_identity(position.local_symbol)
+            closed_rows.append(
+                Form(
+                    Button(
+                        Div(
+                            Span(symbol, cls="text-sm font-semibold"),
+                            Badge("0", variant="secondary"),
+                            cls="flex w-full items-center justify-between",
+                        ),
+                        P(contract_detail, cls="mt-1.5 w-full text-xs text-muted-foreground"),
+                        variant="ghost",
+                        type="submit",
+                        cls=(
+                            "h-auto min-h-20 w-full flex-col items-stretch justify-center gap-0 "
+                            "rounded-none border-l-2 px-4 py-4 text-left hover:bg-accent "
+                            + ("border-emerald-400 bg-emerald-500/10" if position.con_id == self._selected_closed_con_id else "border-transparent")
+                        ),
+                    ),
+                    HTMLInput(type="hidden", name="action", value="select-session-closed"),
+                    HTMLInput(type="hidden", name="con_id", value=str(position.con_id)),
+                    action=f"/{self.session_token}/action",
+                    method="post",
+                )
+            )
         return Div(
             Div(
                 Span(
@@ -2561,6 +2720,11 @@ class StarUIWorkbench:
             ),
             ScrollArea(
                 *rows,
+                Div(
+                    Span("CLOSED THIS SESSION", cls="text-xs font-semibold tracking-wide text-muted-foreground"),
+                    cls="border-t border-border px-3 py-4",
+                ) if closed_rows else None,
+                *closed_rows,
                 aria_label="Open option positions",
                 cls="min-h-0 flex-1",
             ),
@@ -3269,7 +3433,8 @@ class StarUIWorkbench:
         return max(0, self._state.available_quantity - unobserved)
 
     def _pending_layer_row(
-        self, number: int, entry: JournalEntry, index: int, outcome: LayerOutcome
+        self, number: int, entry: JournalEntry, index: int, outcome: LayerOutcome,
+        *, read_only: bool = False,
     ) -> Any:
         layer = entry.layers[index]
         heading = {
@@ -3342,7 +3507,7 @@ class StarUIWorkbench:
                 title="Remove cancelled row from view",
                 cls="relative z-[3] mt-5",
             )
-            if outcome.status == "CANCELLED"
+            if outcome.status == "CANCELLED" and not read_only
             else Div(cls="min-w-0"),
             Div(
                 Span(
@@ -3359,12 +3524,13 @@ class StarUIWorkbench:
         )
 
     def _closed_layer_row(
-        self, number: int, entry: JournalEntry, index: int, outcome: LayerOutcome
+        self, number: int, entry: JournalEntry, index: int, outcome: LayerOutcome,
+        *, recover_legacy: bool = True,
     ) -> Any:
         layer = entry.layers[index]
         recovered = None
         calculator = self._state.quote_calculator
-        if (
+        if recover_legacy and (
             not layer.target_percentage or not layer.stop_percentage
         ) and calculator is not None:
             recovered = _recover_legacy_layer_percentages(
@@ -4460,6 +4626,10 @@ class StarUIWorkbench:
                 impact=(impact.title, impact.details),
             )
         if self._armed_execution is not None:
+            extended = all(
+                pair.target.outside_rth and pair.stop.outside_rth
+                for pair in self._armed_execution.plan.pairs
+            )
             return self._staged_action_controls(
                 confirm_action="execute-confirm",
                 impact=(
@@ -4467,6 +4637,8 @@ class StarUIWorkbench:
                     (
                         "Confirm sends the reviewed OCA target and stop orders to TWS. "
                         "Check the listed prices and quantities before submitting.",
+                        "Outside RTH is enabled for both legs where IBKR supports this index option."
+                        if extended else "Outside RTH is not enabled for this contract.",
                     ),
                 ),
             )
@@ -5508,6 +5680,18 @@ def _recover_legacy_layer_percentages(
     return format(matches[0][0], "f"), format(matches[0][1], "f")
 
 
+def _edited_active_price(
+    working: Decimal | None,
+    calculated: Decimal | None,
+    entered_percentage: Decimal,
+    shown_percentage: Decimal | None,
+) -> Decimal | None:
+    """Keep an untouched broker price even if inverse rounding differs a tick."""
+    if entered_percentage == shown_percentage or calculated == working:
+        return None
+    return calculated
+
+
 def _active_percentage_for_price(
     price: Decimal | None,
     basis: Decimal | None,
@@ -6003,9 +6187,9 @@ def _toast_notice(message: str) -> _ToastNotice | None:
         return None
     if "automatic tws refresh failed" in lowered or "tws refresh could not" in lowered:
         return _ToastNotice(
-            "Couldn't verify the latest state",
-            "TWS received the action. Refresh before making another change.",
-            "error",
+            "Action acknowledged by TWS",
+            "Refresh to verify the latest orders and position before another change.",
+            "warning",
         )
     if "outcome is unknown" in lowered:
         description = (

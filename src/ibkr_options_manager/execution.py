@@ -18,6 +18,7 @@ from .domain import (
     PlanStatus,
     WorkingOrder,
     closing_order_allocation,
+    supports_outside_rth,
 )
 
 
@@ -1258,6 +1259,13 @@ def require_paper_execution_snapshot(
     """Validate a fresh, quantity-safe plan before opening a TWS writer."""
     if plan.status is not PlanStatus.VALID or plan.fingerprint is None:
         raise ExecutionBlocked("the refreshed plan is not valid")
+    outside_rth = supports_outside_rth(snapshot)
+    if any(
+        pair.target.outside_rth != outside_rth
+        or pair.stop.outside_rth != outside_rth
+        for pair in plan.pairs
+    ):
+        raise ExecutionBlocked("the bracket Outside RTH setting does not match the verified contract")
     require_paper_management_snapshot(snapshot)
     reserved, failures = closing_order_allocation(snapshot)
     if failures or reserved != plan.allocated_quantity:

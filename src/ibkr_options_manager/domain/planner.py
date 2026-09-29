@@ -52,6 +52,7 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
         )
     )
     fingerprint = _fingerprint(snapshot, request, allocated, pair_quantities)
+    outside_rth = supports_outside_rth(snapshot)
     pairs: list[ExitPair] = []
 
     for index, quantity in enumerate(pair_quantities):
@@ -88,6 +89,7 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
             tif=tif,
             logical_oca_group=group,
             oca_type=2,
+            outside_rth=outside_rth,
         )
         stop = OrderIntent(
             account=snapshot.selected.account,
@@ -100,6 +102,7 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
             tif=tif,
             logical_oca_group=group,
             oca_type=2,
+            outside_rth=outside_rth,
         )
         pairs.append(
             ExitPair(
@@ -120,6 +123,17 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
         planned_quantity=sum(pair_quantities),
         pairs=tuple(pairs),
         validations=(),
+    )
+
+
+def supports_outside_rth(snapshot: BrokerSnapshot) -> bool:
+    """Use the documented Cboe index-option GTH family only."""
+    contract = snapshot.contract
+    return (
+        contract.sec_type == "OPT"
+        and contract.currency == "USD"
+        and contract.exchange in {"SMART", "CBOE"}
+        and contract.trading_class.upper() in {"SPX", "SPXW", "SPXPM", "VIX", "XSP"}
     )
 
 
