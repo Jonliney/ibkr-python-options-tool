@@ -28,6 +28,7 @@ from starhtml import (
 )
 from starhtml.icons import resolver
 from starhtml.plugins import Plugin
+from starhtml.datastar import evt
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -971,33 +972,23 @@ class StarUIWorkbench:
                     target_percentage is None
                     or target_percentage <= 0
                     or stop_percentage is None
-                    or stop_percentage < 0
-                    or stop_percentage > 100
+                    or stop_percentage <= -100
                 ):
                     raise ExecutionBlocked(
-                        "active target must be positive and stop must be 0% to 100%"
+                        "active target must be positive and stop return must be above -100%"
                     )
                 edited_percentages[layer.target_perm_id] = (
                     format(target_percentage, "f"),
                     format(stop_percentage, "f"),
                 )
-                if stop_percentage == 0:
-                    desired_target = round_up_price(
-                        basis * (Decimal("1") + target_percentage / Decimal("100")),
-                        calculator.bands,
-                    )
-                    desired_stop = round_up_price(basis, calculator.bands)
-                else:
-                    prices = preview_reference_prices(
-                        basis,
-                        target_percentage,
-                        stop_percentage,
-                        calculator.bands,
-                    )
-                    desired_target, desired_stop = (
-                        prices.target_price,
-                        prices.stop_price,
-                    )
+                desired_target = round_up_price(
+                    basis * (Decimal("1") + target_percentage / Decimal("100")),
+                    calculator.bands,
+                )
+                desired_stop = round_up_price(
+                    basis * (Decimal("1") + stop_percentage / Decimal("100")),
+                    calculator.bands,
+                )
                 updates.append(
                     PriceUpdateCandidate(
                         layer=layer,
@@ -2064,6 +2055,9 @@ class StarUIWorkbench:
                 H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
                 Div(
                     Div(
+                        self._set_stops_dialog(active_pairs, basis, quote, selected_snapshot.fresh if selected_snapshot is not None else False)
+                        if basis is not None
+                        else None,
                         Tooltip(
                             TooltipTrigger(
                                 Button(
@@ -2370,6 +2364,92 @@ class StarUIWorkbench:
         if app_order_count:
             return "mixed", app_order_count, len(orders)
         return "external", 0, len(orders)
+
+    def _set_stops_dialog(
+        self, pairs: tuple[tuple[str, Any, Any], ...], basis: Decimal,
+        quote: Any, snapshot_fresh: bool,
+    ) -> Any:
+        current_prices = {stop.stop_price for _group, _target, stop in pairs}
+        initial_price = next(iter(current_prices)) if len(current_prices) == 1 else None
+        initial_return = (
+            _price_percentage(initial_price, basis, target=True)
+            if initial_price is not None else ""
+        )
+        live_ask = (
+            quote.ask
+            if snapshot_fresh
+            and quote is not None
+            and quote.fresh
+            and quote.market_data_type == "LIVE"
+            and quote.ask is not None
+            and quote.ask.is_finite()
+            and quote.ask > 0
+            else None
+        )
+        ask_text = (
+            f"${live_ask:,.{max(2, -live_ask.normalize().as_tuple().exponent)}f}"
+            if live_ask is not None else "Unavailable"
+        )
+        return Tooltip(
+            TooltipTrigger(
+                Dialog(
+                    DialogTrigger(
+                        Icon("lucide:arrow-up", cls="size-4", aria_hidden="true"),
+                        variant="outline", size="icon", aria_label="Set all active stops",
+                        disabled=self._paper_execution is None or bool(self._armed_price_updates),
+                    ),
+                    DialogContent(
+                        DialogHeader(
+                            DialogTitle("Set all active stops"),
+                            DialogDescription(
+                                "Enter a stop price or return percentage to be applied to all active layers."
+                            ),
+                        ),
+                        Div(
+                            Div(
+                                Label("Stop price", fr="all-stop-value", data_stop_input_label=True, cls="text-xs font-medium text-muted-foreground"),
+                                Span(f"{initial_return}% from entry" if initial_return else "—", data_stop_dialog_inverse=True, aria_live="polite", cls="text-xs font-semibold text-foreground"),
+                                cls="flex items-center justify-between gap-2",
+                            ),
+                            Div(
+                                Button("%", type="button", variant="outline", size="icon", data_stop_mode="return", aria_label="Enter return percentage from entry", aria_pressed="false", cls="stop-mode-button"),
+                                Button("$", type="button", variant="outline", size="icon", data_stop_mode="price", aria_label="Enter stop price in dollars", aria_pressed="true", cls="stop-mode-button"),
+                                Input(
+                                    id="all-stop-value", type="number", min="0", step="any",
+                                    value=_price_text(initial_price) if initial_price is not None else "",
+                                    data_stop_dialog_value=True, cls="min-w-0 flex-1",
+                                ),
+                                cls="mt-1 flex items-center gap-2",
+                            ),
+                            cls="space-y-0.5",
+                        ),
+                        Div(
+                            *(Button(f"{pct:+d}%" if pct > 0 else f"{pct}%", type="button", variant="outline", data_stop_preset=str(pct))
+                              for pct in (20, 0, -20, -25, -35)),
+                            cls="flex flex-wrap gap-2",
+                        ),
+                        Div(
+                            Div(Span("Active layers", cls="text-xs text-muted-foreground"), Span(str(len(pairs)), cls="text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
+                            Div(Span("Entry cost", cls="text-xs text-muted-foreground"), Span(f"${basis.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}", cls="text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
+                            Div(Span("Latest ask at refresh" if live_ask is not None else "Latest ask", cls="text-xs text-muted-foreground"), Span(ask_text, cls="text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
+                            Div(Span("Stop price", cls="text-xs text-muted-foreground"), Span("—", data_stop_dialog_summary=True, aria_live="polite", cls="text-right text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
+                            cls="space-y-2 rounded-md border border-border bg-muted/20 px-4 py-3",
+                        ),
+                        DialogFooter(
+                            DialogClose("Cancel", variant="outline"),
+                            Button("Apply to active layers", type="button", data_apply_all_stops=True),
+                            cls="mt-4",
+                        ),
+                        data_stop_dialog=True,
+                        data_stop_basis=format(basis, "f"),
+                    ),
+                    data_on_focusin=evt.stopPropagation(),
+                    data_on_focusout=evt.stopPropagation(),
+                ),
+                delay_duration=250,
+            ),
+            TooltipContent("Set all active stops"),
+        )
 
     def _active_oca_pairs(self) -> tuple[tuple[str, Any, Any], ...]:
         """Return complete LMT/STP pairs that the journal proves are app-owned."""
@@ -2760,7 +2840,7 @@ class StarUIWorkbench:
         stop_percentage = _active_percentage_for_price(
             display_stop_price,
             self._state.unit_basis,
-            target=False,
+            target=True,
             bands=bands,
             presets=_parse_presets(self._stop_presets, maximum=Decimal("100")) or (),
         )
@@ -2803,14 +2883,13 @@ class StarUIWorkbench:
                 kind="active-target",
             ),
             stop_field=_percentage_price_field(
-                "STP loss",
+                "STP return from entry",
                 Input(
                     name=f"active_stop_{target.perm_id}",
                     id=f"active-stop-{index}",
                     type="number",
                     value=stop_percentage,
-                    min="0",
-                    max="100",
+                    min="-99.9",
                     step="0.1",
                     disabled=bool(self._armed_price_updates),
                     data_active_input="stop",
@@ -2823,7 +2902,7 @@ class StarUIWorkbench:
                 input_id=f"active-stop-{index}",
                 price=_price_text(display_stop_price),
                 outcome=loss,
-                outcome_label="max loss",
+                outcome_label="at stop",
                 tone="text-rose-400",
                 layer_index=index,
                 kind="active-stop",
@@ -4243,7 +4322,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         const target = Number(targetInput.value), stop = Number(stopInput?.value);
         const quantity = Number(form.querySelector(`[data-active-quantity="${{permId}}"]`)?.value);
         const targetPrice = Number.isFinite(target) && target > 0 ? (target === Number(targetInput.dataset.activeInitial) ? Number(targetInput.dataset.activeOriginal) : roundUp(basis * (1 + target / 100))) : NaN;
-        const stopPrice = Number.isFinite(stop) && stop >= 0 && stop <= 100 ? (stop === Number(stopInput?.dataset.activeInitial) ? Number(stopInput?.dataset.activeOriginal) : roundUp(basis * (1 - stop / 100))) : NaN;
+        const stopPrice = Number.isFinite(stop) && stop > -100 ? (stop === Number(stopInput?.dataset.activeInitial) ? Number(stopInput?.dataset.activeOriginal) : roundUp(basis * (1 + stop / 100))) : NaN;
         const gain = Number.isFinite(targetPrice) && Number.isFinite(quantity) ? (targetPrice - basis) * multiplier * quantity : NaN;
         const loss = Number.isFinite(stopPrice) && Number.isFinite(quantity) ? (stopPrice - basis) * multiplier * quantity : NaN;
         if (Number.isFinite(gain) && Number.isFinite(loss) && quantity > 0) outcomes.push({{ id: Number(permId), quantity, gain, loss }});
@@ -4251,7 +4330,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         assigned(`[data-live-price="active-target-${{index}}"]`, Number.isFinite(targetPrice) ? (target === Number(targetInput.dataset.activeInitial) ? `$${{targetInput.dataset.activeOriginal}}` : priceText(targetPrice)) : '—');
         assigned(`[data-live-price="active-stop-${{index}}"]`, Number.isFinite(stopPrice) ? (stop === Number(stopInput?.dataset.activeInitial) ? `$${{stopInput.dataset.activeOriginal}}` : priceText(stopPrice)) : '—');
         assigned(`[data-live-outcome="active-target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
-        assigned(`[data-live-outcome="active-stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} max loss` : '— max loss');
+        assigned(`[data-live-outcome="active-stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} at stop` : '— at stop');
         const originalTarget = Number(targetInput.dataset.activeOriginal);
         const originalStop = Number(stopInput?.dataset.activeOriginal);
         const targetEdited = targetInput.value.trim() !== (targetInput.dataset.activeInitial || '').trim();
@@ -4297,6 +4376,78 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{ input.value = '0'; }});
       update();
     }}));
+    const stopDialog = document.querySelector('[data-stop-dialog]');
+    if (stopDialog) {{
+      const valueInput = stopDialog.querySelector('[data-stop-dialog-value]');
+      const inputLabel = stopDialog.querySelector('[data-stop-input-label]');
+      const inverse = stopDialog.querySelector('[data-stop-dialog-inverse]');
+      const summary = stopDialog.querySelector('[data-stop-dialog-summary]');
+      const apply = stopDialog.querySelector('[data-apply-all-stops]');
+      const dialogPriceText = (number) => `$${{number.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 6}})}}`;
+      let mode = 'price';
+      const showMode = () => {{
+        inputLabel.textContent = mode === 'price' ? 'Stop price' : 'Return from entry';
+        valueInput.min = mode === 'price' ? '0' : '-99.999999';
+        stopDialog.querySelectorAll('[data-stop-mode]').forEach((button) => {{
+          button.setAttribute('aria-pressed', String(button.dataset.stopMode === mode));
+        }});
+      }};
+      const previewStop = () => {{
+        const raw = valueInput.value;
+        const number = Number(raw);
+        const proposed = mode === 'price' ? number : basis * (1 + number / 100);
+        const rounded = raw.trim() && Number.isFinite(proposed) && proposed > 0 ? roundUp(proposed) : NaN;
+        const rate = Number.isFinite(rounded) ? (rounded / basis - 1) * 100 : NaN;
+        inverse.textContent = Number.isFinite(rounded)
+          ? (mode === 'price'
+            ? `${{rate >= 0 ? '+' : ''}}${{Number(rate.toFixed(2))}}% from entry`
+            : dialogPriceText(rounded))
+          : '—';
+        summary.textContent = Number.isFinite(rounded)
+          ? `${{dialogPriceText(rounded)}} (${{rate >= 0 ? '+' : ''}}${{Number(rate.toFixed(2))}}%)`
+          : '—';
+        apply.disabled = !Number.isFinite(rounded);
+        return {{ rounded, rate }};
+      }};
+      valueInput.addEventListener('input', previewStop);
+      valueInput.addEventListener('change', () => {{
+        const value = previewStop();
+        if (mode === 'price' && Number.isFinite(value.rounded)) {{
+          valueInput.value = String(Number(value.rounded.toFixed(6)));
+          previewStop();
+        }}
+      }});
+      stopDialog.querySelectorAll('[data-stop-mode]').forEach((button) => button.addEventListener('click', () => {{
+        const value = previewStop();
+        if (Number.isFinite(value.rounded)) {{
+          valueInput.value = button.dataset.stopMode === 'price'
+            ? String(Number(value.rounded.toFixed(6)))
+            : String(Number(value.rate.toFixed(4)));
+        }}
+        mode = button.dataset.stopMode;
+        showMode();
+        previewStop();
+        valueInput.focus();
+      }}));
+      stopDialog.querySelectorAll('[data-stop-preset]').forEach((button) => button.addEventListener('click', () => {{
+        mode = 'return';
+        valueInput.value = button.dataset.stopPreset;
+        showMode();
+        previewStop();
+      }}));
+      apply.addEventListener('click', () => {{
+        const value = previewStop();
+        if (!Number.isFinite(value.rounded)) return;
+        const rate = (value.rounded / basis - 1) * 100;
+        form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{
+          input.value = String(Math.floor(rate * 1e8) / 1e8);
+        }});
+        update();
+        stopDialog.closest('dialog')?.close();
+      }});
+      showMode();
+      previewStop();
+    }}
     document.querySelectorAll('[data-reset-active-prices]').forEach((button) => button.addEventListener('click', () => {{
       form.querySelectorAll('[data-active-input]').forEach((input) => {{
         input.value = input.dataset.activeInitial || '';

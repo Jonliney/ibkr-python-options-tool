@@ -987,7 +987,34 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert 'data-layer-state="working"' in page.text
     assert "$26.20" in page.text
     assert "$16.40" in page.text
+    original_latest_snapshot = workbench._view_model.latest_snapshot
+    snapshot_for_cost = original_latest_snapshot()
+    assert snapshot_for_cost is not None
+    workbench._view_model.latest_snapshot = lambda: replace(  # type: ignore[method-assign]
+        snapshot_for_cost,
+        position=replace(snapshot_for_cost.position, unit_basis=Decimal("27.6128028335")),
+    )
+    cost_page = client.get(workbench.path).text
+    assert "$27.61" in cost_page
+    assert "$27.6128028335" not in cost_page
+    workbench._view_model.latest_snapshot = original_latest_snapshot  # type: ignore[method-assign]
     header = page.text.split('id="active-form"', maxsplit=1)[0]
+    assert 'aria-label="Set all active stops"' in header
+    assert "evt.stopPropagation()" in header
+    assert 'aria-label="Enter return percentage from entry"' in header
+    assert "Enter a stop price or return percentage to be applied to all active layers." in header
+    assert "data-stop-dialog-inverse" in header
+    assert "Active layers" in header and "Entry cost" in header
+    assert "Latest ask" in header
+    assert "data-stop-dialog-summary" in header
+    assert 'data-stop-preset="-20"' in header
+    assert 'data-stop-preset="-25"' in header
+    assert 'data-stop-preset="-35"' in header
+    assert 'data-stop-preset="20"' in header
+    assert header.index('data-stop-preset="20"') < header.index('data-stop-preset="0"')
+    assert header.index('data-stop-preset="0"') < header.index('data-stop-preset="-20"')
+    assert header.index('data-stop-preset="-35"') < header.rindex('Active layers')
+    assert "Apply to active layers" in header
     assert 'aria-label="Move all active stops to B/E"' in header
     assert 'aria-label="Sell all active layers"' in header
     assert 'data-orientation="vertical"' in header
@@ -995,6 +1022,9 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert header.index('aria-label="Move all active stops to B/E"') < header.index(
         'aria-label="Sell all active layers"'
     ) < header.index('aria-label="Split draft layer quantities"')
+    assert header.index('aria-label="Set all active stops"') < header.index(
+        'aria-label="Move all active stops to B/E"'
+    )
     assert "data-reset-active-prices" in page.text
     assert "Cancel changes" in page.text
     active_form = page.text.split('id="active-form"', maxsplit=1)[1].split(
@@ -1093,6 +1123,7 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     delta = after_add.expected_gain - before_add.expected_gain
     direction = "increased" if delta > 0 else "decreased"
     assert f'aria-label="Expected gain {direction} by ${abs(delta):,.2f}"' in added_page.text
+
 
 
 @pytest.mark.parametrize("available_quantity", [0, 1])
@@ -1874,6 +1905,73 @@ def test_stop_above_latest_ask_warns_before_price_update_and_quote_change_rearms
     assert workbench._warned_price_update_concerns == impact.concerns
 
 
+def test_active_stop_accepts_positive_return_from_entry(monkeypatch) -> None:
+    from ibkr_options_manager.app.view_model import WorkingOrderLine
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    basis = Decimal("10.00")
+    group = "owned/tranche-1"
+    target = WorkingOrder(
+        perm_id=101, client_id=17, order_id=11, key=snapshot.selected,
+        action="SELL", order_type="LMT", remaining=Decimal("1"),
+        status="Submitted", oca_group=group, limit_price=Decimal("25.00"), tif="GTC",
+    )
+    stop = replace(
+        target, perm_id=102, order_id=12, order_type="STP",
+        limit_price=None, stop_price=Decimal("8.00"),
+    )
+    active_snapshot = replace(
+        snapshot, read_only_api=False,
+        position=replace(snapshot.position, unit_basis=basis),
+        working_orders=(target, stop),
+    )
+    workbench._state = replace(
+        workbench._state, unit_basis=basis,
+        working_orders=(
+            WorkingOrderLine(
+                perm_id=101, order_id=11, action="SELL", order_type="LMT",
+                remaining="1", status="Submitted", oca_group=group,
+                limit_price=Decimal("25.00"), tif="GTC",
+            ),
+            WorkingOrderLine(
+                perm_id=102, order_id=12, action="SELL", order_type="STP",
+                remaining="1", status="Submitted", oca_group=group,
+                stop_price=Decimal("8.00"), tif="GTC",
+            ),
+        ),
+    )
+    candidate = MarketExitCandidate(
+        account=DEMO_ACCOUNT, con_id=snapshot.selected.con_id,
+        target_order_id=11, target_perm_id=101, client_id=17,
+        quantity=Decimal("1"), tif="GTC", oca_group=group,
+        stop_order_id=12, stop_perm_id=102,
+    )
+
+    class PriceService(_OwnedOrderService):
+        def prepare_market_exits(self, *_args, **_kwargs):
+            return (candidate,)
+
+        def prepare_price_updates(self, _snapshot, *, updates, **_kwargs):
+            return updates
+
+        def price_update_attempt_state(self, *_args):
+            return None
+
+    workbench._paper_execution = PriceService({101, 102})  # type: ignore[assignment]
+    monkeypatch.setattr(workbench._view_model, "select_position", lambda *_: workbench._state)
+    monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: active_snapshot)
+    monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
+
+    workbench._arm_price_updates_locked({"active_target_101": "150", "active_stop_101": "50"})
+
+    assert len(workbench._armed_price_updates) == 1
+    assert workbench._armed_price_updates[0].stop_price == Decimal("15.00")
+    assert workbench._armed_price_updates[0].target_price is None
+
+
 @pytest.mark.parametrize("prior_unknown", [False, True])
 def test_arming_price_update_preserves_edited_percentage_in_active_input(
     tmp_path,
@@ -2000,7 +2098,7 @@ def test_arming_price_update_preserves_edited_percentage_in_active_input(
         data={
             "action": "active-update-arm",
             "active_target_201": "30",
-            "active_stop_201": "25",
+            "active_stop_201": "-25",
         },
     )
 

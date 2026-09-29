@@ -16,6 +16,19 @@ Confirmation requests another fresh snapshot before any paper write. A changed
 or incomplete snapshot blocks the write; cancellation and market-exit reviews
 must be staged again if their verified orders change.
 
+For active stop amendments, the editor uses signed return from verified entry
+cost. A positive value places the proposed stop above entry; 0% is B/E. The
+global **Set all active stops** dialog applies one tick-rounded price to every
+active app-owned layer for the selected contract. It starts at the current
+stop when all layers share that price; otherwise it requires an explicit
+entry. These are local proposals until the existing fresh-snapshot review and
+confirmation gates succeed. A stop is a trigger and does not guarantee the
+displayed gain at fill.
+The dialog displays entry cost to cents while calculations retain the full
+verified average cost. The proposed stop uses the selected contract and
+exchange's verified IBKR market-rule bands; no symbol-specific tick size is
+assumed for SPX, XSP, SPY, or other options.
+
 Immediately before either confirmation is armed or confirmed, the application
 requests a new TWS snapshot. Submission is allowed only when that snapshot
 proves all of the following:

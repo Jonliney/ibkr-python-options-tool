@@ -1,3 +1,14 @@
+.stop-mode-button[aria-pressed="true"] {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--primary-foreground);
+  font-weight: 700;
+}
+
+.stop-mode-button[aria-pressed="false"] {
+  opacity: 0.72;
+}
+
 .connection-failure-backdrop {
   position: fixed;
   inset: 0;
