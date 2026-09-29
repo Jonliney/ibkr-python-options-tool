@@ -1486,6 +1486,7 @@ def test_manual_tws_confirmation_clears_unknown_only_after_fresh_api_check(
     sent_page = client.get(workbench.path).text
     assert 'data-submission-review' in sent_page
     assert 'data-cancelled-bracket-recovery-dialog' not in sent_page
+    assert "Orders need a decision in TWS" in sent_page
     workbench._submission_review_required = False
     workbench._view_model._latest_snapshot = replace(
         snapshot,
@@ -1505,6 +1506,12 @@ def test_manual_tws_confirmation_clears_unknown_only_after_fresh_api_check(
         workbench.path
     ).text
     workbench._view_model._latest_snapshot = snapshot
+    workbench._message = "Journal reconciliation blocked: incomplete TWS read"
+    assert workbench._toast is not None and workbench._toast.variant == "error"
+    assert 'data-cancelled-bracket-recovery-dialog' not in client.get(
+        workbench.path
+    ).text
+    workbench._toast = None
     recovery_page = client.get(workbench.path).text
     assert "Verify cancellation" in recovery_page
     assert 'id="cancelled_bracket_recovery"' in recovery_page
@@ -1577,8 +1584,16 @@ def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
     page = TestClient(workbench.app).get(workbench.path).text
 
     assert "No fill evidence" in page
-    assert "Verify cancellation" in page
-    assert 'data-cancelled-bracket-recovery-dialog' in page
+    assert 'value="verify-cancelled-bracket:' + fingerprint + '"' in page
+    assert 'aria-label="Verify cancellation of layer 1 in TWS"' in page
+    assert ">Verify</button>" not in page
+    assert 'data-cancelled-bracket-recovery-dialog' not in page
+    requested = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={"action": "verify-cancelled-bracket:" + fingerprint},
+    )
+    assert "Verify cancellation" in requested.text
+    assert 'data-cancelled-bracket-recovery-dialog' in requested.text
     clean = replace(
         snapshot, captured_at=Decimal("101"),
         completed_orders_complete=True, executions_complete=True,
@@ -1591,6 +1606,115 @@ def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
         clean, fingerprint, confirmed_in_tws=True,
     )
     assert resolved.state == "CANCELLED_CONFIRMED"
+
+
+def test_old_missing_bracket_does_not_interrupt_new_active_brackets(tmp_path) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    journal = ExecutionJournal(tmp_path / "paper-journal.json")
+    journal._write((JournalEntry(
+        fingerprint="d" * 64,
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        state="RECONCILED",
+        order_ids=(101, 102), perm_ids=(201, 202),
+        snapshot_captured_at="99",
+        layers=(JournalLayer(
+            quantity=2, target_price="1.20", stop_price="0.75", tif="GTC",
+            target_perm_id=201, stop_perm_id=202,
+        ),),
+    ),))
+    workbench._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(), journal
+    )
+    new_target = WorkingOrder(
+        perm_id=301, client_id=17, order_id=201,
+        key=snapshot.selected, action="SELL", order_type="LMT",
+        remaining=Decimal("2"), status="Submitted",
+        oca_group="new-attempt/tranche-1", tif="GTC",
+    )
+    workbench._view_model._latest_snapshot = replace(
+        snapshot, working_orders=(
+            new_target, replace(
+                new_target, perm_id=302, order_id=202, order_type="STP",
+            ),
+        ),
+    )
+
+    page = TestClient(workbench.app).get(workbench.path).text
+    assert 'data-cancelled-bracket-recovery-dialog' not in page
+    assert 'value="verify-cancelled-bracket:' + "d" * 64 + '"' in page
+    requested = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={"action": "verify-cancelled-bracket:" + "d" * 64},
+    )
+    assert 'data-cancelled-bracket-recovery-dialog' in requested.text
+
+
+def test_reused_legacy_oca_group_shows_tws_conflict_and_confirmed_old_cancellations(
+    tmp_path,
+) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    fingerprint = "e" * 64
+    prior_layers = (
+        JournalLayer(1, "24.80", "18.40", "GTC", 201, 202),
+        JournalLayer(1, "34.40", "18.40", "GTC", 203, 204),
+    )
+    journal = ExecutionJournal(tmp_path / "paper-journal.json")
+    journal._write((
+        JournalEntry(
+            fingerprint=fingerprint, account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id, state="SUPERSEDED",
+            snapshot_captured_at="98", resolution_captured_at="99",
+            order_ids=(101, 102, 103, 104), perm_ids=(201, 202, 203, 204),
+            layers=prior_layers,
+        ),
+        JournalEntry(
+            fingerprint=fingerprint, account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id, state="SUBMISSION_UNKNOWN",
+            snapshot_captured_at="99", expected_order_count=4,
+            layers=(
+                JournalLayer(1, "29.50", "18.40", "GTC", 201),
+                JournalLayer(1, "34.40", "18.40", "GTC", 203),
+            ),
+        ),
+    ))
+    workbench._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(), journal,
+    )
+
+    page = TestClient(workbench.app).get(workbench.path).text
+    assert "Conflicting bracket orders in TWS" in page
+    assert "Do not transmit the pending orders" in page
+    assert "Orders placed outside this app are view-only here" not in page
+    assert page.count("Conflicting order group") == 2
+    assert page.count("Bracket cancelled") == 2
+    assert "No fill evidence" not in page
+    assert 'data-cancelled-bracket-recovery-dialog' not in page
+    hidden = journal.dismiss_cancelled_layer(snapshot, fingerprint, "98", 0)
+    assert hidden.layers[0].hidden_from_workspace
+
+
+def test_stale_paper_bracket_confirmation_expires_before_any_send(monkeypatch) -> None:
+    from ibkr_options_manager.app.web import surface
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._armed_execution = object()  # type: ignore[assignment]
+    workbench._armed_execution_deadline = 1009.0
+    monkeypatch.setattr(surface, "monotonic", lambda: 1010.0)
+
+    workbench._confirm_execution_locked()
+
+    assert workbench._armed_execution is None
+    assert "expired" in workbench._message.lower()
+    assert workbench._toast is not None
+    assert workbench._toast.variant == "warning"
 
 
 def test_refresh_replaces_a_draft_that_exceeds_newly_available_quantity() -> None:

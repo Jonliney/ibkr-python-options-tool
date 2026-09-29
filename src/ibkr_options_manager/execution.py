@@ -10,6 +10,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+from uuid import uuid4
 
 from .domain import (
     BrokerSnapshot,
@@ -76,8 +77,30 @@ class JournalEntry:
     perm_ids: tuple[int, ...] = ()
     snapshot_captured_at: str = ""
     resolution_captured_at: str = ""
+    oca_prefix: str = ""
     layers: tuple[JournalLayer, ...] = ()
     fills: tuple[JournalFill, ...] = ()
+
+
+def _entry_oca_prefix(entry: JournalEntry) -> str:
+    """Legacy attempts used the fingerprint prefix directly."""
+    return entry.oca_prefix or entry.fingerprint[:12]
+
+
+def ambiguous_oca_prefixes(
+    entries: tuple[JournalEntry, ...] | list[JournalEntry],
+) -> frozenset[tuple[str, int, str]]:
+    """Find repeated legacy OCA names that cannot identify one attempt."""
+    seen: set[tuple[str, int, str]] = set()
+    repeated: set[tuple[str, int, str]] = set()
+    for entry in entries:
+        if len(entry.fingerprint) != 64 or not entry.layers:
+            continue
+        key = (entry.account, entry.con_id, _entry_oca_prefix(entry))
+        if key in seen:
+            repeated.add(key)
+        seen.add(key)
+    return frozenset(repeated)
 
 
 def classify_journal_layer(
@@ -137,6 +160,10 @@ def classify_journal_layer(
             realized_pnl=pnl,
             currency=next(iter(currencies)),
             exit_side=exit_side,
+        )
+    if entry.state == "SUPERSEDED" and entry.resolution_captured_at:
+        return LayerOutcome(
+            "UNKNOWN" if ids & (observed_perm_ids | active_perm_ids) else "CANCELLED"
         )
     if layer.cancelled:
         return LayerOutcome(
@@ -368,7 +395,10 @@ class ExecutionJournal:
             and entry.account == snapshot.selected.account
             and entry.con_id == snapshot.selected.con_id
             and 0 <= layer_index < len(entry.layers)
-            and entry.layers[layer_index].cancelled
+            and (
+                entry.layers[layer_index].cancelled
+                or (entry.state == "SUPERSEDED" and bool(entry.resolution_captured_at))
+            )
         ]
         if len(matches) != 1:
             raise ExecutionBlocked(
@@ -377,7 +407,7 @@ class ExecutionJournal:
         entry_index = matches[0]
         entry = entries[entry_index]
         layer = entry.layers[layer_index]
-        group = f"{fingerprint[:12]}/tranche-{layer_index + 1}"
+        group = f"{_entry_oca_prefix(entry)}/tranche-{layer_index + 1}"
         layer_perm_ids = (
             entry.perm_ids[layer_index * 2 : layer_index * 2 + 2]
             if len(entry.perm_ids) == len(entry.layers) * 2
@@ -439,6 +469,21 @@ class ExecutionJournal:
             # remain non-retryable: a timeout must never create duplicates.
             prior = entries[prior_index]
             entries[prior_index] = replace(prior, state="SUPERSEDED")
+        oca_prefix = ""
+        if prior_index is not None:
+            used_prefixes = {
+                _entry_oca_prefix(entry)
+                for entry in entries
+                if entry.account == snapshot.selected.account
+                and entry.con_id == snapshot.selected.con_id
+            }
+            for _ in range(8):
+                candidate_prefix = f"{fingerprint[:12]}-{uuid4().hex[:12]}"
+                if candidate_prefix not in used_prefixes:
+                    oca_prefix = candidate_prefix
+                    break
+            if not oca_prefix:
+                raise ExecutionBlocked("could not allocate a distinct OCA group")
         entry = JournalEntry(
             fingerprint=fingerprint,
             account=snapshot.selected.account,
@@ -446,6 +491,7 @@ class ExecutionJournal:
             state="PREPARED",
             expected_order_count=len(plan.pairs) * 2,
             snapshot_captured_at=str(snapshot.captured_at),
+            oca_prefix=oca_prefix,
             layers=tuple(
                 JournalLayer(
                     quantity=pair.quantity,
@@ -498,6 +544,10 @@ class ExecutionJournal:
         ):
             return False
         if entry.state == "SUBMISSION_UNKNOWN":
+            if (
+                entry.account, entry.con_id, _entry_oca_prefix(entry)
+            ) in ambiguous_oca_prefixes(entries):
+                return False
             return ExecutionJournal._cancelled_submission_attempt(entry, snapshot)
         if entry.state == "CANCELLED_CONFIRMED":
             try:
@@ -505,7 +555,7 @@ class ExecutionJournal:
             except (InvalidOperation, ValueError):
                 later = False
             groups = {
-                f"{entry.fingerprint[:12]}/tranche-{number}"
+                f"{_entry_oca_prefix(entry)}/tranche-{number}"
                 for number in range(1, len(entry.layers) + 1)
             }
             return bool(
@@ -620,7 +670,7 @@ class ExecutionJournal:
             or snapshot.captured_at <= Decimal(entry.snapshot_captured_at)
         ):
             return False
-        prefix = entry.fingerprint[:12]
+        prefix = _entry_oca_prefix(entry)
         for index in range(len(entry.layers)):
             group = f"{prefix}/tranche-{index + 1}"
             if any(order.oca_group == group for order in snapshot.working_orders):
@@ -697,7 +747,7 @@ class ExecutionJournal:
         if not later:
             raise ExecutionBlocked("a later TWS snapshot is required")
         groups = {
-            f"{fingerprint[:12]}/tranche-{number}"
+            f"{_entry_oca_prefix(entry)}/tranche-{number}"
             for number in range(1, len(entry.layers) + 1)
         }
         possible_fills = self._has_possible_entry_execution(
@@ -833,6 +883,7 @@ class ExecutionJournal:
                     order_ids=order_ids,
                     perm_ids=perm_ids,
                     snapshot_captured_at=entry.snapshot_captured_at,
+                    oca_prefix=entry.oca_prefix,
                     layers=layers,
                     fills=entry.fills,
                 )
@@ -898,7 +949,7 @@ class ExecutionJournal:
             ):
                 continue
             for layer_index, layer in enumerate(entry.layers):
-                group = f"{entry.fingerprint[:12]}/tranche-{layer_index + 1}"
+                group = f"{_entry_oca_prefix(entry)}/tranche-{layer_index + 1}"
                 if group != candidate.oca_group:
                     continue
                 target_id, stop_id = layer.target_perm_id, layer.stop_perm_id
@@ -950,6 +1001,7 @@ class ExecutionJournal:
                     order_ids=order_ids,
                     perm_ids=(),
                     snapshot_captured_at=entry.snapshot_captured_at,
+                    oca_prefix=entry.oca_prefix,
                     layers=entry.layers,
                     fills=entry.fills,
                 )
@@ -964,6 +1016,7 @@ class ExecutionJournal:
         """Recover planned layer IDs from exact app OCA groups for display only."""
         self._recover_confirmed_cancellations()
         entries = list(self._entries())
+        ambiguous = ambiguous_oca_prefixes(entries)
         changed = False
         for index, entry in enumerate(entries):
             if (
@@ -971,11 +1024,16 @@ class ExecutionJournal:
                 or entry.con_id != snapshot.selected.con_id
                 or len(entry.fingerprint) != 64
                 or not entry.layers
+                or (
+                    (entry.account, entry.con_id, _entry_oca_prefix(entry))
+                    in ambiguous
+                    and not entry.perm_ids
+                )
             ):
                 continue
             layers = list(entry.layers)
             for layer_index, layer in enumerate(layers):
-                group = f"{entry.fingerprint[:12]}/tranche-{layer_index + 1}"
+                group = f"{_entry_oca_prefix(entry)}/tranche-{layer_index + 1}"
                 candidates = [
                     (order.oca_group, order.action, order.order_type, order.perm_id)
                     for order in snapshot.working_orders
@@ -1054,12 +1112,18 @@ class ExecutionJournal:
         if not snapshot.executions_complete:
             return
         entries = list(self._entries())
+        ambiguous = ambiguous_oca_prefixes(entries)
         changed = False
         for index, entry in enumerate(entries):
             if (
                 entry.account != snapshot.selected.account
                 or entry.con_id != snapshot.selected.con_id
                 or len(entry.fingerprint) != 64
+                or (
+                    (entry.account, entry.con_id, _entry_oca_prefix(entry))
+                    in ambiguous
+                    and not entry.perm_ids
+                )
             ):
                 continue
             known_ids = set(entry.perm_ids) | {
@@ -1120,6 +1184,7 @@ class ExecutionJournal:
         observed. Older journals have no count and are marked ``RECONCILED``.
         """
         entries = list(self._entries())
+        ambiguous = ambiguous_oca_prefixes(entries)
         reconciled: list[JournalEntry] = []
         changed = False
         for index, entry in enumerate(entries):
@@ -1133,6 +1198,9 @@ class ExecutionJournal:
                 }
                 or entry.account != snapshot.selected.account
                 or entry.con_id != snapshot.selected.con_id
+                or (
+                    entry.account, entry.con_id, _entry_oca_prefix(entry)
+                ) in ambiguous
             ):
                 continue
             if self._cancelled_submission_attempt(entry, snapshot):
@@ -1157,6 +1225,7 @@ class ExecutionJournal:
                 order_ids=tuple(order.order_id for order in observed),
                 perm_ids=tuple(order.perm_id for order in observed),
                 snapshot_captured_at=entry.snapshot_captured_at,
+                oca_prefix=entry.oca_prefix,
                 layers=entry.layers,
                 fills=entry.fills,
             )
@@ -1190,6 +1259,7 @@ class ExecutionJournal:
                     perm_ids=tuple(int(value) for value in item.get("perm_ids", ())),
                     snapshot_captured_at=str(item.get("snapshot_captured_at", "")),
                     resolution_captured_at=str(item.get("resolution_captured_at", "")),
+                    oca_prefix=str(item.get("oca_prefix", "")),
                     layers=tuple(
                         JournalLayer(
                             quantity=int(layer["quantity"]),
@@ -1313,10 +1383,29 @@ class PaperExecutionService:
             plan,
         )
         entry = self._journal.begin(snapshot, plan)
+        submission_plan = plan
+        if entry.oca_prefix:
+            submission_plan = replace(
+                plan,
+                pairs=tuple(
+                    replace(
+                        pair,
+                        target=replace(
+                            pair.target,
+                            logical_oca_group=f"{entry.oca_prefix}/tranche-{index}",
+                        ),
+                        stop=replace(
+                            pair.stop,
+                            logical_oca_group=f"{entry.oca_prefix}/tranche-{index}",
+                        ),
+                    )
+                    for index, pair in enumerate(plan.pairs, start=1)
+                ),
+            )
         try:
             result = self._transport.submit(
                 snapshot,
-                plan,
+                submission_plan,
                 host=host,
                 port=port,
                 client_id=client_id,
@@ -1326,9 +1415,13 @@ class PaperExecutionService:
             perm_ids = tuple(int(value) for value in result.perm_ids)
             if not order_ids or len(order_ids) != len(perm_ids) or not all(perm_ids):
                 raise ExecutionBlocked("TWS acknowledgement was incomplete")
-        except Exception:
+        except Exception as error:
             self._journal.mark_unknown(entry.fingerprint)
-            raise
+            if isinstance(error, ExecutionOutcomeUnknown):
+                raise
+            raise ExecutionOutcomeUnknown(
+                f"TWS submission was not fully acknowledged: {error}"
+            ) from error
         return SubmissionReceipt(
             self._journal.record_submission(
                 entry.fingerprint,
@@ -1860,7 +1953,7 @@ def _complete_app_oca_orders(
     snapshot: BrokerSnapshot,
     entry: JournalEntry,
 ) -> tuple[WorkingOrder, ...]:
-    prefix = f"{entry.fingerprint[:12]}/tranche-"
+    prefix = f"{_entry_oca_prefix(entry)}/tranche-"
     groups: dict[str, list[WorkingOrder]] = {}
     for order in snapshot.working_orders:
         group = order.oca_group

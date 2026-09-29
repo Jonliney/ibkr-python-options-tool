@@ -385,7 +385,7 @@ def test_indeterminate_transport_outcome_is_durably_blocked_from_retry(
     journal = ExecutionJournal(tmp_path / "journal.json")
     service = PaperExecutionService(transport, journal)
 
-    with pytest.raises(RuntimeError, match="socket failed"):
+    with pytest.raises(ExecutionOutcomeUnknown, match="socket failed"):
         service.submit(
             snapshot,
             plan,
@@ -1551,6 +1551,157 @@ def test_recreates_a_cancelled_partially_reconciled_draft_fingerprint(tmp_path) 
     entries = journal._entries()
     assert entries[-2].state == "SUPERSEDED"
     assert journal.find(plan.fingerprint) == replacement
+
+
+def test_repeated_plan_uses_new_oca_groups_without_adopting_old_orders(tmp_path) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.record_submission(
+        plan.fingerprint, order_ids=(101, 102), perm_ids=(201, 202),
+    )
+    original = journal.find(plan.fingerprint)
+    assert original is not None
+    journal._write((replace(
+        original, state="CANCELLED_CONFIRMED", resolution_captured_at="1",
+    ),))
+    refreshed = replace(
+        snapshot, captured_at=Decimal("2"),
+        completed_orders_complete=True, executions_complete=True,
+    )
+
+    class CapturingTransport(_RecordingTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.groups: tuple[str, str] | None = None
+
+        def submit(self, _snapshot, sent_plan, **_kwargs):
+            pair = sent_plan.pairs[0]
+            self.groups = (pair.target.logical_oca_group, pair.stop.logical_oca_group)
+            return PaperSubmission(order_ids=(103, 104), perm_ids=(203, 204))
+
+    transport = CapturingTransport()
+    receipt = PaperExecutionService(transport, journal).submit(
+        refreshed, plan, host="127.0.0.1", port=7497,
+        client_id=17, timeout_seconds=1,
+    )
+    old_group = plan.pairs[0].target.logical_oca_group
+    assert transport.groups is not None
+    assert transport.groups[0] == transport.groups[1]
+    assert transport.groups[0] != old_group
+    assert receipt.entry.oca_prefix and transport.groups[0].startswith(receipt.entry.oca_prefix)
+
+    old_target = ObservedCompletedOrder(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
+        perm_id=201, order_id=101, client_id=17, action="SELL",
+        order_type="LMT", oca_group=old_group, status="Cancelled",
+    )
+    journal.record_completed_orders(replace(refreshed, completed_orders=(
+        old_target, replace(old_target, perm_id=202, order_id=102, order_type="STP"),
+    )))
+    latest = journal.find(plan.fingerprint)
+    assert latest is not None
+    assert latest.layers[0].target_perm_id == 203
+    assert latest.layers[0].stop_perm_id == 204
+    new_target = WorkingOrder(
+        perm_id=203, client_id=17, order_id=103, key=snapshot.selected,
+        action="SELL", order_type="LMT", remaining=Decimal("2"),
+        status="Submitted", oca_group=transport.groups[0], tif="GTC",
+    )
+    assert journal.reconcile_snapshot(replace(
+        refreshed, working_orders=(
+            new_target, replace(new_target, perm_id=204, order_id=104, order_type="STP"),
+        ),
+    ))[0].state == "RECONCILED"
+    journal.record_pair_cancellation(MarketExitCandidate(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
+        target_order_id=103, target_perm_id=203, client_id=17,
+        quantity=Decimal("2"), tif="GTC", oca_group=transport.groups[0],
+        stop_order_id=104, stop_perm_id=204,
+    ))
+    assert journal.find(plan.fingerprint).layers[0].cancelled
+
+
+def test_legacy_reused_oca_group_cannot_adopt_older_working_pair(tmp_path) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    group = plan.pairs[0].target.logical_oca_group
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal._write((
+        JournalEntry(
+            fingerprint=plan.fingerprint, account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id, state="SUPERSEDED",
+            order_ids=(101, 102), perm_ids=(201, 202),
+            snapshot_captured_at="1",
+            layers=(JournalLayer(2, "1.20", "0.75", "GTC", 201, 202),),
+        ),
+        JournalEntry(
+            fingerprint=plan.fingerprint, account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id, state="SUBMISSION_UNKNOWN",
+            snapshot_captured_at="2", expected_order_count=2,
+            layers=(JournalLayer(2, "1.20", "0.75", "GTC"),),
+        ),
+    ))
+    target = WorkingOrder(
+        perm_id=201, client_id=17, order_id=101, key=snapshot.selected,
+        action="SELL", order_type="LMT", remaining=Decimal("2"),
+        status="Submitted", oca_group=group, tif="GTC",
+    )
+    observed = replace(snapshot, captured_at=Decimal("3"), working_orders=(
+        target, replace(target, perm_id=202, order_id=102, order_type="STP"),
+    ))
+
+    journal.record_completed_orders(observed)
+    assert journal.reconcile_snapshot(observed) == ()
+    latest = journal.find(plan.fingerprint)
+    assert latest is not None
+    assert latest.state == "SUBMISSION_UNKNOWN"
+    assert latest.perm_ids == ()
+    assert latest.layers[0].target_perm_id == 0
+
+
+def test_repeated_two_layer_plan_uses_one_new_group_per_pair(tmp_path) -> None:
+    base = _snapshot()
+    snapshot = replace(base, position=replace(base.position, quantity=Decimal("7")))
+    plan = _two_pair_plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    old = journal.begin(snapshot, plan)
+    journal._write((replace(
+        old, state="CANCELLED_CONFIRMED", resolution_captured_at="1",
+    ),))
+
+    class CapturingTransport(_RecordingTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.groups: tuple[tuple[str, str], ...] = ()
+
+        def submit(self, _snapshot, sent_plan, **_kwargs):
+            self.groups = tuple(
+                (pair.target.logical_oca_group, pair.stop.logical_oca_group)
+                for pair in sent_plan.pairs
+            )
+            return PaperSubmission(
+                order_ids=(103, 104, 105, 106),
+                perm_ids=(203, 204, 205, 206),
+            )
+
+    transport = CapturingTransport()
+    PaperExecutionService(transport, journal).submit(
+        replace(snapshot, captured_at=Decimal("2"),
+                completed_orders_complete=True, executions_complete=True),
+        plan, host="127.0.0.1", port=7497, client_id=17, timeout_seconds=1,
+    )
+    assert len(transport.groups) == 2
+    assert all(target == stop for target, stop in transport.groups)
+    assert len({target for target, _stop in transport.groups}) == 2
+    assert all(
+        sent[0] != planned.target.logical_oca_group
+        for sent, planned in zip(transport.groups, plan.pairs, strict=True)
+    )
 
 
 def test_unknown_bracket_cancelled_in_tws_can_be_rebuilt(tmp_path) -> None:

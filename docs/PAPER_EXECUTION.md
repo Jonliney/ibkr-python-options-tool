@@ -231,9 +231,11 @@ both exact fingerprinted legs of every planned layer cancelled with nonzero
 permanent IDs, no matching fills, and no matching working order. If any of
 that evidence is missing, the attempt remains blocked against duplicate send.
 For a precaution-held or untransmitted leg that never appears in completed-order
-history, or a previously acknowledged or reconciled app bracket whose legs
-disappear from working orders without a matching fill, the workbench opens a
-blocking **Verify cancellation** dialog. The
+history, the workbench opens a blocking **Verify cancellation** dialog. A
+previously reconciled bracket whose legs disappear without a matching fill
+shows a **Verify** action on its row instead. This avoids opening an old
+cancellation dialog over a newly working bracket; an unresolved old layer
+still reserves its quantity until verified. The
 operator must first confirm in TWS that both LMT and STP are gone. The app then
 takes a fresh selected-contract snapshot and requires complete current and
 completed order reads, complete execution history, no matching working leg or
@@ -242,6 +244,24 @@ original plan. The dialog remains open if these checks fail. The journal records
 the confirmation and snapshot time. Sending
 the same draft again still requires a later clean snapshot; the confirmation
 alone never authorizes an order write.
+The final paper bracket confirmation expires after 10 seconds. An expired
+confirmation never sends orders; the operator must press Execute again for a
+fresh plan and another review.
+Recreating a verified cancelled plan keeps its fingerprint for duplicate
+suppression but persists a new OCA group prefix for the new attempt. Journal
+reconciliation uses that prefix rather than attributing an earlier order to
+the new bracket. Legacy attempts that already reused an OCA group cannot be
+reconciled automatically: the workbench shows a conflict and directs the
+operator to resolve every order in that group in TWS before verifying the
+uncertain attempt. It must not invite Transmit for a mixed old/new group.
+TWS may hold an API order for a manual Transmit decision, and untransmitted
+orders can be absent from API open-order reads; a fresh read alone is not
+proof that these orders were cancelled. The ordinary uncertain-order state
+therefore tells the operator to check both legs in TWS, transmit there only
+when the reviewed pair is correct, then Refresh in the app. TWS order
+precautions remain enabled.
+See [IBKR's untransmitted-order behavior](https://interactivebrokers.github.io/tws-api/order_submission.html)
+and [OCA group semantics](https://interactivebrokers.github.io/tws-api/oca.html).
 Executions on other tranches of the same contract do not block this recovery
 when their permanent order IDs map to different OCA groups in the broker order
 read or to another saved app submission. BUY executions cannot belong to the

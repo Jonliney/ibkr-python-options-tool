@@ -50,6 +50,7 @@ from ...execution import (
     MarketExitCandidate,
     PaperExecutionService,
     PriceUpdateCandidate,
+    ambiguous_oca_prefixes,
     classify_journal_layer,
 )
 from ...observation import ObservationSettings, PositionObserver
@@ -171,6 +172,8 @@ class StarUIWorkbench:
         self._verified_position_account: str | None = None
         self._observer_retry_at = 0.0
         self._armed_execution: PaperExecutionCandidate | None = None
+        self._armed_execution_deadline: float | None = None
+        self._recovery_requested_fingerprint: str | None = None
         self._armed_market_exit: MarketExitCandidate | None = None
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
         self._armed_cancellation: MarketExitCandidate | None = None
@@ -575,6 +578,14 @@ class StarUIWorkbench:
                 self._confirm_all_cancellations_locked()
             elif action == "resolve-cancelled-bracket":
                 self._resolve_cancelled_bracket_locked(values)
+            elif action.startswith("verify-cancelled-bracket:"):
+                self._recovery_requested_fingerprint = action.partition(":")[2]
+                if self._cancelled_bracket_recovery(self._submission_outcomes()) is None:
+                    self._recovery_requested_fingerprint = None
+                    self._message = (
+                        "Cancellation verification blocked: refresh TWS and check "
+                        "that both bracket legs are gone."
+                    )
             elif action.startswith("dismiss-cancelled:"):
                 self._dismiss_cancelled_layer_locked(action)
             elif action == "cancel-staged":
@@ -622,6 +633,7 @@ class StarUIWorkbench:
             self._selected_closed_con_id = None
             self._session_position_account = self._settings.account
         self._projection_comparison = None
+        self._recovery_requested_fingerprint = None
         self._disarm_execution_locked()
         state = self._view_model.refresh_portfolio(self._settings)
         self._apply_refreshed_portfolio_locked(
@@ -791,6 +803,7 @@ class StarUIWorkbench:
 
     def _disarm_execution_locked(self) -> None:
         self._armed_execution = None
+        self._armed_execution_deadline = None
         self._armed_market_exit = None
         self._armed_market_exits = ()
         self._armed_cancellation = None
@@ -832,11 +845,19 @@ class StarUIWorkbench:
             self._message = "Execution blocked: refresh and validation did not produce a sendable paper draft."
             return
         self._armed_execution = candidate
+        self._armed_execution_deadline = monotonic() + 10
         self._set_review_status_locked(
-            "Fresh paper snapshot verified. Review the order plan, then confirm."
+            "Fresh paper snapshot verified. Review the order plan and confirm within 10 seconds."
         )
 
     def _confirm_execution_locked(self) -> None:
+        if self._armed_execution is not None and (
+            self._armed_execution_deadline is None
+            or monotonic() >= self._armed_execution_deadline
+        ):
+            self._disarm_execution_locked()
+            self._message = "Paper bracket confirmation expired. Press Execute again to review a fresh plan."
+            return
         drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
         if not 0 < drafted <= self._planning_available_quantity():
             self._disarm_execution_locked()
@@ -1245,6 +1266,7 @@ class StarUIWorkbench:
             self._message = f"Cancellation verification blocked: {error}"
             return
         self._drafts[con_id] = ()
+        self._recovery_requested_fingerprint = None
         self._show_success_toast_locked(
             "Cancelled bracket cleared",
             "You can add a new layer for the verified available quantity.",
@@ -2856,7 +2878,7 @@ class StarUIWorkbench:
             item
             for item in outcomes
             if item[2].status
-            in {"PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE"}
+            in {"PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"}
             or (
                 item[2].status.startswith("CLOSED_")
                 and _journal_target_perm_id(item[0], item[1]) in active_target_ids
@@ -2886,7 +2908,7 @@ class StarUIWorkbench:
             else None
         )
         for _entry, _index, outcome in outcomes:
-            if outcome.status in {"PARTIAL", "UNKNOWN", "NO_EXECUTION_EVIDENCE"}:
+            if outcome.status in {"PARTIAL", "UNKNOWN", "NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"}:
                 realized = None
                 break
             if not outcome.status.startswith("CLOSED_"):
@@ -3050,7 +3072,15 @@ class StarUIWorkbench:
             )
             if selected_snapshot is not None
             else None,
-            self._coverage_alert(coverage, selected_snapshot),
+            self._coverage_alert(
+                coverage,
+                selected_snapshot,
+                uncertain_app_orders=any(
+                    outcome.status in {"PENDING", "UNKNOWN", "GROUP_COLLISION"}
+                    for _entry, _index, outcome in outcomes
+                ),
+            ),
+            self._submission_attention(outcomes),
             Div(
                 ScrollArea(
                     self._existing_layers_panel(active_pairs, outcomes)
@@ -3085,6 +3115,14 @@ class StarUIWorkbench:
         if not callable(getattr(self._paper_execution, "confirm_cancelled_unknown", None)):
             return None
         snapshot = self._view_model.latest_snapshot()
+        if (
+            snapshot is None
+            or not snapshot.complete
+            or not snapshot.fresh
+            or snapshot.selected.account != self._verified_selected_account()
+            or snapshot.selected.con_id != self._selected_con_id
+        ):
+            return None
         working = snapshot.working_orders if snapshot is not None else ()
 
         def has_working_leg(entry: JournalEntry) -> bool:
@@ -3099,18 +3137,51 @@ class StarUIWorkbench:
                 for order in working
             )
 
+        def observed_later(entry: JournalEntry) -> bool:
+            try:
+                return snapshot.captured_at > Decimal(entry.snapshot_captured_at)
+            except (InvalidOperation, ValueError):
+                return False
+
         unresolved = {
             entry.fingerprint: entry
             for entry, _index, outcome in outcomes
             if entry.state in {
                 "SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED", "SUBMITTED", "RECONCILED"
             }
-            and outcome.status in {"UNKNOWN", "NO_EXECUTION_EVIDENCE"}
+            and outcome.status in {"UNKNOWN", "NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"}
             and not has_working_leg(entry)
+            and observed_later(entry)
         }
         if not unresolved:
+            self._recovery_requested_fingerprint = None
             return None
-        fingerprint = next(iter(unresolved))
+        requested = self._recovery_requested_fingerprint
+        collision_fingerprints = {
+            entry.fingerprint
+            for entry, _index, outcome in outcomes
+            if outcome.status == "GROUP_COLLISION"
+        }
+        other_brackets_working = any(
+            order.key == snapshot.selected and order.oca_group
+            for order in working
+        ) if snapshot is not None else False
+        if requested in unresolved:
+            fingerprint = requested
+        else:
+            automatic = {
+                fingerprint: entry
+                for fingerprint, entry in unresolved.items()
+                if entry.state in {"SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED"}
+                and fingerprint not in collision_fingerprints
+            }
+            if (
+                not automatic
+                or other_brackets_working
+                or (self._toast is not None and self._toast.variant == "error")
+            ):
+                return None
+            fingerprint = next(iter(automatic))
         entry = unresolved[fingerprint]
         return Div(
             Dialog(
@@ -3206,7 +3277,7 @@ class StarUIWorkbench:
         held = snapshot.position.quantity
         sold = Decimal("0")
         for _entry, _index, outcome in outcomes:
-            if outcome.status in {"PARTIAL", "UNKNOWN", "NO_EXECUTION_EVIDENCE"}:
+            if outcome.status in {"PARTIAL", "UNKNOWN", "NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"}:
                 return f"{held:g} / —"
             if outcome.status.startswith("CLOSED_"):
                 sold += outcome.filled_quantity
@@ -3358,6 +3429,7 @@ class StarUIWorkbench:
             account=self._verified_selected_account(),
             con_id=self._selected_con_id,
         )
+        ambiguous = ambiguous_oca_prefixes(entries)
         active_ids = frozenset(
             {
                 order.perm_id
@@ -3376,6 +3448,15 @@ class StarUIWorkbench:
         )
 
         def outcome_for(entry: JournalEntry, index: int) -> LayerOutcome:
+            if (
+                entry.state == "SUBMISSION_UNKNOWN"
+                and (
+                    entry.account,
+                    entry.con_id,
+                    entry.oca_prefix or entry.fingerprint[:12],
+                ) in ambiguous
+            ):
+                return LayerOutcome("GROUP_COLLISION")
             outcome = classify_journal_layer(
                 entry,
                 index,
@@ -3412,7 +3493,7 @@ class StarUIWorkbench:
             item
             for item in self._submission_outcomes()
             if item[2].status
-            in {"PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE"}
+            in {"PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"}
         )
 
     def _planning_available_quantity(self) -> int:
@@ -3439,7 +3520,8 @@ class StarUIWorkbench:
         layer = entry.layers[index]
         heading = {
             "PENDING": "Awaiting TWS verification",
-            "UNKNOWN": "Outcome not confirmed",
+            "UNKNOWN": "Awaiting TWS review",
+            "GROUP_COLLISION": "Conflicting order group",
             "PARTIAL": "Partially filled",
             "NO_EXECUTION_EVIDENCE": "No fill evidence",
             "CONFLICT": "Fill and working order conflict",
@@ -3447,7 +3529,8 @@ class StarUIWorkbench:
         }[outcome.status]
         detail = {
             "PENDING": "Check TWS for Transmit or a working order, then Refresh.",
-            "UNKNOWN": "Inspect TWS before taking another action. Do not retry this draft.",
+            "UNKNOWN": "Review both orders in TWS. Transmit there if held and correct, then Refresh.",
+            "GROUP_COLLISION": "An older bracket reused this OCA group. Do not transmit; resolve the conflicting orders in TWS first.",
             "PARTIAL": (
                 f"{format(outcome.filled_quantity, 'f')} of {layer.quantity} "
                 "contracts filled. Verify the remaining order in TWS."
@@ -3508,10 +3591,22 @@ class StarUIWorkbench:
                 cls="relative z-[3] mt-5",
             )
             if outcome.status == "CANCELLED" and not read_only
+            else Button(
+                Icon("lucide:badge-check", cls="size-4", aria_hidden="true"),
+                variant="outline",
+                size="icon",
+                type="submit",
+                name="action",
+                value=f"verify-cancelled-bracket:{entry.fingerprint}",
+                aria_label=f"Verify cancellation of layer {number} in TWS",
+                title="Verify that this bracket was cancelled in TWS",
+                cls="relative z-[3] mt-5",
+            )
+            if outcome.status in {"NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"} and not read_only
             else Div(cls="min-w-0"),
             Div(
                 Span(
-                    "CANCELLED" if outcome.status == "CANCELLED" else "VERIFY IN TWS",
+                    "CANCELLED" if outcome.status == "CANCELLED" else "RESOLVE IN TWS" if outcome.status == "GROUP_COLLISION" else "VERIFY IN TWS",
                     cls="sold-layer-status",
                 ),
                 Span(heading, cls="sold-layer-result"),
@@ -3662,6 +3757,7 @@ class StarUIWorkbench:
                 "UNKNOWN",
                 "PARTIAL",
                 "NO_EXECUTION_EVIDENCE",
+                "GROUP_COLLISION",
                 "CANCELLED",
             }:
                 rows.append(self._pending_layer_row(number, entry, index, outcome))
@@ -3836,6 +3932,8 @@ class StarUIWorkbench:
         self,
         coverage: str,
         snapshot: BrokerSnapshot | None,
+        *,
+        uncertain_app_orders: bool = False,
     ) -> Any:
         held = snapshot.position.quantity if snapshot is not None else None
         available = self._state.available_quantity
@@ -3850,11 +3948,47 @@ class StarUIWorkbench:
             return Alert(
                 AlertTitle("Existing TWS exit orders"),
                 AlertDescription(
-                    message + "Orders placed outside this app are view-only here."
+                    message
+                    + (
+                        "An app submission is still unverified. Inspect TWS before "
+                        "changing these orders."
+                        if uncertain_app_orders
+                        else "Orders placed outside this app are view-only here."
+                    )
                 ),
                 cls="mt-5 border-amber-500/40 bg-amber-500/10 text-amber-100",
             )
         return Div(cls="hidden")
+
+    def _submission_attention(
+        self, outcomes: tuple[tuple[JournalEntry, int, LayerOutcome], ...]
+    ) -> Any:
+        statuses = {outcome.status for _entry, _index, outcome in outcomes}
+        if "GROUP_COLLISION" in statuses:
+            return Alert(
+                AlertTitle("Conflicting bracket orders in TWS"),
+                AlertDescription(
+                    "An earlier and a newer bracket reused the same OCA group. "
+                    "Do not transmit the pending orders. Inspect and resolve the "
+                    "old and new orders in TWS, then Refresh here. Once every "
+                    "order in the conflicting groups is gone, use Verify to clear "
+                    "the uncertain submission."
+                ),
+                cls="mt-5 border-destructive/50 bg-destructive/10 text-foreground",
+            )
+        if statuses & {"PENDING", "UNKNOWN"}:
+            return Alert(
+                AlertTitle("Orders need a decision in TWS"),
+                AlertDescription(
+                    "Check each LMT and STP pair in TWS. If the orders are held "
+                    "for Transmit and the prices and quantities are correct, "
+                    "transmit them there, then Refresh here. If the orders are "
+                    "gone, confirm that in TWS before using Verify. Do not "
+                    "submit the draft again while its outcome is uncertain."
+                ),
+                cls="mt-5 border-amber-500/40 bg-amber-500/10 text-amber-100",
+            )
+        return None
 
     def _draft_panel(self, *, show_empty_state: bool = True) -> Any:
         layers = self._current_layers()
@@ -5424,8 +5558,8 @@ def _journal_target_perm_id(entry: JournalEntry, index: int) -> int:
 
 
 def _journal_oca_group(entry: JournalEntry, index: int) -> str:
-    """Use the plan's deterministic broker OCA name for a journaled layer."""
-    return f"{entry.fingerprint[:12]}/tranche-{index + 1}"
+    """Use the persisted OCA name, including a distinct repeat-attempt suffix."""
+    return f"{entry.oca_prefix or entry.fingerprint[:12]}/tranche-{index + 1}"
 
 
 def _oca_layer_label(index: int, group: str) -> Any:
@@ -6154,6 +6288,12 @@ def _toast_notice(message: str) -> _ToastNotice | None:
     """Notify only when a problem needs attention; successes are explicit."""
     normalized = " ".join(message.split())
     lowered = normalized.lower()
+    if "paper bracket confirmation expired" in lowered:
+        return _ToastNotice(
+            "Review expired",
+            "Press Execute again to review current prices and quantities.",
+            "warning",
+        )
     if "portfolio state is not ready" in lowered or "tws connection failed" in lowered:
         return _ToastNotice(
             title="Couldn't connect to TWS",
