@@ -164,7 +164,9 @@ class StarUIWorkbench:
         self._inventory_revision = 0
         self._new_position_ids: set[int] = set()
         self._observation_requires_reload = False
+        self._selected_quantity_change: tuple[int, int, int] | None = None
         self._verified_position_ids: set[int] = set()
+        self._verified_position_quantities: dict[int, int] = {}
         self._verified_position_account: str | None = None
         self._observer_retry_at = 0.0
         self._armed_execution: PaperExecutionCandidate | None = None
@@ -347,11 +349,14 @@ class StarUIWorkbench:
 
     def _inventory_fragment(self) -> HTMLResponse:
         with self._lock:
+            change = self._selected_quantity_change
             return HTMLResponse(
                 to_xml(self._inventory()),
                 headers={
                     "Cache-Control": "no-store",
+                    "X-Inventory-Revision": str(self._inventory_revision),
                     "X-Selected-Changed": "1" if self._observation_requires_reload else "0",
+                    "X-Selected-Quantity-Change": str(change[2] - change[1]) if change else "0",
                 },
             )
 
@@ -436,8 +441,8 @@ class StarUIWorkbench:
                 previous_selected = self._selected_con_id
                 self._suppress_toasts = True
                 try:
-                    self._refresh_locked(auto_select=False)
-                    if self._state.status is UiStatus.READY:
+                    self._refresh_locked(auto_select=False, preserve_invalid_drafts=True)
+                    if self._state.status in {UiStatus.READY, UiStatus.BLOCKED}:
                         self._observation_requires_reload = previous_selected != self._selected_con_id
                     else:
                         self._observation_requires_reload = True
@@ -507,6 +512,7 @@ class StarUIWorkbench:
             else:
                 self._projection_comparison = None
             if action == "refresh":
+                self._selected_quantity_change = None
                 self._target_presets = values.get(
                     "target_presets", self._target_presets
                 )
@@ -527,7 +533,11 @@ class StarUIWorkbench:
             elif action == "select":
                 self._disarm_execution_locked()
                 self._save_form_locked(values)
+                self._selected_quantity_change = None
                 self._select_locked(_positive_int(values.get("con_id"), 0))
+            elif action == "acknowledge-position-change":
+                self._disarm_execution_locked()
+                self._selected_quantity_change = None
             elif action.startswith("market-exit-arm:"):
                 _, _, perm_id = action.partition(":")
                 self._arm_market_exit_locked(_positive_int(perm_id, 0))
@@ -579,11 +589,15 @@ class StarUIWorkbench:
                     self._confirm_execution_locked()
             return self._page()
 
-    def _refresh_locked(self, *, auto_select: bool = True) -> None:
+    def _refresh_locked(
+        self, *, auto_select: bool = True, preserve_invalid_drafts: bool = False
+    ) -> None:
         self._projection_comparison = None
         self._disarm_execution_locked()
         state = self._view_model.refresh_portfolio(self._settings)
-        self._apply_refreshed_portfolio_locked(state, auto_select=auto_select)
+        self._apply_refreshed_portfolio_locked(
+            state, auto_select=auto_select, preserve_invalid_drafts=preserve_invalid_drafts
+        )
 
     def _refresh_after_acknowledged_write_locked(self, acknowledgement: str) -> bool:
         """Replace optimistic post-write UI state with a fresh broker snapshot."""
@@ -606,9 +620,15 @@ class StarUIWorkbench:
             return False
 
     def _apply_refreshed_portfolio_locked(
-        self, state: ViewState, *, auto_select: bool = True
+        self,
+        state: ViewState,
+        *,
+        auto_select: bool = True,
+        preserve_invalid_drafts: bool = False,
     ) -> None:
         """Apply an already-read portfolio snapshot while holding the UI lock."""
+        if preserve_invalid_drafts and state.status is UiStatus.READY:
+            self._record_selected_quantity_change_locked(state)
         self._record_verified_positions_locked(state)
         previous_con_id = self._selected_con_id
         self._apply_state_locked(state)
@@ -621,12 +641,63 @@ class StarUIWorkbench:
             target = state.positions[0].con_id if auto_select and state.positions else None
         self._preferred_con_id = None
         if target is None:
+            self._selected_quantity_change = None
             return
-        self._select_locked(target)
+        self._select_locked(target, preserve_invalid_draft=preserve_invalid_drafts)
+        if self._selected_con_id != previous_con_id:
+            self._selected_quantity_change = None
+
+    def _record_selected_quantity_change_locked(self, current_state: ViewState) -> None:
+        con_id = self._selected_con_id
+        if (
+            con_id is None
+            or self._verified_position_account != current_state.account
+            or con_id not in self._verified_position_quantities
+        ):
+            return
+        after = next(
+            (position for position in current_state.positions if position.con_id == con_id and position.eligible),
+            None,
+        )
+        if after is None:
+            return
+        try:
+            new_quantity = Decimal(after.quantity)
+        except InvalidOperation:
+            return
+        if (
+            not new_quantity.is_finite()
+            or new_quantity <= 0
+            or new_quantity != new_quantity.to_integral_value()
+        ):
+            return
+        baseline = (
+            self._selected_quantity_change[1]
+            if self._selected_quantity_change is not None
+            and self._selected_quantity_change[0] == con_id
+            else self._verified_position_quantities[con_id]
+        )
+        self._selected_quantity_change = (
+            (con_id, baseline, int(new_quantity)) if int(new_quantity) != baseline else None
+        )
 
     def _record_verified_positions_locked(self, state: ViewState) -> None:
         if state.status is not UiStatus.READY:
             return
+        quantities: dict[int, int] = {}
+        for position in state.positions:
+            if not position.eligible:
+                continue
+            try:
+                quantity = Decimal(position.quantity)
+            except InvalidOperation:
+                continue
+            if (
+                quantity.is_finite()
+                and quantity > 0
+                and quantity == quantity.to_integral_value()
+            ):
+                quantities[position.con_id] = int(quantity)
         verified_ids = {
             position.con_id for position in state.positions if position.eligible
         }
@@ -638,9 +709,10 @@ class StarUIWorkbench:
             self._new_position_ids.clear()
         self._new_position_ids.intersection_update(verified_ids)
         self._verified_position_ids = verified_ids
+        self._verified_position_quantities = quantities
         self._verified_position_account = state.account
 
-    def _select_locked(self, con_id: int) -> None:
+    def _select_locked(self, con_id: int, *, preserve_invalid_draft: bool = False) -> None:
         if con_id not in {position.con_id for position in self._state.positions}:
             self._message = "The selected contract is not in the verified portfolio."
             return
@@ -649,7 +721,7 @@ class StarUIWorkbench:
         state = self._view_model.select_position(
             con_id, self._plan_form(self._drafts.get(con_id, ()))
         )
-        if any(
+        if not preserve_invalid_draft and any(
             validation.code == "LAYER_QUANTITY_EXCEEDS_AVAILABLE"
             for validation in state.validations
         ):
@@ -1889,21 +1961,71 @@ class StarUIWorkbench:
             Script(_projection_script(projection[2])),
             Script(
                 f"""(() => {{
+                  const restoreKey = 'position-draft-restore:{self.session_token}:{self._selected_con_id}';
+                  const restoreDraft = () => {{
+                    try {{
+                      const stored = sessionStorage.getItem(restoreKey);
+                      if (stored) {{
+                        const fields = JSON.parse(stored);
+                        const form = document.getElementById('draft-form');
+                        if (form) {{
+                          sessionStorage.removeItem(restoreKey);
+                          const restored = [];
+                          Object.entries(fields).forEach(([name, value]) => {{
+                            const input = form.elements.namedItem(name);
+                            if (input && 'value' in input) {{
+                              input.value = value;
+                              restored.push(input);
+                            }}
+                          }});
+                          restored.forEach(input => input.dispatchEvent(
+                            new Event('input', {{bubbles: true}})
+                          ));
+                        }}
+                      }}
+                    }} catch (_) {{ /* Browser storage may be unavailable. */ }}
+                  }};
+                  if (document.readyState === 'loading') {{
+                    document.addEventListener('DOMContentLoaded', restoreDraft, {{once: true}});
+                  }} else restoreDraft();
+                  const saveDraft = () => {{
+                    const form = document.getElementById('draft-form');
+                    if (!form) return;
+                    const fields = {{}};
+                    form.querySelectorAll('input[name], select[name]').forEach(input => {{
+                      fields[input.name] = input.value;
+                    }});
+                    try {{ sessionStorage.setItem(restoreKey, JSON.stringify(fields)); }} catch (_) {{}}
+                  }};
+                  document.addEventListener('click', event => {{
+                    if (event.target.closest('#position-change-update')) saveDraft();
+                  }});
                   const stream = new EventSource('/{self.session_token}/inventory-events');
-                  let seen = null;
+                  let seen = '{self._inventory_revision}';
                   stream.onmessage = async (event) => {{
-                    if (seen === null) {{ seen = event.data; return; }}
                     if (event.data === seen) return;
                     seen = event.data;
                     try {{
                       const response = await fetch('/{self.session_token}/inventory-fragment', {{cache:'no-store'}});
                       if (!response.ok) return;
+                      if (response.headers.get('X-Inventory-Revision') !== seen) return;
                       if (response.headers.get('X-Selected-Changed') === '1') {{
+                        saveDraft();
                         window.location.reload(); return;
                       }}
                       const slot = document.getElementById('position-inventory');
-                      if (!slot) {{ window.location.reload(); return; }}
+                      if (!slot) {{ saveDraft(); window.location.reload(); return; }}
                       slot.innerHTML = await response.text();
+                      const change = Number(response.headers.get('X-Selected-Quantity-Change') || '0');
+                      const notice = document.getElementById('selected-quantity-notice');
+                      const message = document.getElementById('selected-quantity-message');
+                      if (notice && message) {{
+                        notice.hidden = change === 0;
+                        const count = Math.abs(change);
+                        message.textContent = change > 0
+                          ? `${{count}} new ${{count === 1 ? 'contract was' : 'contracts were'}} added to this position in TWS. Update this view to plan brackets for the latest quantity.`
+                          : `${{count}} ${{count === 1 ? 'contract was' : 'contracts were'}} removed from this position in TWS. Update this view to review the remaining protection and draft quantities.`;
+                      }}
                     }} catch (_) {{ /* The stream reconnects automatically. */ }}
                   }};
                 }})();"""
@@ -2379,6 +2501,44 @@ class StarUIWorkbench:
             size="lg",
         )
 
+    def _selected_quantity_notice(self) -> Any:
+        change = self._selected_quantity_change
+        delta = change[2] - change[1] if change else 0
+        count = abs(delta)
+        if delta > 0:
+            message = (
+                f"{count} new {'contract was' if count == 1 else 'contracts were'} "
+                "added to this position in TWS. Update this view to plan brackets "
+                "for the latest quantity."
+            )
+        else:
+            message = (
+                f"{count} {'contract was' if count == 1 else 'contracts were'} "
+                "removed from this position in TWS. Update this view to review "
+                "the remaining protection and draft quantities."
+            )
+        return Div(
+            Span(message, id="selected-quantity-message"),
+            Form(
+                Button(
+                    "Update view",
+                    type="submit",
+                    id="position-change-update",
+                    variant="outline",
+                ),
+                HTMLInput(
+                    type="hidden", name="action", value="acknowledge-position-change"
+                ),
+                action=f"/{self.session_token}/action",
+                method="post",
+                cls="shrink-0",
+            ),
+            id="selected-quantity-notice",
+            role="status",
+            hidden=delta == 0,
+            cls="selected-quantity-notice",
+        )
+
     def _workspace(self, title: str) -> Any:
         coverage, _, _ = self._order_coverage()
         active_pairs = self._active_oca_pairs()
@@ -2429,6 +2589,7 @@ class StarUIWorkbench:
             if realized is not None:
                 realized += outcome.realized_pnl
         return Div(
+            self._selected_quantity_notice(),
             Div(
                 H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
                 Div(

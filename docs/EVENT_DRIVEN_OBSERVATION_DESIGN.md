@@ -133,6 +133,14 @@ no badges. Badge detection uses account and contract ID, not row order. A
 contract that first appears unverified receives **NEW** when a later complete
 read establishes eligibility. A same-account Refresh or reconnect compares
 with the last verified inventory; changing accounts starts a new baseline.
+When the verified quantity of the selected contract changes, keep its editor
+mounted and show the net number of contracts added or removed since the last
+view update. Offer an explicit **Update view** action. The server captures the
+new broker state immediately and disarms pending confirmations; the browser
+retains unsubmitted form fields until the operator updates the view. If a
+decrease makes a draft allocation invalid, retain it for review while planning
+remains blocked. The notice describes a position quantity change, not a proven
+fill or trade cause.
 
 ## State and notification rules
 
@@ -151,7 +159,8 @@ need their own completed reconciliation.
 | Confirmed change | UI result | Alert policy |
 | --- | --- | --- |
 | New nonzero long option position | Add to portfolio; retain current selection unless it vanished | One in-app notice, “New option position available”; select it only on user action |
-| Quantity or basis changed | Update row and selected planning values; invalidate affected drafts/confirmations | Notice for a new fill or reduced/closed position; otherwise quiet row update |
+| Selected quantity changed | Update broker state and sidebar, disarm confirmations, keep draft inputs, and offer **Update view**; block invalid allocations | Persistent count of contracts added or removed, without claiming a fill cause |
+| Basis changed | Update selected planning values and disarm affected confirmations | Broker state update; execution attribution awaits reconciliation |
 | App-owned OCA pair appears | Keep pending journal state until both exact legs and their states are verified | One “Both bracket legs observed in TWS” notice only after existing reconciliation proves the pair; otherwise “Pending TWS verification” |
 | Manual/other-client bracket appears | Show as external protection/reservation, inspect-only | One informational notice after a complete order read; never offer manage actions |
 | Bracket price, quantity, status, or OCA pairing changes | Update active rows and reservation, invalidate affected reviews | Flag changed row; alert if protection becomes incomplete, disappears, or fills |

@@ -139,8 +139,10 @@ def test_observed_new_position_updates_sidebar_without_changing_selection() -> N
     workbench._observe_positions = True
     workbench._observer_generation = 1
 
-    def refresh(*, auto_select: bool = True) -> None:
-        del auto_select
+    def refresh(
+        *, auto_select: bool = True, preserve_invalid_drafts: bool = False
+    ) -> None:
+        del auto_select, preserve_invalid_drafts
         state = replace(
             workbench._state,
             positions=(*workbench._state.positions, new_position),
@@ -178,6 +180,130 @@ def test_observed_new_position_updates_sidebar_without_changing_selection() -> N
         worker.join(timeout=1)
 
 
+def test_selected_position_quantity_change_offers_update_without_losing_draft() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._observe_positions = True
+    original = workbench._state
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    initial = next(
+        position for position in original.positions if position.con_id == con_id
+    )
+    initial_quantity = int(Decimal(initial.quantity))
+    draft = workbench._current_layers()
+    assert draft
+
+    def publish(quantity: int, *, blocked: bool = False) -> None:
+        positions = tuple(
+            replace(position, quantity=str(quantity))
+            if position.con_id == con_id
+            else position
+            for position in original.positions
+        )
+        workbench._view_model.select_position = (  # type: ignore[method-assign]
+            lambda selected, _form: replace(
+                original,
+                status=UiStatus.BLOCKED if blocked else UiStatus.READY,
+                positions=positions,
+                selected_con_id=selected,
+            )
+        )
+        workbench._apply_refreshed_portfolio_locked(
+            replace(original, positions=positions, selected_con_id=None),
+            auto_select=False,
+            preserve_invalid_drafts=True,
+        )
+
+    publish(initial_quantity + 6)
+    client = TestClient(workbench.app)
+    fragment = client.get(workbench.path + "inventory-fragment")
+    assert fragment.headers["X-Selected-Quantity-Change"] == "6"
+    page = client.get(workbench.path)
+    assert "6 new contracts were added to this position" in page.text
+    assert 'id="position-change-update"' in page.text
+    notice = re.search(r'<div[^>]*id="selected-quantity-notice"[^>]*>', page.text)
+    assert notice is not None and " hidden" not in notice.group()
+    assert workbench._current_layers() == draft
+
+    workbench._state = replace(workbench._state, status=UiStatus.STALE)
+    publish(initial_quantity - 2, blocked=True)
+    fragment = client.get(workbench.path + "inventory-fragment")
+    assert fragment.headers["X-Selected-Quantity-Change"] == "-2"
+    page = client.get(workbench.path)
+    assert "2 contracts were removed from this position" in page.text
+    assert workbench._current_layers() == draft
+
+    publish(initial_quantity - 2, blocked=True)
+    assert client.get(workbench.path + "inventory-fragment").headers[
+        "X-Selected-Quantity-Change"
+    ] == "-2"
+
+    acknowledged = client.post(
+        workbench.path + "action",
+        data={"action": "acknowledge-position-change", "quantity_1": "99"},
+    )
+    assert acknowledged.status_code == 200
+    assert workbench._selected_quantity_change is None
+    assert workbench._current_layers() == draft
+
+
+def test_observed_quantity_decrease_does_not_reload_or_discard_invalid_draft() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    original = workbench._state
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    draft = workbench._current_layers()
+    original_position = next(
+        position for position in original.positions if position.con_id == con_id
+    )
+    positions = tuple(
+        replace(position, quantity="1") if position.con_id == con_id else position
+        for position in original.positions
+    )
+    assert int(Decimal(original_position.quantity)) > 1
+    workbench._view_model.refresh_portfolio = (  # type: ignore[method-assign]
+        lambda _settings: replace(original, positions=positions, selected_con_id=None)
+    )
+    workbench._view_model.select_position = (  # type: ignore[method-assign]
+        lambda selected, _form: replace(
+            original,
+            status=UiStatus.BLOCKED,
+            positions=positions,
+            selected_con_id=selected,
+            available_quantity=1,
+            validations=(
+                ValidationLine(
+                    "LAYER_QUANTITY_EXCEEDS_AVAILABLE",
+                    "Draft quantity exceeds the verified available quantity.",
+                ),
+            ),
+        )
+    )
+    workbench._observe_positions = True
+    workbench._observer_generation = 1
+    worker = Thread(target=workbench._observation_loop, daemon=True)
+    worker.start()
+    try:
+        workbench._position_hint(1)
+        for _ in range(100):
+            if workbench._inventory_revision:
+                break
+            Event().wait(0.01)
+        assert workbench._inventory_revision > 0
+        assert workbench._observation_requires_reload is False
+        assert workbench._current_layers() == draft
+        assert workbench._selected_quantity_change == (
+            con_id,
+            int(Decimal(original_position.quantity)),
+            1,
+        )
+    finally:
+        workbench.close()
+        worker.join(timeout=1)
+
+
 def test_position_becomes_new_when_contract_verification_completes() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -193,8 +319,10 @@ def test_position_becomes_new_when_contract_verification_completes() -> None:
     )
     updates = [unresolved, verified]
 
-    def refresh(*, auto_select: bool = True) -> None:
-        del auto_select
+    def refresh(
+        *, auto_select: bool = True, preserve_invalid_drafts: bool = False
+    ) -> None:
+        del auto_select, preserve_invalid_drafts
         update = updates.pop(0)
         positions = [
             position
@@ -236,8 +364,10 @@ def test_reconnect_does_not_hide_a_new_verified_position() -> None:
         local_symbol="SPX  261016P07000000",
     )
 
-    def refresh(*, auto_select: bool = True) -> None:
-        del auto_select
+    def refresh(
+        *, auto_select: bool = True, preserve_invalid_drafts: bool = False
+    ) -> None:
+        del auto_select, preserve_invalid_drafts
         state = replace(
             workbench._state,
             positions=(*workbench._state.positions, new_position),
