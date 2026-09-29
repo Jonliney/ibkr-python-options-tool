@@ -91,6 +91,10 @@ milestone. No UI control suggests it can modify an existing order.
   cached broker state.
 - Preview checks snapshot freshness again and becomes unavailable after expiry.
 - Repeated preview actions are deterministic and cannot call the broker.
+- Removing a draft layer preserves the quantities entered in surviving rows,
+  even when the form temporarily totals more than the available position.
+  Paper execution remains blocked until every available contract is assigned
+  to a draft layer; deletion never redistributes contracts automatically.
 - Stop slippage and paper/live execution differences remain visible at all
   times.
 

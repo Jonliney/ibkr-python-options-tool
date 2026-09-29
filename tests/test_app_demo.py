@@ -2867,6 +2867,49 @@ def test_draft_allocation_rejects_out_of_range_quantity() -> None:
     assert execute is not None and re.search(r"\sdisabled(?:\s|>)", execute.group())
 
 
+def test_removing_overallocated_layer_preserves_survivors() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._paper_execution = _OwnedOrderService(set())
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    original = workbench._current_layers()[0]
+    workbench._state = replace(workbench._state, available_quantity=12)
+    workbench._drafts[con_id] = (
+        replace(original, quantity="4"),
+        replace(original, quantity="4"),
+        replace(original, quantity="4"),
+    )
+    client = TestClient(workbench.app)
+
+    response = client.post(
+        workbench.path + "action",
+        data={
+            "action": "remove-layer:3",
+            "quantity_1": "6",
+            "quantity_2": "4",
+            "quantity_3": "4",
+        },
+    )
+
+    assert response.status_code == 200
+    assert [layer.quantity for layer in workbench._current_layers()] == ["6", "4"]
+    assert "Draft quantities must" not in response.text
+    assert "Assign the remaining 2 contracts before execution." in response.text
+    execute = re.search(r'<button[^>]*value="execute-arm"[^>]*>', response.text)
+    assert execute is not None and re.search(r"\sdisabled(?:\s|>)", execute.group())
+    client.post(workbench.path + "action", data={"action": "execute-arm"})
+    assert "Assign all available contracts to draft layers" in workbench._message
+    assert workbench._armed_execution is None
+
+    added = client.post(
+        workbench.path + "action",
+        data={"action": "add-layer", "quantity_1": "6", "quantity_2": "4"},
+    )
+    assert added.status_code == 200
+    assert [layer.quantity for layer in workbench._current_layers()] == ["4", "4", "4"]
+
+
 def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -3287,7 +3330,7 @@ def test_order_status_check_closes_dialog_even_when_planning_stays_blocked(
     assert 'data-submission-review' not in response.text
 
 
-def test_pending_three_contracts_leave_four_available_for_drafting(tmp_path) -> None:
+def test_pending_full_allocation_blocks_new_drafts(tmp_path) -> None:
     def clock() -> Decimal:
         return Decimal("100")
 
@@ -3313,9 +3356,6 @@ def test_pending_three_contracts_leave_four_available_for_drafting(tmp_path) -> 
     workbench.load_demo_data()
     selected = 1_002_100_161  # NVDA has 7 held and no related demo order.
     workbench._select_locked(selected)
-    workbench._drafts[selected] = (
-        replace(workbench._current_layers()[0], quantity="3"),
-    )
     client = TestClient(workbench.app)
 
     assert ">Confirm<" in client.post(
@@ -3326,57 +3366,14 @@ def test_pending_three_contracts_leave_four_available_for_drafting(tmp_path) -> 
     )
 
     assert submitted.status_code == 200
-    assert workbench._planning_available_quantity() == 4
+    assert workbench._planning_available_quantity() == 0
     assert workbench._current_layers() == ()
-    assert "Available" in submitted.text
-    assert "Available to plan" not in submitted.text
     assert "VERIFY IN TWS" in submitted.text
-    assert 'id="verify-quantity-1"' in submitted.text
-    assert 'value="cancel-pair-arm:' not in submitted.text
-    assert 'value="add-layer"' in submitted.text
     assert 'value="execute-arm"' not in submitted.text
-    pending_execute = re.search(
-        r'<button[^>]*disabled[^>]*>\s*Execute paper order\s*</button>',
-        submitted.text,
-    )
-    assert pending_execute is not None
-    assert "Contracts still need protection" in submitted.text
-    assert "One or more brackets need review in TWS" not in submitted.text
     _baseline, pending_projection, config = workbench._projection_state()
-    assert config["unresolved"] is False
-    assert config["pendingQuantity"] == "3"
-    assert pending_projection.covered_quantity == 3
+    assert config["pendingQuantity"] == "7"
+    assert pending_projection.covered_quantity == 7
     assert pending_projection.covered_gain is not None
-    assert "Includes 3 contracts awaiting TWS verification" not in submitted.text
-
-    client.post(workbench.path + "action", data={"action": "add-layer"})
-    assert [layer.quantity for layer in workbench._current_layers()] == ["4"]
-    assert [layer.target_percentage for layer in workbench._current_layers()] == ["40"]
-    _baseline, projected, config = workbench._projection_state()
-    assert config["unresolved"] is False
-    assert config["pendingQuantity"] == "3"
-    assert projected.covered_quantity == 7
-    assert projected.expected_gain is not None
-    assert projected.max_loss is not None
-    projected_page = client.get(workbench.path).text
-    assert _money(projected.expected_gain) in projected_page
-    assert _money(projected.max_loss) in projected_page
-    assert "Includes 3 contracts awaiting TWS verification" not in projected_page
-    client.post(workbench.path + "action", data={"action": "add-layer"})
-    assert [layer.quantity for layer in workbench._current_layers()] == ["2", "2"]
-    assert [layer.target_percentage for layer in workbench._current_layers()] == [
-        "40", "60"
-    ]
-    client.post(workbench.path + "action", data={"action": "add-layer"})
-    repeated = client.post(workbench.path + "action", data={"action": "add-layer"})
-    assert repeated.status_code == 200
-    assert [layer.target_percentage for layer in workbench._current_layers()] == [
-        "40", "60", "100", "100"
-    ]
-    assert [layer.stop_percentage for layer in workbench._current_layers()] == [
-        "25", "25", "25", "25"
-    ]
-    assert "add a higher LMT target preset" not in repeated.text
 
     blocked = client.post(
         workbench.path + "action", data={"action": "execute-arm"}

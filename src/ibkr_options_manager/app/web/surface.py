@@ -572,13 +572,15 @@ class StarUIWorkbench:
             else:
                 if action not in {"execute-arm", "execute-confirm"}:
                     self._disarm_execution_locked()
-                if not self._save_form_locked(values):
+                removing_index = (
+                    _positive_int(action.partition(":")[2], 0)
+                    if action.startswith("remove-layer:")
+                    else None
+                )
+                if not self._save_form_locked(values, removing_index=removing_index):
                     return self._page()
                 if action == "add-layer":
                     self._add_layer_locked()
-                elif action.startswith("remove-layer:"):
-                    _, _, layer_index = action.partition(":")
-                    self._remove_layer_locked(_positive_int(layer_index, 0))
                 elif action in {"equal-split", "equal-split-available"}:
                     self._equal_split_locked(use_available_quantity=True)
                 elif action == "equal-split-assigned":
@@ -764,6 +766,10 @@ class StarUIWorkbench:
         self._toast = _ToastNotice(title, description, "success")
 
     def _arm_execution_locked(self) -> None:
+        drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
+        if drafted != self._planning_available_quantity():
+            self._message = "Assign all available contracts to draft layers before execution."
+            return
         if self._pending_submissions():
             self._message = "Review pending brackets in TWS and Refresh before submitting another draft."
             return
@@ -785,6 +791,11 @@ class StarUIWorkbench:
         )
 
     def _confirm_execution_locked(self) -> None:
+        drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
+        if drafted != self._planning_available_quantity():
+            self._disarm_execution_locked()
+            self._message = "Assign all available contracts to draft layers before execution."
+            return
         if self._pending_submissions():
             self._disarm_execution_locked()
             self._message = "Review pending brackets in TWS and Refresh before submitting another draft."
@@ -1765,7 +1776,9 @@ class StarUIWorkbench:
             return ()
         return self._drafts.get(self._selected_con_id, ())
 
-    def _save_form_locked(self, values: dict[str, str]) -> bool:
+    def _save_form_locked(
+        self, values: dict[str, str], *, removing_index: int | None = None
+    ) -> bool:
         self._target_presets = values.get("target_presets", self._target_presets)
         self._stop_presets = values.get("stop_presets", self._stop_presets)
         if self._selected_con_id is None:
@@ -1774,6 +1787,7 @@ class StarUIWorkbench:
         quantities = [
             values.get(f"quantity_{index}", previous.quantity)
             for index, previous in enumerate(self._current_layers(), start=1)
+            if index != removing_index
         ]
         try:
             parsed = [Decimal(quantity) for quantity in quantities]
@@ -1793,6 +1807,8 @@ class StarUIWorkbench:
             return False
         layers: list[DraftLayerForm] = []
         for index, previous in enumerate(self._current_layers(), start=1):
+            if index == removing_index:
+                continue
             target = values.get(f"target_{index}", previous.target_percentage)
             stop = values.get(f"stop_{index}", previous.stop_percentage)
             quantity = values.get(f"quantity_{index}", previous.quantity)
@@ -4289,7 +4305,6 @@ class StarUIWorkbench:
         has_draft_layers = bool(self._current_layers())
         available = self._planning_available_quantity()
         drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
-        quantity_exceeded = drafted > available
         can_execute_draft = (
             self._paper_execution is not None
             and available > 0
@@ -4309,8 +4324,17 @@ class StarUIWorkbench:
                     form="draft-form",
                     data_busy_text="Checking…",
                     data_execute_enabled=str(can_execute_draft).lower(),
-                    disabled=not can_execute_draft or quantity_exceeded,
+                    disabled=not can_execute_draft or drafted != available,
                     cls="w-full",
+                ),
+                P(
+                    f"Assign the remaining {available - drafted} contracts before execution.",
+                    data_draft_unassigned=True,
+                    cls=(
+                        "mt-2 text-sm text-muted-foreground"
+                        if can_execute_draft and drafted < available
+                        else "hidden mt-2 text-sm text-muted-foreground"
+                    ),
                 ),
                 data_draft_execute=True,
                 cls=(
@@ -4834,7 +4858,12 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         if (over) quantityAlert.querySelector('[data-draft-quantity-message]').textContent = `${{assignedQuantity}} contracts drafted; ${{config.available}} available. Reduce a layer's quantity.`;
       }}
       const executeButton = document.querySelector('[data-draft-execute] [data-execute-enabled]');
-      if (executeButton) executeButton.disabled = executeButton.dataset.executeEnabled !== 'true' || over;
+      if (executeButton) executeButton.disabled = executeButton.dataset.executeEnabled !== 'true' || assignedQuantity !== config.available || !quantitiesValid;
+      const unassigned = document.querySelector('[data-draft-unassigned]');
+      if (unassigned) {{
+        unassigned.classList.toggle('hidden', !executeButton || executeButton.dataset.executeEnabled !== 'true' || assignedQuantity >= config.available || !quantitiesValid);
+        if (assignedQuantity < config.available) unassigned.textContent = `Assign the remaining ${{config.available - assignedQuantity}} contracts before execution.`;
+      }}
       invalid = invalid || !quantitiesValid || over;
       window.ibkrProjection?.updateDraft(outcomes, invalid);
     }};
