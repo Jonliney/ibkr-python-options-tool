@@ -21,12 +21,18 @@ still produce inspectable plans only.
   Build Draft and Add Layer; neither action sends an order to TWS.
 - Retains the current editable layer rows, equal split modes, outcome
   projection, and preview-only action review.
+- If observation is unavailable but the shown layers have usable quantities
+  and prices, the outcome panel may show their arithmetic as an estimate.
+  This does not verify broker state or relax any execution review gate.
 - When the draft is empty, Build Draft creates at most one row per configured
   LMT target, capped by the verified available contract count. It assigns all
   available contracts with the remainder on earlier rows, repeats the final
   STP default as needed, and requires valid prices for every row before saving
   any of them. An existing draft is never replaced by this action.
 - Shows only contracts verified as available for new brackets.
+- A draft may cover fewer than the available contracts. Execution reviews and
+  submits only its explicit layers; unassigned contracts remain without a new
+  bracket. Fresh snapshot and over-allocation checks still apply.
 - Remains blocked when existing orders reserve the whole position.
 
 ### Active layers

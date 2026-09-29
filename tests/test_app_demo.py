@@ -39,6 +39,7 @@ from ibkr_options_manager.app.web.surface import (
     _next_target_preset_above,
     _position_identity,
     _price_update_impact,
+    _price_update_fills_verified,
     _projection_gain_value,
     _projection_loss_value,
     _toast_notice,
@@ -50,7 +51,7 @@ from ibkr_options_manager.app.web_window import (
 )
 from ibkr_options_manager.broker import PortfolioRequest, SnapshotRequest
 from ibkr_options_manager.broker.execution import PaperSubmission
-from ibkr_options_manager.domain import PriceBand, WorkingOrder
+from ibkr_options_manager.domain import ObservedExecution, PriceBand, WorkingOrder
 from ibkr_options_manager.execution import (
     ExecutionJournal,
     ExecutionOutcomeUnknown,
@@ -437,6 +438,39 @@ def test_lost_position_observer_blocks_paper_order_review() -> None:
     assert response.status_code == 200
     assert workbench._armed_execution is None
     assert "TWS observation is unavailable" in workbench._status_message
+
+    assert workbench._toast is not None
+    assert "Dismiss toast" in response.text
+    reloaded = TestClient(workbench.app).get(workbench.path)
+    assert "TWS observation is unavailable" not in reloaded.text
+    second_reload = TestClient(workbench.app).get(workbench.path)
+    assert "TWS observation is unavailable" not in second_reload.text
+
+    first_revision = workbench._toast_revision
+    repeated = TestClient(workbench.app).post(
+        workbench.path + "action", data={"action": "execute-arm"}
+    )
+    assert repeated.status_code == 200
+    assert workbench._toast is not None
+    assert workbench._toast_revision == first_revision + 1
+    assert "Dismiss toast" in repeated.text
+
+
+def test_unverified_projection_shows_layer_estimate_without_enabling_review() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._build_draft_locked()
+    workbench._state = replace(workbench._state, status=UiStatus.STALE, can_preview=False)
+
+    _baseline, outcome, config = workbench._projection_state()
+    page = TestClient(workbench.app).get(workbench.path).text
+
+    assert config["unresolved"] is True
+    assert outcome.expected_gain is None
+    assert "Estimate from shown layers. Refresh TWS before reviewing an order." in page
+    assert "Estimated gain" in page
+    assert "Estimated stop result" in page
+    assert _money(outcome.covered_gain) in page
 
 
 def test_single_tws_header_and_heartbeat_report_observer_health() -> None:
@@ -943,6 +977,42 @@ def test_problem_toast_has_actionable_title_and_body() -> None:
     assert notice.variant == "error"
 
 
+def test_price_update_fill_requires_fresh_exact_complete_execution() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    layer = MarketExitCandidate(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
+        target_order_id=101, target_perm_id=201, client_id=17,
+        quantity=Decimal("3"), tif="GTC", oca_group="app/tranche-1",
+        stop_order_id=102, stop_perm_id=202,
+    )
+    update = PriceUpdateCandidate(layer=layer, target_price=Decimal("12.10"))
+    fill = ObservedExecution(
+        exec_id="new-fill", account=layer.account, con_id=layer.con_id,
+        perm_id=layer.target_perm_id, side="SLD", quantity=Decimal("3"),
+        price=Decimal("12.40"), time="now",
+    )
+    observed = replace(
+        snapshot, connected=True, complete=True, fresh=True,
+        executions_complete=True, executions=(fill,),
+    )
+    assert _price_update_fills_verified(observed, (update,), set())
+    assert not _price_update_fills_verified(observed, (update,), {"new-fill"})
+    assert not _price_update_fills_verified(
+        replace(observed, executions=(replace(fill, quantity=Decimal("1")),)),
+        (update,), set(),
+    )
+    assert not _price_update_fills_verified(
+        replace(observed, executions=(replace(fill, perm_id=999),)),
+        (update,), set(),
+    )
+    assert not _price_update_fills_verified(
+        replace(observed, executions_complete=False), (update,), set(),
+    )
+
+
 @pytest.mark.parametrize(
     ("message", "title", "body"),
     (
@@ -1148,9 +1218,10 @@ def test_confirmed_cancelled_layer_does_not_request_tws_fill_verification(
 
     assert "Bracket cancelled" in page
     assert 'data-layer-state="cancelled"' in page
+    assert 'data-draft-empty-state' not in page
     assert 'value="dismiss-cancelled:' in page
     assert "No fill evidence" not in page
-    assert "mt-2 border-t border-border pt-2" in page
+    assert "mt-2 border-t border-border pt-2" not in page
 
     workbench._view_model._latest_snapshot = replace(
         snapshot, complete=False, fresh=False
@@ -1315,11 +1386,10 @@ def test_empty_draft_stays_empty_until_add_layer() -> None:
     assert workbench._current_layers()[0].quantity == "5"
 
 
-def test_empty_draft_state_shows_beside_existing_exits() -> None:
+def test_empty_draft_state_shows_when_no_app_layers_exist() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
     workbench._drafts[workbench._selected_con_id] = ()
-    workbench._paper_execution = _OwnedOrderService({101, 102})
 
     page = TestClient(workbench.app).get(workbench.path).text
 
@@ -1462,9 +1532,13 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     )
     client = TestClient(workbench.app)
 
+    empty_page = client.get(workbench.path)
+    assert 'data-layer-state="working"' in empty_page.text
+    assert 'data-draft-empty-state' not in empty_page.text
+    workbench._build_draft_locked()
     page = client.get(workbench.path)
 
-    assert "DRAFT 1" in page.text
+    assert 'data-draft-empty-state' not in page.text
     assert 'aria-label="OCA layers workspace"' in page.text
     assert 'aria-label="Existing OCA layer rows"' in page.text
     assert 'data-layer-state="working"' in page.text
@@ -1535,14 +1609,10 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert 'title="Delete OCA bracket"' in page.text
     assert ">State<" not in page.text
     assert "requires a second confirmation" not in page.text
-    assert "DRAFT 1" in page.text
     assert 'aria-current="page"' not in page.text
     assert 'data-active-initial="' in page.text
     assert 'data-live-price="active-target-1"' in page.text
     assert 'data-live-outcome="active-target-1"' in page.text
-    assert page.text.index('data-layer-state="working"') < page.text.index(
-        'data-layer-state="draft"'
-    )
     assert "const targetEdited" in page.text
     active_script = _live_active_script(
         {"basis": "1", "multiplier": "100", "bands": []}
@@ -1971,6 +2041,7 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
     page = client.get(workbench.path)
 
     assert 'data-layer-state="sold"' in page.text
+    assert 'data-draft-empty-state' not in page.text
     assert 'data-result-tone="profit"' in page.text
     assert 'data-revealed="false"' not in page.text
     assert "soldLayerRevealBound" not in page.text
@@ -2434,7 +2505,8 @@ def test_stop_above_latest_ask_warns_before_price_update_and_quote_change_rearms
     assert workbench._warned_price_update_concerns == impact.concerns
 
 
-def test_active_stop_accepts_positive_return_from_entry(monkeypatch) -> None:
+@pytest.mark.parametrize("safe_quote", [False, True])
+def test_active_stop_accepts_positive_return_from_entry(monkeypatch, safe_quote) -> None:
     from ibkr_options_manager.app.view_model import WorkingOrderLine
 
     workbench = _demo_workbench()
@@ -2456,6 +2528,10 @@ def test_active_stop_accepts_positive_return_from_entry(monkeypatch) -> None:
         snapshot, read_only_api=False,
         position=replace(snapshot.position, unit_basis=basis),
         working_orders=(target, stop),
+        quote=replace(
+            snapshot.quote, bid=Decimal("15.50"), ask=Decimal("16.00"),
+            market_data_type="LIVE", fresh=True,
+        ) if safe_quote else snapshot.quote,
     )
     workbench._state = replace(
         workbench._state, unit_basis=basis,
@@ -2493,12 +2569,15 @@ def test_active_stop_accepts_positive_return_from_entry(monkeypatch) -> None:
     monkeypatch.setattr(workbench._view_model, "select_position", lambda *_: workbench._state)
     monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: active_snapshot)
     monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
+    sent = []
+    monkeypatch.setattr(workbench, "_confirm_price_updates_locked", lambda values: sent.append(values))
 
     workbench._arm_price_updates_locked({"active_target_101": "150", "active_stop_101": "50"})
 
     assert len(workbench._armed_price_updates) == 1
     assert workbench._armed_price_updates[0].stop_price == Decimal("15.00")
     assert workbench._armed_price_updates[0].target_price is None
+    assert sent == ([{}] if safe_quote else [])
 
 
 @pytest.mark.parametrize("prior_unknown", [False, True])
@@ -2974,6 +3053,7 @@ def test_active_action_reviews_before_refresh_and_requires_execute(
 def test_draft_allocation_rejects_out_of_range_quantity() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
+    workbench._build_draft_locked()
     client = TestClient(workbench.app)
     form = {
         "action": "save-draft",
@@ -3021,15 +3101,17 @@ def test_draft_allocation_rejects_out_of_range_quantity() -> None:
     assert blocked.index("6 contracts drafted") < blocked.index("Outcome projection")
     alert = re.search(r'<div[^>]*data-draft-quantity-alert[^>]*>', blocked)
     assert alert is not None
-    assert "bg-destructive" in alert.group()
+    assert "bg-red-950" in alert.group()
     assert "border-destructive/70" in alert.group()
-    assert "text-white" in alert.group()
+    assert "text-red-50" in alert.group()
+    assert "Draft exceeds available contracts" in blocked
+    assert 'data-slot="alert-title"' in blocked
     css = client.get("/layers.css").text
     assert ".draft-quantity-alert" not in css
     library_css = client.get("/starui.css").text
-    assert ".bg-destructive{" in library_css
+    assert ".bg-red-950{" in library_css
     assert ".border-destructive\\/70{" in library_css
-    assert ".text-white{" in library_css
+    assert ".text-red-50{" in library_css
     execute = re.search(r'<button[^>]*value="execute-arm"[^>]*>', blocked)
     assert execute is not None and re.search(r"\sdisabled(?:\s|>)", execute.group())
 
@@ -3037,6 +3119,7 @@ def test_draft_allocation_rejects_out_of_range_quantity() -> None:
 def test_removing_overallocated_layer_preserves_survivors() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
+    workbench._build_draft_locked()
     workbench._paper_execution = _OwnedOrderService(set())
     con_id = workbench._selected_con_id
     assert con_id is not None
@@ -3062,12 +3145,9 @@ def test_removing_overallocated_layer_preserves_survivors() -> None:
     assert response.status_code == 200
     assert [layer.quantity for layer in workbench._current_layers()] == ["6", "4"]
     assert "Draft quantities must" not in response.text
-    assert "Assign the remaining 2 contracts before execution." in response.text
+    assert "Assign the remaining" not in response.text
     execute = re.search(r'<button[^>]*value="execute-arm"[^>]*>', response.text)
-    assert execute is not None and re.search(r"\sdisabled(?:\s|>)", execute.group())
-    client.post(workbench.path + "action", data={"action": "execute-arm"})
-    assert "Assign all available contracts to draft layers" in workbench._message
-    assert workbench._armed_execution is None
+    assert execute is not None and not re.search(r"\sdisabled(?:\s|>)", execute.group())
 
     added = client.post(
         workbench.path + "action",
@@ -3075,6 +3155,48 @@ def test_removing_overallocated_layer_preserves_survivors() -> None:
     )
     assert added.status_code == 200
     assert [layer.quantity for layer in workbench._current_layers()] == ["4", "4", "4"]
+
+
+def test_partial_draft_can_be_reviewed_for_paper_execution(tmp_path: Path) -> None:
+    def clock() -> Decimal:
+        return Decimal("100")
+
+    broker = DemoReadOnlyBroker(clock=clock, paper_execution_enabled=True)
+    snapshots = SnapshotCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock)
+    portfolio = PortfolioCoordinator(
+        broker, max_age_seconds=Decimal("15"), clock=clock, paper_execution_mode=True
+    )
+    from ibkr_options_manager.app.view_model import PlannerViewModel
+
+    workbench = StarUIWorkbench(
+        PlannerViewModel(snapshots, portfolio=portfolio, clock=clock),
+        initial_account=DEMO_ACCOUNT,
+        demo_mode=True,
+        paper_execution=PaperExecutionService(
+            DemoPaperExecutionTransport(),
+            ExecutionJournal(tmp_path / "partial-journal.json"),
+        ),
+    )
+    workbench.load_demo_data()
+    workbench._build_draft_locked()
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    first = workbench._current_layers()[0]
+    workbench._drafts[con_id] = (replace(first, quantity="2"),)
+    client = TestClient(workbench.app)
+
+    page = client.get(workbench.path).text
+    execute = re.search(r'<button[^>]*value="execute-arm"[^>]*>', page)
+    assert execute is not None and not re.search(r"\sdisabled(?:\s|>)", execute.group())
+    assert "Assign the remaining" not in page
+
+    reviewed = client.post(workbench.path + "action", data={"action": "execute-arm"})
+    assert reviewed.status_code == 200
+    assert workbench._armed_execution is not None, workbench._message
+    assert workbench._armed_execution.plan.planned_quantity == 2
+    submitted = client.post(workbench.path + "action", data={"action": "execute-confirm"})
+    assert submitted.status_code == 200
+    assert "Orders sent to TWS" in submitted.text
 
 
 def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() -> None:

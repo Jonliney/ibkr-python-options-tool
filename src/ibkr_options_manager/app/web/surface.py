@@ -200,6 +200,7 @@ class StarUIWorkbench:
         self._suppress_toasts = False
         self._toast: _ToastNotice | None = None
         self._toast_revision = 0
+        self._toast_rendered_revision = 0
         self._status_message = ""
         self._message = "Refresh and select a position to build a draft."
         self._launch_connection = "idle"
@@ -775,8 +776,8 @@ class StarUIWorkbench:
 
     def _arm_execution_locked(self) -> None:
         drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
-        if drafted != self._planning_available_quantity():
-            self._message = "Assign all available contracts to draft layers before execution."
+        if not 0 < drafted <= self._planning_available_quantity():
+            self._message = "Draft quantity must be positive and within the verified available contracts."
             return
         if self._pending_submissions():
             self._message = "Review pending brackets in TWS and Refresh before submitting another draft."
@@ -800,9 +801,9 @@ class StarUIWorkbench:
 
     def _confirm_execution_locked(self) -> None:
         drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
-        if drafted != self._planning_available_quantity():
+        if not 0 < drafted <= self._planning_available_quantity():
             self._disarm_execution_locked()
-            self._message = "Assign all available contracts to draft layers before execution."
+            self._message = "Draft quantity must be positive and within the verified available contracts."
             return
         if self._pending_submissions():
             self._disarm_execution_locked()
@@ -1471,6 +1472,8 @@ class StarUIWorkbench:
                 "An earlier price amendment has an unknown outcome. Inspect the order "
                 "in TWS for a pending change, then confirm the check below before retrying."
             )
+        elif not self._warned_price_update_concerns:
+            self._confirm_price_updates_locked({})
         else:
             self._set_review_status_locked(
                 f"Fresh paper snapshot verified. Review {changed_legs} selected price "
@@ -1547,6 +1550,8 @@ class StarUIWorkbench:
                 reason="new immediate-sell concern after refresh",
             )
             return
+        prior_execution_ids = {fill.exec_id for fill in snapshot.executions}
+        submitted = False
         try:
             confirmed = self._paper_execution.prepare_price_updates(
                 snapshot,
@@ -1555,6 +1560,7 @@ class StarUIWorkbench:
             )
             if confirmed != updates:
                 raise ExecutionBlocked("the selected OCA layers changed after review")
+            submitted = True
             receipt = self._paper_execution.modify_prices(
                 snapshot,
                 updates,
@@ -1564,15 +1570,33 @@ class StarUIWorkbench:
                 timeout_seconds=self._settings.timeout_seconds,
                 allow_unknown_retry=self._price_update_retry_required,
             )
-        except ExecutionOutcomeUnknown as error:
-            self._message = f"Price update outcome is unknown: {error}. Refresh TWS before any further action."
-            record_price_update_event("ui_result", outcome="unknown", reason=str(error))
-        except ExecutionBlocked as error:
-            self._message = f"Price update blocked: {error}"
-            record_price_update_event("ui_result", outcome="blocked", reason=str(error))
         except Exception as error:
-            self._message = f"Price update outcome is unknown: {error}"
-            record_price_update_event("ui_result", outcome="unknown", reason=str(error))
+            if not submitted:
+                self._message = f"Price update blocked: {error}"
+                record_price_update_event("ui_result", outcome="blocked", reason=str(error))
+                return
+            # A marketable amended limit can fill while TWS cancels its OCA
+            # sibling. A 202 callback or a missing open order cannot establish
+            # whether the amendment failed; use fresh executions instead.
+            try:
+                self._refresh_locked()
+                refreshed = self._view_model.latest_snapshot()
+            except Exception:
+                refreshed = None
+            if snapshot.executions_complete and _price_update_fills_verified(
+                refreshed, updates, prior_execution_ids
+            ):
+                self._message = "Price update filled: the selected exit sold in TWS."
+                self._show_success_toast_locked(
+                    "Exit filled in TWS", "The selected exit sold. Position and layers refreshed."
+                )
+                record_price_update_event("ui_result", outcome="filled", reason=str(error))
+            else:
+                self._message = (
+                    f"Price update outcome is unknown: {error}. Check TWS and refresh "
+                    "before another action."
+                )
+                record_price_update_event("ui_result", outcome="unknown", reason=str(error))
         else:
             for update in updates:
                 self._remember_pending_active_prices_locked(
@@ -2183,7 +2207,9 @@ class StarUIWorkbench:
         )
 
     def _toast_component(self) -> Any:
-        notice = self._toast
+        notice = self._toast if self._toast_revision > self._toast_rendered_revision else None
+        if notice is not None:
+            self._toast_rendered_revision = self._toast_revision
         # Keep the official Toaster mounted on every response so the embedded
         # Datastar runtime always has its signal and close button. A normal
         # Toaster uses an ``ifmissing`` signal, which is right for initial
@@ -2849,9 +2875,11 @@ class StarUIWorkbench:
                     if active_pairs or outcomes
                     else None,
                     Div(
-                        self._draft_panel(),
+                        self._draft_panel(show_empty_state=not (active_pairs or outcomes)),
                         cls=(
                             "mt-2 border-t border-border pt-2"
+                            if (active_pairs or outcomes) and self._current_layers()
+                            else "hidden"
                             if active_pairs or outcomes
                             else "h-full"
                             if not self._current_layers()
@@ -3644,7 +3672,7 @@ class StarUIWorkbench:
             )
         return Div(cls="hidden")
 
-    def _draft_panel(self) -> Any:
+    def _draft_panel(self, *, show_empty_state: bool = True) -> Any:
         layers = self._current_layers()
         return Form(
             Div(
@@ -3675,6 +3703,8 @@ class StarUIWorkbench:
                 data_draft_empty_state=True,
                 cls="draft-empty-state",
             )
+            if not layers and show_empty_state
+            else Div(cls="hidden")
             if not layers
             else ScrollArea(
                 Div(
@@ -3712,7 +3742,7 @@ class StarUIWorkbench:
             id="draft-form",
             action=f"/{self.session_token}/action",
             method="post",
-            cls="h-full" if not layers else "",
+            cls="h-full" if not layers and show_empty_state else "",
         )
 
     def _live_draft_configuration(self) -> dict[str, Any] | None:
@@ -4127,10 +4157,19 @@ class StarUIWorkbench:
             and not config["marketExit"]
             and 0 < outcome.covered_quantity < outcome.held_quantity
         )
-        gain_value = outcome.covered_gain if partial else outcome.expected_gain
-        loss_value = outcome.covered_loss if partial else outcome.max_loss
+        estimate = (
+            config["unresolved"]
+            and not config["marketExit"]
+            and outcome.covered_quantity > 0
+            and outcome.covered_quantity <= outcome.held_quantity
+        )
+        gain_value = outcome.covered_gain if partial or estimate else outcome.expected_gain
+        loss_value = outcome.covered_loss if partial or estimate else outcome.max_loss
         baseline_gain = baseline.covered_gain if partial else baseline.expected_gain
         baseline_loss = baseline.covered_loss if partial else baseline.max_loss
+        if estimate:
+            baseline_gain = None
+            baseline_loss = None
         if partial and baseline.covered_quantity != outcome.covered_quantity:
             baseline_gain = None
             baseline_loss = None
@@ -4145,7 +4184,7 @@ class StarUIWorkbench:
             else None
         )
         status = _projection_status(
-            outcome, config["unresolved"], config["marketExit"],
+            outcome, config["unresolved"], config["marketExit"], estimate,
         )
         return Card(
             CardHeader(
@@ -4155,7 +4194,7 @@ class StarUIWorkbench:
             CardContent(
                 Div(
                     *_metric(
-                        "Expected gain",
+                        "Estimated gain" if estimate else "Expected gain",
                         _projection_gain_value(gain_value, gain_delta),
                         "text-emerald-400",
                         live_key="gain",
@@ -4171,7 +4210,7 @@ class StarUIWorkbench:
                         ),
                     ),
                     *_metric(
-                        "Max loss",
+                        "Estimated stop result" if estimate else "Max loss",
                         _projection_loss_value(loss_value, loss_delta),
                         "text-rose-400",
                         live_key="loss",
@@ -4321,16 +4360,19 @@ class StarUIWorkbench:
         available = self._planning_available_quantity()
         drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
         return Alert(
+            Icon("lucide:circle-alert"),
+            AlertTitle("Draft exceeds available contracts"),
             AlertDescription(
                 f"{drafted} contracts drafted; {available} available. "
                 "Reduce a layer's quantity.",
                 data_draft_quantity_message=True,
             ),
+            variant="destructive",
             data_draft_quantity_alert=True,
             live=True,
             cls=(
                 "min-w-0 break-words border-destructive/70 "
-                "bg-destructive text-white"
+                "bg-red-950 text-red-50 [&_p]:text-red-100/90"
                 + ("" if drafted > available else " hidden")
             ),
         )
@@ -4433,17 +4475,8 @@ class StarUIWorkbench:
                     form="draft-form",
                     data_busy_text="Checking…",
                     data_execute_enabled=str(can_execute_draft).lower(),
-                    disabled=not can_execute_draft or drafted != available,
+                    disabled=not can_execute_draft or not 0 < drafted <= available,
                     cls="w-full",
-                ),
-                P(
-                    f"Assign the remaining {available - drafted} contracts before execution.",
-                    data_draft_unassigned=True,
-                    cls=(
-                        "mt-2 text-sm text-muted-foreground"
-                        if can_execute_draft and drafted < available
-                        else "hidden mt-2 text-sm text-muted-foreground"
-                    ),
                 ),
                 data_draft_execute=True,
                 cls=(
@@ -4948,7 +4981,7 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         if (ring) ring.style.setProperty('--quantity-share', `${{quantityValid ? Math.min(100, quantity / config.available * 100) : 0}}%`);
         if (share) share.textContent = quantityValid ? `${{quantity}} of ${{config.available}} available contracts (${{Math.round(quantity / config.available * 100)}}%)` : `Enter 1 to ${{config.available}} available contracts`;
         if (Number.isInteger(quantity) && quantity > 0) assignedQuantity += quantity;
-        else quantitiesValid = false;
+        if (!quantityValid) quantitiesValid = false;
         const valid = Number.isFinite(target) && target > 0 && Number.isFinite(stop) && stop > 0 && stop <= 100 && quantityValid;
         const targetPrice = valid ? (target === Number(input.dataset.liveInitial) ? Number(input.dataset.liveOriginal) : roundUp(basis * (1 + target / 100))) : NaN;
         const stopPrice = valid ? (stop === Number(stopInput?.dataset.liveInitial) ? Number(stopInput?.dataset.liveOriginal) : roundUp(basis * (1 - stop / 100))) : NaN;
@@ -4971,12 +5004,7 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         if (over) quantityAlert.querySelector('[data-draft-quantity-message]').textContent = `${{assignedQuantity}} contracts drafted; ${{config.available}} available. Reduce a layer's quantity.`;
       }}
       const executeButton = document.querySelector('[data-draft-execute] [data-execute-enabled]');
-      if (executeButton) executeButton.disabled = executeButton.dataset.executeEnabled !== 'true' || assignedQuantity !== config.available || !quantitiesValid;
-      const unassigned = document.querySelector('[data-draft-unassigned]');
-      if (unassigned) {{
-        unassigned.classList.toggle('hidden', !executeButton || executeButton.dataset.executeEnabled !== 'true' || assignedQuantity >= config.available || !quantitiesValid);
-        if (assignedQuantity < config.available) unassigned.textContent = `Assign the remaining ${{config.available - assignedQuantity}} contracts before execution.`;
-      }}
+      if (executeButton) executeButton.disabled = executeButton.dataset.executeEnabled !== 'true' || assignedQuantity <= 0 || over || !quantitiesValid;
       invalid = invalid || !quantitiesValid || over;
       window.ibkrProjection?.updateDraft(outcomes, invalid);
     }};
@@ -5510,6 +5538,36 @@ def _sell_price_with_return(raw_price: str, basis: Decimal | None) -> str:
     return f"{amount} ({change:+.1f}%)"
 
 
+def _price_update_fills_verified(
+    snapshot: BrokerSnapshot | None,
+    updates: tuple[PriceUpdateCandidate, ...],
+    prior_execution_ids: set[str],
+) -> bool:
+    """Confirm every amended layer exited via a new, exact broker execution."""
+    if (
+        snapshot is None or not snapshot.connected or not snapshot.complete
+        or not snapshot.fresh or not snapshot.executions_complete
+    ):
+        return False
+    for update in updates:
+        fills = (
+            fill for fill in snapshot.executions
+            if fill.exec_id not in prior_execution_ids
+            and fill.account == update.layer.account
+            and fill.con_id == update.layer.con_id
+            and fill.side.upper() in {"SLD", "SELL"}
+            and fill.perm_id in {
+                perm_id for perm_id, price in (
+                    (update.layer.target_perm_id, update.target_price),
+                    (update.layer.stop_perm_id, update.stop_price),
+                ) if price is not None
+            }
+        )
+        if sum((fill.quantity for fill in fills), Decimal("0")) != update.layer.quantity:
+            return False
+    return bool(updates)
+
+
 def _price_update_impact(
     snapshot: BrokerSnapshot | None,
     updates: tuple[PriceUpdateCandidate, ...],
@@ -5810,13 +5868,16 @@ def _projection_status(
     outcome: PositionOutcome,
     unresolved: bool,
     market_exit: bool,
+    estimate: bool = False,
 ) -> str:
     if market_exit:
         return ""
     if unresolved:
         if outcome.covered_quantity > outcome.held_quantity:
             return "Proposed exits exceed the held quantity."
-        return "Broker or layer state needs verification before a whole-position total is available."
+        if estimate:
+            return "Estimate from shown layers. Refresh TWS before reviewing an order."
+        return "Refresh TWS to calculate an outcome."
     if outcome.covered_quantity > outcome.held_quantity:
         return "Proposed exits exceed the held quantity."
     return ""
@@ -5865,17 +5926,18 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       const overallocated = covered > Number(config.held) + 1e-8;
       const complete = config.marketExit || (!config.unresolved && !invalidDraft && !invalidActive && !overallocated && Number.isFinite(covered) && Math.abs(covered - Number(config.held)) < 1e-8);
       const partial = !config.marketExit && !config.unresolved && !invalidDraft && !invalidActive && !overallocated && covered > 0 && covered < Number(config.held);
-      const projected = complete || partial;
+      const estimate = !config.marketExit && config.unresolved && !invalidDraft && !invalidActive && !overallocated && covered > 0 && covered <= Number(config.held);
+      const projected = complete || partial || estimate;
       const gainNode = document.querySelector('[data-live-metric="gain"]');
       const lossNode = document.querySelector('[data-live-metric="loss"]');
       const comparablePartial = partial && Math.abs(covered - Number(config.baselineCoveredQuantity)) < 1e-8;
-      const gainBaseline = partial ? (comparablePartial ? Number(config.baselineCoveredGain) : null) : config.baselineGain === null ? null : Number(config.baselineGain);
-      const lossBaseline = partial ? (comparablePartial ? Number(config.baselineCoveredLoss) : null) : config.baselineLoss === null ? null : Number(config.baselineLoss);
+      const gainBaseline = estimate ? null : partial ? (comparablePartial ? Number(config.baselineCoveredGain) : null) : config.baselineGain === null ? null : Number(config.baselineGain);
+      const lossBaseline = estimate ? null : partial ? (comparablePartial ? Number(config.baselineCoveredLoss) : null) : config.baselineLoss === null ? null : Number(config.baselineLoss);
       updateMetric(gainNode, projected ? (config.marketExit ? (config.baselineGain === null ? null : Number(config.baselineGain)) : gain) : null, gainBaseline, 'gain');
       updateMetric(lossNode, projected ? (config.marketExit ? (config.baselineLoss === null ? null : Number(config.baselineLoss)) : loss) : null, lossBaseline, 'loss');
       const status = document.querySelector('[data-projection-status]');
       if (status) {{
-        status.textContent = config.marketExit ? '' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : overallocated ? 'Proposed exits exceed the held quantity.' : config.unresolved ? 'Broker or layer state needs verification before a whole-position total is available.' : '';
+        status.textContent = config.marketExit ? '' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : overallocated ? 'Proposed exits exceed the held quantity.' : estimate ? 'Estimate from shown layers. Refresh TWS before reviewing an order.' : config.unresolved ? 'Refresh TWS to calculate an outcome.' : '';
         status.classList.toggle('hidden', !status.textContent);
       }}
     }};
