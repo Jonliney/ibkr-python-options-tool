@@ -2436,7 +2436,7 @@ class StarUIWorkbench:
                 aria_label="Open option positions",
                 cls="min-h-0 flex-1",
             ),
-            cls="flex min-h-0 flex-col overflow-hidden border-r border-border bg-card/30",
+            cls="flex h-full min-h-0 flex-col overflow-hidden border-r border-border bg-card/30",
         )
 
     def _settings_dialog(self) -> Any:
