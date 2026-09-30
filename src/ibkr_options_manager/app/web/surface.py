@@ -20,9 +20,12 @@ from starhtml import (
     Icon,
     Link,
     P,
+    Polygon,
     Script,
     Signal,
     Span,
+    Svg,
+    Circle,
     star_app,
     to_xml,
 )
@@ -103,6 +106,7 @@ from .components.ui.select import (
 )
 from .components.ui.separator import Separator
 from .components.ui.toast import Toaster
+from .components.ui.toggle_group import ToggleGroup
 from .components.ui.tooltip import Tooltip, TooltipContent, TooltipTrigger
 
 _STATIC_DIR = Path(__file__).with_name("static")
@@ -533,6 +537,9 @@ class StarUIWorkbench:
             else:
                 self._projection_comparison = None
             if action == "refresh":
+                if values.get("global_stop_type") == "STP LMT":
+                    self._message = "STP LMT defaults are not available yet. Select STP to save settings."
+                    return self._page()
                 self._selected_quantity_change = None
                 self._target_presets = values.get(
                     "target_presets", self._target_presets
@@ -628,7 +635,10 @@ class StarUIWorkbench:
                 elif action == "equal-split-assigned":
                     self._equal_split_locked(use_available_quantity=False)
                 elif action == "execute-arm":
-                    self._arm_execution_locked()
+                    if values.get("draft_stop_type") == "STP LMT":
+                        self._message = "STP LMT submission is not available yet. Select STP to review this draft."
+                    else:
+                        self._arm_execution_locked()
                 elif action == "execute-confirm":
                     self._confirm_execution_locked()
             return self._page()
@@ -2919,6 +2929,24 @@ class StarUIWorkbench:
                         "Comma-separated percentages. The final value repeats for later layers.",
                         cls="mt-3 text-xs leading-5 text-muted-foreground",
                     ),
+                    Separator(cls="my-5"),
+                    H3("Protective order default", cls="text-sm font-semibold"),
+                    Div(
+                        Button("STP", type="button", variant="outline", size="sm", aria_pressed="true", data_global_stop_choice="STP", cls="rounded-r-none border-primary bg-primary/10"),
+                        Button("STP LMT", type="button", variant="outline", size="sm", aria_pressed="false", data_global_stop_choice="STP LMT", cls="-ml-px rounded-l-none"),
+                        cls="mt-3 inline-flex",
+                    ),
+                    Div(
+                        Label("Default limit below trigger", fr="global-stop-limit-offset", cls="text-xs font-medium text-muted-foreground"),
+                        Div(
+                            Input(id="global-stop-limit-offset", type="number", min="0.1", step="any", value="5", disabled=True, cls="w-24"),
+                            Span("%", cls="text-sm text-muted-foreground"),
+                            cls="mt-2 flex items-center gap-2",
+                        ),
+                        cls="mt-4",
+                    ),
+                    HTMLInput(type="hidden", name="global_stop_type", value="STP"),
+                    Script(_global_stop_type_visual_script()),
                     DialogFooter(
                         DialogClose("Cancel", variant="outline"),
                         Button(
@@ -3204,7 +3232,7 @@ class StarUIWorkbench:
                     Div(
                         self._draft_panel(show_empty_state=not (active_pairs or outcomes)),
                         cls=(
-                            "mt-2 border-t border-border pt-2"
+                            "mt-5 border-t border-border pt-4"
                             if (active_pairs or outcomes) and self._current_layers()
                             else "hidden"
                             if active_pairs or outcomes
@@ -4163,17 +4191,20 @@ class StarUIWorkbench:
             if not layers and show_empty_state
             else Div(cls="hidden")
             if not layers
-            else ScrollArea(
-                Div(
-                    *[
-                        self._draft_layer_row(index, layer)
-                        for index, layer in enumerate(layers, start=1)
-                    ],
-                    cls="oca-layer-list w-full min-w-[41rem]",
+            else Div(
+                self._position_stop_type_control(),
+                ScrollArea(
+                    Div(
+                        *[
+                            self._draft_layer_row(index, layer)
+                            for index, layer in enumerate(layers, start=1)
+                        ],
+                        cls="oca-layer-list w-full min-w-[41rem]",
+                    ),
+                    aria_label="Draft layer rows",
+                    orientation="horizontal",
+                    cls="w-full",
                 ),
-                aria_label="Draft layer rows",
-                orientation="horizontal",
-                cls="w-full",
             ),
             Button(
                 type="submit",
@@ -4195,11 +4226,68 @@ class StarUIWorkbench:
             ),
             HTMLInput(type="hidden", name="target_presets", value=self._target_presets),
             HTMLInput(type="hidden", name="stop_presets", value=self._stop_presets),
+            HTMLInput(type="hidden", name="draft_stop_type", value="STP"),
             Script(_live_draft_script(self._live_draft_configuration())),
+            Script(_stop_type_visual_script()) if layers else None,
             id="draft-form",
             action=f"/{self.session_token}/action",
             method="post",
             cls="h-full" if not layers and show_empty_state else "",
+        )
+
+    def _position_stop_type_control(self) -> Any:
+        return Div(
+            ToggleGroup(
+                ("STP", "STP"),
+                ("STP LMT", "STP LMT"),
+                type="single",
+                value="STP",
+                variant="outline",
+                size="default",
+                aria_label="Protective order type for new layers",
+                data_draft_stop_type_group=True,
+            ),
+                Dialog(
+                    DialogTrigger(
+                        Svg(
+                            Polygon(points="10 2 14 2 14.5 4 17 5 19 4 21 6 20 8 21 10 23 10 23 14 21 14 20 16 21 18 19 20 17 19 14.5 20 14 22 10 22 9.5 20 7 19 5 20 3 18 4 16 3 14 1 14 1 10 3 10 4 8 3 6 5 4 7 5 9.5 4"),
+                            Circle(cx="12", cy="12", r="3"),
+                            viewBox="0 0 24 24", fill="none", stroke="currentColor",
+                            stroke_width="2", stroke_linejoin="round",
+                            cls="size-4", aria_hidden="true",
+                        ),
+                        variant="outline", size="icon",
+                        aria_label="Stop-limit settings", disabled=True,
+                        data_stop_limit_settings_trigger=True,
+                    ),
+                    DialogContent(
+                        DialogHeader(
+                            DialogTitle("Stop-limit settings"),
+                            DialogDescription("Set the minimum sell price below each layer’s stop trigger."),
+                        ),
+                        Div(
+                            Label("How far below the stop?", fr="stop-limit-offset", cls="text-sm font-medium"),
+                            Div(
+                                Input(id="stop-limit-offset", type="number", min="0.1", step="any", value="5", data_stop_limit_offset=True, cls="min-w-0 flex-1"),
+                                ToggleGroup(
+                                    ("percent", "%"),
+                                    ("dollars", "$"),
+                                    type="single",
+                                    value="percent",
+                                    variant="outline",
+                                    size="default",
+                                    aria_label="Stop-limit offset unit",
+                                    data_stop_limit_unit_group=True,
+                                    data_selected_unit="percent",
+                                ),
+                                cls="mt-2 flex items-center gap-2",
+                            ),
+                            cls="mt-5",
+                        ),
+                        DialogFooter(DialogClose("Done", variant="outline"), cls="mt-6"),
+                    ),
+                ),
+            cls="mb-3 flex items-center justify-end gap-2",
         )
 
     def _live_draft_configuration(self) -> dict[str, Any] | None:
@@ -5219,6 +5307,19 @@ class StarUIWorkbench:
                         cls="text-sm font-semibold text-rose-400",
                     ),
                     "text-rose-400",
+                    row_attributes={"data_draft_review_stop_row": index},
+                ),
+                self._review_order_line(
+                    "SELL STP LMT",
+                    Span(
+                        "—",
+                        data_live_review_price=f"stop-limit-{index}",
+                        aria_live="polite",
+                        cls="text-sm font-semibold text-rose-400",
+                    ),
+                    "text-rose-400",
+                    row_attributes={"data_draft_review_stop_limit_row": index},
+                    hidden=True,
                 ),
             ),
         )
@@ -5383,6 +5484,65 @@ class StarUIWorkbench:
         )
 
 
+def _global_stop_type_visual_script() -> str:
+    return """
+(() => {
+  const start = () => {
+    const buttons = document.querySelectorAll('[data-global-stop-choice]');
+    const offset = document.getElementById('global-stop-limit-offset');
+    const selection = document.querySelector('[name="global_stop_type"]');
+    buttons.forEach((button) => button.addEventListener('click', () => {
+      buttons.forEach((choice) => {
+        const selected = choice === button;
+        choice.setAttribute('aria-pressed', String(selected));
+        choice.classList.toggle('border-primary', selected);
+        choice.classList.toggle('bg-primary/10', selected);
+      });
+      if (selection) selection.value = button.dataset.globalStopChoice;
+      if (offset) offset.disabled = button.dataset.globalStopChoice !== 'STP LMT';
+    }));
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+  else start();
+})();
+"""
+
+
+def _stop_type_visual_script() -> str:
+    """Keep the proposed stop-type controls interactive without changing orders."""
+    return """
+(() => {
+  const start = () => {
+    const form = document.getElementById('draft-form');
+    if (!form) return;
+    const mode = form.elements['draft_stop_type'];
+    const settings = form.querySelector('[data-stop-limit-settings-trigger]');
+    const group = form.querySelector('[data-draft-stop-type-group]');
+    const unitGroup = form.querySelector('[data-stop-limit-unit-group]');
+    const refreshPrices = () => form.dispatchEvent(new Event('stop-limit-settings-change'));
+    group?.querySelectorAll('[data-value]').forEach((button) => {
+      button.addEventListener('click', () => {
+        mode.value = button.dataset.value;
+        if (settings) settings.disabled = mode.value !== 'STP LMT';
+        const execute = document.querySelector('[data-draft-execute] [data-execute-enabled]');
+        if (execute) execute.disabled = mode.value === 'STP LMT' || execute.dataset.executeEnabled !== 'true';
+        refreshPrices();
+      });
+    });
+    unitGroup?.querySelectorAll('[data-value]').forEach((button) => {
+      button.addEventListener('click', () => {
+        unitGroup.dataset.selectedUnit = button.dataset.value;
+        refreshPrices();
+      });
+    });
+    form.querySelector('[data-stop-limit-offset]')?.addEventListener('input', refreshPrices);
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+  else start();
+})();
+"""
+
+
 def _live_draft_script(configuration: dict[str, Any] | None) -> str:
     """Calculate a local, illustrative draft without weakening server validation."""
     if configuration is None:
@@ -5415,11 +5575,27 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
       }}
       return NaN;
     }};
+    const roundDown = (number) => {{
+      let candidate = number;
+      for (let attempt = 0; attempt <= bands.length; attempt += 1) {{
+        const candidates = bands.filter((item) => item.low <= candidate + 1e-9);
+        const band = candidates[candidates.length - 1];
+        if (!band) return NaN;
+        const rounded = Math.floor(number / band.increment + 1e-9) * band.increment;
+        const roundedCandidates = bands.filter((item) => item.low <= rounded + 1e-9);
+        if (roundedCandidates[roundedCandidates.length - 1] === band) return rounded;
+        candidate = rounded;
+      }}
+      return NaN;
+    }};
     const update = () => {{
       const outcomes = [];
       let invalid = false;
       let assignedQuantity = 0;
       let quantitiesValid = true;
+      const stopLimit = form.elements['draft_stop_type']?.value === 'STP LMT';
+      const offset = Number(form.querySelector('[data-stop-limit-offset]')?.value);
+      const unit = form.querySelector('[data-stop-limit-unit-group]')?.dataset.selectedUnit || 'percent';
       form.querySelectorAll('[data-live-input="target"]').forEach((input) => {{
         const index = input.dataset.liveLayer;
         const stopInput = form.elements[`stop_${{index}}`];
@@ -5435,6 +5611,20 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         const valid = Number.isFinite(target) && target > 0 && Number.isFinite(stop) && stop > 0 && stop <= 100 && quantityValid;
         const targetPrice = valid ? (target === Number(input.dataset.liveInitial) ? Number(input.dataset.liveOriginal) : roundUp(basis * (1 + target / 100))) : NaN;
         const stopPrice = valid ? (stop === Number(stopInput?.dataset.liveInitial) ? Number(stopInput?.dataset.liveOriginal) : roundUp(basis * (1 - stop / 100))) : NaN;
+        const rawLimit = unit === 'dollars' ? stopPrice - offset : stopPrice * (1 - offset / 100);
+        const limitPrice = stopLimit && Number.isFinite(stopPrice) && Number.isFinite(offset) && offset > 0 && rawLimit > 0 ? roundDown(rawLimit) : NaN;
+        const limitLabel = form.querySelector(`[data-live-stop-limit-price="${{index}}"]`);
+        if (limitLabel) {{
+          limitLabel.textContent = stopLimit ? `(LMT ${{Number.isFinite(limitPrice) ? priceText(limitPrice) : '—'}})` : '';
+          limitLabel.classList.toggle('hidden', !stopLimit);
+        }}
+        document.querySelectorAll(`[data-draft-review-stop-row="${{index}}"]`).forEach((row) => {{
+          row.querySelector('span').textContent = 'SELL STP';
+        }});
+        document.querySelectorAll(`[data-draft-review-stop-limit-row="${{index}}"]`).forEach((row) => {{
+          row.classList.toggle('hidden', !stopLimit);
+        }});
+        assigned(`[data-live-review-price="stop-limit-${{index}}"]`, Number.isFinite(limitPrice) ? priceText(limitPrice) : '—');
         const gain = valid && Number.isFinite(targetPrice) ? (targetPrice - basis) * multiplier * quantity : NaN;
         const loss = valid && Number.isFinite(stopPrice) ? (stopPrice - basis) * multiplier * quantity : NaN;
         assigned(`[data-live-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? (target === Number(input.dataset.liveInitial) ? `$${{input.dataset.liveOriginal}}` : priceText(targetPrice)) : '—');
@@ -5454,12 +5644,13 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         if (over) quantityAlert.querySelector('[data-draft-quantity-message]').textContent = `${{assignedQuantity}} contracts drafted; ${{config.available}} available. Reduce a layer's quantity.`;
       }}
       const executeButton = document.querySelector('[data-draft-execute] [data-execute-enabled]');
-      if (executeButton) executeButton.disabled = executeButton.dataset.executeEnabled !== 'true' || assignedQuantity <= 0 || over || !quantitiesValid;
+      if (executeButton) executeButton.disabled = executeButton.dataset.executeEnabled !== 'true' || assignedQuantity <= 0 || over || !quantitiesValid || form.elements['draft_stop_type']?.value === 'STP LMT';
       invalid = invalid || !quantitiesValid || over;
       window.ibkrProjection?.updateDraft(outcomes, invalid);
     }};
     form.querySelectorAll('[data-live-input]').forEach((input) => input.addEventListener('input', update));
     form.querySelectorAll('[data-live-input]').forEach((input) => input.addEventListener('change', update));
+    form.addEventListener('stop-limit-settings-change', update);
     update();
   }};
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, {{ once: true }});
@@ -5779,12 +5970,25 @@ def _percentage_price_field(
     """Render a percentage input with its calculated price and layer outcome."""
     return Div(
         Div(
-            Label(label, fr=input_id, cls="text-xs font-medium text-muted-foreground"),
-            Span(
-                f"${price}",
-                data_live_price=f"{kind}-{layer_index}",
-                aria_live="polite",
-                cls="text-xs font-semibold text-foreground",
+            Label(
+                label,
+                fr=input_id,
+                cls="text-xs font-medium text-muted-foreground",
+            ),
+            Div(
+                Span(
+                    f"${price}",
+                    data_live_price=f"{kind}-{layer_index}",
+                    aria_live="polite",
+                    cls="text-xs font-semibold text-foreground",
+                ),
+                Span(
+                    "",
+                    data_live_stop_limit_price=layer_index if kind == "stop" else None,
+                    aria_live="polite" if kind == "stop" else None,
+                    cls="hidden text-xs text-muted-foreground" if kind == "stop" else "hidden",
+                ),
+                cls="flex flex-wrap items-baseline justify-end gap-x-1",
             ),
             cls="flex items-center justify-between gap-2",
         ),

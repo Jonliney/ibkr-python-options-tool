@@ -11,6 +11,16 @@ from types import SimpleNamespace
 
 import pytest
 
+
+def test_bundled_starui_css_styles_selected_toggle_group_items() -> None:
+    css = (
+        Path(__file__).resolve().parents[1]
+        / "src/ibkr_options_manager/app/web/static/starui.css"
+    ).read_text()
+    assert "data-\\[state\\=on\\]\\:bg-accent[data-state=on]" in css
+    assert "first\\:rounded-l-md:first-child" in css
+    assert "last\\:rounded-r-md:last-child" in css
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--no-sandbox --disable-gpu")
 
@@ -2126,6 +2136,32 @@ def test_existing_tws_bracket_waits_for_add_layer_before_creating_a_draft() -> N
     assert len(workbench._current_layers()) == 1
 
 
+def test_unwired_stop_limit_choice_cannot_arm_a_stop_order() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._build_draft_locked()
+    response = TestClient(workbench.app).post(
+        f"/{workbench.session_token}/action",
+        data={"action": "execute-arm", "draft_stop_type": "STP LMT"},
+    )
+
+    assert response.status_code == 200
+    assert workbench._armed_execution is None
+    assert "STP LMT submission is not available yet" in workbench._status_message
+
+
+def test_unwired_global_stop_limit_default_cannot_be_saved() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    response = TestClient(workbench.app).post(
+        f"/{workbench.session_token}/action",
+        data={"action": "refresh", "global_stop_type": "STP LMT"},
+    )
+
+    assert response.status_code == 200
+    assert "STP LMT defaults are not available yet" in workbench._status_message
+
+
 def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     from ibkr_options_manager.app.view_model import WorkingOrderLine
 
@@ -2235,6 +2271,24 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert 'step="any"' in stop_input.group()
     assert 'name="active_stop_price_101"' in page.text
     assert 'rate.toFixed(2)' in page.text
+    assert 'data-draft-stop-type-group' in page.text
+    assert 'data-value="STP LMT"' in page.text
+    assert 'role="radiogroup"' in page.text
+    assert 'data-stop-limit-settings-trigger' in page.text
+    assert "How far below the stop?" in page.text
+    assert "mt-5 border-t border-border pt-4" in page.text
+    assert 'data-stop-limit-unit-group' in page.text
+    assert 'data-value="percent"' in page.text
+    assert 'data-value="dollars"' in page.text
+    assert 'data-live-stop-limit-price="1"' in page.text
+    assert 'data-draft-review-stop-limit-row="1"' in page.text
+    assert 'data-live-review-price="stop-limit-1"' in page.text
+    assert "SELL STP LMT" in page.text
+    assert "STP SELL" in page.text
+    assert "STP loss (with LMT)" not in page.text
+    assert "stop-limit-settings-change" in page.text
+    assert "The limit is rounded down to a valid price increment" not in page.text
+    assert 'name="draft_stop_type"' in page.text
     assert "data-active-review-row" in page.text
     assert "data-active-execute" in page.text
     assert 'id="active-quantity-1"' in page.text
