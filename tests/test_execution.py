@@ -1741,6 +1741,40 @@ def test_unknown_bracket_cancelled_in_tws_can_be_rebuilt(tmp_path) -> None:
     assert journal.begin(refreshed, plan).state == "PREPARED"
 
 
+def test_immediately_filled_unknown_bracket_recovers_from_completed_history(tmp_path) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot)
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.mark_unknown(plan.fingerprint)
+    group = f"{plan.fingerprint[:12]}/tranche-1"
+    target = ObservedCompletedOrder(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
+        perm_id=201, order_id=101, client_id=17, action="SELL",
+        order_type="LMT", oca_group=group, status="Filled",
+    )
+    stop = replace(target, perm_id=202, order_id=102,
+                   order_type="STP", status="Cancelled")
+    fill = ObservedExecution(
+        exec_id="fill.01", account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id, perm_id=201, side="SLD",
+        quantity=Decimal(str(plan.pairs[0].quantity)), price=Decimal("20"),
+        time="now", realized_pnl=Decimal("125"), currency="USD",
+    )
+    history = replace(snapshot, complete=False, fresh=False, working_orders=(),
+                      completed_orders=(target, stop), completed_orders_complete=True,
+                      executions=(fill,), executions_complete=True)
+    journal.record_completed_orders(history)
+    journal.record_executions(history)
+    entry = journal.find(plan.fingerprint)
+    assert entry is not None
+    outcome = classify_journal_layer(entry, 0, active_perm_ids=frozenset(),
+                                     observed_perm_ids=frozenset())
+    assert outcome.status == "CLOSED_PROFIT"
+    assert outcome.realized_pnl == Decimal("125")
+
+
 def test_unknown_bracket_without_cancel_evidence_stays_blocked(tmp_path) -> None:
     snapshot = _snapshot()
     plan = _two_pair_plan(snapshot)

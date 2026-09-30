@@ -107,6 +107,17 @@ TWS verification before another draft can be submitted.
 
 ## Closed bracket history
 
+If a verified position disappears from the portfolio during the current
+session, Refresh makes a separate read-only history capture for that exact
+contract. It requires a fresh, complete account, completed-order, and execution
+read plus matching contract identity before adding evidence to the journal. The
+history capture is deliberately marked ineligible for order actions. A missing
+working order alone never proves a fill; without an exact execution and its
+realised P&L report, the layer remains for TWS review and its P&L is unknown.
+Cancelled brackets are omitted from the closed-position page. The realised
+header sums only closed layers with verified P&L; unrelated cancelled or
+unresolved rows do not erase that known amount.
+
 On refresh, the selected-contract snapshot also requests completed API orders
 and executions from TWS. The app joins a completed order to a planned layer by
 the exact account, contract ID, fingerprinted OCA group, order type, and
@@ -247,11 +258,13 @@ original plan. The dialog remains open if these checks fail. The journal records
 the confirmation and snapshot time. Sending
 the same draft again still requires a later clean snapshot; the confirmation
 alone never authorizes an order write.
-The final paper bracket confirmation expires after 10 seconds. An expired
-confirmation never sends orders; the operator must press Execute again for a
-fresh plan and another review. The Confirm button shows the remaining seconds;
-its browser countdown is informational, while the server deadline controls
-whether submission is allowed.
+Final paper confirmation for new brackets, price updates, bracket cancellation,
+and market exits expires after 10 seconds. An expired confirmation never sends
+an order change. The Confirm button shows the remaining seconds and returns to
+the Execute step at zero; its browser countdown is informational, while the
+server deadline controls whether submission is allowed. Price updates always
+require this confirmation, including when the latest quote raises no new
+immediate-sell warning.
 Recreating a verified cancelled plan keeps its fingerprint for duplicate
 suppression but persists a new OCA group prefix for the new attempt. Journal
 reconciliation uses that prefix rather than attributing an earlier order to

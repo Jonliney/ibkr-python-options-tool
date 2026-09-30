@@ -6,6 +6,7 @@ from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from threading import Event, Thread
+from time import monotonic
 from types import SimpleNamespace
 
 import pytest
@@ -91,7 +92,8 @@ def test_closed_position_remains_read_only_for_current_session() -> None:
     assert workbench._selected_closed_con_id == closed_id
     page = to_xml(workbench._page())
     assert "CLOSED THIS SESSION" in page
-    assert "Closed this session" in page
+    assert "Closed this session" not in page
+    assert "workspace-content flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6" in page
     assert 'grid-cols-[16rem_minmax(0,1fr)_19rem]' in page
     assert "Held / total" in page
     assert "ACTION REVIEW" in page
@@ -123,6 +125,66 @@ def test_closed_position_remains_read_only_for_current_session() -> None:
         replace(workbench._state, positions=remaining)
     )
     assert not workbench._session_closed_positions
+
+
+def test_closed_session_hides_cancelled_brackets_and_keeps_verified_pnl() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    workbench._session_closed_positions[con_id] = next(
+        position for position in workbench._state.positions if position.con_id == con_id
+    )
+    workbench._selected_closed_con_id = con_id
+    workbench._selected_con_id = None
+    closed = JournalEntry(
+        fingerprint="a" * 64, account=workbench._settings.account,
+        con_id=con_id, state="RECONCILED",
+        layers=(JournalLayer(1, "20", "10", "GTC", 201, 202),),
+        fills=(JournalFill("fill.01", 201, "SLD", "1", "20", "now", "125", "USD"),),
+    )
+    cancelled = JournalEntry(
+        fingerprint="b" * 64, account=workbench._settings.account,
+        con_id=con_id, state="RECONCILED",
+        layers=(JournalLayer(1, "25", "10", "GTC", 203, 204, cancelled=True),),
+    )
+
+    class History:
+        def submission_entries(self, **_kwargs):
+            return (closed, cancelled)
+
+    workbench._paper_execution = History()  # type: ignore[assignment]
+    page = to_xml(workbench._page())
+    assert "+$125.00" in page
+    assert "Bracket cancelled" not in page
+    assert "Awaiting TWS review" not in page
+
+
+def test_closed_history_refresh_records_exact_broker_evidence(monkeypatch) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    con_id = workbench._selected_con_id
+    assert con_id is not None
+    baseline = workbench._view_model.latest_snapshot()
+    assert baseline is not None
+    workbench._session_contract_snapshots[con_id] = baseline
+    workbench._session_closed_positions[con_id] = next(
+        position for position in workbench._state.positions if position.con_id == con_id
+    )
+    calls = []
+
+    class History:
+        def record_completed_orders(self, snapshot):
+            calls.append(("orders", snapshot.complete, snapshot.selected.con_id))
+
+        def record_executions(self, snapshot):
+            calls.append(("fills", snapshot.complete, snapshot.selected.con_id))
+
+    workbench._paper_execution = History()  # type: ignore[assignment]
+    monkeypatch.setattr(workbench._view_model, "refresh_closed_history",
+                        lambda _settings, _baseline: replace(baseline, complete=False, fresh=False))
+    workbench._refresh_closed_history_locked()
+    assert calls == [("orders", False, con_id), ("fills", False, con_id)]
 
 
 def test_demo_broker_exercises_inventory_and_reserved_quantity_without_tws() -> None:
@@ -1221,6 +1283,7 @@ def test_immediate_price_update_fill_records_edited_values(monkeypatch) -> None:
 
     workbench._paper_execution = PriceService()  # type: ignore[assignment]
     workbench._armed_price_updates = (update,)
+    workbench._armed_execution_deadline = monotonic() + 10
     workbench._armed_active_percentages = {201: ("2", "-25")}
     workbench._warned_price_update_concerns = _price_update_impact(initial, (update,)).concerns
     monkeypatch.setattr(workbench._view_model, "select_position", lambda *_: workbench._state)
@@ -1750,6 +1813,85 @@ def test_paper_bracket_confirm_button_counts_down_to_server_deadline(monkeypatch
     later = TestClient(workbench.app).get(workbench.path).text
     assert "Confirm (4s)" in later
     assert 'data-confirm-countdown-ms="3800"' in later
+    monkeypatch.setattr(surface, "monotonic", lambda: 1010.0)
+    expired = TestClient(workbench.app).get(workbench.path).text
+    assert workbench._armed_execution is None
+    assert 'value="execute-arm"' in expired
+    assert 'value="execute-confirm"' not in expired
+
+
+def test_expired_active_and_price_reviews_return_to_execute(monkeypatch) -> None:
+    from ibkr_options_manager.app.web import surface
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    candidate = MarketExitCandidate(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
+        target_order_id=101, target_perm_id=201, client_id=17,
+        quantity=Decimal("1"), tif="GTC", oca_group="app/tranche-1",
+        stop_order_id=102, stop_perm_id=202,
+    )
+    monkeypatch.setattr(surface, "monotonic", lambda: 1000.0)
+    workbench._armed_cancellation = candidate
+    workbench._active_action_verified = True
+    workbench._armed_execution_deadline = 1010.0
+    active_review = TestClient(workbench.app).get(workbench.path).text
+    assert "Confirm (10s)" in active_review
+    assert 'value="cancel-pair-confirm"' in active_review
+    monkeypatch.setattr(surface, "monotonic", lambda: 1010.0)
+    workbench._confirm_cancellation_locked()
+    assert workbench._armed_cancellation == candidate
+    assert not workbench._active_action_verified
+    assert 'value="active-action-execute"' in TestClient(workbench.app).get(workbench.path).text
+
+    workbench._disarm_execution_locked()
+    workbench._armed_price_updates = (
+        PriceUpdateCandidate(layer=candidate, target_price=Decimal("12.10")),
+    )
+    workbench._armed_active_percentages = {201: ("2", "-25")}
+    workbench._armed_execution_deadline = 1010.0
+    monkeypatch.setattr(surface, "monotonic", lambda: 1000.0)
+    price_review = TestClient(workbench.app).get(workbench.path).text
+    assert "Confirm (10s)" in price_review
+    assert 'value="price-update-confirm"' in price_review
+    monkeypatch.setattr(surface, "monotonic", lambda: 1010.0)
+    workbench._confirm_price_updates_locked({})
+    assert not workbench._armed_price_updates
+    assert workbench._armed_active_percentages == {201: ("2", "-25")}
+    assert 'value="price-update-confirm"' not in TestClient(workbench.app).get(workbench.path).text
+
+
+@pytest.mark.parametrize("action", ["market-exit", "cancel-all"])
+def test_expired_bulk_active_review_requires_execute_again(monkeypatch, action) -> None:
+    from ibkr_options_manager.app.web import surface
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    candidate = MarketExitCandidate(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
+        target_order_id=101, target_perm_id=201, client_id=17,
+        quantity=Decimal("1"), tif="GTC", oca_group="app/tranche-1",
+        stop_order_id=102, stop_perm_id=202,
+    )
+    if action == "market-exit":
+        workbench._armed_market_exits = (candidate,)
+        confirm = workbench._confirm_market_exit_locked
+    else:
+        workbench._armed_cancellations = (candidate,)
+        confirm = workbench._confirm_all_cancellations_locked
+    workbench._active_action_verified = True
+    workbench._armed_execution_deadline = 1010.0
+    monkeypatch.setattr(surface, "monotonic", lambda: 1010.0)
+
+    confirm()
+
+    assert not workbench._active_action_verified
+    assert workbench._armed_market_exits or workbench._armed_cancellations
+    assert 'value="active-action-execute"' in TestClient(workbench.app).get(workbench.path).text
 
 
 def test_refresh_replaces_a_draft_that_exceeds_newly_available_quantity() -> None:
@@ -2924,6 +3066,7 @@ def test_stop_above_latest_ask_warns_before_price_update_and_quote_change_rearms
 
     workbench._paper_execution = object()  # type: ignore[assignment]
     workbench._armed_price_updates = updates
+    workbench._armed_execution_deadline = monotonic() + 10
     workbench._warned_price_update_concerns = _price_update_impact(safe, updates).concerns
     monkeypatch.setattr(workbench._view_model, "select_position", lambda *_: workbench._state)
     monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: risky)
@@ -3008,7 +3151,8 @@ def test_active_stop_accepts_positive_return_from_entry(monkeypatch, safe_quote)
     assert len(workbench._armed_price_updates) == 1
     assert workbench._armed_price_updates[0].stop_price == Decimal("15.00")
     assert workbench._armed_price_updates[0].target_price is None
-    assert sent == ([{}] if safe_quote else [])
+    assert sent == []
+    assert workbench._armed_execution_deadline is not None
 
 
 @pytest.mark.parametrize("prior_unknown", [False, True])
@@ -3935,7 +4079,7 @@ def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
     )
 
     assert armed.status_code == 200
-    assert ">Confirm<" in armed.text
+    assert "Confirm (" in armed.text
     assert workbench._status_message.startswith("Fresh paper snapshot verified")
     assert workbench._toast is None
 
@@ -4018,7 +4162,7 @@ def test_unknown_submission_uses_guided_refresh_without_error_toast(
     )
     workbench.load_demo_data()
     client = TestClient(workbench.app)
-    assert ">Confirm<" in client.post(
+    assert "Confirm (" in client.post(
         workbench.path + "action", data={"action": "execute-arm"}
     ).text
 
@@ -4091,7 +4235,7 @@ def test_pending_full_allocation_blocks_new_drafts(tmp_path) -> None:
     workbench._select_locked(selected)
     client = TestClient(workbench.app)
 
-    assert ">Confirm<" in client.post(
+    assert "Confirm (" in client.post(
         workbench.path + "action", data={"action": "execute-arm"}
     ).text
     submitted = client.post(
@@ -4157,7 +4301,7 @@ def test_external_order_change_before_confirmation_blocks_demo_submission(
     workbench.load_demo_data()
     client = TestClient(workbench.app)
     armed = client.post(workbench.path + "action", data={"action": "execute-arm"})
-    assert ">Confirm<" in armed.text
+    assert "Confirm (" in armed.text
 
     original_capture = broker.capture
 

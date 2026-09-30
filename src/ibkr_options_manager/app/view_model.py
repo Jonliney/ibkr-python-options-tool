@@ -8,9 +8,11 @@ from enum import StrEnum
 from importlib.metadata import PackageNotFoundError, version
 from typing import Protocol
 
-from ..broker import PortfolioRequest, SnapshotRequest
+from ..broker import BrokerCapture, PortfolioRequest, SnapshotRequest
 from ..domain import (
     BrokerSnapshot,
+    ObservedCompletedOrder,
+    ObservedExecution,
     LayerRequest,
     PlanRequest,
     PlanResult,
@@ -200,6 +202,8 @@ class ViewState:
 class SnapshotSource(Protocol):
     def refresh(self, request: SnapshotRequest) -> SnapshotResult: ...
 
+    def capture_closed_history(self, request: SnapshotRequest) -> BrokerCapture | None: ...
+
     def current(self) -> SnapshotResult: ...
 
 
@@ -236,6 +240,47 @@ class PlannerViewModel:
     def latest_snapshot(self) -> BrokerSnapshot | None:
         """Return the most recent coherent selected-position snapshot, if any."""
         return self._latest_snapshot
+
+    def refresh_closed_history(
+        self, settings: ConnectionSettings, baseline: BrokerSnapshot
+    ) -> BrokerSnapshot | None:
+        """Fetch exact-contract history for journal display only."""
+        capture = self._snapshots.capture_closed_history(SnapshotRequest(
+            host="127.0.0.1", port=settings.port, client_id=settings.client_id,
+            expected_account=settings.account, option_con_id=baseline.selected.con_id,
+            timeout_seconds=settings.timeout_seconds,
+        ))
+        if capture is None or baseline.selected.account != settings.account:
+            return None
+        contract = next(contract for contract in capture.contract_details
+                        if contract.con_id == baseline.selected.con_id)
+        identity = ("sec_type", "expiry", "strike", "right", "multiplier",
+                    "currency", "trading_class", "exchange", "local_symbol")
+        if any(getattr(contract, field) != getattr(baseline.contract, field)
+               for field in identity):
+            return None
+        return replace(
+            baseline, complete=False, fresh=False,
+            working_orders=(),
+            executions=tuple(ObservedExecution(
+                exec_id=fill.exec_id, account=fill.account, con_id=fill.con_id,
+                perm_id=fill.perm_id, side=fill.side, quantity=fill.quantity,
+                price=fill.price, time=fill.time, realized_pnl=fill.realized_pnl,
+                currency=fill.currency,
+            ) for fill in capture.executions
+                if fill.account == settings.account
+                and fill.con_id == baseline.selected.con_id),
+            executions_complete=True,
+            completed_orders=tuple(ObservedCompletedOrder(
+                account=order.account, con_id=order.con_id, perm_id=order.perm_id,
+                order_id=order.order_id, client_id=order.client_id,
+                action=order.action, order_type=order.order_type,
+                oca_group=order.oca_group, status=order.status,
+            ) for order in capture.completed_orders
+                if order.account == settings.account
+                and order.con_id == baseline.selected.con_id),
+            completed_orders_complete=True,
+        )
 
     def refresh_portfolio(self, settings: ConnectionSettings) -> ViewState:
         self._settings = settings

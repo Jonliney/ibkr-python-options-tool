@@ -102,6 +102,24 @@ def request() -> SnapshotRequest:
     )
 
 
+def test_closed_history_capture_accepts_zero_position_only_with_complete_history() -> None:
+    capture = replace(
+        complete_capture(), positions=(), read_only_api=False,
+        completed_orders_complete=True, executions_complete=True,
+    )
+    broker = FakeReadOnlyBroker(capture)
+    coordinator = SnapshotCoordinator(
+        broker, max_age_seconds=Decimal("15"), clock=lambda: Decimal("100")
+    )
+    assert coordinator.capture_closed_history(request()) == capture
+    assert coordinator.current().snapshot is None
+
+    broker.capture_value = replace(capture, executions_complete=False)
+    assert coordinator.capture_closed_history(request()) is None
+    broker.capture_value = replace(capture, managed_accounts=("DU_OTHER",))
+    assert coordinator.capture_closed_history(request()) is None
+
+
 def test_snapshot_request_rejects_a_non_paper_account_id() -> None:
     try:
         SnapshotRequest(

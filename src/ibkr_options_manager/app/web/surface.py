@@ -197,6 +197,7 @@ class StarUIWorkbench:
         self._session_position_account = initial_account
         self._session_seen_positions: dict[int, PortfolioPositionLine] = {}
         self._session_closed_positions: dict[int, PortfolioPositionLine] = {}
+        self._session_contract_snapshots: dict[int, BrokerSnapshot] = {}
         self._state = view_model.empty()
         self._drafts: dict[int, tuple[DraftLayerForm, ...]] = {}
         self._projection_comparison: PositionOutcome | None = None
@@ -630,6 +631,7 @@ class StarUIWorkbench:
         if self._session_position_account != self._settings.account:
             self._session_seen_positions.clear()
             self._session_closed_positions.clear()
+            self._session_contract_snapshots.clear()
             self._selected_closed_con_id = None
             self._session_position_account = self._settings.account
         self._projection_comparison = None
@@ -639,6 +641,25 @@ class StarUIWorkbench:
         self._apply_refreshed_portfolio_locked(
             state, auto_select=auto_select, preserve_invalid_drafts=preserve_invalid_drafts
         )
+        self._refresh_closed_history_locked()
+
+    def _refresh_closed_history_locked(self) -> None:
+        if self._paper_execution is None or self._state.status is not UiStatus.READY:
+            return
+        for con_id in self._session_closed_positions:
+            baseline = self._session_contract_snapshots.get(con_id)
+            if baseline is None:
+                continue
+            try:
+                snapshot = self._view_model.refresh_closed_history(self._settings, baseline)
+                if snapshot is None:
+                    continue
+                self._paper_execution.record_completed_orders(snapshot)
+                self._paper_execution.record_executions(snapshot)
+            except ExecutionBlocked as error:
+                self._message = f"Closed history reconciliation blocked: {error}"
+            except Exception:
+                self._message = "Closed history refresh unavailable. Check TWS connection and Refresh."
 
     def _refresh_after_acknowledged_write_locked(self, acknowledgement: str) -> bool:
         """Replace optimistic post-write UI state with a fresh broker snapshot."""
@@ -734,6 +755,7 @@ class StarUIWorkbench:
         if self._session_position_account != self._settings.account:
             self._session_seen_positions.clear()
             self._session_closed_positions.clear()
+            self._session_contract_snapshots.clear()
             self._selected_closed_con_id = None
             self._session_position_account = self._settings.account
         current = {position.con_id: position for position in state.positions}
@@ -794,6 +816,9 @@ class StarUIWorkbench:
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
         self._announce_reconciliation_locked()
+        snapshot = self._view_model.latest_snapshot()
+        if snapshot is not None and snapshot.complete and snapshot.fresh:
+            self._session_contract_snapshots[con_id] = snapshot
 
     def _plan_form(self, layers: tuple[DraftLayerForm, ...]) -> PlanForm:
         return PlanForm(
@@ -814,6 +839,31 @@ class StarUIWorkbench:
         self._warned_price_update_concerns = frozenset()
         self._price_update_retry_required = False
         self._armed_active_percentages = {}
+
+    def _expire_confirmation_locked(self, *, require_deadline: bool = False) -> bool:
+        if not (
+            self._armed_execution is not None
+            or self._armed_price_updates
+            or self._active_action_verified
+        ):
+            return False
+        deadline = self._armed_execution_deadline
+        if deadline is None and not require_deadline:
+            return False
+        if deadline is not None and monotonic() < deadline:
+            return False
+        if self._armed_price_updates:
+            edited_percentages = dict(self._armed_active_percentages)
+            self._disarm_execution_locked()
+            self._armed_active_percentages = edited_percentages
+        elif self._armed_execution is not None:
+            self._disarm_execution_locked()
+        else:
+            # Keep the selected active-layer action available for a new Execute.
+            self._active_action_verified = False
+            self._armed_execution_deadline = None
+        self._status_message = "Review expired. Press Execute paper order again for a fresh review."
+        return True
 
     def _set_review_status_locked(self, message: str) -> None:
         """Keep routine review transitions out of the notification queue."""
@@ -851,10 +901,7 @@ class StarUIWorkbench:
         )
 
     def _confirm_execution_locked(self) -> None:
-        if self._armed_execution is not None and (
-            self._armed_execution_deadline is None
-            or monotonic() >= self._armed_execution_deadline
-        ):
+        if self._armed_execution is not None and self._expire_confirmation_locked(require_deadline=True):
             self._disarm_execution_locked()
             self._message = "Paper bracket confirmation expired. Press Execute again to review a fresh plan."
             return
@@ -1070,12 +1117,16 @@ class StarUIWorkbench:
             self._message = f"Execution blocked: {error}. Review the latest state again."
             return
         self._active_action_verified = True
+        self._armed_execution_deadline = monotonic() + 10
         self._set_review_status_locked(
-            "Fresh paper snapshot verified. Review the action, then confirm."
+            "Fresh paper snapshot verified. Review the action and confirm within 10 seconds."
         )
 
     def _confirm_cancellation_locked(self) -> None:
         """Cancel the staged pair after one more fresh-snapshot equality check."""
+        if self._expire_confirmation_locked(require_deadline=True):
+            self._message = "Review expired. Press Execute paper order again."
+            return
         candidate = self._armed_cancellation
         if (
             self._paper_execution is None
@@ -1155,6 +1206,9 @@ class StarUIWorkbench:
 
     def _confirm_all_cancellations_locked(self) -> None:
         """Cancel reviewed pairs one at a time, verifying TWS between writes."""
+        if self._expire_confirmation_locked(require_deadline=True):
+            self._message = "Review expired. Press Execute paper order again."
+            return
         candidates = self._armed_cancellations
         if (
             self._paper_execution is None
@@ -1335,6 +1389,9 @@ class StarUIWorkbench:
         )
 
     def _confirm_market_exit_locked(self) -> None:
+        if self._expire_confirmation_locked(require_deadline=True):
+            self._message = "Review expired. Press Execute paper order again."
+            return
         armed = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
@@ -1531,6 +1588,7 @@ class StarUIWorkbench:
             self._warned_price_update_concerns = _price_update_impact(
                 snapshot, self._armed_price_updates
             ).concerns
+            self._armed_execution_deadline = monotonic() + 10
         except (ExecutionBlocked, ValueError) as error:
             self._disarm_execution_locked()
             self._message = f"Price update blocked: {error}"
@@ -1544,15 +1602,16 @@ class StarUIWorkbench:
                 "An earlier price amendment has an unknown outcome. Inspect the order "
                 "in TWS for a pending change, then confirm the check below before retrying."
             )
-        elif not self._warned_price_update_concerns:
-            self._confirm_price_updates_locked({})
         else:
             self._set_review_status_locked(
                 f"Fresh paper snapshot verified. Review {changed_legs} selected price "
-                "amendments, then confirm."
+                "amendments and confirm within 10 seconds."
             )
 
     def _confirm_price_updates_locked(self, values: dict[str, str]) -> None:
+        if self._expire_confirmation_locked(require_deadline=True):
+            self._message = "Review expired. Press Execute paper order again."
+            return
         updates = self._armed_price_updates
         if (
             self._paper_execution is None
@@ -2086,6 +2145,7 @@ class StarUIWorkbench:
         return targets[min(index, len(targets) - 1)], stops[min(index, len(stops) - 1)]
 
     def _page(self) -> Any:
+        self._expire_confirmation_locked()
         state = self._state
         projection = self._projection_state()
         recovery_dialog = (
@@ -2568,7 +2628,7 @@ class StarUIWorkbench:
         position = self._session_closed_positions[con_id]
         reader = getattr(self._paper_execution, "submission_entries", None)
         entries = reader(account=self._settings.account, con_id=con_id) if callable(reader) else ()
-        rows = []
+        rows: list[Any] = []
         realized = Decimal("0")
         pnl_verified = True
         for entry in entries:
@@ -2577,6 +2637,8 @@ class StarUIWorkbench:
                     entry, index, active_perm_ids=frozenset(),
                     observed_perm_ids=frozenset(),
                 )
+                if outcome.status == "CANCELLED":
+                    continue
                 if outcome.status.startswith("CLOSED_"):
                     rows.append(self._closed_layer_row(
                         len(rows) + 1, entry, index, outcome,
@@ -2587,19 +2649,16 @@ class StarUIWorkbench:
                     else:
                         pnl_verified = False
                 else:
-                    pnl_verified = False
                     rows.append(self._pending_layer_row(
                         len(rows) + 1, entry, index, outcome, read_only=True,
                     ))
         symbol, contract_detail = _position_identity(position.local_symbol)
         title = f"{symbol} {contract_detail}".strip()
-        result = _header_pnl(realized, "USD") if pnl_verified and rows else "—"
-        center = Div(
-            Div(
-                H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
-                Badge("Closed this session", variant="secondary"),
-                cls="flex flex-wrap items-center justify-between gap-3",
-            ),
+        result = _header_pnl(realized, "USD") if pnl_verified and any(
+            entry.fills for entry in entries
+        ) else "—"
+        center = self._workspace_content(
+            H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
             Div(
                 _contract_header_metric("Held / total", "0 / 0"),
                 _contract_header_metric("Available", "0"),
@@ -2611,13 +2670,12 @@ class StarUIWorkbench:
             ),
             ScrollArea(
                 Div(*rows, cls="mt-2") if rows else P(
-                    "No app-owned layer history is available for this contract.",
+                    "No closed fills or unresolved layers to show.",
                     cls="pt-8 text-sm text-muted-foreground",
                 ),
                 cls="min-h-0 flex-1",
             ),
             data_closed_session=True,
-            cls="flex min-h-0 min-w-0 flex-col gap-5 overflow-hidden px-8 py-8",
         )
         review = Div(
             Div(
@@ -2870,6 +2928,13 @@ class StarUIWorkbench:
             cls="selected-quantity-notice",
         )
 
+    def _workspace_content(self, *children: Any, **attributes: Any) -> Any:
+        return Div(
+            *children,
+            cls="workspace-content flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6",
+            **attributes,
+        )
+
     def _workspace(self, title: str) -> Any:
         coverage, _, _ = self._order_coverage()
         active_pairs = self._active_oca_pairs()
@@ -2919,7 +2984,7 @@ class StarUIWorkbench:
                 break
             if realized is not None:
                 realized += outcome.realized_pnl
-        return Div(
+        return self._workspace_content(
             self._selected_quantity_notice(),
             Div(
                 H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
@@ -3107,7 +3172,6 @@ class StarUIWorkbench:
                 ),
                 cls="mt-5 min-h-0 flex-1 overflow-hidden",
             ),
-            cls="workspace-content flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6",
         )
 
     def _cancelled_bracket_recovery(
@@ -3823,6 +3887,8 @@ class StarUIWorkbench:
             bands=bands,
             presets=_parse_presets(self._stop_presets, maximum=Decimal("100")) or (),
         )
+        initial_target_percentage = target_percentage
+        initial_stop_percentage = stop_percentage
         staged_percentages = self._armed_active_percentages.get(target.perm_id)
         if staged_percentages is not None:
             target_percentage, stop_percentage = staged_percentages
@@ -3849,7 +3915,7 @@ class StarUIWorkbench:
                     data_active_input="target",
                     data_active_perm_id=target.perm_id,
                     data_active_original=display_target_price,
-                    data_active_initial=target_percentage,
+                    data_active_initial=initial_target_percentage,
                     data_live_layer=index,
                     cls="pr-8",
                 ),
@@ -3874,7 +3940,7 @@ class StarUIWorkbench:
                     data_active_input="stop",
                     data_active_perm_id=target.perm_id,
                     data_active_original=display_stop_price,
-                    data_active_initial=stop_percentage,
+                    data_active_initial=initial_stop_percentage,
                     data_live_layer=index,
                     cls="pr-8",
                 ),
@@ -4894,8 +4960,7 @@ class StarUIWorkbench:
         """One deliberate Cancel / Confirm bar for every staged order change."""
         countdown_ms = (
             max(0, round((self._armed_execution_deadline - monotonic()) * 1000))
-            if confirm_action == "execute-confirm"
-            and self._armed_execution_deadline is not None
+            if self._armed_execution_deadline is not None
             else None
         )
         return Form(
@@ -6401,6 +6466,10 @@ def _paper_confirmation_countdown_script() -> str:
         if (!button.isConnected || button.getAttribute('aria-busy') === 'true') return false;
         const seconds = Math.ceil(Math.max(0, deadline - performance.now()) / 1000);
         button.textContent = `Confirm (${seconds}s)`;
+        if (seconds === 0) {
+          button.disabled = true;
+          window.setTimeout(() => window.location.reload(), 150);
+        }
         return seconds > 0;
       };
       if (!render()) return;
