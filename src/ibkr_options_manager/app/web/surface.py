@@ -4798,13 +4798,6 @@ class StarUIWorkbench:
             return self._staged_action_controls(
                 confirm_action="cancel-all-confirm",
                 busy_text="Cancelling…",
-                impact=(
-                    "All active brackets will close",
-                    (
-                        "Confirm requests cancellation of every reviewed active OCA bracket. "
-                        "The position remains open without those brackets' protection.",
-                    ),
-                ),
             )
         if self._armed_cancellation is not None:
             return self._staged_action_controls(
@@ -4839,7 +4832,7 @@ class StarUIWorkbench:
             return self._staged_action_controls(
                 confirm_action="price-update-confirm",
                 retry_acknowledgement=self._price_update_retry_required,
-                impact=(impact.title, impact.details),
+                impact=(impact.title, impact.details) if impact.concerns else None,
             )
         if self._armed_execution is not None:
             return self._staged_action_controls(
@@ -5993,9 +5986,7 @@ def _price_update_impact(
         and quote.fresh
         and quote.market_data_type == "LIVE"
     )
-    ask = quote.ask if quote is not None else None
     bid = quote.bid if quote is not None else None
-    ask = ask if ask is not None and ask.is_finite() and ask > 0 else None
     bid = bid if bid is not None and bid.is_finite() and bid > 0 else None
     concerns: set[tuple[int, str]] = set()
     details: list[str] = []
@@ -6003,14 +5994,14 @@ def _price_update_impact(
     for index, update in enumerate(updates, start=1):
         perm_id = update.layer.target_perm_id
         if update.stop_price is not None:
-            if ask is not None and update.stop_price >= ask:
-                concerns.add((perm_id, "stop-crosses-ask"))
+            if bid is not None and update.stop_price >= bid:
+                concerns.add((perm_id, "stop-crosses-bid"))
                 crosses_quote = True
                 details.append(
                     f"Layer {index}: SELL STP ${_price_text(update.stop_price)} is at or above "
-                    f"the {'current' if reliable else 'latest snapshot'} ask ${_price_text(ask)}."
+                    f"the {'current' if reliable else 'latest snapshot'} bid ${_price_text(bid)}."
                 )
-            elif ask is None or not reliable:
+            elif bid is None or not reliable:
                 concerns.add((perm_id, "stop-quote-unknown"))
         if update.target_price is not None:
             if bid is not None and update.target_price <= bid:
@@ -6031,15 +6022,11 @@ def _price_update_impact(
     elif concerns:
         title = "Immediate sell risk cannot be assessed"
         details.append(
-            "A current live bid or ask is unavailable for every modified sell leg. "
+            "A current live bid is unavailable for every modified sell leg. "
             "Check TWS before confirming; a changed order may execute soon."
         )
     else:
-        title = "No immediate sell indicated by quote"
-        details.append(
-            "The modified sell prices do not cross the latest live bid or ask. "
-            "Market prices can change before TWS acknowledges the amendment."
-        )
+        title = ""
     if quote is not None and not reliable:
         details.append(
             f"Quote status: {quote.market_data_type.lower().replace('_', ' ')}; "

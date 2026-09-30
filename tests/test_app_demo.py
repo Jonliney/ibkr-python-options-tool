@@ -2979,6 +2979,36 @@ def test_price_update_confirmation_uses_the_shared_cancel_confirm_bar() -> None:
     assert "Click to confirm" not in sidebar
 
 
+def test_safe_price_update_omits_immediate_sell_alert(monkeypatch) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    safe = replace(
+        snapshot,
+        quote=replace(
+            snapshot.quote, bid=Decimal("14.30"), ask=Decimal("14.50"),
+            market_data_type="LIVE", fresh=True,
+        ),
+    )
+    layer = MarketExitCandidate(
+        account=DEMO_ACCOUNT, con_id=snapshot.selected.con_id,
+        target_order_id=11, target_perm_id=101, client_id=17,
+        quantity=Decimal("1"), tif="GTC", oca_group="example/tranche-1",
+        stop_order_id=12, stop_perm_id=102,
+    )
+    workbench._armed_price_updates = (
+        PriceUpdateCandidate(layer=layer, stop_price=Decimal("12.00")),
+    )
+    monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: safe)
+
+    controls = to_xml(workbench._execution_control())
+
+    assert 'value="price-update-confirm"' in controls
+    assert "No immediate sell indicated by quote" not in controls
+    assert "Immediate sell risk cannot be assessed" not in controls
+
+
 @pytest.mark.parametrize(
     ("kind", "confirm_action"),
     (
@@ -3027,7 +3057,7 @@ def test_every_paper_write_uses_the_same_final_confirmation(
         assert "Outside RTH" not in html
 
 
-def test_stop_above_latest_ask_warns_before_price_update_and_quote_change_rearms(
+def test_stop_above_latest_bid_warns_before_price_update_and_quote_change_rearms(
     monkeypatch,
 ) -> None:
     workbench = _demo_workbench()
@@ -3051,7 +3081,7 @@ def test_stop_above_latest_ask_warns_before_price_update_and_quote_change_rearms
         snapshot,
         quote=replace(
             snapshot.quote,
-            bid=Decimal("10.00"),
+            bid=Decimal("10.15"),
             ask=Decimal("10.20"),
             market_data_type="LIVE",
             fresh=True,
@@ -3062,7 +3092,7 @@ def test_stop_above_latest_ask_warns_before_price_update_and_quote_change_rearms
     )
     impact = _price_update_impact(risky, updates)
     assert impact.title == "Possible immediate sell"
-    assert "SELL STP $10.10 is at or above the current ask $9.80" in impact.details[0]
+    assert "SELL STP $10.10 is at or above the current bid $9.70" in impact.details[0]
 
     workbench._paper_execution = object()  # type: ignore[assignment]
     workbench._armed_price_updates = updates
@@ -3077,6 +3107,31 @@ def test_stop_above_latest_ask_warns_before_price_update_and_quote_change_rearms
     assert "confirm again" in workbench._message
     assert workbench._armed_price_updates == updates
     assert workbench._warned_price_update_concerns == impact.concerns
+
+
+def test_stop_above_bid_warns_even_when_below_ask() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    layer = MarketExitCandidate(
+        account=DEMO_ACCOUNT, con_id=snapshot.selected.con_id,
+        target_order_id=11, target_perm_id=101, client_id=17,
+        quantity=Decimal("1"), tif="GTC", oca_group="example/tranche-1",
+        stop_order_id=12, stop_perm_id=102,
+    )
+    quote = replace(
+        snapshot.quote, bid=Decimal("14.30"), ask=Decimal("21.00"),
+        market_data_type="LIVE", fresh=True,
+    )
+
+    impact = _price_update_impact(
+        replace(snapshot, quote=quote),
+        (PriceUpdateCandidate(layer=layer, stop_price=Decimal("20.80")),),
+    )
+
+    assert impact.title == "Possible immediate sell"
+    assert "SELL STP $20.80 is at or above the current bid $14.30" in impact.details[0]
 
 
 @pytest.mark.parametrize("safe_quote", [False, True])
@@ -3486,8 +3541,8 @@ def test_delete_all_active_layers_reviews_every_bracket_and_blocks_changed_set(
     )
     assert workbench._active_action_verified
     assert 'value="cancel-all-confirm"' in execute.text
-    assert "Confirm requests cancellation of every reviewed active OCA bracket." in execute.text
-    assert re.search(r"<p>Confirm requests cancellation of every reviewed active OCA bracket\.", execute.text)
+    assert "All active brackets will close" not in execute.text
+    assert "Confirm requests cancellation of every reviewed active OCA bracket." not in execute.text
 
     active_ids = (101, 103, 105)
     changed = client.post(
