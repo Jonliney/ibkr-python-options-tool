@@ -49,6 +49,7 @@ class PositionObserver:
         self._on_health = on_health
         self._lock = Lock()
         self._generation = 0
+        self._start_count = 0
         self._stop = Event()
         self._thread: Thread | None = None
         self._app: Any = None
@@ -60,12 +61,14 @@ class PositionObserver:
     ) -> int:
         self.stop()
         with self._lock:
+            reconnecting = self._start_count > 0
+            self._start_count += 1
             self._generation += 1
             generation = self._generation
             self._stop = Event()
             self._thread = Thread(
                 target=self._run,
-                args=(settings, generation, self._stop),
+                args=(settings, generation, reconnecting, self._stop),
                 name="ibkr-position-observer",
                 daemon=True,
             )
@@ -98,7 +101,10 @@ class PositionObserver:
         with self._lock:
             return generation == self._generation
 
-    def _run(self, settings: ObservationSettings, generation: int, stop: Event) -> None:
+    def _run(
+        self, settings: ObservationSettings, generation: int,
+        reconnecting: bool, stop: Event,
+    ) -> None:
         try:
             imports = _load_ibapi()
             owner = self
@@ -109,6 +115,8 @@ class PositionObserver:
                     imports.EClient.__init__(self, self)
                     self.handshake = Event()
                     self.baseline = False
+                    self.baseline_has_options = False
+                    self.observed_options: dict[int, tuple[str, str]] = {}
                     self.fatal = False
 
                 def nextValidId(self, orderId: int) -> None:
@@ -118,22 +126,31 @@ class PositionObserver:
                 def position(
                     self, account: str, contract: Any, pos: Any, avgCost: Any
                 ) -> None:
-                    del pos, avgCost
                     if (
-                        self.baseline
-                        and account == settings.account
-                        and str(getattr(contract, "secType", "")) == "OPT"
-                        and owner._current(generation)
+                        account != settings.account
+                        or str(getattr(contract, "secType", "")) != "OPT"
                     ):
+                        return
+                    contract_id = int(getattr(contract, "conId", 0))
+                    observed = (str(pos), str(avgCost))
+                    prior = self.observed_options.get(contract_id)
+                    self.observed_options[contract_id] = observed
+                    if not self.baseline:
+                        self.baseline_has_options = True
+                    elif observed != prior and owner._current(generation):
                         owner._on_change(generation)
 
                 def positionEnd(self) -> None:
-                    if self.fatal:
+                    if self.fatal or self.baseline:
                         return
                     self.baseline = True
                     if owner._current(generation):
                         owner._on_health(generation, "connected")
-                        owner._on_change(generation)
+                        # The launch capture already verified an empty portfolio.
+                        # Reconcile a populated baseline, or any reconnect that
+                        # may have missed a removal while offline.
+                        if self.baseline_has_options or reconnecting:
+                            owner._on_change(generation)
 
                 def connectionClosed(self) -> None:
                     if owner._current(generation):

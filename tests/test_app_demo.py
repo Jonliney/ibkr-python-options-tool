@@ -94,6 +94,7 @@ def test_closed_position_remains_read_only_for_current_session() -> None:
     assert "CLOSED THIS SESSION" in page
     assert "Closed this session" not in page
     assert "workspace-content flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6" in page
+    assert re.search(r'<button[^>]*disabled[^>]*>.*Add Layer</button>', page)
     assert 'grid-cols-[16rem_minmax(0,1fr)_19rem]' in page
     assert "Held / total" in page
     assert "ACTION REVIEW" in page
@@ -156,6 +157,7 @@ def test_closed_session_hides_cancelled_brackets_and_keeps_verified_pnl() -> Non
     workbench._paper_execution = History()  # type: ignore[assignment]
     page = to_xml(workbench._page())
     assert "+$125.00" in page
+    assert "oca-layer-list" in page
     assert "Bracket cancelled" not in page
     assert "Awaiting TWS review" not in page
 
@@ -621,6 +623,40 @@ def test_single_tws_header_and_heartbeat_report_observer_health() -> None:
         "observer": "disconnected",
     }
     workbench.close()
+
+
+def test_refresh_reuses_healthy_position_subscription(monkeypatch) -> None:
+    from ibkr_options_manager.app.web import surface
+
+    starts = []
+
+    class FakeObserver:
+        def __init__(self, _on_change, _on_health):
+            pass
+
+        def start(self, settings, on_generation=None):
+            starts.append(settings)
+            if on_generation is not None:
+                on_generation(len(starts))
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(surface, "PositionObserver", FakeObserver)
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._observe_positions = True
+    try:
+        with workbench._lock:
+            workbench._start_observer_locked()
+            workbench._observer_health = "connected"
+            workbench._start_observer_locked()
+            assert len(starts) == 1
+            workbench._observer_health = "disconnected"
+            workbench._start_observer_locked()
+            assert len(starts) == 2
+    finally:
+        workbench.close()
 
 
 def test_embedded_tws_indicator_tracks_observer_disconnect() -> None:
@@ -1202,7 +1238,10 @@ def test_arming_target_only_does_not_reprice_untouched_stop(monkeypatch) -> None
     assert workbench._armed_price_updates[0].stop_price is None
 
 
-def test_quote_movement_without_new_sell_risk_still_sends_amendment(monkeypatch) -> None:
+@pytest.mark.parametrize("refreshed", [True, False])
+def test_quote_movement_without_new_sell_risk_still_sends_amendment(
+    monkeypatch, refreshed: bool
+) -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
     snapshot = workbench._view_model.latest_snapshot()
@@ -1234,16 +1273,21 @@ def test_quote_movement_without_new_sell_risk_still_sends_amendment(monkeypatch)
 
     workbench._paper_execution = PriceService()  # type: ignore[assignment]
     workbench._armed_price_updates = (update,)
+    workbench._armed_execution_deadline = monotonic() + 10
     workbench._armed_active_percentages = {201: ("1", "-25")}
     workbench._warned_price_update_concerns = _price_update_impact(before, (update,)).concerns
     monkeypatch.setattr(workbench._view_model, "select_position", lambda *_: workbench._state)
     monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: after)
     monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
-    monkeypatch.setattr(workbench, "_refresh_after_acknowledged_write_locked", lambda *_: True)
+    monkeypatch.setattr(workbench, "_refresh_after_acknowledged_write_locked", lambda *_: refreshed)
 
     workbench._confirm_price_updates_locked({})
 
     assert sent == [update]
+    assert workbench._toast is not None
+    assert workbench._toast.variant == "success"
+    assert workbench._toast.title == "Price update acknowledged by TWS"
+    assert ("Refresh before another order change" in workbench._toast.description) is not refreshed
 
 
 def test_immediate_price_update_fill_records_edited_values(monkeypatch) -> None:
@@ -1357,6 +1401,24 @@ def test_failed_post_write_refresh_does_not_show_a_success_toast() -> None:
     assert workbench._toast is not None
     assert workbench._toast.title == "Action acknowledged by TWS"
     assert workbench._toast.variant == "warning"
+
+
+def test_post_write_snapshot_is_verified_even_if_draft_plan_is_blocked() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None and snapshot.complete and snapshot.fresh
+
+    def refreshed_but_plan_blocked() -> None:
+        workbench._state = replace(workbench._state, status=UiStatus.BLOCKED)
+
+    workbench._refresh_locked = refreshed_but_plan_blocked  # type: ignore[method-assign]
+
+    assert workbench._refresh_after_acknowledged_write_locked(
+        "TWS acknowledged the price amendment."
+    )
+    assert workbench._status_message.endswith("TWS state refreshed.")
+    assert workbench._toast is None
 
 
 def test_busy_submit_only_applies_to_explicitly_async_controls() -> None:
@@ -2168,6 +2230,11 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert 'data-layer-state="draft"' in page.text
     assert 'name="active_target_101"' in page.text
     assert 'name="active_stop_101"' in page.text
+    stop_input = re.search(r'<input[^>]*name="active_stop_101"[^>]*>', page.text)
+    assert stop_input is not None
+    assert 'step="any"' in stop_input.group()
+    assert 'name="active_stop_price_101"' in page.text
+    assert 'rate.toFixed(2)' in page.text
     assert "data-active-review-row" in page.text
     assert "data-active-execute" in page.text
     assert 'id="active-quantity-1"' in page.text
@@ -3135,14 +3202,15 @@ def test_stop_above_bid_warns_even_when_below_ask() -> None:
 
 
 @pytest.mark.parametrize("safe_quote", [False, True])
-def test_active_stop_accepts_positive_return_from_entry(monkeypatch, safe_quote) -> None:
+@pytest.mark.parametrize("exact_price", [False, True])
+def test_active_stop_accepts_positive_return_from_entry(monkeypatch, safe_quote, exact_price) -> None:
     from ibkr_options_manager.app.view_model import WorkingOrderLine
 
     workbench = _demo_workbench()
     workbench.load_demo_data()
     snapshot = workbench._view_model.latest_snapshot()
     assert snapshot is not None
-    basis = Decimal("10.00")
+    basis = Decimal("10.03" if exact_price else "10.00")
     group = "owned/tranche-1"
     target = WorkingOrder(
         perm_id=101, client_id=17, order_id=11, key=snapshot.selected,
@@ -3201,7 +3269,16 @@ def test_active_stop_accepts_positive_return_from_entry(monkeypatch, safe_quote)
     sent = []
     monkeypatch.setattr(workbench, "_confirm_price_updates_locked", lambda values: sent.append(values))
 
-    workbench._arm_price_updates_locked({"active_target_101": "150", "active_stop_101": "50"})
+    target_return = format((Decimal("25.00") / basis - 1) * 100, "f")
+    values = {
+        "active_target_101": target_return,
+        "active_stop_101": "49.55" if exact_price else "50",
+    }
+    if exact_price:
+        values["active_stop_price_101"] = "15.00"
+        workbench._arm_price_updates_locked({**values, "active_stop_price_101": "15.10"})
+        assert not workbench._armed_price_updates
+    workbench._arm_price_updates_locked(values)
 
     assert len(workbench._armed_price_updates) == 1
     assert workbench._armed_price_updates[0].stop_price == Decimal("15.00")
@@ -3373,7 +3450,7 @@ def test_arming_price_update_preserves_edited_percentage_in_active_input(
         "TWS acknowledged 1 app-owned OCA price amendment"
     ), workbench._status_message
     assert workbench._toast_revision > arm_toast_revision
-    assert "Price update sent to TWS" in confirmed.text
+    assert "Price update acknowledged by TWS" in confirmed.text
     source = journal.find(fingerprint)
     assert source is not None
     assert source.layers[0].target_percentage == "30"

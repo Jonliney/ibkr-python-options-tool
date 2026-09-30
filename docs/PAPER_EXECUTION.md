@@ -5,6 +5,13 @@ This is an explicit, paper-only milestone. It is enabled only with
 
 ## Execution contract
 
+The persistent position subscriber supplies change hints and connection
+health. A verified empty portfolio stays idle after its initial subscription;
+manual Refresh reuses a healthy subscriber. An option-position event or a
+reconnection still triggers a fresh portfolio capture. Subscription hints
+never authorize an order action: the normal fresh-snapshot checks below remain
+required.
+
 Choosing an active-layer action (delete bracket, delete all active brackets,
 sell one layer, or sell all
 active layers) first builds its Action review from the selected position's
@@ -16,6 +23,11 @@ quantities, prices, and OCA pairs. Only a matching result exposes **Confirm**.
 Confirmation requests another fresh snapshot before any paper write. A changed
 or incomplete snapshot blocks the write; cancellation and market-exit reviews
 must be staged again if their verified orders change.
+After an acknowledged price amendment, the app also refreshes automatically.
+That broker read can be verified even when an unrelated draft validation leaves
+the planning page blocked. The position subscriber reports position changes;
+it does not prove a stop-price amendment. If the automatic read cannot verify
+TWS state, another order change remains gated by a fresh snapshot.
 
 Draft submission, active price updates, bracket cancellation, and market exits
 share the same visible sequence: inspect the action review, choose **Execute
@@ -40,7 +52,10 @@ cost. A positive value places the proposed stop above entry; 0% is B/E. The
 global **Set all active stops** dialog applies one tick-rounded price to every
 active app-owned layer for the selected contract. It starts at the current
 stop when all layers share that price; otherwise it requires an explicit
-entry. These are local proposals until the existing fresh-snapshot review and
+entry. Active stop fields show price-derived returns to two decimal places;
+the selected tick-rounded price is kept separately for the review and checked
+against that displayed return. These are local
+proposals until the existing fresh-snapshot review and
 confirmation gates succeed. A stop is a trigger and does not guarantee the
 displayed gain at fill.
 The dialog displays entry cost to cents while calculations retain the full

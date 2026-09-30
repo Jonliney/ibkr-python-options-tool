@@ -156,6 +156,7 @@ class StarUIWorkbench:
         self._observe_positions = observe_positions and not demo_mode
         self._observer_client_id = observer_client_id
         self._observer: PositionObserver | None = None
+        self._observer_settings: ObservationSettings | None = None
         self._observer_generation = 0
         self._observer_signal = Event()
         self._observer_health = "idle"
@@ -394,8 +395,15 @@ class StarUIWorkbench:
             )
             self._inventory_revision += 1
             return
+        if (
+            self._observer is not None
+            and settings == self._observer_settings
+            and self._observer_health in {"connecting", "connected"}
+        ):
+            return
         if self._observer is None:
             self._observer = PositionObserver(self._position_hint, self._position_health)
+        self._observer_settings = settings
         self._observer_generation = -1
         self._observer.start(
             settings,
@@ -671,7 +679,15 @@ class StarUIWorkbench:
                 f"another action. ({error})"
             )
             return False
-        if self._state.status is UiStatus.READY:
+        snapshot = self._view_model.latest_snapshot()
+        selected_snapshot_ready = (
+            snapshot is not None
+            and snapshot.complete
+            and snapshot.fresh
+            and snapshot.selected.account == self._settings.account
+            and snapshot.selected.con_id == self._selected_con_id
+        )
+        if self._state.status is UiStatus.READY or selected_snapshot_ready:
             self._message = f"{acknowledgement} TWS state refreshed."
             return True
         else:
@@ -1535,6 +1551,18 @@ class StarUIWorkbench:
                     basis * (Decimal("1") + stop_percentage / Decimal("100")),
                     calculator.bands,
                 )
+                exact_stop_text = values.get(f"active_stop_price_{layer.target_perm_id}")
+                if exact_stop_text:
+                    exact_stop = _decimal_value(exact_stop_text)
+                    if (
+                        exact_stop is None
+                        or exact_stop <= 0
+                        or round_up_price(exact_stop, calculator.bands) != exact_stop
+                        or abs((exact_stop / basis - 1) * 100 - stop_percentage)
+                        > Decimal("0.005001")
+                    ):
+                        raise ExecutionBlocked("bulk stop price does not match its displayed return")
+                    desired_stop = exact_stop
                 shown_target = _decimal_value(_active_percentage_for_price(
                     target.limit_price, basis, target=True,
                     bands=calculator.bands,
@@ -1555,7 +1583,8 @@ class StarUIWorkbench:
                             )
                         ),
                         stop_price=(
-                            _edited_active_price(
+                            desired_stop if exact_stop_text and desired_stop != stop.stop_price
+                            else _edited_active_price(
                                 stop.stop_price, desired_stop,
                                 stop_percentage, shown_stop,
                             )
@@ -1754,7 +1783,7 @@ class StarUIWorkbench:
                     target_price=update.target_price,
                     stop_price=update.stop_price,
                 )
-            self._refresh_after_acknowledged_write_locked(
+            refreshed = self._refresh_after_acknowledged_write_locked(
                 f"TWS acknowledged {len(receipt.entry.order_ids)} app-owned OCA "
                 "price amendment(s)."
             )
@@ -1778,11 +1807,12 @@ class StarUIWorkbench:
                     if order.order_id in receipt.entry.order_ids
                 ],
             )
-            if self._status_message.endswith("TWS state refreshed."):
-                self._show_success_toast_locked(
-                    "Price update sent to TWS",
-                    "Check TWS for any required Transmit.",
-                )
+            self._show_success_toast_locked(
+                "Price update acknowledged by TWS",
+                "Latest TWS state loaded. Check TWS for any required Transmit."
+                if refreshed
+                else "The automatic refresh could not verify TWS state. Refresh before another order change.",
+            )
         finally:
             self._disarm_execution_locked()
 
@@ -2658,7 +2688,14 @@ class StarUIWorkbench:
             entry.fills for entry in entries
         ) else "—"
         center = self._workspace_content(
-            H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
+            Div(
+                H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
+                Div(
+                    self._add_layer_control(disabled=True),
+                    cls="ml-auto flex flex-wrap items-center justify-end gap-2",
+                ),
+                cls="flex flex-wrap items-center gap-4",
+            ),
             Div(
                 _contract_header_metric("Held / total", "0 / 0"),
                 _contract_header_metric("Available", "0"),
@@ -2668,12 +2705,22 @@ class StarUIWorkbench:
                 _contract_header_metric("Realised P&L", result),
                 cls="contract-header-facts",
             ),
-            ScrollArea(
-                Div(*rows, cls="mt-2") if rows else P(
-                    "No closed fills or unresolved layers to show.",
-                    cls="pt-8 text-sm text-muted-foreground",
+            Div(
+                ScrollArea(
+                    ScrollArea(
+                        Div(*rows, cls="oca-layer-list w-full min-w-[41rem]"),
+                        aria_label="Closed OCA layer rows",
+                        orientation="horizontal",
+                        cls="w-full",
+                    ) if rows else P(
+                        "No closed fills or unresolved layers to show.",
+                        cls="pt-8 text-sm text-muted-foreground",
+                    ),
+                    aria_label="OCA layers workspace",
+                    orientation="vertical",
+                    cls="h-full",
                 ),
-                cls="min-h-0 flex-1",
+                cls="mt-5 min-h-0 flex-1 overflow-hidden",
             ),
             data_closed_session=True,
         )
@@ -2935,6 +2982,26 @@ class StarUIWorkbench:
             **attributes,
         )
 
+    def _add_layer_control(self, *, disabled: bool) -> Any:
+        return Tooltip(
+            TooltipTrigger(
+                Button(
+                    Icon("lucide:plus", cls="size-4", aria_hidden="true"),
+                    "Add Layer",
+                    variant="default",
+                    size="default",
+                    type="submit",
+                    form="draft-form",
+                    name="action",
+                    value="add-layer",
+                    aria_label="Create new OCA bracket",
+                    disabled=disabled,
+                ),
+                delay_duration=250,
+            ),
+            TooltipContent("Create new OCA bracket"),
+        )
+
     def _workspace(self, title: str) -> Any:
         coverage, _, _ = self._order_coverage()
         active_pairs = self._active_oca_pairs()
@@ -3085,28 +3152,10 @@ class StarUIWorkbench:
                             ),
                             TooltipContent("Split draft layer quantities"),
                         ),
-                        Tooltip(
-                            TooltipTrigger(
-                                Button(
-                                    Icon(
-                                        "lucide:plus", cls="size-4", aria_hidden="true"
-                                    ),
-                                    "Add Layer",
-                                    variant="default",
-                                    size="default",
-                                    type="submit",
-                                    form="draft-form",
-                                    name="action",
-                                    value="add-layer",
-                                    aria_label="Create new OCA bracket",
-                                    disabled=not draft_allowed
-                                    or planning_available <= 0
-                                    or len(self._current_layers())
-                                    >= planning_available,
-                                ),
-                                delay_duration=250,
-                            ),
-                            TooltipContent("Create new OCA bracket"),
+                        self._add_layer_control(
+                            disabled=not draft_allowed
+                            or planning_available <= 0
+                            or len(self._current_layers()) >= planning_available,
                         ),
                         cls="flex items-center gap-2",
                     ),
@@ -3929,20 +3978,28 @@ class StarUIWorkbench:
             ),
             stop_field=_percentage_price_field(
                 "STP return from entry",
-                Input(
-                    name=f"active_stop_{target.perm_id}",
-                    id=f"active-stop-{index}",
-                    type="number",
-                    value=stop_percentage,
-                    min="-99.9",
-                    step="0.1",
-                    disabled=bool(self._armed_price_updates),
-                    data_active_input="stop",
-                    data_active_perm_id=target.perm_id,
-                    data_active_original=display_stop_price,
-                    data_active_initial=initial_stop_percentage,
-                    data_live_layer=index,
-                    cls="pr-8",
+                Div(
+                    Input(
+                        name=f"active_stop_{target.perm_id}",
+                        id=f"active-stop-{index}",
+                        type="number",
+                        value=stop_percentage,
+                        min="-99.9",
+                        step="any",
+                        disabled=bool(self._armed_price_updates),
+                        data_active_input="stop",
+                        data_active_perm_id=target.perm_id,
+                        data_active_original=display_stop_price,
+                        data_active_initial=initial_stop_percentage,
+                        data_live_layer=index,
+                        cls="pr-8",
+                    ),
+                    Input(
+                        type="hidden",
+                        name=f"active_stop_price_{target.perm_id}",
+                        value="",
+                        data_active_exact_stop=target.perm_id,
+                    ),
                 ),
                 input_id=f"active-stop-{index}",
                 price=_price_text(display_stop_price),
@@ -5468,21 +5525,22 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         const stopInput = form.querySelector(`[data-active-input="stop"][data-active-perm-id="${{permId}}"]`);
         const index = targetInput.dataset.liveLayer;
         const target = Number(targetInput.value), stop = Number(stopInput?.value);
+        const exactStop = form.querySelector(`[data-active-exact-stop="${{permId}}"]`);
         const quantity = Number(form.querySelector(`[data-active-quantity="${{permId}}"]`)?.value);
         const targetPrice = Number.isFinite(target) && target > 0 ? (target === Number(targetInput.dataset.activeInitial) ? Number(targetInput.dataset.activeOriginal) : roundUp(basis * (1 + target / 100))) : NaN;
-        const stopPrice = Number.isFinite(stop) && stop > -100 ? (stop === Number(stopInput?.dataset.activeInitial) ? Number(stopInput?.dataset.activeOriginal) : roundUp(basis * (1 + stop / 100))) : NaN;
+        const stopPrice = Number.isFinite(stop) && stop > -100 ? (exactStop?.value ? Number(exactStop.value) : stop === Number(stopInput?.dataset.activeInitial) ? Number(stopInput?.dataset.activeOriginal) : roundUp(basis * (1 + stop / 100))) : NaN;
         const gain = Number.isFinite(targetPrice) && Number.isFinite(quantity) ? (targetPrice - basis) * multiplier * quantity : NaN;
         const loss = Number.isFinite(stopPrice) && Number.isFinite(quantity) ? (stopPrice - basis) * multiplier * quantity : NaN;
         if (Number.isFinite(gain) && Number.isFinite(loss) && quantity > 0) outcomes.push({{ id: Number(permId), quantity, gain, loss }});
         else invalid = true;
         assigned(`[data-live-price="active-target-${{index}}"]`, Number.isFinite(targetPrice) ? (target === Number(targetInput.dataset.activeInitial) ? `$${{targetInput.dataset.activeOriginal}}` : priceText(targetPrice)) : '—');
-        assigned(`[data-live-price="active-stop-${{index}}"]`, Number.isFinite(stopPrice) ? (stop === Number(stopInput?.dataset.activeInitial) ? `$${{stopInput.dataset.activeOriginal}}` : priceText(stopPrice)) : '—');
+        assigned(`[data-live-price="active-stop-${{index}}"]`, Number.isFinite(stopPrice) ? (exactStop?.value || stop !== Number(stopInput?.dataset.activeInitial) ? priceText(stopPrice) : `$${{stopInput.dataset.activeOriginal}}`) : '—');
         assigned(`[data-live-outcome="active-target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
         assigned(`[data-live-outcome="active-stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} at stop` : '— at stop');
         const originalTarget = Number(targetInput.dataset.activeOriginal);
         const originalStop = Number(stopInput?.dataset.activeOriginal);
         const targetEdited = targetInput.value.trim() !== (targetInput.dataset.activeInitial || '').trim();
-        const stopEdited = stopInput?.value.trim() !== (stopInput?.dataset.activeInitial || '').trim();
+        const stopEdited = Boolean(exactStop?.value) || stopInput?.value.trim() !== (stopInput?.dataset.activeInitial || '').trim();
         edited ||= targetEdited || stopEdited;
         const targetChanged = targetEdited && Number.isFinite(targetPrice) && Math.abs(targetPrice - originalTarget) > 1e-8;
         const stopChanged = stopEdited && Number.isFinite(stopPrice) && Math.abs(stopPrice - originalStop) > 1e-8;
@@ -5512,7 +5570,13 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       setReviewMode(changed);
       window.ibkrProjection?.updateActive(outcomes, invalid);
     }};
-    form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('input', update));
+    form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('input', () => {{
+      if (input.dataset.activeInput === 'stop') {{
+        const exact = form.querySelector(`[data-active-exact-stop="${{input.dataset.activePermId}}"]`);
+        if (exact) exact.value = '';
+      }}
+      update();
+    }}));
     document.querySelectorAll('[data-edit-active-prices]').forEach((button) => button.addEventListener('click', () => {{
       const firstPrice = form.querySelector('[data-active-input]:not(:disabled)');
       if (!firstPrice) return;
@@ -5522,6 +5586,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('change', update));
     document.querySelectorAll('[data-move-stops-to-be]').forEach((button) => button.addEventListener('click', () => {{
       form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{ input.value = '0'; }});
+      form.querySelectorAll('[data-active-exact-stop]').forEach((input) => {{ input.value = ''; }});
       update();
     }}));
     const stopDialog = document.querySelector('[data-stop-dialog]');
@@ -5588,7 +5653,9 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         if (!Number.isFinite(value.rounded)) return;
         const rate = (value.rounded / basis - 1) * 100;
         form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{
-          input.value = String(Math.floor(rate * 1e8) / 1e8);
+          input.value = rate.toFixed(2);
+          const exact = form.querySelector(`[data-active-exact-stop="${{input.dataset.activePermId}}"]`);
+          if (exact) exact.value = String(value.rounded);
         }});
         update();
         stopDialog.closest('dialog')?.close();
@@ -5600,6 +5667,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       form.querySelectorAll('[data-active-input]').forEach((input) => {{
         input.value = input.dataset.activeInitial || '';
       }});
+      form.querySelectorAll('[data-active-exact-stop]').forEach((input) => {{ input.value = ''; }});
       update();
     }}));
     update();
