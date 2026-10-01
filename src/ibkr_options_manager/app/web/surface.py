@@ -205,6 +205,9 @@ class StarUIWorkbench:
         self._session_contract_snapshots: dict[int, BrokerSnapshot] = {}
         self._state = view_model.empty()
         self._drafts: dict[int, tuple[DraftLayerForm, ...]] = {}
+        self._default_stop_type = "STP"
+        self._default_stop_limit_offset = "5"
+        self._position_stop_config: dict[int, tuple[str, str, str]] = {}
         self._projection_comparison: PositionOutcome | None = None
         self._settings = ConnectionSettings(account=initial_account)
         self._target_presets = "20, 40, 60, 100"
@@ -537,9 +540,13 @@ class StarUIWorkbench:
             else:
                 self._projection_comparison = None
             if action == "refresh":
-                if values.get("global_stop_type") == "STP LMT":
-                    self._message = "STP LMT defaults are not available yet. Select STP to save settings."
+                stop_type = values.get("global_stop_type", self._default_stop_type)
+                offset = values.get("global_stop_limit_offset", self._default_stop_limit_offset)
+                if stop_type not in {"STP", "STP LMT"} or not _valid_stop_limit_offset(offset, "percent"):
+                    self._message = "Choose STP or STP LMT and enter a limit offset above 0% and below 100%."
                     return self._page()
+                self._default_stop_type = stop_type
+                self._default_stop_limit_offset = offset
                 self._selected_quantity_change = None
                 self._target_presets = values.get(
                     "target_presets", self._target_presets
@@ -635,10 +642,7 @@ class StarUIWorkbench:
                 elif action == "equal-split-assigned":
                     self._equal_split_locked(use_available_quantity=False)
                 elif action == "execute-arm":
-                    if values.get("draft_stop_type") == "STP LMT":
-                        self._message = "STP LMT submission is not available yet. Select STP to review this draft."
-                    else:
-                        self._arm_execution_locked()
+                    self._arm_execution_locked()
                 elif action == "execute-confirm":
                     self._confirm_execution_locked()
             return self._page()
@@ -647,6 +651,7 @@ class StarUIWorkbench:
         self, *, auto_select: bool = True, preserve_invalid_drafts: bool = False
     ) -> None:
         if self._session_position_account != self._settings.account:
+            self._position_stop_config.clear()
             self._session_seen_positions.clear()
             self._session_closed_positions.clear()
             self._session_contract_snapshots.clear()
@@ -847,9 +852,21 @@ class StarUIWorkbench:
             self._session_contract_snapshots[con_id] = snapshot
 
     def _plan_form(self, layers: tuple[DraftLayerForm, ...]) -> PlanForm:
+        stop_type, offset, unit = self._stop_configuration()
         return PlanForm(
             layers=layers,
             paper_execution_mode=self._paper_execution is not None,
+            stop_order_type=stop_type,
+            stop_limit_offset=offset,
+            stop_limit_unit=unit,
+        )
+
+    def _stop_configuration(self) -> tuple[str, str, str]:
+        if self._selected_con_id is None:
+            return self._default_stop_type, self._default_stop_limit_offset, "percent"
+        return self._position_stop_config.get(
+            self._selected_con_id,
+            (self._default_stop_type, self._default_stop_limit_offset, "percent"),
         )
 
     def _disarm_execution_locked(self) -> None:
@@ -1973,6 +1990,18 @@ class StarUIWorkbench:
         self._stop_presets = values.get("stop_presets", self._stop_presets)
         if self._selected_con_id is None:
             return True
+        if "draft_stop_type" in values:
+            stop_type = values["draft_stop_type"]
+            offset = values.get("draft_stop_limit_offset", self._stop_configuration()[1])
+            unit = values.get("draft_stop_limit_unit", self._stop_configuration()[2])
+            if stop_type not in {"STP", "STP LMT"} or (
+                stop_type == "STP LMT" and not _valid_stop_limit_offset(offset, unit)
+            ):
+                self._message = "Enter a valid stop-limit offset before reviewing the draft."
+                return False
+            if stop_type == "STP" and not _valid_stop_limit_offset(offset, unit):
+                offset, unit = self._stop_configuration()[1:]
+            self._position_stop_config[self._selected_con_id] = (stop_type, offset, unit)
         available = self._planning_available_quantity()
         quantities = [
             values.get(f"quantity_{index}", previous.quantity)
@@ -2932,20 +2961,20 @@ class StarUIWorkbench:
                     Separator(cls="my-5"),
                     H3("Protective order default", cls="text-sm font-semibold"),
                     Div(
-                        Button("STP", type="button", variant="outline", size="sm", aria_pressed="true", data_global_stop_choice="STP", cls="rounded-r-none border-primary bg-primary/10"),
-                        Button("STP LMT", type="button", variant="outline", size="sm", aria_pressed="false", data_global_stop_choice="STP LMT", cls="-ml-px rounded-l-none"),
+                        Button("STP", type="button", variant="outline", size="sm", aria_pressed="true" if self._default_stop_type == "STP" else "false", data_global_stop_choice="STP", cls="rounded-r-none border-primary bg-primary/10" if self._default_stop_type == "STP" else "rounded-r-none"),
+                        Button("STP LMT", type="button", variant="outline", size="sm", aria_pressed="true" if self._default_stop_type == "STP LMT" else "false", data_global_stop_choice="STP LMT", cls="-ml-px rounded-l-none border-primary bg-primary/10" if self._default_stop_type == "STP LMT" else "-ml-px rounded-l-none"),
                         cls="mt-3 inline-flex",
                     ),
                     Div(
-                        Label("Default limit below trigger", fr="global-stop-limit-offset", cls="text-xs font-medium text-muted-foreground"),
+                        Label("How far below the stop?", fr="global-stop-limit-offset", cls="text-xs font-medium text-muted-foreground"),
                         Div(
-                            Input(id="global-stop-limit-offset", type="number", min="0.1", step="any", value="5", disabled=True, cls="w-24"),
+                            Input(id="global-stop-limit-offset", name="global_stop_limit_offset", type="number", min="0.1", max="99.9", step="any", value=self._default_stop_limit_offset, disabled=self._default_stop_type != "STP LMT", cls="w-24"),
                             Span("%", cls="text-sm text-muted-foreground"),
                             cls="mt-2 flex items-center gap-2",
                         ),
                         cls="mt-4",
                     ),
-                    HTMLInput(type="hidden", name="global_stop_type", value="STP"),
+                    HTMLInput(type="hidden", name="global_stop_type", value=self._default_stop_type),
                     Script(_global_stop_type_visual_script()),
                     DialogFooter(
                         DialogClose("Cancel", variant="outline"),
@@ -3099,11 +3128,16 @@ class StarUIWorkbench:
                                     data_move_stops_to_be=True,
                                     aria_label="Move all active stops to B/E",
                                     disabled=self._paper_execution is None
-                                    or bool(self._armed_price_updates),
+                                    or bool(self._armed_price_updates)
+                                    or any(stop.order_type == "STP LMT" for _group, _target, stop in active_pairs),
                                 ),
                                 delay_duration=250,
                             ),
-                            TooltipContent("Move all active stops to B/E"),
+                            TooltipContent(
+                                "STP LMT prices are view-only; cancel and recreate the bracket to change them."
+                                if any(stop.order_type == "STP LMT" for _group, _target, stop in active_pairs)
+                                else "Move all active stops to B/E"
+                            ),
                         ),
                         Tooltip(
                             TooltipTrigger(
@@ -3366,9 +3400,11 @@ class StarUIWorkbench:
                                     cls="mt-3 flex justify-between gap-3 text-sm",
                                 ),
                                 Div(
-                                    Span("STP loss", cls="text-muted-foreground"),
+                                    Span(f"{layer.stop_order_type} loss", cls="text-muted-foreground"),
                                     Span(
-                                        f"{layer.stop_price} · {layer.quantity} contracts",
+                                        f"{layer.stop_price}"
+                                        + (f" (LMT {layer.stop_limit_price})" if layer.stop_limit_price else "")
+                                        + f" · {layer.quantity} contracts",
                                     ),
                                     cls="mt-2 flex justify-between gap-3 text-sm",
                                 ),
@@ -3393,7 +3429,7 @@ class StarUIWorkbench:
                                 value="yes",
                                 required=True,
                             ),
-                            "I confirmed the listed LMT and STP orders are gone in TWS",
+                            "I confirmed the listed bracket orders are gone in TWS",
                             cls="flex items-center gap-2 text-sm",
                         ),
                         DialogFooter(
@@ -3462,6 +3498,7 @@ class StarUIWorkbench:
         self, pairs: tuple[tuple[str, Any, Any], ...], basis: Decimal,
         quote: Any, snapshot_fresh: bool,
     ) -> Any:
+        has_stop_limit = any(stop.order_type == "STP LMT" for _group, _target, stop in pairs)
         current_prices = {stop.stop_price for _group, _target, stop in pairs}
         initial_price = next(iter(current_prices)) if len(current_prices) == 1 else None
         initial_return = (
@@ -3489,7 +3526,7 @@ class StarUIWorkbench:
                     DialogTrigger(
                         Icon("lucide:arrow-up", cls="size-4", aria_hidden="true"),
                         variant="outline", size="icon", aria_label="Set all active stops",
-                        disabled=self._paper_execution is None or bool(self._armed_price_updates),
+                        disabled=self._paper_execution is None or bool(self._armed_price_updates) or has_stop_limit,
                     ),
                     DialogContent(
                         DialogHeader(
@@ -3541,7 +3578,10 @@ class StarUIWorkbench:
                 ),
                 delay_duration=250,
             ),
-            TooltipContent("Set all active stops"),
+            TooltipContent(
+                "STP LMT prices are view-only; cancel and recreate the bracket to change them."
+                if has_stop_limit else "Set all active stops"
+            ),
         )
 
     def _active_oca_pairs(self) -> tuple[tuple[str, Any, Any], ...]:
@@ -3562,13 +3602,21 @@ class StarUIWorkbench:
         for group in sorted(groups):
             orders = groups[group]
             targets = [order for order in orders if order.order_type == "LMT"]
-            stops = [order for order in orders if order.order_type == "STP"]
+            stops = [order for order in orders if order.order_type in {"STP", "STP LMT"}]
             if (
                 len(targets) == 1
                 and len(stops) == 1
                 and len(orders) == 2
                 and all(
                     order.status in {"Submitted", "PreSubmitted"} for order in orders
+                )
+                and (
+                    stops[0].order_type == "STP"
+                    or (
+                        stops[0].stop_price is not None
+                        and stops[0].limit_price is not None
+                        and 0 < stops[0].limit_price < stops[0].stop_price
+                    )
                 )
             ):
                 pairs.append((group, targets[0], stops[0]))
@@ -3718,6 +3766,7 @@ class StarUIWorkbench:
                 value=layer.stop_percentage,
                 price=layer.stop_price,
                 input_id=f"verify-stop-{number}",
+                limit_price=layer.stop_limit_price or None,
             ),
             _field(
                 "Quantity",
@@ -3832,6 +3881,7 @@ class StarUIWorkbench:
                 price=layer.stop_price,
                 input_id=f"sold-stop-{number}",
                 inferred=not layer.stop_percentage and bool(recovered),
+                limit_price=layer.stop_limit_price or None,
             ),
             _field(
                 "Quantity",
@@ -3988,7 +4038,7 @@ class StarUIWorkbench:
                     value=target_percentage,
                     min="0.1",
                     step="0.1",
-                    disabled=bool(self._armed_price_updates),
+                    disabled=bool(self._armed_price_updates) or stop.order_type == "STP LMT",
                     data_active_input="target",
                     data_active_perm_id=target.perm_id,
                     data_active_original=display_target_price,
@@ -4014,10 +4064,11 @@ class StarUIWorkbench:
                         value=stop_percentage,
                         min="-99.9",
                         step="any",
-                        disabled=bool(self._armed_price_updates),
+                        disabled=bool(self._armed_price_updates) or stop.order_type == "STP LMT",
                         data_active_input="stop",
                         data_active_perm_id=target.perm_id,
                         data_active_original=display_stop_price,
+                        data_active_stop_limit_price=stop.limit_price if stop.order_type == "STP LMT" else None,
                         data_active_initial=initial_stop_percentage,
                         data_live_layer=index,
                         cls="pr-8",
@@ -4030,7 +4081,12 @@ class StarUIWorkbench:
                     ),
                 ),
                 input_id=f"active-stop-{index}",
-                price=_price_text(display_stop_price),
+                price=(
+                    _price_text(display_stop_price)
+                    + f" (LMT ${_price_text(stop.limit_price)})"
+                    if stop.order_type == "STP LMT"
+                    else _price_text(display_stop_price)
+                ),
                 outcome=loss,
                 outcome_label="at stop",
                 tone="text-rose-400",
@@ -4159,6 +4215,7 @@ class StarUIWorkbench:
 
     def _draft_panel(self, *, show_empty_state: bool = True) -> Any:
         layers = self._current_layers()
+        stop_type, offset, unit = self._stop_configuration()
         return Form(
             Div(
                 H3("Build your exit draft", cls="text-lg font-semibold"),
@@ -4226,7 +4283,8 @@ class StarUIWorkbench:
             ),
             HTMLInput(type="hidden", name="target_presets", value=self._target_presets),
             HTMLInput(type="hidden", name="stop_presets", value=self._stop_presets),
-            HTMLInput(type="hidden", name="draft_stop_type", value="STP"),
+            HTMLInput(type="hidden", name="draft_stop_type", value=stop_type),
+            HTMLInput(type="hidden", name="draft_stop_limit_unit", value=unit),
             Script(_live_draft_script(self._live_draft_configuration())),
             Script(_stop_type_visual_script()) if layers else None,
             id="draft-form",
@@ -4236,14 +4294,17 @@ class StarUIWorkbench:
         )
 
     def _position_stop_type_control(self) -> Any:
+        stop_type, offset, unit = self._stop_configuration()
+        locked = self._armed_execution is not None
         return Div(
             ToggleGroup(
                 ("STP", "STP"),
                 ("STP LMT", "STP LMT"),
                 type="single",
-                value="STP",
+                value=stop_type,
                 variant="outline",
                 size="default",
+                disabled=locked,
                 aria_label="Protective order type for new layers",
                 data_draft_stop_type_group=True,
             ),
@@ -4257,7 +4318,7 @@ class StarUIWorkbench:
                             cls="size-4", aria_hidden="true",
                         ),
                         variant="outline", size="icon",
-                        aria_label="Stop-limit settings", disabled=True,
+                        aria_label="Stop-limit settings", disabled=locked or stop_type != "STP LMT",
                         data_stop_limit_settings_trigger=True,
                     ),
                     DialogContent(
@@ -4268,17 +4329,18 @@ class StarUIWorkbench:
                         Div(
                             Label("How far below the stop?", fr="stop-limit-offset", cls="text-sm font-medium"),
                             Div(
-                                Input(id="stop-limit-offset", type="number", min="0.1", step="any", value="5", data_stop_limit_offset=True, cls="min-w-0 flex-1"),
+                                Input(id="stop-limit-offset", name="draft_stop_limit_offset", type="number", min="0.1", step="any", value=offset, disabled=locked, data_stop_limit_offset=True, cls="min-w-0 flex-1"),
                                 ToggleGroup(
                                     ("percent", "%"),
                                     ("dollars", "$"),
                                     type="single",
-                                    value="percent",
+                                    value=unit,
                                     variant="outline",
                                     size="default",
+                                    disabled=locked,
                                     aria_label="Stop-limit offset unit",
                                     data_stop_limit_unit_group=True,
-                                    data_selected_unit="percent",
+                                    data_selected_unit=unit,
                                 ),
                                 cls="mt-2 flex items-center gap-2",
                             ),
@@ -4376,7 +4438,7 @@ class StarUIWorkbench:
                 input_id=f"stop_{index}",
                 price=layer.stop_price,
                 outcome=loss,
-                outcome_label="max loss",
+                outcome_label="at stop trigger" if self._stop_configuration()[0] == "STP LMT" else "max loss",
                 tone="text-rose-400",
                 layer_index=index,
                 kind="stop",
@@ -4896,6 +4958,14 @@ class StarUIWorkbench:
             Div(self._draft_quantity_alert(), cls="mx-4 mb-3 min-w-0")
             if draft_rows and not has_staged_action
             else None,
+            P(
+                "A stop-limit order may remain unfilled after its trigger.",
+                data_stop_limit_warning=True,
+                cls="mx-4 mb-2 text-xs leading-5 text-amber-300"
+                + ("" if self._stop_configuration()[0] == "STP LMT" else " hidden"),
+            )
+            if draft_rows
+            else None,
             Div(self._outcome_projection(projection), cls="mx-4 mb-3"),
             self._execution_control(),
             cls="flex min-h-0 flex-col overflow-hidden border-l border-border bg-card/30",
@@ -5278,6 +5348,20 @@ class StarUIWorkbench:
         )
 
     def _review_pair(self, index: int, layer: DraftLayerForm) -> Any:
+        stop_limit = self._stop_configuration()[0] == "STP LMT"
+        reviewed_limit = None
+        locked_limit = None
+        if index <= len(self._state.pairs):
+            preview_pair = self._state.pairs[index - 1]
+            if (
+                str(preview_pair.stop_price) == layer.stop_price
+                and str(preview_pair.target_price) == layer.target_price
+                and preview_pair.quantity == _int_or_zero(layer.quantity)
+            ):
+                reviewed_limit = preview_pair.stop_limit_price
+        if self._armed_execution is not None and index <= len(self._armed_execution.plan.pairs):
+            locked_limit = self._armed_execution.plan.pairs[index - 1].stop.limit_price
+            reviewed_limit = locked_limit
         return self._review_oca_pair(
             index=index,
             quantity=layer.quantity,
@@ -5297,7 +5381,7 @@ class StarUIWorkbench:
                     "text-emerald-400",
                 ),
                 self._review_order_line(
-                    "SELL STP",
+                    "STP SELL" if stop_limit else "SELL STP",
                     Span(
                         _sell_price_with_return(
                             layer.stop_price, self._state.unit_basis
@@ -5312,14 +5396,15 @@ class StarUIWorkbench:
                 self._review_order_line(
                     "SELL STP LMT",
                     Span(
-                        "—",
+                        f"${_price_text(reviewed_limit)}" if reviewed_limit is not None else "—",
                         data_live_review_price=f"stop-limit-{index}",
+                        data_reviewed_limit_price=_price_text(locked_limit) if locked_limit is not None else None,
                         aria_live="polite",
                         cls="text-sm font-semibold text-rose-400",
                     ),
                     "text-rose-400",
                     row_attributes={"data_draft_review_stop_limit_row": index},
-                    hidden=True,
+                    hidden=not stop_limit,
                 ),
             ),
         )
@@ -5509,7 +5594,7 @@ def _global_stop_type_visual_script() -> str:
 
 
 def _stop_type_visual_script() -> str:
-    """Keep the proposed stop-type controls interactive without changing orders."""
+    """Synchronize stop-limit draft controls before server-side validation."""
     return """
 (() => {
   const start = () => {
@@ -5524,14 +5609,14 @@ def _stop_type_visual_script() -> str:
       button.addEventListener('click', () => {
         mode.value = button.dataset.value;
         if (settings) settings.disabled = mode.value !== 'STP LMT';
-        const execute = document.querySelector('[data-draft-execute] [data-execute-enabled]');
-        if (execute) execute.disabled = mode.value === 'STP LMT' || execute.dataset.executeEnabled !== 'true';
+        document.querySelector('[data-stop-limit-warning]')?.classList.toggle('hidden', mode.value !== 'STP LMT');
         refreshPrices();
       });
     });
     unitGroup?.querySelectorAll('[data-value]').forEach((button) => {
       button.addEventListener('click', () => {
         unitGroup.dataset.selectedUnit = button.dataset.value;
+        form.elements['draft_stop_limit_unit'].value = button.dataset.value;
         refreshPrices();
       });
     });
@@ -5592,7 +5677,7 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
       const outcomes = [];
       let invalid = false;
       let assignedQuantity = 0;
-      let quantitiesValid = true;
+      let quantitiesValid = true, limitsValid = true;
       const stopLimit = form.elements['draft_stop_type']?.value === 'STP LMT';
       const offset = Number(form.querySelector('[data-stop-limit-offset]')?.value);
       const unit = form.querySelector('[data-stop-limit-unit-group]')?.dataset.selectedUnit || 'percent';
@@ -5613,18 +5698,21 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         const stopPrice = valid ? (stop === Number(stopInput?.dataset.liveInitial) ? Number(stopInput?.dataset.liveOriginal) : roundUp(basis * (1 - stop / 100))) : NaN;
         const rawLimit = unit === 'dollars' ? stopPrice - offset : stopPrice * (1 - offset / 100);
         const limitPrice = stopLimit && Number.isFinite(stopPrice) && Number.isFinite(offset) && offset > 0 && rawLimit > 0 ? roundDown(rawLimit) : NaN;
+        if (stopLimit && (!Number.isFinite(limitPrice) || limitPrice <= 0 || limitPrice >= stopPrice)) limitsValid = false;
         const limitLabel = form.querySelector(`[data-live-stop-limit-price="${{index}}"]`);
         if (limitLabel) {{
           limitLabel.textContent = stopLimit ? `(LMT ${{Number.isFinite(limitPrice) ? priceText(limitPrice) : '—'}})` : '';
           limitLabel.classList.toggle('hidden', !stopLimit);
         }}
         document.querySelectorAll(`[data-draft-review-stop-row="${{index}}"]`).forEach((row) => {{
-          row.querySelector('span').textContent = 'SELL STP';
+          row.querySelector('span').textContent = stopLimit ? 'STP SELL' : 'SELL STP';
         }});
         document.querySelectorAll(`[data-draft-review-stop-limit-row="${{index}}"]`).forEach((row) => {{
           row.classList.toggle('hidden', !stopLimit);
         }});
-        assigned(`[data-live-review-price="stop-limit-${{index}}"]`, Number.isFinite(limitPrice) ? priceText(limitPrice) : '—');
+        document.querySelectorAll(`[data-live-review-price="stop-limit-${{index}}"]`).forEach((node) => {{
+          node.textContent = node.dataset.reviewedLimitPrice ? `$${{node.dataset.reviewedLimitPrice}}` : Number.isFinite(limitPrice) ? priceText(limitPrice) : '—';
+        }});
         const gain = valid && Number.isFinite(targetPrice) ? (targetPrice - basis) * multiplier * quantity : NaN;
         const loss = valid && Number.isFinite(stopPrice) ? (stopPrice - basis) * multiplier * quantity : NaN;
         assigned(`[data-live-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? (target === Number(input.dataset.liveInitial) ? `$${{input.dataset.liveOriginal}}` : priceText(targetPrice)) : '—');
@@ -5632,7 +5720,7 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         assigned(`[data-live-review-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? sellPriceText(targetPrice, target === Number(input.dataset.liveInitial) ? `$${{input.dataset.liveOriginal}}` : priceText(targetPrice)) : '—');
         assigned(`[data-live-review-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? sellPriceText(stopPrice, stop === Number(stopInput?.dataset.liveInitial) ? `$${{stopInput.dataset.liveOriginal}}` : priceText(stopPrice)) : '—');
         assigned(`[data-live-outcome="target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
-        assigned(`[data-live-outcome="stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} max loss` : '— max loss');
+        assigned(`[data-live-outcome="stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} ${{stopLimit ? 'at stop trigger' : 'max loss'}}` : `— ${{stopLimit ? 'at stop trigger' : 'max loss'}}`);
         assigned(`[data-live-review-quantity="${{index}}"]`, `${{quantityValid ? quantity : '—'}} contracts · ${{form.elements[`tif_${{index}}`]?.value || 'GTC'}}`);
         if (Number.isFinite(gain) && Number.isFinite(loss)) outcomes.push({{ quantity, gain, loss }});
         else invalid = true;
@@ -5644,8 +5732,8 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         if (over) quantityAlert.querySelector('[data-draft-quantity-message]').textContent = `${{assignedQuantity}} contracts drafted; ${{config.available}} available. Reduce a layer's quantity.`;
       }}
       const executeButton = document.querySelector('[data-draft-execute] [data-execute-enabled]');
-      if (executeButton) executeButton.disabled = executeButton.dataset.executeEnabled !== 'true' || assignedQuantity <= 0 || over || !quantitiesValid || form.elements['draft_stop_type']?.value === 'STP LMT';
-      invalid = invalid || !quantitiesValid || over;
+      if (executeButton) executeButton.disabled = executeButton.dataset.executeEnabled !== 'true' || assignedQuantity <= 0 || over || !quantitiesValid || !limitsValid;
+      invalid = invalid || !quantitiesValid || !limitsValid || over;
       window.ibkrProjection?.updateDraft(outcomes, invalid);
     }};
     form.querySelectorAll('[data-live-input]').forEach((input) => input.addEventListener('input', update));
@@ -5725,7 +5813,8 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         if (Number.isFinite(gain) && Number.isFinite(loss) && quantity > 0) outcomes.push({{ id: Number(permId), quantity, gain, loss }});
         else invalid = true;
         assigned(`[data-live-price="active-target-${{index}}"]`, Number.isFinite(targetPrice) ? (target === Number(targetInput.dataset.activeInitial) ? `$${{targetInput.dataset.activeOriginal}}` : priceText(targetPrice)) : '—');
-        assigned(`[data-live-price="active-stop-${{index}}"]`, Number.isFinite(stopPrice) ? (exactStop?.value || stop !== Number(stopInput?.dataset.activeInitial) ? priceText(stopPrice) : `$${{stopInput.dataset.activeOriginal}}`) : '—');
+        const stopLimitPrice = stopInput?.dataset.activeStopLimitPrice;
+        assigned(`[data-live-price="active-stop-${{index}}"]`, Number.isFinite(stopPrice) ? `${{exactStop?.value || stop !== Number(stopInput?.dataset.activeInitial) ? priceText(stopPrice) : `$${{stopInput.dataset.activeOriginal}}`}}${{stopLimitPrice ? ` (LMT $${{stopLimitPrice}})` : ''}}` : '—');
         assigned(`[data-live-outcome="active-target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
         assigned(`[data-live-outcome="active-stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} at stop` : '— at stop');
         const originalTarget = Number(targetInput.dataset.activeOriginal);
@@ -6014,13 +6103,17 @@ def _percentage_price_field(
 
 
 def _sold_percentage_price_field(
-    label: str, *, value: str, price: str, input_id: str, inferred: bool = False
+    label: str, *, value: str, price: str, input_id: str,
+    inferred: bool = False, limit_price: str | None = None,
 ) -> Any:
     """Retain the active field geometry without inventing old percentages."""
     return Div(
         Div(
             Label(label, fr=input_id, cls="text-xs font-medium text-muted-foreground"),
-            Span(f"${price}", cls="text-xs font-semibold text-foreground"),
+            Span(
+                f"${price} (LMT ${limit_price})" if limit_price else f"${price}",
+                cls="text-xs font-semibold text-foreground",
+            ),
             cls="flex items-center justify-between gap-2",
         ),
         Div(
@@ -6439,6 +6532,18 @@ def _split_quantity(total: int, count: int) -> tuple[int, ...]:
         return ()
     each, remainder = divmod(total, count)
     return tuple(each + int(index < remainder) for index in range(count))
+
+
+def _valid_stop_limit_offset(value: str, unit: str) -> bool:
+    if unit not in {"percent", "dollars"}:
+        return False
+    try:
+        offset = Decimal(value)
+    except InvalidOperation:
+        return False
+    return offset.is_finite() and offset > 0 and (
+        unit != "percent" or offset < 100
+    )
 
 
 def _positive_int(value: str | None, default: int) -> int:

@@ -1,6 +1,6 @@
 # Outside RTH on paper exit brackets
 
-New paper OCA brackets enable IBKR's `outsideRth` flag on both the SELL LMT target and SELL STP protection leg by default when the verified contract is a USD option in the documented Cboe global-trading-hours family: SPX, SPXW, SPXPM, VIX, or XSP, routed through SMART or CBOE. The plan remains pure and records the same setting on both legs. Other contracts retain `outsideRth=False` because product and destination support is not established by this app.
+New paper OCA brackets enable IBKR's `outsideRth` flag on both the SELL LMT target and the selected SELL STP or SELL STP LMT protection leg by default when the verified contract is a USD option in the documented Cboe global-trading-hours family: SPX, SPXW, SPXPM, VIX, or XSP, routed through SMART or CBOE. The plan remains pure and records the same setting on both legs. Other contracts retain `outsideRth=False` because product and destination support is not established by this app.
 
 The flag permits activation, triggering, or filling outside *regular* hours where IBKR and the destination support it; it does not make an option tradable while its exchange is closed. IBKR can reject an invalid flag with error 411. TWS precautions remain enabled, and a rejected or incompletely acknowledged bracket remains an uncertain submission requiring reconciliation. Existing working orders are not changed automatically. Paper testing during an eligible extended session is required before relying on stop behavior; paper success does not establish live behavior.
 

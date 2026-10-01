@@ -129,6 +129,98 @@ def test_explicit_layer_draft_preserves_individual_prices_and_quantities() -> No
     assert result.pairs[1].runner is True
 
 
+@pytest.mark.parametrize(
+    ("unit", "offset", "expected"),
+    [
+        ("percent", Decimal("5"), Decimal("0.75")),
+        ("dollars", Decimal("0.12"), Decimal("0.65")),
+    ],
+)
+def test_stop_limit_plan_rounds_limit_down_and_fingerprints_settings(
+    unit: str, offset: Decimal, expected: Decimal
+) -> None:
+    request = replace(
+        canonical_request(),
+        stop_order_type="STP LMT",
+        stop_limit_offset=offset,
+        stop_limit_unit=unit,
+    )
+    result = build_exit_plan(complete_snapshot(), request)
+
+    assert result.status is PlanStatus.VALID
+    assert all(pair.stop.order_type == "STP LMT" for pair in result.pairs)
+    assert all(pair.stop.limit_price == expected for pair in result.pairs)
+    assert all(pair.stop.limit_price < pair.stop.rounded_price for pair in result.pairs)
+    assert result.fingerprint != build_exit_plan(
+        complete_snapshot(), replace(request, stop_order_type="STP")
+    ).fingerprint
+
+
+@pytest.mark.parametrize(
+    ("unit", "offset"),
+    [
+        ("percent", Decimal("0")),
+        ("percent", Decimal("100")),
+        ("dollars", Decimal("2")),
+        ("dollars", Decimal("NaN")),
+        ("ticks", Decimal("5")),
+    ],
+)
+def test_stop_limit_plan_fails_closed_on_invalid_offset(
+    unit: str, offset: Decimal
+) -> None:
+    result = build_exit_plan(complete_snapshot(), replace(
+        canonical_request(), stop_order_type="STP LMT",
+        stop_limit_offset=offset, stop_limit_unit=unit,
+    ))
+    assert result.status is PlanStatus.BLOCKED
+    assert result.pairs == ()
+
+
+def test_existing_stop_limit_oca_pair_reserves_one_layer_quantity() -> None:
+    key = ContractKey("DU1234567", 917864414)
+    target = WorkingOrder(
+        41, 17, 101, key, "SELL", "LMT", Decimal("2"), "Submitted",
+        oca_group="owned/tranche-1", limit_price=Decimal("1.2"),
+    )
+    stop = replace(
+        target, perm_id=42, order_id=102, order_type="STP LMT",
+        limit_price=Decimal("0.7"), stop_price=Decimal("0.8"),
+    )
+    result = build_exit_plan(
+        complete_snapshot(working_orders=(target, stop)), canonical_request()
+    )
+    assert result.status is PlanStatus.VALID
+    assert result.allocated_quantity == 2
+    invalid = build_exit_plan(
+        complete_snapshot(working_orders=(target, replace(stop, limit_price=None))),
+        canonical_request(),
+    )
+    assert invalid.status is PlanStatus.BLOCKED
+
+
+def test_manual_tws_stop_limit_price_change_changes_new_plan_fingerprint() -> None:
+    key = ContractKey("DU1234567", 917864414)
+    target = WorkingOrder(
+        41, 17, 101, key, "SELL", "LMT", Decimal("2"), "Submitted",
+        oca_group="owned/tranche-1", limit_price=Decimal("1.2"),
+    )
+    stop = replace(
+        target, perm_id=42, order_id=102, order_type="STP LMT",
+        limit_price=Decimal("0.7"), stop_price=Decimal("0.8"),
+    )
+    request = canonical_request()
+    before = build_exit_plan(
+        complete_snapshot(working_orders=(target, stop)), request,
+    )
+    after = build_exit_plan(
+        complete_snapshot(working_orders=(target, replace(stop, limit_price=Decimal("0.65")))),
+        request,
+    )
+    assert before.status is after.status is PlanStatus.VALID
+    assert before.fingerprint != after.fingerprint
+
+
 def test_open_buy_order_blocks_a_new_bracket() -> None:
     selected = ContractKey("DU1234567", 917864414)
     order = WorkingOrder(

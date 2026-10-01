@@ -65,6 +65,9 @@ class PlanForm:
     tif: str = "GTC"
     layers: tuple[DraftLayerForm, ...] = ()
     paper_execution_mode: bool = False
+    stop_order_type: str = "STP"
+    stop_limit_offset: str = "5"
+    stop_limit_unit: str = "percent"
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +100,7 @@ class PlanPairLine:
     tif: str
     logical_group: str
     runner: bool = False
+    stop_limit_price: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -681,6 +685,7 @@ def _ready_state(
             tif=pair.target.tif,
             logical_group=pair.target.logical_oca_group,
             runner=pair.runner,
+            stop_limit_price=pair.stop.limit_price,
         )
         for pair in result.pairs
     )
@@ -755,7 +760,11 @@ def _with_preview_rows(state: ViewState, form: PlanForm) -> ViewState:
                     f"{pair.index:02d}",
                     str(pair.quantity),
                     f"{pair.target_price}  (+{pair.target_percentage}%)",
-                    str(pair.stop_price),
+                    (
+                        f"{pair.stop_price} (LMT {pair.stop_limit_price})"
+                        if pair.stop_limit_price is not None
+                        else str(pair.stop_price)
+                    ),
                     pair.tif,
                     pair.logical_group,
                 )
@@ -968,6 +977,10 @@ def _parse_plan_form(
             if part.strip()
         )
         stop = Decimal(form.stop_loss_percentage.strip())
+        stop_limit_offset = (
+            Decimal(form.stop_limit_offset.strip())
+            if form.stop_order_type == "STP LMT" else Decimal("5")
+        )
     except (InvalidOperation, ValueError):
         return None, ValidationLine(
             "INPUT_INVALID",
@@ -982,6 +995,9 @@ def _parse_plan_form(
             tif=form.tif.strip().upper(),
             layers=layers,
             paper_execution_mode=form.paper_execution_mode,
+            stop_order_type=form.stop_order_type,
+            stop_limit_offset=stop_limit_offset,
+            stop_limit_unit=form.stop_limit_unit,
         ),
         None,
     )

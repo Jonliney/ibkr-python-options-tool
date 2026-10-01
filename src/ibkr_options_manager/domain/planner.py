@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from .model import (
     BrokerSnapshot,
@@ -78,6 +78,28 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
             stop_rounded = _round_up(stop_raw, snapshot.market_rule.bands)
             tif = request.tif
         group = f"{fingerprint[:12]}/tranche-{index + 1}"
+        try:
+            stop_limit_price = (
+                _stop_limit_price(
+                    stop_rounded,
+                    request.stop_limit_offset,
+                    request.stop_limit_unit,
+                    snapshot.market_rule.bands,
+                )
+                if request.stop_order_type == "STP LMT"
+                else None
+            )
+        except ValueError:
+            return _blocked(
+                (
+                    Validation(
+                        "STOP_LIMIT_PRICE_INVALID",
+                        f"layer {index + 1} needs a positive limit price below its "
+                        "stop trigger on the verified price increment",
+                        True,
+                    ),
+                )
+            )
         target = OrderIntent(
             account=snapshot.selected.account,
             con_id=snapshot.selected.con_id,
@@ -95,7 +117,7 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
             account=snapshot.selected.account,
             con_id=snapshot.selected.con_id,
             action="SELL",
-            order_type="STP",
+            order_type=request.stop_order_type,
             quantity=quantity,
             raw_price=stop_raw,
             rounded_price=stop_rounded,
@@ -103,6 +125,7 @@ def build_exit_plan(snapshot: BrokerSnapshot, request: PlanRequest) -> PlanResul
             logical_oca_group=group,
             oca_type=2,
             outside_rth=outside_rth,
+            limit_price=stop_limit_price,
         )
         pairs.append(
             ExitPair(
@@ -172,6 +195,25 @@ def round_up_price(value: Decimal, bands: tuple[PriceBand, ...]) -> Decimal:
     if not value.is_finite() or value <= 0 or not bands:
         raise ValueError("price and market-rule bands must be positive and complete")
     return _round_up(value, bands)
+
+
+def _stop_limit_price(
+    stop_price: Decimal,
+    offset: Decimal,
+    unit: str,
+    bands: tuple[PriceBand, ...],
+) -> Decimal:
+    raw = (
+        stop_price * (Decimal("1") - offset / Decimal("100"))
+        if unit == "percent"
+        else stop_price - offset
+    )
+    if not raw.is_finite() or raw <= 0:
+        raise ValueError("stop-limit price must be positive")
+    rounded = _round_down(raw, bands)
+    if rounded <= 0 or rounded >= stop_price:
+        raise ValueError("stop-limit price must be below the stop trigger")
+    return rounded
 
 
 def _validate_snapshot_state(
@@ -393,7 +435,20 @@ def closing_order_allocation(
         elif (
             len(orders) != 2
             or len(selected_orders) != 2
-            or {order.order_type for order in selected_orders} != {"LMT", "STP"}
+            or {order.order_type for order in selected_orders} not in (
+                {"LMT", "STP"}, {"LMT", "STP LMT"}
+            )
+            or any(
+                order.order_type == "STP LMT"
+                and (
+                    order.stop_price is None
+                    or order.limit_price is None
+                    or not order.stop_price.is_finite()
+                    or not order.limit_price.is_finite()
+                    or not 0 < order.limit_price < order.stop_price
+                )
+                for order in selected_orders
+            )
         ):
             failures.append(
                 Validation(
@@ -524,6 +579,21 @@ def _validate_request(
     available: int,
     bands: tuple[PriceBand, ...],
 ) -> tuple[Validation, ...]:
+    if request.stop_order_type not in {"STP", "STP LMT"}:
+        return (Validation("STOP_ORDER_TYPE_INVALID", "select STP or STP LMT", True),)
+    if request.stop_order_type == "STP LMT" and (
+        request.stop_limit_unit not in {"percent", "dollars"}
+        or not request.stop_limit_offset.is_finite()
+        or request.stop_limit_offset <= 0
+        or (request.stop_limit_unit == "percent" and request.stop_limit_offset >= 100)
+    ):
+        return (
+            Validation(
+                "STOP_LIMIT_OFFSET_INVALID",
+                "enter a positive stop-limit offset below 100%",
+                True,
+            ),
+        )
     if request.layers:
         return _validate_layers(request.layers, available, bands)
     if request.tranche_size <= 0:
@@ -718,6 +788,26 @@ def _round_up(value: Decimal, bands: tuple[PriceBand, ...]) -> Decimal:
     raise ValueError("market-rule rounding did not converge")
 
 
+def _round_down(value: Decimal, bands: tuple[PriceBand, ...]) -> Decimal:
+    candidate = value
+    for _ in range(len(bands) + 1):
+        band = max(
+            (band for band in bands if band.low_edge <= candidate),
+            key=lambda item: item.low_edge,
+        )
+        rounded = (value / band.increment).to_integral_value(
+            rounding=ROUND_FLOOR
+        ) * band.increment
+        rounded_band = max(
+            (item for item in bands if item.low_edge <= rounded),
+            key=lambda item: item.low_edge,
+        )
+        if rounded_band == band:
+            return rounded
+        candidate = rounded
+    raise ValueError("market-rule rounding did not converge")
+
+
 def _percentage_from_basis(price: Decimal, basis: Decimal) -> Decimal:
     return ((price / basis) - Decimal("1")) * Decimal("100")
 
@@ -754,6 +844,15 @@ def _fingerprint(
         "remainder_policy": request.remainder_policy.value,
         "tif": request.tif,
         "paper_execution_mode": request.paper_execution_mode,
+        "stop_order_type": request.stop_order_type,
+        "stop_limit_offset": (
+            _decimal_text(request.stop_limit_offset)
+            if request.stop_order_type == "STP LMT"
+            else None
+        ),
+        "stop_limit_unit": (
+            request.stop_limit_unit if request.stop_order_type == "STP LMT" else None
+        ),
         "layers": [
             {
                 "quantity": layer.quantity,
@@ -777,6 +876,14 @@ def _fingerprint(
                 "con_id": order.key.con_id,
                 "action": order.action,
                 "order_type": order.order_type,
+                "limit_price": (
+                    _decimal_text(order.limit_price)
+                    if order.limit_price is not None else None
+                ),
+                "stop_price": (
+                    _decimal_text(order.stop_price)
+                    if order.stop_price is not None else None
+                ),
                 "remaining": _decimal_text(order.remaining),
                 "status": order.status,
                 "oca_group": order.oca_group,

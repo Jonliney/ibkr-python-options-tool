@@ -147,6 +147,9 @@ class PlanRequest:
     tif: str
     layers: tuple[LayerRequest, ...] = ()
     paper_execution_mode: bool = False
+    stop_order_type: str = "STP"
+    stop_limit_offset: Decimal = Decimal("5")
+    stop_limit_unit: str = "percent"
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +184,7 @@ class OrderIntent:
     logical_oca_group: str
     oca_type: int
     outside_rth: bool = False
+    limit_price: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)

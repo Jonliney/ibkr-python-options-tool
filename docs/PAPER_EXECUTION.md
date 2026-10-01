@@ -96,6 +96,29 @@ TWS may still apply its own order precaution and require the user to click
 **Transmit** there. The application must not bypass that independent TWS
 safety control.
 
+The protective leg may be a SELL `STP LMT` for a new paper draft. The
+position-level choice defaults to STP; the connection settings can set a
+session default. One positive percentage or dollar amount below each verified
+stop trigger determines its limit price. The pure planner rounds that limit
+**down** to the selected contract's market-rule increment and blocks a zero,
+invalid, or non-lower result. The reviewed plan, fingerprint, journal, and
+paper writer all carry both prices. The writer sends a single `STP LMT` leg
+with `auxPrice` as the stop trigger and `lmtPrice` as the limit, alongside the
+SELL LMT target in the same two-order OCA group. The writer rechecks price
+increments before connecting to TWS. For the documented index-option family,
+both legs retain the verified Outside RTH setting. An active STP LMT pair may
+be cancelled or selected for a market exit after the existing ownership and
+freshness checks; price amendments are blocked because changing its trigger
+without jointly reviewing the limit price could alter the intended cushion.
+As with every stop-limit order, reaching the trigger does not guarantee a fill.
+
+Verification commands for this stack are `.venv/bin/python -m pytest -q
+tests/test_planner.py tests/test_execution.py tests/test_app_view_model.py
+tests/test_source_safety.py` and the focused `tests/test_app_demo.py -k
+'stop_limit'` server tests. Paper TWS testing during an eligible extended
+session remains necessary; simulation is not evidence of identical live
+behavior.
+
 After a submission receives complete API acknowledgements, the workbench shows
 an **Orders sent to TWS** toast and journal-backed **Pending TWS verification**
 rows until a fresh snapshot verifies the orders as working.
@@ -161,7 +184,7 @@ permission to amend or cancel an order.
 
 The initial active-layer management action is deliberately narrow: **Sell now
 (MKT)** can exit one app-created, fully reconciled OCA layer. It is available
-only after two fresh snapshots prove the selected LMT and its SELL STP peer are
+only after two fresh snapshots prove the selected LMT and its SELL STP or SELL STP LMT peer are
 the complete two-leg OCA pair, have the same remaining quantity, were created
 by the configured API client, and are proven app-owned by the journal. The
 writer cancels exactly those two order IDs, waits for both cancellation

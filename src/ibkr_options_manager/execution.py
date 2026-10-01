@@ -19,6 +19,7 @@ from .domain import (
     PlanStatus,
     WorkingOrder,
     closing_order_allocation,
+    round_up_price,
     supports_outside_rth,
 )
 
@@ -43,6 +44,8 @@ class JournalLayer:
     stop_percentage: str = ""
     cancelled: bool = False
     hidden_from_workspace: bool = False
+    stop_order_type: str = "STP"
+    stop_limit_price: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +228,10 @@ class MarketExitCandidate:
     oca_group: str
     stop_order_id: int
     stop_perm_id: int
+    target_price: Decimal | None = None
+    stop_order_type: str = "STP"
+    stop_price: Decimal | None = None
+    stop_limit_price: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,6 +505,11 @@ class ExecutionJournal:
                     target_price=format(pair.target.rounded_price, "f"),
                     stop_price=format(pair.stop.rounded_price, "f"),
                     tif=pair.target.tif,
+                    stop_order_type=pair.stop.order_type,
+                    stop_limit_price=(
+                        format(pair.stop.limit_price, "f")
+                        if pair.stop.limit_price is not None else ""
+                    ),
                     target_percentage=format(pair.target_percentage, "f"),
                     stop_percentage=(
                         format(
@@ -684,7 +696,7 @@ class ExecutionJournal:
             ]
             if (
                 len(legs) != 2
-                or {leg.order_type for leg in legs} != {"LMT", "STP"}
+                or {leg.order_type for leg in legs} != {"LMT", entry.layers[index].stop_order_type}
                 or any(
                     leg.action != "SELL"
                     or leg.status not in {"Cancelled", "ApiCancelled"}
@@ -1048,7 +1060,7 @@ class ExecutionJournal:
                     )
                 for order_type, field in (
                     ("LMT", "target_perm_id"),
-                    ("STP", "stop_perm_id"),
+                    (layer.stop_order_type, "stop_perm_id"),
                 ):
                     matching_ids = {
                         perm_id
@@ -1266,6 +1278,8 @@ class ExecutionJournal:
                             target_price=str(layer["target_price"]),
                             stop_price=str(layer["stop_price"]),
                             tif=str(layer["tif"]),
+                            stop_order_type=str(layer.get("stop_order_type", "STP")),
+                            stop_limit_price=str(layer.get("stop_limit_price", "")),
                             target_perm_id=int(layer.get("target_perm_id", 0)),
                             stop_perm_id=int(layer.get("stop_perm_id", 0)),
                             target_percentage=str(layer.get("target_percentage", "")),
@@ -1338,6 +1352,57 @@ def require_paper_execution_snapshot(
         for pair in plan.pairs
     ):
         raise ExecutionBlocked("the bracket Outside RTH setting does not match the verified contract")
+    if any(
+        pair.target.order_type != "LMT"
+        or pair.stop.order_type not in {"STP", "STP LMT"}
+        or (
+            pair.stop.order_type == "STP LMT"
+            and (
+                pair.stop.limit_price is None
+                or not pair.stop.limit_price.is_finite()
+                or not pair.stop.rounded_price.is_finite()
+                or not 0 < pair.stop.limit_price < pair.stop.rounded_price
+            )
+        )
+        or (pair.stop.order_type == "STP" and pair.stop.limit_price is not None)
+        for pair in plan.pairs
+    ):
+        raise ExecutionBlocked("the bracket stop type or limit price is invalid")
+    groups: set[str] = set()
+    for pair in plan.pairs:
+        target, stop = pair.target, pair.stop
+        if (
+            pair.quantity <= 0
+            or target.quantity != pair.quantity
+            or stop.quantity != pair.quantity
+            or any(
+                intent.account != snapshot.selected.account
+                or intent.con_id != snapshot.selected.con_id
+                or intent.action != "SELL"
+                or intent.oca_type != 2
+                or intent.tif not in {"DAY", "GTC"}
+                for intent in (target, stop)
+            )
+            or target.tif != stop.tif
+            or target.logical_oca_group != stop.logical_oca_group
+            or not target.logical_oca_group
+            or target.logical_oca_group in groups
+        ):
+            raise ExecutionBlocked("the bracket pair identity or quantity is invalid")
+        groups.add(target.logical_oca_group)
+        try:
+            prices: tuple[Decimal, ...] = (target.rounded_price, stop.rounded_price)
+            if stop.limit_price is not None:
+                prices += (stop.limit_price,)
+            if any(
+                not price.is_finite()
+                or price <= 0
+                or round_up_price(price, snapshot.market_rule.bands) != price
+                for price in prices
+            ):
+                raise ValueError("price is not on the verified market rule")
+        except (InvalidOperation, ValueError) as error:
+            raise ExecutionBlocked("the bracket contains an invalid price increment") from error
     require_paper_management_snapshot(snapshot)
     reserved, failures = closing_order_allocation(snapshot)
     if failures or reserved != plan.allocated_quantity:
@@ -1527,7 +1592,14 @@ class PaperExecutionService:
             order
             for order in peers
             if order.action == "SELL"
-            and order.order_type == "STP"
+            and order.order_type in {"STP", "STP LMT"}
+            and (order.order_type != "STP LMT" or (
+                order.stop_price is not None
+                and order.limit_price is not None
+                and order.stop_price.is_finite()
+                and order.limit_price.is_finite()
+                and 0 < order.limit_price < order.stop_price
+            ))
             and order.perm_id in owned
             and order.order_id > 0
             and order.client_id == expected_client_id
@@ -1552,6 +1624,10 @@ class PaperExecutionService:
             oca_group=target.oca_group,
             stop_order_id=stop.order_id,
             stop_perm_id=stop.perm_id,
+            target_price=target.limit_price,
+            stop_order_type=stop.order_type,
+            stop_price=stop.stop_price,
+            stop_limit_price=stop.limit_price if stop.order_type == "STP LMT" else None,
         )
 
     def prepare_market_exits(
@@ -1612,6 +1688,8 @@ class PaperExecutionService:
             stop = orders_by_id.get(update.layer.stop_order_id)
             if target is None or stop is None:
                 raise ExecutionBlocked("the selected OCA layer is no longer complete")
+            if stop.order_type == "STP LMT":
+                raise ExecutionBlocked("active STP LMT price changes are not supported; cancel and recreate the bracket")
             if (
                 update.prior_target_price is not None
                 and target.limit_price != update.prior_target_price
@@ -1962,7 +2040,7 @@ def _complete_app_oca_orders(
             or not group
             or not group.startswith(prefix)
             or order.action != "SELL"
-            or order.order_type not in {"LMT", "STP"}
+            or order.order_type not in {"LMT", "STP", "STP LMT"}
             or order.perm_id <= 0
             or order.order_id <= 0
         ):
@@ -1972,7 +2050,43 @@ def _complete_app_oca_orders(
     complete: list[WorkingOrder] = []
     for group in sorted(groups):
         pair = groups[group]
-        if len(pair) != 2 or {order.order_type for order in pair} != {"LMT", "STP"}:
+        suffix = group.rsplit("-", 1)[-1]
+        if not suffix.isdecimal():
+            return ()
+        index = int(suffix) - 1
+        if index < 0 or index >= len(entry.layers):
+            return ()
+        layer = entry.layers[index]
+        try:
+            expected_stop = Decimal(layer.stop_price)
+            expected_limit = (
+                Decimal(layer.stop_limit_price)
+                if layer.stop_order_type == "STP LMT" else None
+            )
+        except InvalidOperation:
+            return ()
+        if not expected_stop.is_finite() or (
+            expected_limit is not None and not expected_limit.is_finite()
+        ):
+            return ()
+        if (
+            len(pair) != 2
+            or {order.order_type for order in pair} != {"LMT", layer.stop_order_type}
+            or any(
+                not order.remaining.is_finite()
+                or not 0 < order.remaining <= layer.quantity
+                for order in pair
+            )
+            or pair[0].remaining != pair[1].remaining
+            or any(
+                order.order_type == "STP LMT"
+                and (
+                    order.stop_price != expected_stop
+                    or order.limit_price != expected_limit
+                )
+                for order in pair
+            )
+        ):
             return ()
         complete.extend(sorted(pair, key=lambda order: order.order_type))
     return tuple(complete)

@@ -32,6 +32,7 @@ from ibkr_options_manager.execution import (
     ExecutionJournal,
     ExecutionOutcomeUnknown,
     JournalEntry,
+    JournalFill,
     JournalLayer,
     MarketExitCandidate,
     PaperExecutionService,
@@ -103,7 +104,12 @@ def test_cancel_order_supplies_the_required_empty_order_cancel_options() -> None
     assert vars(calls[0][1])["extOperator"] == ""
 
 
-def _plan(snapshot: BrokerSnapshot):
+def _plan(
+    snapshot: BrokerSnapshot,
+    *,
+    stop_order_type: str = "STP",
+    stop_limit_offset: Decimal = Decimal("5"),
+):
     return build_exit_plan(
         snapshot,
         PlanRequest(
@@ -122,6 +128,8 @@ def _plan(snapshot: BrokerSnapshot):
                 ),
             ),
             paper_execution_mode=True,
+            stop_order_type=stop_order_type,
+            stop_limit_offset=stop_limit_offset,
         ),
     )
 
@@ -217,6 +225,99 @@ def test_paper_bracket_writer_sends_matching_outside_rth_flags(
 
     assert result.order_ids == (500, 501)
     assert sent == [("LMT", supported, False), ("STP", supported, True)]
+
+
+@pytest.mark.parametrize("rejected", [False, True])
+def test_paper_writer_sends_one_stop_limit_leg_with_trigger_limit_and_oca(
+    monkeypatch, rejected: bool,
+) -> None:
+    from ibkr_options_manager.broker import execution as broker_execution
+
+    snapshot = _snapshot()
+    plan = _plan(snapshot, stop_order_type="STP LMT")
+    assert plan.pairs[0].stop.limit_price == Decimal("0.70")
+    sent = []
+
+    class FakeWrapper:
+        def __init__(self) -> None:
+            pass
+
+    class FakeClient:
+        def __init__(self, wrapper) -> None:
+            self.wrapper = wrapper
+            self.connected = False
+
+        def connect(self, *_args) -> None:
+            self.connected = True
+            self.wrapper.nextValidId(500)
+
+        def run(self) -> None:
+            pass
+
+        def isConnected(self) -> bool:
+            return self.connected
+
+        def disconnect(self) -> None:
+            self.connected = False
+
+        def placeOrder(self, order_id, _contract, order) -> None:
+            sent.append((order_id, order.orderType, order.auxPrice, order.lmtPrice,
+                         order.ocaGroup, order.ocaType, order.outsideRth, order.transmit))
+            if rejected and order.orderType == "STP LMT":
+                self.wrapper.error(order_id, 109, "TWS price precaution")
+                return
+            order.permId = order_id + 1000
+            self.wrapper.openOrder(order_id, None, order, None)
+
+    monkeypatch.setattr(
+        broker_execution, "_load_ibapi",
+        lambda: _IbapiImports(FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace),
+    )
+    if rejected:
+        with pytest.raises(ExecutionBlocked, match="TWS price precaution"):
+            IbkrPaperExecutionBroker().submit(
+                snapshot, plan, host="127.0.0.1", port=7497,
+                client_id=17, timeout_seconds=1,
+            )
+    else:
+        receipt = IbkrPaperExecutionBroker().submit(
+            snapshot, plan, host="127.0.0.1", port=7497,
+            client_id=17, timeout_seconds=1,
+        )
+        assert receipt.order_ids == (500, 501)
+    assert [(row[1], row[5], row[6], row[7]) for row in sent] == [
+        ("LMT", 2, True, False), ("STP LMT", 2, True, True),
+    ]
+    assert sent[0][4] == sent[1][4]
+    assert sent[1][2:4] == (0.75, 0.7)
+
+
+def test_stop_limit_off_tick_price_is_blocked_before_writer_connects() -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot, stop_order_type="STP LMT")
+    pair = plan.pairs[0]
+    invalid = replace(plan, pairs=(replace(
+        pair, stop=replace(pair.stop, limit_price=Decimal("0.72"))
+    ),))
+    with pytest.raises(ExecutionBlocked, match="invalid price increment"):
+        require_paper_execution_snapshot(snapshot, invalid)
+    with pytest.raises(ExecutionBlocked, match="invalid price increment"):
+        IbkrPaperExecutionBroker().submit(
+            snapshot, invalid, host="127.0.0.1", port=7497,
+            client_id=17, timeout_seconds=1,
+        )
+
+
+def test_stop_limit_reconnect_requires_a_fresh_complete_snapshot() -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot, stop_order_type="STP LMT")
+    for disconnected in (
+        replace(snapshot, connected=False),
+        replace(snapshot, fresh=False),
+        replace(snapshot, complete=False),
+    ):
+        with pytest.raises(ExecutionBlocked):
+            require_paper_execution_snapshot(disconnected, plan)
 
 
 def _two_pair_plan(snapshot: BrokerSnapshot):
@@ -376,11 +477,12 @@ def test_paper_execution_journals_before_and_after_one_acknowledged_submission(
     assert transport.calls == 1
 
 
+@pytest.mark.parametrize("stop_order_type", ["STP", "STP LMT"])
 def test_indeterminate_transport_outcome_is_durably_blocked_from_retry(
-    tmp_path,
+    tmp_path, stop_order_type: str,
 ) -> None:
     snapshot = _snapshot()
-    plan = _plan(snapshot)
+    plan = _plan(snapshot, stop_order_type=stop_order_type)
     transport = _RecordingTransport(fail=True)
     journal = ExecutionJournal(tmp_path / "journal.json")
     service = PaperExecutionService(transport, journal)
@@ -1251,7 +1353,7 @@ def test_unknown_price_amendment_needs_explicit_fresh_retry(tmp_path) -> None:
         refreshed,
         working_orders=(replace(target, limit_price=Decimal("1.40")), stop),
     )
-    with pytest.raises(ExecutionBlocked, match="prices changed"):
+    with pytest.raises(ExecutionBlocked, match="changed since review"):
         amend(already_changed, allow_unknown_retry=True)
     assert transport.attempts == 1
     assert (
@@ -1456,6 +1558,106 @@ def test_unknown_submission_reconciles_only_when_a_complete_oca_pair_is_observed
         account=snapshot.selected.account,
         con_id=snapshot.selected.con_id,
     ) == frozenset({201, 202})
+
+
+def test_stop_limit_unknown_submission_recovers_after_restart_only_with_exact_prices(
+    tmp_path,
+) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot, stop_order_type="STP LMT")
+    assert plan.fingerprint is not None
+    path = tmp_path / "journal.json"
+    initial = ExecutionJournal(path)
+    initial.begin(snapshot, plan)
+    initial.mark_unknown(plan.fingerprint)
+    journal = ExecutionJournal(path)
+    group = f"{plan.fingerprint[:12]}/tranche-1"
+    target = WorkingOrder(
+        201, 17, 101, snapshot.selected, "SELL", "LMT", Decimal("1"),
+        "Submitted", oca_group=group, limit_price=Decimal("1.20"),
+    )
+    stop = replace(
+        target, perm_id=202, order_id=102, order_type="STP LMT",
+        limit_price=Decimal("0.70"), stop_price=Decimal("0.75"),
+    )
+    assert journal.reconcile_snapshot(replace(
+        snapshot, working_orders=(target, replace(stop, limit_price=Decimal("0.65")))
+    )) == ()
+    assert journal.reconcile_snapshot(replace(
+        snapshot, working_orders=(target, stop)
+    ))[0].state == "RECONCILED"
+    entry = journal.find(plan.fingerprint)
+    assert entry is not None
+    assert entry.layers[0].stop_order_type == "STP LMT"
+    assert entry.layers[0].stop_limit_price == "0.70"
+    assert journal.owned_perm_ids(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
+    ) == frozenset({201, 202})
+
+
+def test_active_stop_limit_pair_can_be_selected_for_cancel_but_not_price_amendment(
+    tmp_path,
+) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot, stop_order_type="STP LMT")
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(snapshot, plan)
+    journal.record_submission(
+        plan.fingerprint, order_ids=(101, 102), perm_ids=(201, 202),
+    )
+    group = f"{plan.fingerprint[:12]}/tranche-1"
+    target = WorkingOrder(
+        201, 17, 101, snapshot.selected, "SELL", "LMT", Decimal("2"),
+        "Submitted", oca_group=group, limit_price=Decimal("1.20"), tif="GTC",
+    )
+    stop = replace(
+        target, perm_id=202, order_id=102, order_type="STP LMT",
+        limit_price=Decimal("0.70"), stop_price=Decimal("0.75"),
+    )
+    active = replace(snapshot, working_orders=(target, stop))
+    service = PaperExecutionService(_RecordingTransport(), journal)
+    candidate = service.prepare_market_exit(
+        active, target_perm_id=201, expected_client_id=17,
+    )
+    assert candidate.stop_perm_id == 202
+    changed = replace(active, working_orders=(
+        target, replace(stop, limit_price=Decimal("0.65")),
+    ))
+    assert service.prepare_market_exit(
+        changed, target_perm_id=201, expected_client_id=17,
+    ) != candidate
+    with pytest.raises(ExecutionBlocked, match="active STP LMT price changes"):
+        service.prepare_price_updates(
+            active,
+            updates=(PriceUpdateCandidate(
+                layer=candidate, target_price=Decimal("1.25"),
+                prior_target_price=Decimal("1.20"),
+            ),),
+            expected_client_id=17,
+        )
+
+
+def test_stop_limit_partial_fill_remains_a_review_state() -> None:
+    entry = JournalEntry(
+        fingerprint="a" * 64, account="DU1234567", con_id=917_864_414,
+        state="RECONCILED", perm_ids=(201, 202),
+        layers=(JournalLayer(
+            quantity=2, target_price="1.20", stop_price="0.75", tif="GTC",
+            target_perm_id=201, stop_perm_id=202,
+            stop_order_type="STP LMT", stop_limit_price="0.70",
+        ),),
+        fills=(JournalFill(
+            exec_id="fill-1", perm_id=202, side="SLD", quantity="1",
+            price="0.70", time="now", realized_pnl="-5", currency="USD",
+        ),),
+    )
+    outcome = classify_journal_layer(
+        entry, 0, active_perm_ids=frozenset({201, 202}),
+        observed_perm_ids=frozenset({201, 202}),
+    )
+    assert outcome.status == "PARTIAL"
+    assert outcome.filled_quantity == Decimal("1")
 
 
 def test_unknown_submission_recovers_a_surviving_complete_pair_after_sibling_cancel(

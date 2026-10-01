@@ -2136,30 +2136,80 @@ def test_existing_tws_bracket_waits_for_add_layer_before_creating_a_draft() -> N
     assert len(workbench._current_layers()) == 1
 
 
-def test_unwired_stop_limit_choice_cannot_arm_a_stop_order() -> None:
+def test_stop_limit_choice_is_saved_but_paper_execution_stays_launch_gated() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
     workbench._build_draft_locked()
     response = TestClient(workbench.app).post(
         f"/{workbench.session_token}/action",
-        data={"action": "execute-arm", "draft_stop_type": "STP LMT"},
+        data={"action": "execute-arm", "draft_stop_type": "STP LMT", "draft_stop_limit_offset": "5", "draft_stop_limit_unit": "percent"},
     )
 
     assert response.status_code == 200
     assert workbench._armed_execution is None
-    assert "STP LMT submission is not available yet" in workbench._status_message
+    assert workbench._stop_configuration() == ("STP LMT", "5", "percent")
+    assert "Paper transmission is disabled" in workbench._status_message
 
 
-def test_unwired_global_stop_limit_default_cannot_be_saved() -> None:
+@pytest.mark.parametrize("offset", ["0", "100", "NaN", "bogus"])
+def test_stop_limit_draft_rejects_invalid_offset_before_arming(offset: str) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._build_draft_locked()
+    response = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={
+            "action": "execute-arm", "draft_stop_type": "STP LMT",
+            "draft_stop_limit_offset": offset,
+            "draft_stop_limit_unit": "percent",
+        },
+    )
+    assert response.status_code == 200
+    assert workbench._armed_execution is None
+    assert "valid stop-limit offset" in workbench._status_message
+
+
+def test_global_stop_limit_default_can_be_saved() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
     response = TestClient(workbench.app).post(
         f"/{workbench.session_token}/action",
-        data={"action": "refresh", "global_stop_type": "STP LMT"},
+        data={"action": "refresh", "global_stop_type": "STP LMT", "global_stop_limit_offset": "7.5"},
     )
 
     assert response.status_code == 200
-    assert "STP LMT defaults are not available yet" in workbench._status_message
+    assert workbench._default_stop_type == "STP LMT"
+    assert workbench._default_stop_limit_offset == "7.5"
+    assert workbench._stop_configuration() == ("STP LMT", "7.5", "percent")
+
+
+def test_active_stop_limit_layer_shows_both_prices_and_locks_price_edits() -> None:
+    from ibkr_options_manager.app.view_model import WorkingOrderLine
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._paper_execution = _OwnedOrderService({101, 102})
+    workbench._state = replace(
+        workbench._state,
+        working_orders=(
+            WorkingOrderLine(
+                perm_id=101, order_id=11, action="SELL", order_type="LMT",
+                remaining="2", status="Submitted", oca_group="owned/tranche-1",
+                limit_price=Decimal("26.20"), tif="GTC",
+            ),
+            WorkingOrderLine(
+                perm_id=102, order_id=12, action="SELL", order_type="STP LMT",
+                remaining="2", status="Submitted", oca_group="owned/tranche-1",
+                stop_price=Decimal("16.40"), limit_price=Decimal("15.55"), tif="GTC",
+            ),
+        ),
+    )
+    page = TestClient(workbench.app).get(workbench.path).text
+    assert 'data-layer-state="working"' in page
+    assert "STP return from entry" in page
+    assert 'data-active-stop-limit-price="15.55"' in page
+    stop_input = re.search(r'<input[^>]*name="active_stop_101"[^>]*>', page)
+    assert stop_input is not None and "disabled" in stop_input.group()
 
 
 def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
@@ -4316,6 +4366,56 @@ def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
     assert 'data-layer-state="verify"' in unknown.text
     assert "Outcome not confirmed" in unknown.text
     assert 'value="execute-arm"' not in unknown.text
+
+
+def test_demo_stop_limit_draft_reviews_and_journals_the_paper_pair(tmp_path) -> None:
+    def clock() -> Decimal:
+        return Decimal("100")
+
+    broker = DemoReadOnlyBroker(clock=clock, paper_execution_enabled=True)
+    from ibkr_options_manager.app.view_model import PlannerViewModel
+
+    journal = ExecutionJournal(tmp_path / "paper-journal.json")
+    workbench = StarUIWorkbench(
+        PlannerViewModel(
+            SnapshotCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock),
+            portfolio=PortfolioCoordinator(
+                broker, max_age_seconds=Decimal("15"), clock=clock,
+                paper_execution_mode=True,
+            ),
+            clock=clock,
+        ),
+        initial_account=DEMO_ACCOUNT,
+        demo_mode=True,
+        paper_execution=PaperExecutionService(DemoPaperExecutionTransport(), journal),
+    )
+    workbench.load_demo_data()
+    workbench._add_layer_locked()
+    client = TestClient(workbench.app)
+    armed = client.post(workbench.path + "action", data={
+        "action": "execute-arm", "draft_stop_type": "STP LMT",
+        "draft_stop_limit_offset": "1", "draft_stop_limit_unit": "dollars",
+    })
+    assert armed.status_code == 200
+    assert workbench._armed_execution is not None
+    pair = workbench._armed_execution.plan.pairs[0]
+    assert pair.stop.order_type == "STP LMT"
+    assert pair.stop.limit_price is not None
+    assert pair.stop.limit_price < pair.stop.rounded_price
+    assert f'data-reviewed-limit-price="{pair.stop.limit_price}"' in armed.text
+    assert "A stop-limit order may remain unfilled after its trigger." in armed.text
+    assert "Confirm (" in armed.text
+
+    submitted = client.post(workbench.path + "action", data={"action": "execute-confirm"})
+    assert submitted.status_code == 200
+    assert "Orders sent to TWS" in submitted.text
+    assert f"(LMT ${pair.stop.limit_price})" in submitted.text
+    entries = journal.submission_entries(
+        account=DEMO_ACCOUNT, con_id=workbench._selected_con_id,
+    )
+    assert len(entries) == 1
+    assert entries[0].layers[0].stop_order_type == "STP LMT"
+    assert entries[0].layers[0].stop_limit_price == str(pair.stop.limit_price)
 
 
 def test_unknown_submission_uses_guided_refresh_without_error_toast(

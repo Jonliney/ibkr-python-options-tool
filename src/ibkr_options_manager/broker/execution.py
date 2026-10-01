@@ -9,12 +9,13 @@ from time import monotonic, sleep
 from typing import Any
 from uuid import uuid4
 
-from ..domain import BrokerSnapshot, PlanResult, supports_outside_rth
+from ..domain import BrokerSnapshot, PlanResult
 from ..execution import (
     ExecutionBlocked,
     ExecutionOutcomeUnknown,
     MarketExitCandidate,
     PriceUpdateCandidate,
+    require_paper_execution_snapshot,
 )
 from ..ibkr_probe import _load_ibapi, _parse_error_arguments
 from ..price_update_trace import record_price_update_event
@@ -46,18 +47,7 @@ class IbkrPaperExecutionBroker:
         client_id: int,
         timeout_seconds: float,
     ) -> PaperSubmission:
-        if (
-            not snapshot.selected.account.upper().startswith("DU")
-            or plan.fingerprint is None
-        ):
-            raise ExecutionBlocked("a fingerprinted paper-account plan is required")
-        outside_rth = supports_outside_rth(snapshot)
-        if any(
-            pair.target.outside_rth != outside_rth
-            or pair.stop.outside_rth != outside_rth
-            for pair in plan.pairs
-        ):
-            raise ExecutionBlocked("the bracket Outside RTH setting does not match the verified contract")
+        require_paper_execution_snapshot(snapshot, plan)
         imports = _load_ibapi()
         from ibapi.order import Order
 
@@ -123,6 +113,11 @@ class IbkrPaperExecutionBroker:
                     order.transmit = transmit
                     if intent.order_type == "LMT":
                         order.lmtPrice = float(intent.rounded_price)
+                    elif intent.order_type == "STP LMT":
+                        if intent.limit_price is None:
+                            raise ExecutionBlocked("the stop-limit price is missing")
+                        order.auxPrice = float(intent.rounded_price)
+                        order.lmtPrice = float(intent.limit_price)
                     else:
                         order.auxPrice = float(intent.rounded_price)
                     order_id = app.next_order_id + len(ids)

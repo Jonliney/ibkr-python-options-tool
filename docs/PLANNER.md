@@ -21,9 +21,13 @@ A valid result contains independent target/stop pairs. Both intents in a pair:
 - display intended OCA type `2` (proportional reduction with block);
 - retain both raw and market-rule-rounded prices.
 
-Targets are sell limits and stops are sell stop triggers. Both prices round
-upward to avoid silently selecting a lower target or protective trigger. The
-rounder reselects the price band when rounding crosses a market-rule edge.
+Targets are sell limits and protective legs are sell stop or stop-limit orders.
+Targets and stop triggers round upward to avoid silently selecting a lower
+target or protective trigger. For STP LMT, the offset is applied below the
+rounded trigger and its limit price rounds downward to a verified market-rule
+increment. A nonpositive limit or one no lower than the trigger blocks the
+plan. The rounder reselects the price band when rounding crosses a market-rule
+edge.
 
 ## Allocation and remainders
 
