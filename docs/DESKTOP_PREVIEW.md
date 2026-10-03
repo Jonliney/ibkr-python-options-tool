@@ -41,6 +41,30 @@ states `SIMULATED DATA`; this mode neither connects to TWS nor sends, modifies,
 or cancels an order. Optional `--con-id` values must be one of the contracts
 present in the simulated data.
 
+With `--enable-paper-execution`, simulated acknowledgements are saved in a
+separate demo journal. Later demo snapshots reconstruct acknowledged bracket
+orders from that journal, including after a restart, so they can be verified
+and managed in the interface. To rehearse a stop amendment without TWS, run:
+
+```sh
+.venv/bin/ibkr-options-manager-gui --demo-data --enable-paper-execution --con-id 1003625093
+```
+
+Build and confirm a SPY bracket, then set its active stop return to `0%` and
+confirm the amendment. The demo acknowledges the exact amended legs and the
+next simulated read shows the new stop price. The app labels that result as
+simulated; it does not establish how TWS will acknowledge or fill the order.
+For a repeatable check with a fresh temporary demo journal, run
+`.venv/bin/python -m pytest -q tests/test_app_demo.py -k demo_weekend_stop_to_break_even_uses_acknowledged_price_update`.
+The desktop demo journal itself persists across launches, so prior order
+attempts remain visible. It is separate from paper TWS history. A one-time
+NVDA example starts with three contracts awaiting
+verification, leaving four of seven available. Confirming that its orders do
+not exist clears it permanently from the demo journal. An unresolved layer
+keeps a Verify action: finding both exact orders
+makes it active, while confirming neither exists requires a fresh, complete
+order and execution check before the reserved quantity is released.
+
 The account must use the project's `DU` paper-account allowlist convention.
 The exact ID is kept only in memory for the current process. The evidence view
 redacts it, and changing any connection-selection field immediately clears the

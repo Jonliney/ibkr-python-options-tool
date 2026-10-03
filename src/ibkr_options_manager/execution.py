@@ -353,6 +353,73 @@ class ExecutionJournal:
             None,
         )
 
+    def unresolved_management_entries(
+        self, *, account: str, con_id: int
+    ) -> tuple[JournalEntry, ...]:
+        """Return unresolved paper management attempts for one exact contract."""
+        latest: dict[str, JournalEntry] = {}
+        for entry in self._entries():
+            if (
+                entry.account == account
+                and entry.con_id == con_id
+                and entry.fingerprint.startswith((
+                    "price-update:", "market-exit:", "market-exit-many:",
+                    "cancel-bracket:",
+                ))
+            ):
+                latest[entry.fingerprint.split(":retry-", 1)[0]] = entry
+        return tuple(
+            entry for entry in latest.values()
+            if entry.state in {"PREPARED", "SUBMISSION_UNKNOWN"}
+        )
+
+    def confirm_unknown_management(
+        self, snapshot: BrokerSnapshot, fingerprint: str, *, confirmed_in_tws: bool
+    ) -> JournalEntry:
+        """Release a contract lock only after a later complete read and TWS review."""
+        if not confirmed_in_tws:
+            raise ExecutionBlocked("confirm the contract's orders and fills in TWS")
+        entries = list(self._entries())
+        unresolved = {
+            entry.fingerprint for entry in self.unresolved_management_entries(
+                account=snapshot.selected.account, con_id=snapshot.selected.con_id
+            )
+        }
+        matches = [
+            index for index, entry in enumerate(entries)
+            if entry.fingerprint == fingerprint
+            and entry.account == snapshot.selected.account
+            and entry.con_id == snapshot.selected.con_id
+            and entry.fingerprint in unresolved
+        ]
+        if len(matches) != 1:
+            raise ExecutionBlocked("the uncertain management attempt is missing or ambiguous")
+        index = matches[0]
+        entry = entries[index]
+        try:
+            later = snapshot.captured_at > Decimal(entry.snapshot_captured_at)
+        except (InvalidOperation, ValueError, ArithmeticError):
+            later = False
+        if (
+            not snapshot.connected
+            or not snapshot.paper_account_verified
+            or not snapshot.complete
+            or not snapshot.fresh
+            or not snapshot.completed_orders_complete
+            or not snapshot.executions_complete
+            or not later
+            or any(order.status != "Submitted" for order in snapshot.working_orders)
+        ):
+            raise ExecutionBlocked(
+                "a later, complete TWS read with stable working orders and fills is required"
+            )
+        updated = replace(
+            entry, state="RESOLVED", resolution_captured_at=str(snapshot.captured_at)
+        )
+        entries[index] = updated
+        self._write(tuple(entries))
+        return updated
+
     def owned_perm_ids(self, *, account: str, con_id: int) -> frozenset[int]:
         """Return permanent IDs of broker orders proven to be app-owned."""
         return frozenset(
@@ -450,6 +517,10 @@ class ExecutionJournal:
         fingerprint = plan.fingerprint
         if plan.status is not PlanStatus.VALID or fingerprint is None:
             raise ExecutionBlocked("only a valid, fingerprinted plan may be sent")
+        if self.unresolved_management_entries(
+            account=snapshot.selected.account, con_id=snapshot.selected.con_id
+        ):
+            raise ExecutionBlocked("this contract is locked by an uncertain order outcome")
         entries = list(self._entries())
         prior_index = next(
             (
@@ -826,6 +897,10 @@ class ExecutionJournal:
         """Reserve a management attempt, retaining any indeterminate predecessor."""
         if not operation or expected_order_count <= 0:
             raise ExecutionBlocked("management journal entry is incomplete")
+        if self.unresolved_management_entries(
+            account=snapshot.selected.account, con_id=snapshot.selected.con_id
+        ):
+            raise ExecutionBlocked("this contract is locked by an uncertain order outcome")
         fingerprint = self._management_fingerprint(snapshot, operation, material)
         previous = self.latest_management_attempt(
             snapshot, operation=operation, material=material
@@ -834,7 +909,7 @@ class ExecutionJournal:
             if (
                 not allow_unknown_price_retry
                 or operation != "price-update"
-                or previous.state != "SUBMISSION_UNKNOWN"
+                or previous.state != "RESOLVED"
             ):
                 raise ExecutionBlocked(
                     "this management attempt is already journaled; "
@@ -1543,6 +1618,18 @@ class PaperExecutionService:
     ) -> tuple[JournalEntry, ...]:
         """Expose durable submission attempts to the read-only UI."""
         return self._journal.submission_entries(account=account, con_id=con_id)
+
+    def unresolved_management_entries(
+        self, *, account: str, con_id: int
+    ) -> tuple[JournalEntry, ...]:
+        return self._journal.unresolved_management_entries(account=account, con_id=con_id)
+
+    def confirm_unknown_management(
+        self, snapshot: BrokerSnapshot, fingerprint: str, *, confirmed_in_tws: bool
+    ) -> JournalEntry:
+        return self._journal.confirm_unknown_management(
+            snapshot, fingerprint, confirmed_in_tws=confirmed_in_tws
+        )
 
     def prepare_market_exit(
         self,

@@ -37,6 +37,7 @@ from ibkr_options_manager.app.demo import (
     DEMO_CON_IDS,
     DemoPaperExecutionTransport,
     DemoReadOnlyBroker,
+    seed_demo_journal,
 )
 from ibkr_options_manager.app.main import build_parser, main
 from ibkr_options_manager.app.view_model import PlanForm, UiStatus, ValidationLine
@@ -108,8 +109,8 @@ def test_closed_position_remains_read_only_for_current_session() -> None:
     assert 'grid-cols-[16rem_minmax(0,1fr)_19rem]' in page
     assert "Held / total" in page
     assert "ACTION REVIEW" in page
-    assert "Execute paper order" in page
-    assert re.search(r'<button[^>]*disabled[^>]*>Execute paper order</button>', page)
+    assert "Review order" in page
+    assert re.search(r'<button[^>]*disabled[^>]*>Review order</button>', page)
     assert "data-closed-session" in page
     assert 'value="select-session-closed"' in page
     assert 'value="price-update-confirm"' not in page
@@ -249,6 +250,97 @@ def test_demo_launch_populates_the_starui_workbench_without_a_tws_refresh() -> N
     assert workbench._state.selected_con_id is not None
     assert workbench._state.quote_calculator is not None
     assert workbench._state.available_quantity == 5
+
+
+def test_existing_exit_order_explanation_opens_from_available_metric() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+
+    page = TestClient(workbench.app).get(workbench.path).text
+    assert 'aria-label="Why are fewer contracts available?"' in page
+    assert 'd="m21.73 18l-8-14' in page
+    assert 'id="existing_exit_orders"' in page
+    assert "5 contracts already have exit orders in TWS." in page
+    assert "Orders placed outside this app are view-only here." in page
+    assert page.index("Available") < page.index("Existing TWS exit orders")
+    assert page.index("Existing TWS exit orders") < page.index("Average price")
+    assert 'border-amber-500/40 bg-amber-500/10 text-amber-100' not in page
+
+    workbench._select_locked(1_002_100_161)
+    no_external_orders = TestClient(workbench.app).get(workbench.path).text
+    assert 'aria-label="Why are fewer contracts available?"' not in no_external_orders
+
+
+def test_seeded_nvda_demo_bracket_can_be_verified_absent_without_reseeding(tmp_path) -> None:
+    def clock() -> Decimal:
+        return Decimal("100")
+
+    from ibkr_options_manager.app.view_model import PlannerViewModel
+
+    path = tmp_path / "demo-execution-journal.json"
+    journal = seed_demo_journal(path)
+    broker = DemoReadOnlyBroker(clock=clock, paper_execution_enabled=True)
+    broker.use_journal(journal)
+    workbench = StarUIWorkbench(
+        PlannerViewModel(
+            SnapshotCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock),
+            portfolio=PortfolioCoordinator(
+                broker, max_age_seconds=Decimal("15"), clock=clock,
+                paper_execution_mode=True,
+            ),
+            clock=clock,
+        ),
+        initial_account=DEMO_ACCOUNT,
+        initial_con_id=1_002_100_161,
+        demo_mode=True,
+        paper_execution=PaperExecutionService(
+            DemoPaperExecutionTransport(journal), journal,
+        ),
+    )
+    workbench.load_demo_data()
+    assert workbench._selected_con_id == 1_002_100_161
+    assert workbench._planning_available_quantity() == 4
+    client = TestClient(workbench.app)
+    page = client.get(workbench.path).text
+    assert "Awaiting TWS review" in page
+    assert 'aria-label="Verify bracket status of layer 1"' in page
+    assert 'data-cancelled-bracket-recovery-dialog' not in page
+
+    entry = journal.submission_entries(
+        account=DEMO_ACCOUNT, con_id=1_002_100_161,
+    )[0]
+    resolved = client.post(workbench.path + "action", data={
+        "action": "resolve-cancelled-bracket",
+        "confirmed": "yes",
+        "fingerprint": entry.fingerprint,
+    })
+    assert resolved.status_code == 200
+    assert journal.find(entry.fingerprint).state == "CANCELLED_CONFIRMED"
+    assert workbench._planning_available_quantity() == 7
+    seed_demo_journal(path)
+    assert journal.submission_entries(
+        account=DEMO_ACCOUNT, con_id=1_002_100_161,
+    ) == ()
+
+
+def test_nvda_verification_example_is_added_once_to_existing_demo_journal(tmp_path) -> None:
+    path = tmp_path / "demo-execution-journal.json"
+    journal = ExecutionJournal(path)
+    existing = JournalEntry(
+        fingerprint="a" * 64, account=DEMO_ACCOUNT, con_id=1_004_470_201,
+        state="CANCELLED_CONFIRMED",
+    )
+    journal._write((existing,))
+
+    seed_demo_journal(path)
+    first = journal._entries()
+    assert len(first) == 2
+    assert first[0] == existing
+    assert first[1].con_id == 1_002_100_161
+    assert first[1].layers[0].quantity == 3
+
+    seed_demo_journal(path)
+    assert journal._entries() == first
 
 
 def test_observed_new_position_updates_sidebar_without_changing_selection() -> None:
@@ -590,7 +682,7 @@ def test_unverified_projection_shows_layer_estimate_without_enabling_review() ->
 
     assert config["unresolved"] is True
     assert outcome.expected_gain is None
-    assert "Estimate from shown layers. Refresh TWS before reviewing an order." in page
+    assert "Estimate from shown layers. Refresh TWS before reviewing an order." not in page
     assert "Expected gain" in page
     assert "Max loss" in page
     assert "Estimated gain" not in page
@@ -726,7 +818,7 @@ def test_verified_empty_portfolio_shows_refresh_guidance_without_order_review() 
     assert 'data-empty-positions' in page
     assert "ACTION REVIEW" not in page
     assert "LONG POSITIONS" not in page
-    assert "Execute paper order" not in page
+    assert "Review order" not in page
 
 
 def test_unverified_empty_portfolio_does_not_claim_no_positions() -> None:
@@ -757,8 +849,10 @@ def test_selected_contract_header_uses_verified_position_and_quote_values() -> N
     assert "5 contracts already have exit orders in TWS." in page
     assert "5 remain available for new brackets." in page
     assert "Orders placed outside this app are view-only here." in page
-    assert page.index("Realised P&amp;L") < page.index("Existing TWS exit orders")
-    assert page.index("Existing TWS exit orders") < page.index("DRAFT 1")
+    assert 'aria-label="Why are fewer contracts available?"' in page
+    assert 'id="existing_exit_orders"' in page
+    assert page.index("Available") < page.index("Existing TWS exit orders")
+    assert page.index("Existing TWS exit orders") < page.index("Average price")
     assert "Expected gain" in page
     assert "Max loss" in page
     assert "+$280.00" in page
@@ -1296,7 +1390,7 @@ def test_quote_movement_without_new_sell_risk_still_sends_amendment(
     assert sent == [update]
     assert workbench._toast is not None
     assert workbench._toast.variant == "success"
-    assert workbench._toast.title == "Price update acknowledged by TWS"
+    assert workbench._toast.title == "Simulated price update acknowledged"
     assert ("Refresh before another order change" in workbench._toast.description) is not refreshed
 
 
@@ -1330,7 +1424,7 @@ def test_immediate_price_update_fill_records_edited_values(monkeypatch) -> None:
             return updates
 
         def modify_prices(self, *_args, **_kwargs):
-            raise ExecutionBlocked("IBKR error code=202: Order Canceled")
+            raise ExecutionOutcomeUnknown("IBKR error code=202: Order Canceled")
 
         def record_verified_price_updates(self, _snapshot, updates, percentages):
             recorded.append((updates, percentages))
@@ -1347,9 +1441,10 @@ def test_immediate_price_update_fill_records_edited_values(monkeypatch) -> None:
 
     workbench._confirm_price_updates_locked({})
 
-    assert recorded == [((update,), {201: ("2", "-25")})]
-    assert workbench._toast is not None
-    assert workbench._toast.title == "Exit filled in TWS"
+    assert recorded == [((update,), {201: ("2", "-25")})], (
+        workbench._message, workbench._toast
+    )
+    assert workbench._toast is None
 
 
 @pytest.mark.parametrize(
@@ -1649,8 +1744,16 @@ def test_manual_tws_confirmation_clears_unknown_only_after_fresh_api_check(
         workbench.path
     ).text
     workbench._toast = None
-    recovery_page = client.get(workbench.path).text
-    assert "Verify cancellation" in recovery_page
+    assert 'data-cancelled-bracket-recovery-dialog' not in client.get(
+        workbench.path
+    ).text
+    recovery_page = client.post(
+        workbench.path + "action",
+        data={"action": f"verify-cancelled-bracket:{fingerprint}"},
+    ).text
+    assert "Refresh layers" in recovery_page
+    assert "Clear unverified bracket" in recovery_page
+    assert 'name="confirmed"' in recovery_page
     assert 'id="cancelled_bracket_recovery"' in recovery_page
     assert 'required' in recovery_page
     assert f"{fingerprint[:12]}/tranche-1" in recovery_page
@@ -1686,8 +1789,8 @@ def test_manual_tws_confirmation_clears_unknown_only_after_fresh_api_check(
     )
 
     assert response.status_code == 200
-    assert "Cancelled bracket cleared" in response.text
-    assert "Verify cancellation" not in response.text
+    assert "Cancelled bracket cleared" not in response.text
+    assert "Clear unverified bracket" not in response.text
     assert journal.find(fingerprint).state == "CANCELLED_CONFIRMED"
 
 
@@ -1722,8 +1825,9 @@ def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
 
     assert "No fill evidence" in page
     assert 'value="verify-cancelled-bracket:' + fingerprint + '"' in page
-    assert 'aria-label="Verify cancellation of layer 1 in TWS"' in page
-    assert ">Verify</button>" not in page
+    assert 'aria-label="Verify bracket status of layer 1"' in page
+    assert 'verify-layer-button' not in page
+    assert 'grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem]' in page
     assert 'data-cancelled-bracket-recovery-dialog' not in page
     # A blocked plan refresh may clear the view model's snapshot. The explicit
     # Verify action must still open; confirmation obtains a new TWS read.
@@ -1732,7 +1836,7 @@ def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
         workbench.path + "action",
         data={"action": "verify-cancelled-bracket:" + fingerprint},
     )
-    assert "Verify cancellation" in requested.text
+    assert "Clear unverified bracket" in requested.text
     assert 'data-cancelled-bracket-recovery-dialog' in requested.text
     clean = replace(
         snapshot, captured_at=Decimal("101"),
@@ -1755,7 +1859,7 @@ def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
             "fingerprint": fingerprint,
         },
     )
-    assert "Cancelled bracket cleared" in resolved_page.text
+    assert "Cancelled bracket cleared" not in resolved_page.text
     assert journal.find(fingerprint).state == "CANCELLED_CONFIRMED"
 
 
@@ -2334,7 +2438,8 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert 'data-draft-review-stop-limit-row="1"' in page.text
     assert 'data-live-review-price="stop-limit-1"' in page.text
     assert "SELL STP LMT" in page.text
-    assert "STP SELL" in page.text
+    assert "STP SELL" not in page.text
+    assert "SELL STP" in page.text
     assert "STP loss (with LMT)" not in page.text
     assert "stop-limit-settings-change" in page.text
     assert "The limit is rounded down to a valid price increment" not in page.text
@@ -3144,7 +3249,7 @@ def test_price_update_confirmation_uses_the_shared_cancel_confirm_bar() -> None:
     )
 
     assert 'value="price-update-confirm"' in sidebar
-    assert "Quote status: frozen" in sidebar
+    assert "Quote status:" not in sidebar
     assert ">Cancel<" in sidebar
     assert ">Confirm<" in sidebar
     assert "Click to confirm" not in sidebar
@@ -3263,7 +3368,13 @@ def test_stop_above_latest_bid_warns_before_price_update_and_quote_change_rearms
     )
     impact = _price_update_impact(risky, updates)
     assert impact.title == "Possible immediate sell"
-    assert "SELL STP $10.10 is at or above the current bid $9.70" in impact.details[0]
+    assert impact.details == ((
+        "Confirming may cause one or more of these sell orders to execute soon "
+        "and close their OCA brackets. A stop does not guarantee its fill price."
+    ),)
+    frozen = replace(risky, quote=replace(risky.quote, market_data_type="FROZEN"))
+    frozen_impact = _price_update_impact(frozen, updates)
+    assert frozen_impact.details == impact.details
 
     workbench._paper_execution = object()  # type: ignore[assignment]
     workbench._armed_price_updates = updates
@@ -3302,7 +3413,19 @@ def test_stop_above_bid_warns_even_when_below_ask() -> None:
     )
 
     assert impact.title == "Possible immediate sell"
-    assert "SELL STP $20.80 is at or above the current bid $14.30" in impact.details[0]
+    assert len(impact.details) == 1
+    assert "Confirming may cause one or more" in impact.details[0]
+
+    layers = tuple(
+        PriceUpdateCandidate(
+            layer=replace(layer, target_perm_id=101 + index, stop_perm_id=201 + index),
+            stop_price=Decimal("20.80"),
+        )
+        for index in range(4)
+    )
+    multi_layer_impact = _price_update_impact(replace(snapshot, quote=quote), layers)
+    assert multi_layer_impact.details == impact.details
+    assert len(multi_layer_impact.concerns) == 4
 
 
 @pytest.mark.parametrize("safe_quote", [False, True])
@@ -3516,6 +3639,44 @@ def test_arming_price_update_preserves_edited_percentage_in_active_input(
     workbench._view_model.select_position = lambda *_args: workbench._state  # type: ignore[method-assign]
     workbench._view_model.latest_snapshot = lambda: active_snapshot  # type: ignore[method-assign]
 
+    if prior_unknown:
+        restarted_journal = ExecutionJournal(tmp_path / "journal.json")
+        assert restarted_journal.unresolved_management_entries(
+            account=snapshot.selected.account, con_id=snapshot.selected.con_id
+        )
+        workbench._paper_execution = PaperExecutionService(writer, restarted_journal)
+        locked = TestClient(workbench.app).get(workbench.path).text
+        assert 'data-contract-lockdown' in locked
+        assert re.search(r'<fieldset[^>]*disabled', locked)
+        assert "Order changes locked" in locked
+        for action in ("active-update-arm", "cancel-pair-arm:201", "execute-arm", "add-layer"):
+            blocked = TestClient(workbench.app).post(
+                workbench.path + "action",
+                data={
+                    "action": action,
+                    "active_target_201": "30",
+                    "active_stop_201": "-25",
+                },
+            )
+            assert not workbench._armed_price_updates
+            assert "locked" in blocked.text.lower()
+        unconfirmed = TestClient(workbench.app).post(
+            workbench.path + "action",
+            data={"action": "verify-management", "fingerprint": prior_entry.fingerprint},
+        )
+        assert 'data-contract-lockdown' in unconfirmed.text
+        verified = TestClient(workbench.app).post(
+            workbench.path + "action",
+            data={
+                "action": "verify-management",
+                "fingerprint": prior_entry.fingerprint,
+                "confirmed": "yes",
+            },
+        )
+        assert "Order status verified" not in verified.text
+        assert 'data-contract-lockdown' not in verified.text
+        assert journal.find(prior_entry.fingerprint).state == "RESOLVED"
+
     page = TestClient(workbench.app).post(
         workbench.path + "action",
         data={
@@ -3551,10 +3712,10 @@ def test_arming_price_update_preserves_edited_percentage_in_active_input(
 
     assert writer.prices == [Decimal("31.50")]
     assert workbench._status_message.startswith(
-        "TWS acknowledged 1 app-owned OCA price amendment"
+        "Simulated broker acknowledged 1 app-owned OCA price amendment"
     ), workbench._status_message
     assert workbench._toast_revision > arm_toast_revision
-    assert "Price update acknowledged by TWS" in confirmed.text
+    assert "Simulated price update acknowledged" in confirmed.text
     source = journal.find(fingerprint)
     assert source is not None
     assert source.layers[0].target_percentage == "30"
@@ -3622,6 +3783,7 @@ def test_close_all_review_lists_pair_cancellations_then_one_market_order() -> No
     assert proposed.expected_gain == baseline.expected_gain
     assert proposed.max_loss == baseline.max_loss
     assert 'value="active-action-execute"' in sidebar
+    assert ">Review market sell</button>" in sidebar
     assert ">Confirm<" not in sidebar
     assert ">Cancel changes<" in sidebar
     assert "Wait for both cancellation confirmations" not in sidebar
@@ -3664,6 +3826,7 @@ def test_delete_active_layer_review_cancels_only_that_oca_bracket() -> None:
     assert "example/tranche-1" in sidebar
     assert "SELL MKT" not in sidebar
     assert 'value="active-action-execute"' in sidebar
+    assert ">Review cancellation</button>" in sidebar
     assert "Review the action above" not in sidebar
     assert ">Confirm<" not in sidebar
     assert ">Cancel changes<" in sidebar
@@ -3837,7 +4000,10 @@ def test_active_action_reviews_before_refresh_and_requires_execute(
     review = client.post(workbench.path + "action", data={"action": review_action})
     assert refreshes == []
     assert workbench._toast is None
-    assert "Review cancellation" not in review.text
+    assert (
+        "Review cancellation" if review_action.startswith("cancel-")
+        else "Review market sell"
+    ) in review.text
     assert 'value="active-action-execute"' in review.text
     assert "Cancel changes" in review.text
     assert "Review the action above" not in review.text
@@ -4071,7 +4237,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     )[0]
     action_panel = page.text.split('aria-label="Planned order actions"', maxsplit=1)[1]
     assert action_panel.index("Outcome projection") < action_panel.index(
-        "Execute paper order"
+        "Review order"
     )
     assert "data-outcome-projection" in action_panel
     assert "Expected gain" in action_panel
@@ -4095,7 +4261,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert 'form="draft-form" name="action" value="add-layer"' in header
     assert 'id="split-all-submit"' in draft
     assert 'id="split-assigned-submit"' in draft
-    assert "Execute paper order" not in draft
+    assert "Review order" not in draft
     assert 'name="action" value="save-draft"' not in draft
     assert "font-mono" not in draft
     assert "text-xs font-semibold text-foreground" in draft
@@ -4403,7 +4569,20 @@ def test_demo_stop_limit_draft_reviews_and_journals_the_paper_pair(tmp_path) -> 
     assert pair.stop.limit_price is not None
     assert pair.stop.limit_price < pair.stop.rounded_price
     assert f'data-reviewed-limit-price="{pair.stop.limit_price}"' in armed.text
-    assert "A stop-limit order may remain unfilled after its trigger." in armed.text
+    assert "Your stop may not sell the option" in armed.text
+    assert "you may still own the option and lose more than shown above" in armed.text
+    warning_match = re.search(
+        r'<div[^>]*data-stop-limit-warning[^>]*>.*?data-slot="alert-description"',
+        armed.text,
+        re.S,
+    )
+    assert warning_match is not None
+    warning = warning_match.group()
+    assert "border-amber-500/40 bg-amber-500/10 text-amber-100" in warning
+    assert "<svg" not in warning
+    assert armed.text.index("Outcome projection") < armed.text.index(
+        "Your stop may not sell the option"
+    ) < armed.text.index("Confirm (")
     assert "Confirm (" in armed.text
 
     submitted = client.post(workbench.path + "action", data={"action": "execute-confirm"})
@@ -4416,6 +4595,315 @@ def test_demo_stop_limit_draft_reviews_and_journals_the_paper_pair(tmp_path) -> 
     assert len(entries) == 1
     assert entries[0].layers[0].stop_order_type == "STP LMT"
     assert entries[0].layers[0].stop_limit_price == str(pair.stop.limit_price)
+
+
+def test_demo_weekend_stop_to_break_even_uses_acknowledged_price_update(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "IBKR_OPTIONS_MANAGER_PRICE_TRACE", str(tmp_path / "price-amendments.jsonl")
+    )
+    now = [Decimal("100")]
+
+    def clock() -> Decimal:
+        return now[0]
+
+    from ibkr_options_manager.app.view_model import PlannerViewModel
+
+    journal = ExecutionJournal(tmp_path / "demo-execution-journal.json")
+    broker = DemoReadOnlyBroker(clock=clock, paper_execution_enabled=True)
+    broker.use_journal(journal)
+    workbench = StarUIWorkbench(
+        PlannerViewModel(
+            SnapshotCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock),
+            portfolio=PortfolioCoordinator(
+                broker, max_age_seconds=Decimal("15"), clock=clock,
+                paper_execution_mode=True,
+            ),
+            clock=clock,
+        ),
+        initial_account=DEMO_ACCOUNT,
+        demo_mode=True,
+        paper_execution=PaperExecutionService(DemoPaperExecutionTransport(journal), journal),
+    )
+    workbench.load_demo_data()
+    workbench._select_locked(1_003_625_093)  # SPY has a frozen bid below break-even.
+    workbench._add_layer_locked()
+    client = TestClient(workbench.app)
+    assert "Confirm (" in client.post(
+        workbench.path + "action", data={"action": "execute-arm"}
+    ).text
+    assert "Orders sent to TWS" in client.post(
+        workbench.path + "action", data={"action": "execute-confirm"}
+    ).text, (workbench._message, workbench._status_message, workbench._current_layers())
+    pairs = workbench._active_oca_pairs()
+    assert len(pairs) == 1
+    _group, target, stop = pairs[0]
+    assert stop.stop_price is not None
+    armed = client.post(workbench.path + "action", data={
+        "action": "active-update-arm",
+        f"active_target_{target.perm_id}": "20",
+        f"active_stop_{target.perm_id}": "0",
+    })
+    assert "Confirm (" in armed.text
+    confirmed = client.post(workbench.path + "action", data={
+        "action": "price-update-confirm",
+    })
+    assert "Simulated price update acknowledged" in confirmed.text, (
+        workbench._message, workbench._status_message, workbench._toast
+    )
+    assert "Order status is uncertain" not in confirmed.text
+    assert workbench._active_oca_pairs()[0][2].stop_price == Decimal("1.85")
+    assert not journal.unresolved_management_entries(
+        account=DEMO_ACCOUNT, con_id=1_003_625_093,
+    )
+
+    # Missing transport capability is a preflight block, never an uncertain send.
+    workbench._paper_execution = PaperExecutionService(object(), journal)
+    assert "Confirm (" in client.post(workbench.path + "action", data={
+        "action": "active-update-arm",
+        f"active_target_{target.perm_id}": "20",
+        f"active_stop_{target.perm_id}": "-20",
+    }).text
+    unsupported = client.post(workbench.path + "action", data={
+        "action": "price-update-confirm",
+    })
+    assert unsupported.status_code == 200
+    assert workbench._toast is not None
+    assert workbench._toast.title == "Couldn't change prices"
+    assert "Price update blocked" in workbench._message
+    assert not journal.unresolved_management_entries(
+        account=DEMO_ACCOUNT, con_id=1_003_625_093,
+    )
+
+    class LostAcknowledgement(DemoPaperExecutionTransport):
+        def modify_prices(self, *_args, **_kwargs):
+            raise ExecutionOutcomeUnknown("simulated acknowledgement lost")
+
+    workbench._paper_execution = PaperExecutionService(
+        LostAcknowledgement(journal), journal
+    )
+    assert "Confirm (" in client.post(workbench.path + "action", data={
+        "action": "active-update-arm",
+        f"active_target_{target.perm_id}": "20",
+        f"active_stop_{target.perm_id}": "-20",
+    }).text
+    uncertain = client.post(workbench.path + "action", data={
+        "action": "price-update-confirm",
+    })
+    assert workbench._toast is not None
+    assert workbench._toast.title == "Order status is uncertain"
+    assert 'data-contract-lockdown' in uncertain.text
+    assert journal.unresolved_management_entries(
+        account=DEMO_ACCOUNT, con_id=1_003_625_093,
+    )
+    blocked = client.post(workbench.path + "action", data={
+        "action": "active-update-arm",
+        f"active_target_{target.perm_id}": "20",
+        f"active_stop_{target.perm_id}": "-25",
+    })
+    assert "contract is locked" in workbench._message.lower()
+    assert 'data-contract-lockdown' in blocked.text
+    now[0] = Decimal("101")
+    pending = journal.unresolved_management_entries(
+        account=DEMO_ACCOUNT, con_id=1_003_625_093,
+    )[0]
+    verified = client.post(workbench.path + "action", data={
+        "action": "verify-management",
+        "fingerprint": pending.fingerprint,
+        "confirmed": "yes",
+    })
+    assert 'data-contract-lockdown' not in verified.text
+    assert journal.find(pending.fingerprint).state == "RESOLVED"
+
+
+def test_demo_acknowledged_bracket_reappears_as_active_after_refresh_and_restart(tmp_path) -> None:
+    def clock() -> Decimal:
+        return Decimal("100")
+
+    from ibkr_options_manager.app.view_model import PlannerViewModel
+
+    journal_path = tmp_path / "paper-journal.json"
+    journal = ExecutionJournal(journal_path)
+    broker = DemoReadOnlyBroker(clock=clock, paper_execution_enabled=True)
+    broker.use_journal(journal)
+
+    def workbench_for(source: DemoReadOnlyBroker, record: ExecutionJournal) -> StarUIWorkbench:
+        return StarUIWorkbench(
+            PlannerViewModel(
+                SnapshotCoordinator(source, max_age_seconds=Decimal("15"), clock=clock),
+                portfolio=PortfolioCoordinator(
+                    source, max_age_seconds=Decimal("15"), clock=clock,
+                    paper_execution_mode=True,
+                ),
+                clock=clock,
+            ),
+            initial_account=DEMO_ACCOUNT,
+            demo_mode=True,
+            paper_execution=PaperExecutionService(
+                DemoPaperExecutionTransport(record), record,
+            ),
+        )
+
+    workbench = workbench_for(broker, journal)
+    workbench.load_demo_data()
+    workbench._add_layer_locked()
+    client = TestClient(workbench.app)
+    assert "Confirm (" in client.post(
+        workbench.path + "action", data={
+            "action": "execute-arm", "draft_stop_type": "STP LMT",
+            "draft_stop_limit_offset": "5", "draft_stop_limit_unit": "percent",
+        }
+    ).text
+    submitted = client.post(
+        workbench.path + "action", data={"action": "execute-confirm"}
+    )
+    assert "Orders sent to TWS" in submitted.text
+    selected = workbench._selected_con_id
+    assert selected is not None
+    entry = journal.submission_entries(account=DEMO_ACCOUNT, con_id=selected)[0]
+    assert len(entry.perm_ids) == 2
+    assert entry.layers[0].stop_order_type == "STP LMT"
+    refreshed_page = client.post(
+        workbench.path + "action", data={"action": "refresh"}
+    ).text
+    assert 'data-layer-state="working"' in refreshed_page, (
+        workbench._state.status,
+        workbench._message, workbench._status_message,
+        [(e.state, e.perm_ids) for e in journal.submission_entries(account=DEMO_ACCOUNT, con_id=selected)],
+    )
+
+    restarted_journal = ExecutionJournal(journal_path)
+    restarted_broker = DemoReadOnlyBroker(clock=clock, paper_execution_enabled=True)
+    restarted_broker.use_journal(restarted_journal)
+    restarted = workbench_for(restarted_broker, restarted_journal)
+    restarted.load_demo_data()
+    assert 'data-layer-state="working"' in TestClient(restarted.app).get(
+        restarted.path
+    ).text
+
+
+def test_pending_bracket_verify_button_stays_available_and_requires_broker_evidence(
+    tmp_path, monkeypatch,
+) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    fingerprint = "d" * 64
+    journal = ExecutionJournal(tmp_path / "paper-journal.json")
+    journal._write((JournalEntry(
+        fingerprint=fingerprint,
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        state="SUBMITTED",
+        expected_order_count=2,
+        order_ids=(101, 102),
+        perm_ids=(201, 202),
+        snapshot_captured_at="99",
+        layers=(JournalLayer(
+            quantity=2, target_price="1.20", stop_price="0.75", tif="GTC",
+            target_perm_id=201, stop_perm_id=202,
+        ),),
+    ),))
+    workbench._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(), journal,
+    )
+    client = TestClient(workbench.app)
+    page = client.get(workbench.path).text
+    assert 'value="verify-cancelled-bracket:' + fingerprint + '"' in page
+    dialog = client.post(workbench.path + "action", data={
+        "action": "verify-cancelled-bracket:" + fingerprint,
+    }).text
+    assert "Refresh layers" in dialog
+    assert "Clear unverified bracket" in dialog
+    assert 'name="verification_choice"' not in dialog
+    assert 'name="confirmed"' in dialog
+    assert 'data-slot="checkbox"' in dialog
+    assert 'id="bracket-refresh-form"' in dialog
+    assert 'form="bracket-clear-form"' in dialog
+    clear_button = re.search(r'<button[^>]*form="bracket-clear-form"[^>]*>', dialog)
+    assert clear_button is not None
+    assert "disabled" in clear_button.group()
+    assert 'data-attr:disabled="!($bracket_absence_confirmed)"' in clear_button.group()
+    assert "If either order filled, refresh to recover the execution" in dialog
+    assert 'flex w-full flex-wrap items-center justify-between gap-3' in dialog
+    assert 'aria-label="Close"' in dialog
+    assert ">Cancel</button>" in dialog
+    no_choice = client.post(workbench.path + "action", data={
+        "action": "resolve-cancelled-bracket", "fingerprint": fingerprint,
+    }).text
+    assert "Confirm neither bracket leg is working or filled in TWS first" in no_choice
+    assert journal.find(fingerprint).state == "SUBMITTED"
+
+    def unchanged(*_args):
+        workbench._view_model._latest_snapshot = snapshot
+        return workbench._state
+
+    monkeypatch.setattr(workbench._view_model, "select_position", unchanged)
+    still_pending = client.post(workbench.path + "action", data={
+        "action": "verify-bracket-exists", "fingerprint": fingerprint,
+    }).text
+    assert "Bracket not verified" in still_pending
+    assert journal.find(fingerprint).state == "SUBMITTED"
+
+    matched = replace(snapshot, captured_at=Decimal("101"), working_orders=(
+        WorkingOrder(
+            perm_id=201, client_id=17, order_id=101, key=snapshot.selected,
+            action="SELL", order_type="LMT", remaining=Decimal("2"),
+            status="Submitted", oca_group=f"{fingerprint[:12]}/tranche-1",
+            limit_price=Decimal("1.20"), tif="GTC",
+        ),
+        WorkingOrder(
+            perm_id=202, client_id=17, order_id=102, key=snapshot.selected,
+            action="SELL", order_type="STP", remaining=Decimal("2"),
+            status="Submitted", oca_group=f"{fingerprint[:12]}/tranche-1",
+            stop_price=Decimal("0.75"), tif="GTC",
+        ),
+    ))
+
+    from ibkr_options_manager.app.view_model import WorkingOrderLine
+
+    def matching(*_args):
+        workbench._view_model._latest_snapshot = matched
+        return replace(workbench._state, working_orders=tuple(
+            WorkingOrderLine(
+                perm_id=order.perm_id, action=order.action,
+                order_type=order.order_type, remaining="2", status=order.status,
+                order_id=order.order_id, oca_group=order.oca_group,
+                limit_price=order.limit_price, stop_price=order.stop_price,
+                tif=order.tif,
+            ) for order in matched.working_orders
+        ))
+
+    monkeypatch.setattr(workbench._view_model, "select_position", matching)
+    verified = client.post(workbench.path + "action", data={
+        "action": "verify-bracket-exists", "fingerprint": fingerprint,
+    }).text
+    assert "Bracket verified" not in verified, (
+        workbench._message, workbench._status_message,
+        journal.find(fingerprint).state,
+        [(outcome.status) for _entry, _index, outcome in workbench._submission_outcomes()],
+    )
+    assert journal.find(fingerprint).state == "RECONCILED"
+
+    entry = journal.find(fingerprint)
+    assert entry is not None
+    journal._write((replace(entry, fills=(
+        JournalFill("filled.01", 201, "SLD", "2", "1.20", "now", "40", "USD"),
+    )),))
+    filled_snapshot = replace(matched, captured_at=Decimal("102"), working_orders=())
+
+    def filled(*_args):
+        workbench._view_model._latest_snapshot = filled_snapshot
+        return replace(workbench._state, working_orders=())
+
+    monkeypatch.setattr(workbench._view_model, "select_position", filled)
+    filled_page = client.post(workbench.path + "action", data={
+        "action": "verify-bracket-exists", "fingerprint": fingerprint,
+    }).text
+    assert "Bracket status updated" not in filled_page
+    assert workbench._recovery_requested_fingerprint is None
 
 
 def test_unknown_submission_uses_guided_refresh_without_error_toast(
@@ -4701,10 +5189,10 @@ def test_embedded_webview_regresses_settings_refresh_add_and_execute_controls(
                 return
             result["add_layer"] = True
             phase = 2
-            click_button("Execute paper order")
+            click_button("Review order")
         elif phase == 2:
             if "Confirm" not in body:
-                finish("Execute paper order did not arm its confirmation")
+                finish("Review order did not arm its confirmation")
                 return
             phase = 3
             click_button("Confirm")

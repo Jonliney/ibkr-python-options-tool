@@ -3,6 +3,14 @@
 This is an explicit, paper-only milestone. It is enabled only with
 `--enable-paper-execution`; the default desktop launch remains read-only.
 
+`--demo-data --enable-paper-execution` runs a local, socket-free rehearsal on
+weekends. Its synthetic transport acknowledges bracket submissions and exact
+price amendments, and later demo reads show the amended order prices from the
+separate demo journal. The server still runs the normal review, journal, and
+contract-lock checks. A deterministic lost-acknowledgement test covers the
+uncertain-outcome lock. Demo acknowledgements do not establish how paper TWS
+or live TWS will respond to an order or precaution.
+
 ## Execution contract
 
 The persistent position subscriber supplies change hints and connection
@@ -17,7 +25,7 @@ sell one layer, or sell all
 active layers) first builds its Action review from the selected position's
 already displayed snapshot. It does not contact TWS again or permit a write.
 Changing active target/stop prices, including Move to B/E, likewise updates the
-review before another broker read. **Execute paper order** then requests a fresh
+review before another broker read. The **Review cancellation** or **Review market sell** button then requests a fresh
 snapshot and verifies the reviewed account, contract, app-owned order IDs,
 quantities, prices, and OCA pairs. Only a matching result exposes **Confirm**.
 Confirmation requests another fresh snapshot before any paper write. A changed
@@ -122,6 +130,14 @@ behavior.
 After a submission receives complete API acknowledgements, the workbench shows
 an **Orders sent to TWS** toast and journal-backed **Pending TWS verification**
 rows until a fresh snapshot verifies the orders as working.
+Every unresolved row offers **Verify**. **Refresh layers** requests a fresh
+broker read and updates the row only when the exact app-owned OCA pair or a
+matching completed fill is observed. **Clear unverified bracket** stays disabled
+until the operator confirms that neither leg is working and neither filled.
+Clearing also requires a later, complete order and execution read with no
+matching working leg or possible fill. A fill must be recovered as an execution;
+if it cannot be recovered, the row stays unverified for investigation in TWS.
+The operator's statement alone is never broker evidence.
 These rows show the recorded plan, not permission to modify the orders. A
 timeout or incomplete acknowledgement is labelled **Outcome not confirmed**;
 the UI does not claim that TWS accepted those orders. Another submission is
@@ -213,13 +229,17 @@ an immediate-sell concern not shown during review, no amendment is sent until
 the operator reviews the new warning and confirms again.
 
 If an earlier price amendment is journaled with an unknown outcome, the app
-requires a later fresh snapshot showing the same app-owned orders at their old
-prices. The operator must also inspect TWS and explicitly confirm that no
-amendment is waiting for Transmit. Only then can a new, separately journaled
-price-only attempt be sent. The uncertain attempt remains in the audit trail;
-other management operations remain non-retryable. If the broker snapshot has
-changed or cannot be established as later than the unknown attempt, the app
-blocks the recovery.
+locks order and draft changes for that account and contract, including after
+a restart. The operator may refresh or select another contract. To release the
+lock, the operator must inspect the orders and fills in TWS, confirm no change
+is awaiting Transmit, and obtain a later, complete broker read with stable
+working orders and complete order and execution evidence. That manual
+verification is recorded in the journal; it does not claim the amendment
+succeeded. Retrying the exact price change still requires a fresh snapshot
+showing the same app-owned orders at their old prices and a separate explicit
+confirmation. A changed or incomplete snapshot blocks the retry. Unknown
+cancellation and market-exit outcomes use the same contract lock and TWS
+verification gate; their attempts remain non-retryable.
 
 Each price-update confirmation writes a local JSON Lines trace to
 `~/Library/Application Support/IBKR Options Manager/logs/price-amendments.jsonl`
@@ -288,7 +308,7 @@ still reserves its quantity until verified. An explicit **Verify** click opens
 the dialog even if a malformed order group made the last planning snapshot
 unavailable; opening the dialog does not clear the journal or authorize an
 order. The
-operator must first confirm in TWS that both LMT and STP are gone. The app then
+operator must first confirm in TWS that neither leg is working or filled. The app then
 takes a fresh selected-contract snapshot and requires complete current and
 completed order reads, complete execution history, no matching working leg or
 execution, no conflicting completed status, and enough held quantity for the

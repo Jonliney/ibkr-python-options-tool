@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
+from hashlib import sha256
+from pathlib import Path
 
 from ..broker import (
     REQUIRED_COMPLETIONS,
@@ -24,7 +26,13 @@ from ..broker import (
 )
 from ..broker.execution import PaperSubmission
 from ..domain import BrokerSnapshot, PlanResult, PriceBand
-from ..execution import MarketExitCandidate
+from ..execution import (
+    ExecutionJournal,
+    JournalEntry,
+    JournalLayer,
+    MarketExitCandidate,
+    PriceUpdateCandidate,
+)
 from ..snapshot import SnapshotCoordinator, SnapshotResult
 
 DEMO_ACCOUNT = "DU0000000"
@@ -117,6 +125,31 @@ _POSITIONS = (
 DEMO_CON_IDS = frozenset(position.contract.con_id for position in _POSITIONS)
 
 
+def seed_demo_journal(path: Path) -> ExecutionJournal:
+    """Add the missing-order example once, preserving later user resolution."""
+    journal = ExecutionJournal(path)
+    fingerprint = sha256(b"demo-nvda-unverified-bracket-v1").hexdigest()
+    if journal.find(fingerprint) is None:
+        journal._write((*journal._entries(), JournalEntry(
+            fingerprint=fingerprint,
+            account=DEMO_ACCOUNT,
+            con_id=1_002_100_161,
+            state="SUBMISSION_UNKNOWN",
+            expected_order_count=2,
+            snapshot_captured_at="0",
+            oca_prefix="demo-nvda-unverified",
+            layers=(JournalLayer(
+                quantity=3,
+                target_price="8.40",
+                stop_price="3.15",
+                tif="GTC",
+                target_percentage="100",
+                stop_percentage="25",
+            ),),
+        )))
+    return journal
+
+
 class DemoReadOnlyBroker:
     """A fresh, coherent demo capture for every read-only refresh request."""
 
@@ -128,6 +161,58 @@ class DemoReadOnlyBroker:
     ) -> None:
         self._clock = clock
         self._paper_execution_enabled = paper_execution_enabled
+        self._journal: ExecutionJournal | None = None
+
+    def use_journal(self, journal: ExecutionJournal) -> None:
+        """Expose acknowledged demo brackets in subsequent simulated reads."""
+        self._journal = journal
+
+    def _journal_orders(self, account: str) -> tuple[CapturedOrder, ...]:
+        if self._journal is None:
+            return ()
+        orders: list[CapturedOrder] = []
+        for position in _POSITIONS:
+            for entry in self._journal.submission_entries(
+                account=account, con_id=position.contract.con_id
+            ):
+                if (
+                    entry.state not in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"}
+                    or len(entry.order_ids) != len(entry.layers) * 2
+                    or len(entry.perm_ids) != len(entry.order_ids)
+                    or any(value <= 0 for value in (*entry.order_ids, *entry.perm_ids))
+                    or len(set(entry.order_ids)) != len(entry.order_ids)
+                    or len(set(entry.perm_ids)) != len(entry.perm_ids)
+                ):
+                    continue
+                for index, layer in enumerate(entry.layers):
+                    if layer.cancelled:
+                        continue
+                    group = f"{entry.oca_prefix or entry.fingerprint[:12]}/tranche-{index + 1}"
+                    for leg, order_type, price in (
+                        (0, "LMT", Decimal(layer.target_price)),
+                        (1, layer.stop_order_type, Decimal(layer.stop_price)),
+                    ):
+                        orders.append(CapturedOrder(
+                            perm_id=entry.perm_ids[index * 2 + leg],
+                            client_id=17,
+                            order_id=entry.order_ids[index * 2 + leg],
+                            account=account,
+                            con_id=entry.con_id,
+                            action="SELL",
+                            order_type=order_type,
+                            remaining=Decimal(layer.quantity),
+                            status="Submitted",
+                            oca_group=group,
+                            parent_id=0,
+                            limit_price=(
+                                price if leg == 0 else
+                                Decimal(layer.stop_limit_price)
+                                if layer.stop_order_type == "STP LMT" else None
+                            ),
+                            stop_price=price if leg == 1 else None,
+                            tif=layer.tif,
+                        ))
+        return tuple(orders)
 
     def capture(
         self,
@@ -155,7 +240,7 @@ class DemoReadOnlyBroker:
             localhost_only=True,
             managed_accounts=(account,),
             positions=positions,
-            orders=_orders(account),
+            orders=(*_orders(account), *self._journal_orders(account)),
             contract_details=contracts,
             quote=CapturedQuote(
                 bid=selected.bid,
@@ -180,6 +265,8 @@ class DemoReadOnlyBroker:
             ),
             errors=(),
             captured_at=now,
+            completed_orders_complete=True,
+            executions_complete=True,
         )
 
 
@@ -214,6 +301,9 @@ class DemoSnapshotSource:
 class DemoPaperExecutionTransport:
     """Safe local acknowledgement simulator for the paper execution UI."""
 
+    def __init__(self, journal: ExecutionJournal | None = None) -> None:
+        self._journal = journal
+
     def submit(
         self,
         snapshot: BrokerSnapshot,
@@ -224,11 +314,23 @@ class DemoPaperExecutionTransport:
         client_id: int,
         timeout_seconds: float,
     ) -> PaperSubmission:
-        del snapshot, host, port, client_id, timeout_seconds
+        del host, port, client_id, timeout_seconds
         count = len(plan.pairs) * 2
+        prior = (
+            tuple(
+                entry
+                for position in _POSITIONS
+                for entry in self._journal.submission_entries(
+                    account=snapshot.selected.account,
+                    con_id=position.contract.con_id,
+                )
+            ) if self._journal is not None else ()
+        )
+        next_order_id = max((value for entry in prior for value in entry.order_ids), default=900_000) + 1
+        next_perm_id = max((value for entry in prior for value in entry.perm_ids), default=800_000) + 1
         return PaperSubmission(
-            order_ids=tuple(range(900_001, 900_001 + count)),
-            perm_ids=tuple(range(800_001, 800_001 + count)),
+            order_ids=tuple(range(next_order_id, next_order_id + count)),
+            perm_ids=tuple(range(next_perm_id, next_perm_id + count)),
         )
 
     def cancel_pair(
@@ -246,6 +348,38 @@ class DemoPaperExecutionTransport:
         target = candidate.target_order_id
         stop = candidate.stop_order_id
         return PaperSubmission(order_ids=tuple(sorted((target, stop))), perm_ids=())
+
+    def modify_prices(
+        self,
+        snapshot: BrokerSnapshot,
+        candidates: tuple[PriceUpdateCandidate, ...],
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmission:
+        """Acknowledge only the exact simulated legs selected for amendment."""
+        del host, port, client_id, timeout_seconds
+        orders = {order.order_id: order for order in snapshot.working_orders}
+        acknowledged: list[tuple[int, int]] = []
+        for candidate in candidates:
+            for order_id, perm_id, price in (
+                (candidate.layer.target_order_id, candidate.layer.target_perm_id,
+                 candidate.target_price),
+                (candidate.layer.stop_order_id, candidate.layer.stop_perm_id,
+                 candidate.stop_price),
+            ):
+                if price is None:
+                    continue
+                order = orders.get(order_id)
+                if order is None or order.perm_id != perm_id or order.key != snapshot.selected:
+                    raise ValueError("the simulated OCA leg changed before acknowledgement")
+                acknowledged.append((order_id, perm_id))
+        return PaperSubmission(
+            order_ids=tuple(order_id for order_id, _ in acknowledged),
+            perm_ids=tuple(perm_id for _, perm_id in acknowledged),
+        )
 
 
 def _selected_position(
@@ -287,4 +421,5 @@ __all__ = [
     "DemoPaperExecutionTransport",
     "DemoReadOnlyBroker",
     "DemoSnapshotSource",
+    "seed_demo_journal",
 ]

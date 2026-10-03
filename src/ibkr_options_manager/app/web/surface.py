@@ -16,6 +16,7 @@ from starhtml import (
     H1,
     H3,
     Div,
+    Fieldset,
     Form,
     Icon,
     Link,
@@ -78,6 +79,7 @@ from .components.ui.card import (
     CardHeader,
     CardTitle,
 )
+from .components.ui.checkbox import Checkbox
 from .components.ui.dialog import (
     Dialog,
     DialogClose,
@@ -504,6 +506,16 @@ class StarUIWorkbench:
         with self._lock:
             # Each response carries only feedback produced by this action.
             self._toast = None
+            contract_locked = bool(self._unresolved_management_entries())
+            if contract_locked and action not in {
+                "refresh", "select", "select-session-closed", "verify-management"
+            }:
+                self._disarm_execution_locked()
+                self._message = (
+                    "This contract is locked while an order outcome is uncertain. "
+                    "Check TWS, then verify its state before making changes."
+                )
+                return self._page()
             trading_actions = {
                 "market-exit-selected",
                 "cancel-all-active",
@@ -567,7 +579,8 @@ class StarUIWorkbench:
                 self._submission_review_required = False
             elif action == "select":
                 self._disarm_execution_locked()
-                self._save_form_locked(values)
+                if not contract_locked:
+                    self._save_form_locked(values)
                 self._selected_quantity_change = None
                 self._select_locked(_positive_int(values.get("con_id"), 0))
             elif action == "select-session-closed":
@@ -606,9 +619,13 @@ class StarUIWorkbench:
                 if self._cancelled_bracket_recovery(self._submission_outcomes()) is None:
                     self._recovery_requested_fingerprint = None
                     self._message = (
-                        "Cancellation verification blocked: refresh TWS and check "
-                        "that both bracket legs are gone."
+                        "Bracket verification is unavailable; refresh the selected "
+                        "position and try again."
                     )
+            elif action == "verify-bracket-exists":
+                self._verify_bracket_exists_locked(values)
+            elif action == "verify-management":
+                self._verify_management_locked(values)
             elif action.startswith("dismiss-cancelled:"):
                 self._dismiss_cancelled_layer_locked(action)
             elif action == "cancel-staged":
@@ -905,7 +922,7 @@ class StarUIWorkbench:
             # Keep the selected active-layer action available for a new Execute.
             self._active_action_verified = False
             self._armed_execution_deadline = None
-        self._status_message = "Review expired. Press Execute paper order again for a fresh review."
+        self._status_message = "Review expired. Review the action again with fresh TWS data."
         return True
 
     def _set_review_status_locked(self, message: str) -> None:
@@ -946,7 +963,7 @@ class StarUIWorkbench:
     def _confirm_execution_locked(self) -> None:
         if self._armed_execution is not None and self._expire_confirmation_locked(require_deadline=True):
             self._disarm_execution_locked()
-            self._message = "Paper bracket confirmation expired. Press Execute again to review a fresh plan."
+            self._message = "Paper bracket confirmation expired. Review the order again."
             return
         drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
         if not 0 < drafted <= self._planning_available_quantity():
@@ -1039,7 +1056,7 @@ class StarUIWorkbench:
         self._armed_market_exits = (candidate,)
         self._set_review_status_locked(
             f"Review the MKT exit for {candidate.quantity} contracts, then press "
-            "Execute paper order to verify a fresh snapshot."
+            "Review the market sell to verify a fresh snapshot."
         )
 
     def _arm_cancellation_locked(self, target_perm_id: int) -> None:
@@ -1064,7 +1081,7 @@ class StarUIWorkbench:
         self._armed_cancellation = candidate
         self._set_review_status_locked(
             f"Review cancellation of OCA bracket {candidate.oca_group}; no replacement "
-            "sell order will be sent. Press Execute paper order to verify a fresh snapshot."
+            "sell order will be sent. Review the cancellation to verify a fresh snapshot."
         )
 
     def _arm_all_cancellations_locked(self) -> None:
@@ -1090,7 +1107,7 @@ class StarUIWorkbench:
         self._armed_cancellations = candidates
         self._set_review_status_locked(
             f"Review cancellation of {len(candidates)} active OCA brackets. "
-            "The position will remain open. Press Execute paper order to verify a fresh snapshot."
+            "The position will remain open. Review the cancellation to verify a fresh snapshot."
         )
 
     def _execute_active_action_locked(self) -> None:
@@ -1168,7 +1185,7 @@ class StarUIWorkbench:
     def _confirm_cancellation_locked(self) -> None:
         """Cancel the staged pair after one more fresh-snapshot equality check."""
         if self._expire_confirmation_locked(require_deadline=True):
-            self._message = "Review expired. Press Execute paper order again."
+            self._message = "Review expired. Review the cancellation again."
             return
         candidate = self._armed_cancellation
         if (
@@ -1177,7 +1194,7 @@ class StarUIWorkbench:
             or self._selected_con_id is None
             or not self._active_action_verified
         ):
-            self._message = "Press Execute paper order before confirming bracket cancellation."
+            self._message = "Review the cancellation before confirming it."
             return
         state = self._view_model.select_position(
             self._selected_con_id,
@@ -1224,7 +1241,7 @@ class StarUIWorkbench:
             )
             observed = self._view_model.latest_snapshot()
             cancelled_ids = {candidate.target_perm_id, candidate.stop_perm_id}
-            if (
+            if refreshed and not (
                 observed is not None
                 and observed.selected.account == candidate.account
                 and observed.selected.con_id == candidate.con_id
@@ -1235,11 +1252,6 @@ class StarUIWorkbench:
                     for order in observed.working_orders
                 )
             ):
-                self._show_success_toast_locked(
-                    "Selected bracket orders cancelled",
-                    "The position remains open.",
-                )
-            elif refreshed:
                 self._message = (
                     "Bracket cancellation needs verification: the refreshed TWS "
                     "snapshot still shows a selected order. Check TWS and refresh."
@@ -1250,7 +1262,7 @@ class StarUIWorkbench:
     def _confirm_all_cancellations_locked(self) -> None:
         """Cancel reviewed pairs one at a time, verifying TWS between writes."""
         if self._expire_confirmation_locked(require_deadline=True):
-            self._message = "Review expired. Press Execute paper order again."
+            self._message = "Review expired. Review the cancellation again."
             return
         candidates = self._armed_cancellations
         if (
@@ -1259,7 +1271,7 @@ class StarUIWorkbench:
             or not candidates
             or not self._active_action_verified
         ):
-            self._message = "Press Execute paper order before confirming bracket cancellation."
+            self._message = "Review the cancellation before confirming it."
             return
         cancelled = 0
         try:
@@ -1315,7 +1327,7 @@ class StarUIWorkbench:
                     for candidate in candidates
                     for perm_id in (candidate.target_perm_id, candidate.stop_perm_id)
                 }
-                if (
+                if not (
                     observed is not None
                     and observed.selected.account == candidates[0].account
                     and observed.selected.con_id == candidates[0].con_id
@@ -1326,10 +1338,6 @@ class StarUIWorkbench:
                         for order in observed.working_orders
                     )
                 ):
-                    self._show_success_toast_locked(
-                        "Active brackets cancelled", "The position remains open."
-                    )
-                else:
                     self._message = (
                         "Bracket cancellation needs verification: refreshed TWS still "
                         "shows a selected order. Check TWS and refresh."
@@ -1337,12 +1345,81 @@ class StarUIWorkbench:
         finally:
             self._disarm_execution_locked()
 
+    def _verify_bracket_exists_locked(self, values: dict[str, str]) -> None:
+        if self._paper_execution is None or self._selected_con_id is None:
+            self._message = "Select a position before verifying its bracket."
+            return
+        fingerprint = values.get("fingerprint", "")
+        self._recovery_requested_fingerprint = fingerprint
+        state = self._view_model.select_position(self._selected_con_id, self._plan_form(()))
+        self._apply_state_locked(state)
+        self._record_refresh_time_locked()
+        snapshot = self._view_model.latest_snapshot()
+        if (
+            snapshot is None
+            or not snapshot.connected
+            or not snapshot.complete
+            or not snapshot.fresh
+            or snapshot.selected.account != self._settings.account
+            or snapshot.selected.con_id != self._selected_con_id
+        ):
+            self._message = "Bracket not verified: a fresh, complete broker read is required."
+            return
+        self._announce_reconciliation_locked()
+        outcomes = [
+            outcome for entry, _index, outcome in self._submission_outcomes()
+            if entry.fingerprint == fingerprint
+        ]
+        if outcomes and all(outcome.status == "ACTIVE" for outcome in outcomes):
+            self._recovery_requested_fingerprint = None
+        elif outcomes and all(
+            outcome.status == "ACTIVE" or outcome.status.startswith("CLOSED_")
+            for outcome in outcomes
+        ):
+            self._recovery_requested_fingerprint = None
+        else:
+            self._message = (
+                "Bracket not verified: the fresh snapshot did not establish a "
+                "complete active or filled outcome. Check TWS and try again."
+            )
+
+    def _verify_management_locked(self, values: dict[str, str]) -> None:
+        if self._paper_execution is None or self._selected_con_id is None:
+            self._message = "Select the locked contract before verifying it."
+            return
+        fingerprint = values.get("fingerprint", "")
+        if values.get("confirmed") != "yes":
+            self._message = "Confirm the contract's orders and fills in TWS first."
+            return
+        try:
+            state = self._view_model.select_position(
+                self._selected_con_id,
+                self._plan_form(self._drafts.get(self._selected_con_id, ())),
+            )
+            self._apply_state_locked(state)
+            self._record_refresh_time_locked()
+            snapshot = self._view_model.latest_snapshot()
+            if snapshot is None:
+                raise ExecutionBlocked("a fresh TWS snapshot is unavailable")
+            self._paper_execution.confirm_unknown_management(
+                snapshot, fingerprint, confirmed_in_tws=True
+            )
+        except ExecutionBlocked as error:
+            self._message = f"Order status not verified: {error}"
+            return
+        except Exception:
+            self._message = "Order status not verified: TWS read failed. Refresh and try again."
+            return
+        self._disarm_execution_locked()
+
     def _resolve_cancelled_bracket_locked(self, values: dict[str, str]) -> None:
         if self._paper_execution is None or self._selected_con_id is None:
             self._message = "Cancellation verification requires a selected position."
             return
         if values.get("confirmed") != "yes":
-            self._message = "Confirm both bracket legs are cancelled in TWS first."
+            self._message = (
+                "Confirm neither bracket leg is working or filled in TWS first."
+            )
             return
         con_id = self._selected_con_id
         state = self._view_model.select_position(con_id, self._plan_form(()))
@@ -1364,10 +1441,6 @@ class StarUIWorkbench:
             return
         self._drafts[con_id] = ()
         self._recovery_requested_fingerprint = None
-        self._show_success_toast_locked(
-            "Cancelled bracket cleared",
-            "You can add a new layer for the verified available quantity.",
-        )
 
     def _dismiss_cancelled_layer_locked(self, action: str) -> None:
         if self._paper_execution is None or self._selected_con_id is None:
@@ -1390,10 +1463,6 @@ class StarUIWorkbench:
         except (ExecutionBlocked, ValueError) as error:
             self._message = f"Cancelled row could not be removed: {error}"
             return
-        self._show_success_toast_locked(
-            "Cancelled row removed",
-            "Its order history remains saved for duplicate protection.",
-        )
 
     def _arm_selected_market_exit_locked(self, values: dict[str, str]) -> None:
         """Review an all-active-layer exit from the displayed snapshot."""
@@ -1428,12 +1497,12 @@ class StarUIWorkbench:
         total = sum((candidate.quantity for candidate in candidates), Decimal("0"))
         self._set_review_status_locked(
             f"Review cancellation of {len(candidates)} OCA layers and one MKT sell "
-            f"for {total} contracts, then press Execute paper order."
+            f"for {total} contracts, then review the market sell."
         )
 
     def _confirm_market_exit_locked(self) -> None:
         if self._expire_confirmation_locked(require_deadline=True):
-            self._message = "Review expired. Press Execute paper order again."
+            self._message = "Review expired. Review the market sell again."
             return
         armed = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
@@ -1444,7 +1513,7 @@ class StarUIWorkbench:
             or self._selected_con_id is None
             or not self._active_action_verified
         ):
-            self._message = "Press Execute paper order before confirming the market exit."
+            self._message = "Review the market sell before confirming it."
             return
         state = self._view_model.select_position(
             self._selected_con_id,
@@ -1635,11 +1704,11 @@ class StarUIWorkbench:
             prior_state = self._paper_execution.price_update_attempt_state(
                 snapshot, self._armed_price_updates
             )
-            if prior_state is not None and prior_state != "SUBMISSION_UNKNOWN":
+            if prior_state not in {None, "RESOLVED"}:
                 raise ExecutionBlocked(
                     "this exact amendment has already been sent or reserved; refresh TWS"
                 )
-            self._price_update_retry_required = prior_state == "SUBMISSION_UNKNOWN"
+            self._price_update_retry_required = prior_state == "RESOLVED"
             self._armed_active_percentages = edited_percentages
             self._warned_price_update_concerns = _price_update_impact(
                 snapshot, self._armed_price_updates
@@ -1655,8 +1724,8 @@ class StarUIWorkbench:
         )
         if self._price_update_retry_required:
             self._message = (
-                "An earlier price amendment has an unknown outcome. Inspect the order "
-                "in TWS for a pending change, then confirm the check below before retrying."
+                "The earlier uncertain amendment was verified in TWS. Check that "
+                "the old price remains and no change awaits Transmit before retrying."
             )
         else:
             self._set_review_status_locked(
@@ -1666,7 +1735,7 @@ class StarUIWorkbench:
 
     def _confirm_price_updates_locked(self, values: dict[str, str]) -> None:
         if self._expire_confirmation_locked(require_deadline=True):
-            self._message = "Review expired. Press Execute paper order again."
+            self._message = "Review expired. Review the price changes again."
             return
         updates = self._armed_price_updates
         if (
@@ -1759,7 +1828,11 @@ class StarUIWorkbench:
                 allow_unknown_retry=self._price_update_retry_required,
             )
         except Exception as error:
-            if not submitted:
+            if not submitted or (
+                isinstance(error, ExecutionBlocked)
+                and not isinstance(error, ExecutionOutcomeUnknown)
+                and not self._unresolved_management_entries()
+            ):
                 self._message = f"Price update blocked: {error}"
                 record_price_update_event("ui_result", outcome="blocked", reason=str(error))
                 return
@@ -1782,9 +1855,6 @@ class StarUIWorkbench:
                     self._message = f"Price update outcome is unknown: {journal_error}. Check TWS and refresh."
                     return
                 self._message = "Price update filled: the selected exit sold in TWS."
-                self._show_success_toast_locked(
-                    "Exit filled in TWS", "The selected exit sold. Position and layers refreshed."
-                )
                 record_price_update_event("ui_result", outcome="filled", reason=str(error))
             else:
                 self._message = (
@@ -1811,7 +1881,8 @@ class StarUIWorkbench:
                     stop_price=update.stop_price,
                 )
             refreshed = self._refresh_after_acknowledged_write_locked(
-                f"TWS acknowledged {len(receipt.entry.order_ids)} app-owned OCA "
+                f"{'Simulated broker' if self._demo_mode else 'TWS'} acknowledged "
+                f"{len(receipt.entry.order_ids)} app-owned OCA "
                 "price amendment(s)."
             )
             record_price_update_event(
@@ -1835,10 +1906,13 @@ class StarUIWorkbench:
                 ],
             )
             self._show_success_toast_locked(
-                "Price update acknowledged by TWS",
-                "Latest TWS state loaded. Check TWS for any required Transmit."
+                "Simulated price update acknowledged"
+                if self._demo_mode else "Price update acknowledged by TWS",
+                "Demo order state refreshed; no TWS order was sent."
+                if refreshed and self._demo_mode
+                else "Latest TWS state loaded. Check TWS for any required Transmit."
                 if refreshed
-                else "The automatic refresh could not verify TWS state. Refresh before another order change.",
+                else "The automatic refresh could not verify broker state. Refresh before another order change.",
             )
         finally:
             self._disarm_execution_locked()
@@ -2776,7 +2850,7 @@ class StarUIWorkbench:
                 ),
                 cls="flex min-h-0 flex-1 flex-col items-center justify-center px-6",
             ),
-            Div(Button("Execute paper order", disabled=True, cls="w-full"), cls="mx-4 mb-4"),
+            Div(Button("Review order", disabled=True, cls="w-full"), cls="mx-4 mb-4"),
             cls="flex min-h-0 flex-col overflow-hidden border-l border-border bg-card/30",
         )
         return center, review
@@ -3033,10 +3107,45 @@ class StarUIWorkbench:
         )
 
     def _workspace_content(self, *children: Any, **attributes: Any) -> Any:
+        locked = bool(self._unresolved_management_entries())
+        if not locked:
+            return Div(
+                *children,
+                cls="workspace-content flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6",
+                **attributes,
+            )
         return Div(
-            *children,
+            self._management_lock_notice(),
+            Fieldset(*children, disabled=True, cls="contents"),
             cls="workspace-content flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6",
             **attributes,
+        )
+
+    def _management_lock_notice(self) -> Any:
+        entries = self._unresolved_management_entries()
+        if not entries:
+            return None
+        return Alert(
+            AlertTitle("Order status is uncertain — contract locked"),
+            AlertDescription(
+                "Check this contract's orders and fills in TWS, including any "
+                "change awaiting Transmit. Refresh, then verify the state here."
+            ),
+            Form(
+                Label(
+                    HTMLInput(type="checkbox", name="confirmed", value="yes", required=True),
+                    "I checked TWS: no change is awaiting Transmit, and the displayed "
+                    "orders and fills match this contract.",
+                    cls="mt-3 flex items-start gap-2 text-sm",
+                ),
+                HTMLInput(type="hidden", name="action", value="verify-management"),
+                HTMLInput(type="hidden", name="fingerprint", value=entries[0].fingerprint),
+                Button("Verify order status", type="submit", cls="mt-3"),
+                action=f"/{self.session_token}/action",
+                method="post",
+            ),
+            data_contract_lockdown=True,
+            cls="mb-4 shrink-0 border-amber-500/50 bg-amber-500/10 text-amber-100",
         )
 
     def _add_layer_control(self, *, disabled: bool) -> Any:
@@ -3231,7 +3340,15 @@ class StarUIWorkbench:
                     self._header_quantity(outcomes, selected_snapshot),
                 ),
                 _contract_header_metric(
-                    "Available", f"{planning_available:g}" if draft_allowed else "—"
+                    "Available", f"{planning_available:g}" if draft_allowed else "—",
+                    adornment=self._coverage_dialog(
+                        coverage,
+                        selected_snapshot,
+                        uncertain_app_orders=any(
+                            outcome.status in {"PENDING", "UNKNOWN", "GROUP_COLLISION"}
+                            for _entry, _index, outcome in outcomes
+                        ),
+                    ),
                 ),
                 _contract_header_metric(
                     "Average price", _header_price(basis, currency)
@@ -3249,14 +3366,6 @@ class StarUIWorkbench:
             )
             if selected_snapshot is not None
             else None,
-            self._coverage_alert(
-                coverage,
-                selected_snapshot,
-                uncertain_app_orders=any(
-                    outcome.status in {"PENDING", "UNKNOWN", "GROUP_COLLISION"}
-                    for _entry, _index, outcome in outcomes
-                ),
-            ),
             self._submission_attention(outcomes),
             Div(
                 ScrollArea(
@@ -3291,97 +3400,32 @@ class StarUIWorkbench:
         if not callable(getattr(self._paper_execution, "confirm_cancelled_unknown", None)):
             return None
         requested = self._recovery_requested_fingerprint
-        requested_entries = {
-            entry.fingerprint: entry
-            for entry, _index, outcome in outcomes
-            if entry.fingerprint == requested
-            and entry.state in {
+        entry = next((
+            candidate
+            for candidate, _index, outcome in outcomes
+            if candidate.fingerprint == requested
+            and candidate.state in {
                 "SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED", "SUBMITTED", "RECONCILED"
             }
-            and outcome.status in {"UNKNOWN", "NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"}
-        }
-        snapshot = self._view_model.latest_snapshot()
-        if requested in requested_entries:
-            entry = requested_entries[requested]
-            fingerprint = requested
-        else:
-            if requested is not None:
-                self._recovery_requested_fingerprint = None
-            if (
-                snapshot is None
-                or not snapshot.complete
-                or not snapshot.fresh
-                or snapshot.selected.account != self._verified_selected_account()
-                or snapshot.selected.con_id != self._selected_con_id
-            ):
-                return None
-            entry = None
-        working = snapshot.working_orders if snapshot is not None else ()
-
-        def has_working_leg(entry: JournalEntry) -> bool:
-            groups = {
-                _journal_oca_group(entry, index)
-                for index in range(len(entry.layers))
+            and outcome.status in {
+                "PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE",
+                "GROUP_COLLISION", "CONFLICT",
             }
-            return any(
-                order.oca_group in groups
-                or order.order_id in entry.order_ids
-                or (order.perm_id > 0 and order.perm_id in entry.perm_ids)
-                for order in working
-            )
-
-        def observed_later(entry: JournalEntry) -> bool:
-            if snapshot is None:
-                return False
-            try:
-                return snapshot.captured_at > Decimal(entry.snapshot_captured_at)
-            except (InvalidOperation, ValueError):
-                return False
-
-        unresolved = {
-            entry.fingerprint: entry
-            for entry, _index, outcome in outcomes
-            if entry.state in {
-                "SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED", "SUBMITTED", "RECONCILED"
-            }
-            and outcome.status in {"UNKNOWN", "NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"}
-            and not has_working_leg(entry)
-            and observed_later(entry)
-        }
-        if entry is None and not unresolved:
-            return None
-        collision_fingerprints = {
-            entry.fingerprint
-            for entry, _index, outcome in outcomes
-            if outcome.status == "GROUP_COLLISION"
-        }
-        other_brackets_working = any(
-            order.key == snapshot.selected and order.oca_group
-            for order in working
-        ) if snapshot is not None else False
+        ), None)
         if entry is None:
-            automatic = {
-                fingerprint: entry
-                for fingerprint, entry in unresolved.items()
-                if entry.state in {"SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED"}
-                and fingerprint not in collision_fingerprints
-            }
-            if (
-                not automatic
-                or other_brackets_working
-                or (self._toast is not None and self._toast.variant == "error")
-            ):
-                return None
-            fingerprint = next(iter(automatic))
-            entry = unresolved[fingerprint]
+            self._recovery_requested_fingerprint = None
+            return None
+        fingerprint = entry.fingerprint
+
         return Div(
             Dialog(
                 DialogContent(
                     DialogHeader(
-                        DialogTitle("Confirm bracket status in TWS"),
+                        DialogTitle("Verify bracket status"),
                         DialogDescription(
-                            "Find the following tranche IDs in TWS and check that "
-                            "neither listed order remains."
+                            "Check both listed orders in TWS. Refresh to check for "
+                            "working orders or fills. Only clear this layer if neither "
+                            "order is working and neither filled."
                         ),
                     ),
                     Div(
@@ -3419,43 +3463,57 @@ class StarUIWorkbench:
                         role="alert",
                         cls="text-sm text-destructive",
                     )
-                    if self._message.startswith("Cancellation verification blocked:")
+                    if self._message.startswith((
+                        "Cancellation verification blocked:", "Bracket not verified:",
+                        "Confirm neither bracket leg",
+                    ))
                     else None,
                     Form(
+                        P("If either order filled, refresh to recover the execution. "
+                          "If the fill still does not appear here, investigate it in TWS "
+                          "and leave this layer unverified.",
+                          cls="text-sm text-muted-foreground"),
                         Label(
-                            HTMLInput(
-                                type="checkbox",
-                                name="confirmed",
-                                value="yes",
-                                required=True,
-                            ),
-                            "I confirmed the listed bracket orders are gone in TWS",
-                            cls="flex items-center gap-2 text-sm",
+                            Checkbox(name="confirmed", value="yes", required=True,
+                                     signal="bracket_absence_confirmed"),
+                            Span("I confirm neither order is working in TWS and neither filled"),
+                            cls="mt-3 flex items-start gap-2 text-sm",
                         ),
-                        DialogFooter(
-                            Button(
-                                "Verify cancellation",
-                                type="submit",
-                                data_busy_text="Verifying…",
-                            ),
-                            cls="mt-6",
-                        ),
-                        HTMLInput(
-                            type="hidden", name="action", value="resolve-cancelled-bracket"
-                        ),
-                        HTMLInput(
-                            type="hidden", name="fingerprint", value=fingerprint
-                        ),
+                        HTMLInput(type="hidden", name="action",
+                                  value="resolve-cancelled-bracket"),
+                        HTMLInput(type="hidden", name="fingerprint", value=fingerprint),
                         action=f"/{self.session_token}/action",
                         method="post",
-                        data_cancelled_bracket_recovery=True,
+                        id="bracket-clear-form",
                     ),
-                    show_close_button=False,
+                    Div(
+                        Form(
+                            Button("Refresh layers", type="submit", variant="outline",
+                                   data_busy_text="Refreshing layers…"),
+                            HTMLInput(type="hidden", name="action",
+                                      value="verify-bracket-exists"),
+                            HTMLInput(type="hidden", name="fingerprint",
+                                      value=fingerprint),
+                            action=f"/{self.session_token}/action",
+                            method="post",
+                            id="bracket-refresh-form",
+                        ),
+                        Div(
+                            DialogClose("Cancel", variant="outline"),
+                            Button("Clear unverified bracket", type="submit",
+                                   form="bracket-clear-form",
+                                   disabled=True,
+                                   data_attr_disabled=~Signal("bracket_absence_confirmed", False),
+                                   data_busy_text="Checking absence…"),
+                            cls="flex gap-2",
+                        ),
+                        cls="flex w-full flex-wrap items-center justify-between gap-3",
+                    ),
                 ),
                 signal="cancelled_bracket_recovery",
                 default_open=True,
-                dismissible=False,
-                size="md",
+                dismissible=True,
+                size="lg",
             ),
             data_cancelled_bracket_recovery_dialog=True,
         )
@@ -3691,6 +3749,17 @@ class StarUIWorkbench:
             )
         )
 
+    def _unresolved_management_entries(self) -> tuple[JournalEntry, ...]:
+        if self._paper_execution is None or self._selected_con_id is None:
+            return ()
+        reader = getattr(self._paper_execution, "unresolved_management_entries", None)
+        if not callable(reader):
+            return ()
+        entries: tuple[JournalEntry, ...] = reader(
+            account=self._verified_selected_account(), con_id=self._selected_con_id
+        )
+        return entries
+
     def _pending_submissions(
         self,
     ) -> tuple[tuple[JournalEntry, int, LayerOutcome], ...]:
@@ -3798,17 +3867,20 @@ class StarUIWorkbench:
             )
             if outcome.status == "CANCELLED" and not read_only
             else Button(
-                Icon("lucide:badge-check", cls="size-4", aria_hidden="true"),
+                Icon("lucide:check", cls="size-4", aria_hidden="true"),
                 variant="outline",
                 size="icon",
                 type="submit",
                 name="action",
                 value=f"verify-cancelled-bracket:{entry.fingerprint}",
-                aria_label=f"Verify cancellation of layer {number} in TWS",
-                title="Verify that this bracket was cancelled in TWS",
+                aria_label=f"Verify bracket status of layer {number}",
+                title="Check this bracket against TWS",
                 cls="relative z-[3] mt-5",
             )
-            if outcome.status in {"NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"} and not read_only
+            if outcome.status in {
+                "PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE",
+                "GROUP_COLLISION", "CONFLICT",
+            } and not read_only
             else Div(cls="min-w-0"),
             Div(
                 Span(
@@ -4151,13 +4223,15 @@ class StarUIWorkbench:
         loss = (stop_price - basis) * multiplier * quantity
         return _money(gain), _money(loss)
 
-    def _coverage_alert(
+    def _coverage_dialog(
         self,
         coverage: str,
         snapshot: BrokerSnapshot | None,
         *,
         uncertain_app_orders: bool = False,
     ) -> Any:
+        if coverage not in {"mixed", "external"}:
+            return None
         held = snapshot.position.quantity if snapshot is not None else None
         available = self._state.available_quantity
         reserved = held - available if held is not None else None
@@ -4167,21 +4241,32 @@ class StarUIWorkbench:
             if reserved is not None and reserved >= 0
             else f"{available:g} {'contract remains' if available == 1 else 'contracts remain'} available for new brackets. "
         )
-        if coverage in {"mixed", "external"}:
-            return Alert(
-                AlertTitle("Existing TWS exit orders"),
-                AlertDescription(
-                    message
-                    + (
-                        "An app submission is still unverified. Inspect TWS before "
-                        "changing these orders."
-                        if uncertain_app_orders
-                        else "Orders placed outside this app are view-only here."
-                    )
+        return Dialog(
+            DialogTrigger(
+                Icon("lucide:triangle-alert", cls="size-4", aria_hidden="true"),
+                variant="ghost",
+                aria_label="Why are fewer contracts available?",
+                title="Show existing TWS exit orders",
+                cls="available-warning-trigger",
+            ),
+            DialogContent(
+                DialogHeader(
+                    DialogTitle("Existing TWS exit orders"),
+                    DialogDescription(
+                        message
+                        + (
+                            "An app submission is still unverified. Inspect TWS before "
+                            "changing these orders."
+                            if uncertain_app_orders
+                            else "Orders placed outside this app are view-only here."
+                        )
+                    ),
                 ),
-                cls="mt-5 border-amber-500/40 bg-amber-500/10 text-amber-100",
-            )
-        return Div(cls="hidden")
+                DialogFooter(DialogClose("Done", variant="outline")),
+            ),
+            signal="existing_exit_orders",
+            size="sm",
+        )
 
     def _submission_attention(
         self, outcomes: tuple[tuple[JournalEntry, int, LayerOutcome], ...]
@@ -4958,15 +5043,21 @@ class StarUIWorkbench:
             Div(self._draft_quantity_alert(), cls="mx-4 mb-3 min-w-0")
             if draft_rows and not has_staged_action
             else None,
-            P(
-                "A stop-limit order may remain unfilled after its trigger.",
+            Div(self._outcome_projection(projection), cls="mx-4 mb-3"),
+            Alert(
+                AlertTitle("Your stop may not sell the option"),
+                AlertDescription(
+                    "If the stop price is reached, the order will only sell at "
+                    "your limit price or higher. If the market drops below that "
+                    "price, you may still own the option and lose more than shown above."
+                ),
                 data_stop_limit_warning=True,
-                cls="mx-4 mb-2 text-xs leading-5 text-amber-300"
+                cls="mx-4 mb-3 w-[calc(100%-2rem)] border-amber-500/40 "
+                "bg-amber-500/10 text-amber-100"
                 + ("" if self._stop_configuration()[0] == "STP LMT" else " hidden"),
             )
             if draft_rows
             else None,
-            Div(self._outcome_projection(projection), cls="mx-4 mb-3"),
             self._execution_control(),
             cls="flex min-h-0 flex-col overflow-hidden border-l border-border bg-card/30",
         )
@@ -4993,10 +5084,15 @@ class StarUIWorkbench:
         )
 
     def _execution_control(self) -> Any:
+        if self._unresolved_management_entries():
+            return Div(
+                Button("Order changes locked", type="button", disabled=True, cls="w-full"),
+                cls="mx-4 mb-4 w-[calc(100%-2rem)]",
+            )
         if self._pending_submissions():
             return Div(
                 Button(
-                    "Execute paper order",
+                    "Review order",
                     variant="default",
                     type="button",
                     disabled=True,
@@ -5068,7 +5164,7 @@ class StarUIWorkbench:
             else None,
             Div(
                 Button(
-                    "Execute paper order",
+                    "Review order",
                     variant="default",
                     type="submit",
                     name="action",
@@ -5088,7 +5184,7 @@ class StarUIWorkbench:
             ),
             Div(
                 Button(
-                    "Execute paper order",
+                    "Review price changes",
                     variant="default",
                     type="submit",
                     name="action",
@@ -5138,11 +5234,14 @@ class StarUIWorkbench:
 
     def _reviewed_active_action_controls(self) -> Any:
         """Keep review separate from the fresh check and final confirmation."""
+        market_exits = self._armed_market_exits or (
+            (self._armed_market_exit,) if self._armed_market_exit is not None else ()
+        )
         return Form(
             self._cancel_changes_control(staged=True),
             Div(
                 Button(
-                    "Execute paper order",
+                    "Review market sell" if market_exits else "Review cancellation",
                     variant="default",
                     type="submit",
                     name="action",
@@ -5381,7 +5480,7 @@ class StarUIWorkbench:
                     "text-emerald-400",
                 ),
                 self._review_order_line(
-                    "STP SELL" if stop_limit else "SELL STP",
+                    "SELL STP",
                     Span(
                         _sell_price_with_return(
                             layer.stop_price, self._state.unit_basis
@@ -5704,9 +5803,6 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
           limitLabel.textContent = stopLimit ? `(LMT ${{Number.isFinite(limitPrice) ? priceText(limitPrice) : '—'}})` : '';
           limitLabel.classList.toggle('hidden', !stopLimit);
         }}
-        document.querySelectorAll(`[data-draft-review-stop-row="${{index}}"]`).forEach((row) => {{
-          row.querySelector('span').textContent = stopLimit ? 'STP SELL' : 'SELL STP';
-        }});
         document.querySelectorAll(`[data-draft-review-stop-limit-row="${{index}}"]`).forEach((row) => {{
           row.classList.toggle('hidden', !stopLimit);
         }});
@@ -6356,32 +6452,24 @@ def _price_update_impact(
     concerns: set[tuple[int, str]] = set()
     details: list[str] = []
     crosses_quote = False
-    for index, update in enumerate(updates, start=1):
+    for update in updates:
         perm_id = update.layer.target_perm_id
         if update.stop_price is not None:
             if bid is not None and update.stop_price >= bid:
                 concerns.add((perm_id, "stop-crosses-bid"))
                 crosses_quote = True
-                details.append(
-                    f"Layer {index}: SELL STP ${_price_text(update.stop_price)} is at or above "
-                    f"the {'current' if reliable else 'latest snapshot'} bid ${_price_text(bid)}."
-                )
             elif bid is None or not reliable:
                 concerns.add((perm_id, "stop-quote-unknown"))
         if update.target_price is not None:
             if bid is not None and update.target_price <= bid:
                 concerns.add((perm_id, "limit-crosses-bid"))
                 crosses_quote = True
-                details.append(
-                    f"Layer {index}: SELL LMT ${_price_text(update.target_price)} is at or below "
-                    f"the {'current' if reliable else 'latest snapshot'} bid ${_price_text(bid)}."
-                )
             elif bid is None or not reliable:
                 concerns.add((perm_id, "limit-quote-unknown"))
     if crosses_quote:
         title = "Possible immediate sell"
         details.append(
-            "Confirming may cause these sell orders to execute soon and close "
+            "Confirming may cause one or more of these sell orders to execute soon and close "
             "their OCA brackets. A stop does not guarantee its fill price."
         )
     elif concerns:
@@ -6392,11 +6480,6 @@ def _price_update_impact(
         )
     else:
         title = ""
-    if quote is not None and not reliable:
-        details.append(
-            f"Quote status: {quote.market_data_type.lower().replace('_', ' ')}; "
-            "the displayed prices may not reflect the current market."
-        )
     return _PriceUpdateImpact(title, tuple(details), frozenset(concerns))
 
 
@@ -6441,10 +6524,16 @@ def _contract_display_name(contract: VerifiedOptionContract) -> str:
     )
 
 
-def _contract_header_metric(label: str, value: str) -> Any:
+def _contract_header_metric(label: str, value: str, *, adornment: Any = None) -> Any:
     return Div(
         Span(label, cls="block text-xs text-muted-foreground"),
-        Span(value, cls="mt-1 block text-sm font-medium tabular-nums"),
+        Div(
+            Span(value, cls="block text-sm font-medium tabular-nums"),
+            adornment,
+            cls="mt-1 flex items-center gap-1",
+        ) if adornment is not None else Span(
+            value, cls="mt-1 block text-sm font-medium tabular-nums"
+        ),
         cls="min-w-0",
     )
 
@@ -6652,7 +6741,7 @@ def _projection_status(
         if outcome.covered_quantity > outcome.held_quantity:
             return "Proposed exits exceed the held quantity."
         if estimate:
-            return "Estimate from shown layers. Refresh TWS before reviewing an order."
+            return ""
         return "Refresh TWS to calculate an outcome."
     if outcome.covered_quantity > outcome.held_quantity:
         return "Proposed exits exceed the held quantity."
@@ -6713,7 +6802,7 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       updateMetric(lossNode, projected ? (config.marketExit ? (config.baselineLoss === null ? null : Number(config.baselineLoss)) : loss) : null, lossBaseline, 'loss');
       const status = document.querySelector('[data-projection-status]');
       if (status) {{
-        status.textContent = config.marketExit ? '' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : overallocated ? 'Proposed exits exceed the held quantity.' : estimate ? 'Estimate from shown layers. Refresh TWS before reviewing an order.' : config.unresolved ? 'Refresh TWS to calculate an outcome.' : '';
+        status.textContent = config.marketExit ? '' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : overallocated ? 'Proposed exits exceed the held quantity.' : estimate ? '' : config.unresolved ? 'Refresh TWS to calculate an outcome.' : '';
         status.classList.toggle('hidden', !status.textContent);
       }}
     }};
@@ -6744,7 +6833,7 @@ def _toast_notice(message: str) -> _ToastNotice | None:
     if "paper bracket confirmation expired" in lowered:
         return _ToastNotice(
             "Review expired",
-            "Press Execute again to review current prices and quantities.",
+            "Review the action again with current prices and quantities.",
             "warning",
         )
     if "portfolio state is not ready" in lowered or "tws connection failed" in lowered:

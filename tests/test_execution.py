@@ -1342,13 +1342,51 @@ def test_unknown_price_amendment_needs_explicit_fresh_retry(tmp_path) -> None:
 
     with pytest.raises(ExecutionOutcomeUnknown, match="lost TWS"):
         amend(active)
-    with pytest.raises(ExecutionBlocked, match="already journaled"):
+    with pytest.raises(ExecutionBlocked, match="contract is locked"):
         amend(active)
-    with pytest.raises(ExecutionBlocked, match=r"fresh.*later"):
+    with pytest.raises(ExecutionBlocked, match="contract is locked"):
         amend(active, allow_unknown_retry=True)
+    with pytest.raises(ExecutionBlocked, match="contract is locked"):
+        service.modify_prices(
+            active, (replace(update, target_price=Decimal("1.50")),),
+            host="127.0.0.1", port=7497, client_id=17, timeout_seconds=1,
+        )
+    with pytest.raises(ExecutionBlocked, match="contract is locked"):
+        journal.begin(active, plan)
     assert transport.attempts == 1
 
-    refreshed = replace(active, captured_at=Decimal("1"))
+    refreshed = replace(
+        active, captured_at=Decimal("1"),
+        executions_complete=True, completed_orders_complete=True,
+    )
+    unknown = service.unresolved_management_entries(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id
+    )
+    assert len(unknown) == 1
+    assert not service.unresolved_management_entries(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id + 1
+    )
+    with pytest.raises(ExecutionBlocked, match=r"later.*read"):
+        service.confirm_unknown_management(
+            active, unknown[0].fingerprint, confirmed_in_tws=True
+        )
+    with pytest.raises(ExecutionBlocked, match="confirm"):
+        service.confirm_unknown_management(
+            refreshed, unknown[0].fingerprint, confirmed_in_tws=False
+        )
+    with pytest.raises(ExecutionBlocked, match="stable working orders"):
+        service.confirm_unknown_management(
+            replace(refreshed, working_orders=(
+                replace(target, status="PendingSubmit"), stop,
+            )),
+            unknown[0].fingerprint, confirmed_in_tws=True,
+        )
+    service.confirm_unknown_management(
+        refreshed, unknown[0].fingerprint, confirmed_in_tws=True
+    )
+    assert not service.unresolved_management_entries(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id
+    )
     already_changed = replace(
         refreshed,
         working_orders=(replace(target, limit_price=Decimal("1.40")), stop),
@@ -1356,10 +1394,7 @@ def test_unknown_price_amendment_needs_explicit_fresh_retry(tmp_path) -> None:
     with pytest.raises(ExecutionBlocked, match="changed since review"):
         amend(already_changed, allow_unknown_retry=True)
     assert transport.attempts == 1
-    assert (
-        service.price_update_attempt_state(refreshed, (update,))
-        == "SUBMISSION_UNKNOWN"
-    )
+    assert service.price_update_attempt_state(refreshed, (update,)) == "RESOLVED"
     receipt = amend(refreshed, allow_unknown_retry=True)
     assert receipt.entry.order_ids == (101,)
     assert transport.attempts == 2
@@ -1367,7 +1402,7 @@ def test_unknown_price_amendment_needs_explicit_fresh_retry(tmp_path) -> None:
         entry for entry in journal._entries()
         if entry.fingerprint.startswith("price-update:")
     ]
-    assert [entry.state for entry in attempts] == ["SUBMISSION_UNKNOWN", "SUBMITTED"]
+    assert [entry.state for entry in attempts] == ["RESOLVED", "SUBMITTED"]
     assert attempts[0].fingerprint != attempts[1].fingerprint
     with pytest.raises(ExecutionBlocked, match="already journaled"):
         amend(replace(refreshed, captured_at=Decimal("2")), allow_unknown_retry=True)

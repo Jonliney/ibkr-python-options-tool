@@ -104,6 +104,18 @@
   border-bottom: 1px solid var(--border);
 }
 
+.available-warning-trigger {
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  color: #fbbf24;
+}
+
+.available-warning-trigger:hover,
+.available-warning-trigger:focus-visible {
+  color: #fde68a;
+}
+
 .oca-layer-list > [data-layer-state]:first-child {
   border-top: 0;
 }
@@ -328,4 +340,8 @@
   font-weight: 700;
   line-height: 1.2;
   letter-spacing: 0.04em;
+}
+
+[data-cancelled-bracket-recovery-dialog] dialog[data-dialog] {
+  max-width: min(38rem, calc(100vw - 2rem));
 }

@@ -22,6 +22,7 @@ from .demo import (
     DemoPaperExecutionTransport,
     DemoReadOnlyBroker,
     DemoSnapshotSource,
+    seed_demo_journal,
 )
 from .view_model import PlannerViewModel
 from .web_window import StarUIPlannerWindow
@@ -96,14 +97,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     view_model = PlannerViewModel(coordinator, portfolio=portfolio, clock=clock)
     paper_execution: PaperExecutionService | None = None
     if args.enable_paper_execution:
+        journal_path = default_paper_journal_path()
+        if args.demo_data:
+            # Simulated acknowledgements must never share the paper TWS journal.
+            journal_path = journal_path.with_name("demo-execution-journal.json")
+        journal = (
+            seed_demo_journal(journal_path)
+            if args.demo_data else ExecutionJournal(journal_path)
+        )
+        if isinstance(broker, DemoReadOnlyBroker):
+            broker.use_journal(journal)
         transport = (
-            DemoPaperExecutionTransport()
+            DemoPaperExecutionTransport(journal)
             if args.demo_data
             else IbkrPaperExecutionBroker()
         )
         paper_execution = PaperExecutionService(
             transport,
-            ExecutionJournal(default_paper_journal_path()),
+            journal,
         )
     window = StarUIPlannerWindow(
         view_model,
