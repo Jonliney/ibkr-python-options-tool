@@ -4772,6 +4772,7 @@ class StarUIWorkbench:
         currency = snapshot.contract.currency if snapshot is not None else None
         realized = Decimal("0")
         pending_quantity = Decimal("0")
+        sold_quantity = Decimal("0")
         observed: list[ExitScenario] = []
         proposed: list[ExitScenario] = []
         pending_config: list[dict[str, Any]] = []
@@ -4803,6 +4804,7 @@ class StarUIWorkbench:
                     unresolved = True
                 else:
                     realized += outcome.realized_pnl
+                    sold_quantity += outcome.filled_quantity
             elif outcome.status == "PENDING":
                 layer = _entry.layers[_index]
                 quantity = Decimal(layer.quantity)
@@ -4963,6 +4965,8 @@ class StarUIWorkbench:
             proposed_outcome,
             {
                 "held": format(held, "f"),
+                "unitCost": format(basis * multiplier, "f") if basis is not None and multiplier is not None else None,
+                "soldQuantity": format(sold_quantity, "f"),
                 "realized": format(realized, "f"),
                 "unresolved": unresolved,
                 "pendingQuantity": format(pending_quantity, "f"),
@@ -5009,6 +5013,12 @@ class StarUIWorkbench:
         if partial and baseline.covered_quantity != outcome.covered_quantity:
             baseline_gain = None
             baseline_loss = None
+        unit_cost = Decimal(config["unitCost"]) if config["unitCost"] is not None else None
+        covered_cost = unit_cost * outcome.covered_quantity if unit_cost is not None else None
+        gain_cost = (
+            covered_cost + unit_cost * Decimal(config["soldQuantity"])
+            if covered_cost is not None else None
+        )
         gain_delta = (
             gain_value - baseline_gain
             if gain_value is not None and baseline_gain is not None
@@ -5019,50 +5029,50 @@ class StarUIWorkbench:
             if loss_value is not None and baseline_loss is not None
             else None
         )
-        return Card(
-            CardHeader(
-                CardTitle("Outcome projection", cls="text-sm"),
-                cls="px-4",
-            ),
-            CardContent(
-                Div(
-                    *_metric(
+        return Div(
+            H3("Outcome projection", cls="mb-3 text-sm font-semibold"),
+            Div(
+                    _metric(
                         "Expected gain",
-                        _projection_gain_value(gain_value, gain_delta),
+                        _projection_gain_value(gain_value, gain_delta, gain_cost),
                         "text-emerald-400",
                         live_key="gain",
                         help_text=(
+                            "Return percentage uses the cost of shown contracts and verified sold contracts. "
                             "Realised P&L plus projected target results from shown "
                             "layers. Pending bracket prices assume TWS accepts "
                             "the submitted exits; other contracts are excluded."
                             if Decimal(config["pendingQuantity"]) else
+                            "Return percentage uses the cost of shown contracts and verified sold contracts. "
                             "Realised P&L plus projected gains from the shown layers. "
                             "Excludes contracts without a verified target and stop."
                             if partial else
+                            "Return percentage uses the cost of held and verified sold contracts. "
                             "Realised P&L plus projected gains from the current layer plan."
                         ),
                     ),
-                    *_metric(
+                    _metric(
                         "Max loss",
-                        _projection_loss_value(loss_value, loss_delta),
+                        _projection_loss_value(loss_value, loss_delta, covered_cost),
                         "text-rose-400",
                         live_key="loss",
                         help_text=(
+                            "Return percentage uses the cost of shown held contracts. "
                             "Projected stop results from shown layers; excludes "
                             "realised P&L. Pending stops may not be working in TWS."
                             if Decimal(config["pendingQuantity"]) else
+                            "Return percentage uses the cost of shown held contracts. "
                             "Projected result at the shown layer stops; excludes "
                             "realised P&L and contracts without a verified target and stop."
                             if partial else
+                            "Return percentage uses the cost of held contracts. "
                             "Projected losses at the current layer stops; excludes realised P&L."
                         ),
                     ),
-                    cls="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] items-baseline gap-x-3 gap-y-3",
-                ),
-                cls="px-4",
+                cls="grid grid-cols-2 gap-2",
             ),
             data_outcome_projection=True,
-            cls="gap-4 rounded-2xl py-4 shadow-none",
+            cls="border-t border-border pt-3",
         )
 
     def _review(
@@ -6923,16 +6933,16 @@ def _money(value: Decimal) -> str:
     return f"{'+' if value >= 0 else '-'}${abs(value):,.2f}"
 
 
-def _projection_gain_value(value: Decimal | None, delta: Decimal | None) -> Any:
-    return _projection_change_value(value, delta, metric="gain")
+def _projection_gain_value(value: Decimal | None, delta: Decimal | None, cost: Decimal | None = None) -> Any:
+    return _projection_change_value(value, delta, metric="gain", cost=cost)
 
 
-def _projection_loss_value(value: Decimal | None, delta: Decimal | None) -> Any:
-    return _projection_change_value(value, delta, metric="loss")
+def _projection_loss_value(value: Decimal | None, delta: Decimal | None, cost: Decimal | None = None) -> Any:
+    return _projection_change_value(value, delta, metric="loss", cost=cost)
 
 
 def _projection_change_value(
-    value: Decimal | None, delta: Decimal | None, *, metric: str
+    value: Decimal | None, delta: Decimal | None, *, metric: str, cost: Decimal | None = None
 ) -> Any:
     changed = value is not None and delta is not None and bool(delta)
     up = changed and (delta > 0 if metric == "gain" else delta < 0)
@@ -6951,11 +6961,17 @@ def _projection_change_value(
         if value is not None and delta is not None
         else "Comparison unavailable"
     )
+    percent = _projection_percent(value, cost)
     return Span(
         Span(
             _money(value) if value is not None else "— Incomplete",
             cls="whitespace-nowrap",
             **{f"data_{metric}_value": True},
+        ),
+        Span(
+            f"({percent})" if percent is not None else "",
+            cls="text-muted-foreground text-[11px] font-normal leading-4 whitespace-nowrap",
+            **{f"data_{metric}_percent": True},
         ),
         Span(
             "(",
@@ -6978,8 +6994,15 @@ def _projection_change_value(
             cls="text-muted-foreground text-[11px] font-normal leading-4 whitespace-nowrap",
             **{f"data_{metric}_change": True},
         ),
-        cls="inline-flex flex-col items-end",
+        cls="inline-flex flex-col items-start gap-0.5",
     )
+
+
+def _projection_percent(value: Decimal | None, cost: Decimal | None) -> str | None:
+    if value is None or cost is None or not cost.is_finite() or cost <= 0:
+        return None
+    percent = (value / cost * Decimal("100")).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    return f"{percent:+,.1f}%"
 
 
 def _projection_script(configuration: dict[str, Any]) -> str:
@@ -6992,11 +7015,13 @@ def _projection_script(configuration: dict[str, Any]) -> str:
     const active = new Map(config.active.map((item) => [item.id, item]));
     let draft = config.draft, invalidDraft = false, invalidActive = false;
     const money = (number) => `${{number >= 0 ? '+' : '-'}}$${{Math.abs(number).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}})}}`;
-    const updateMetric = (node, value, baseline, kind) => {{
+    const updateMetric = (node, value, baseline, kind, cost) => {{
       if (!node) return;
       const select = (part) => node.querySelector('[data-' + kind + '-' + part + ']');
       const change = select('change');
       select('value').textContent = value === null ? '— Incomplete' : money(value);
+      select('percent').textContent = value !== null && Number.isFinite(cost) && cost > 0
+        ? `(${{new Intl.NumberFormat(undefined, {{minimumFractionDigits: 1, maximumFractionDigits: 1, signDisplay: 'always'}}).format(value / cost * 100)}}%)` : '';
       const changed = value !== null && baseline !== null && Math.abs(value - baseline) > 0.005;
       if (!changed) {{
         select('amount').textContent = '—';
@@ -7032,8 +7057,11 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       const comparablePartial = partial && Math.abs(covered - Number(config.baselineCoveredQuantity)) < 1e-8;
       const gainBaseline = estimate ? null : partial ? (comparablePartial ? Number(config.baselineCoveredGain) : null) : config.baselineGain === null ? null : Number(config.baselineGain);
       const lossBaseline = estimate ? null : partial ? (comparablePartial ? Number(config.baselineCoveredLoss) : null) : config.baselineLoss === null ? null : Number(config.baselineLoss);
-      updateMetric(gainNode, projected ? (config.marketExit ? (config.baselineGain === null ? null : Number(config.baselineGain)) : gain) : null, gainBaseline, 'gain');
-      updateMetric(lossNode, projected ? (config.marketExit ? (config.baselineLoss === null ? null : Number(config.baselineLoss)) : loss) : null, lossBaseline, 'loss');
+      const unitCost = config.unitCost === null ? NaN : Number(config.unitCost);
+      const coveredCost = unitCost * covered;
+      const gainCost = coveredCost + unitCost * Number(config.soldQuantity);
+      updateMetric(gainNode, projected ? (config.marketExit ? (config.baselineGain === null ? null : Number(config.baselineGain)) : gain) : null, gainBaseline, 'gain', gainCost);
+      updateMetric(lossNode, projected ? (config.marketExit ? (config.baselineLoss === null ? null : Number(config.baselineLoss)) : loss) : null, lossBaseline, 'loss', coveredCost);
     }};
     window.ibkrProjection = {{
       updateDraft(items, invalid) {{
@@ -7239,14 +7267,15 @@ def _metric(
         if help_text
         else P(label, cls="min-w-0 text-xs font-medium text-muted-foreground")
     )
-    return (
+    return Div(
         label_node,
         P(
             value,
             data_live_metric=live_key,
             aria_live="polite" if live_key else None,
-            cls=f"min-w-0 break-words text-right font-mono text-xs font-semibold tabular-nums {tone}",
+            cls=f"min-w-0 font-mono text-xs font-semibold tabular-nums {tone}",
         ),
+        cls="flex min-w-0 flex-col gap-2 rounded-xl border border-border bg-muted/20 px-2.5 py-2.5",
     )
 
 

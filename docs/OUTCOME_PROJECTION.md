@@ -11,6 +11,13 @@ verified, same-currency realized P&L from sold app-owned layers to the target
 sum. **Max loss** uses only the stop-price results for contracts still held;
 realized P&L does not offset this open-position risk. Separate displays of
 realized P&L and cost basis are deferred to a later task.
+Each headline amount also shows a percentage of its matching entry cost.
+Expected gain uses the cost of shown held contracts plus verified sold
+contracts included in its realized P&L. Max loss uses the cost of shown held
+contracts only, since sold P&L is excluded. For a partial projection, "shown"
+means covered contracts only. The percentage is omitted when that cost is
+missing or nonpositive; incomplete amounts have no percentage. These ratios
+are illustrative outcomes at the displayed prices, not guarantees of fills.
 Draft layers contribute their proposed prices and quantities. Active layers
 contribute observed prices until edited; staged amendments use their proposed
 prices. A staged bracket deletion removes its exit scenarios but does not

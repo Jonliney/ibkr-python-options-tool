@@ -2933,6 +2933,15 @@ def test_unchanged_projection_keeps_neutral_placeholder_and_hides_arrows() -> No
         assert 'text-muted-foreground' in markup
 
 
+def test_projection_percent_uses_total_cost_basis_and_hides_invalid_ratio() -> None:
+    gain = str(_projection_gain_value(Decimal("500"), Decimal("0"), Decimal("1000")))
+    loss = str(_projection_loss_value(Decimal("-250"), Decimal("0"), Decimal("1000")))
+    assert 'data-gain-percent' in gain and '(+50.0%)' in gain
+    assert 'data-loss-percent' in loss and '(-25.0%)' in loss
+    assert '(+50.0%)' not in str(_projection_gain_value(Decimal("500"), None, Decimal("0")))
+    assert '(+50.0%)' not in str(_projection_gain_value(None, None, Decimal("1000")))
+
+
 def test_fully_allocated_position_keeps_active_outcome_visible() -> None:
     from ibkr_options_manager.app.view_model import WorkingOrderLine
 
