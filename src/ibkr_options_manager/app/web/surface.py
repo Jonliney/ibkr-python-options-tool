@@ -59,6 +59,7 @@ from ...execution import (
 )
 from ...observation import ObservationSettings, PositionObserver
 from ...price_update_trace import record_price_update_event
+from ..position_observation import VerifiedPositionChanges
 from ..view_model import (
     ConnectionSettings,
     DraftLayerForm,
@@ -165,12 +166,8 @@ class StarUIWorkbench:
         self._observation_thread: Thread | None = None
         self._closed = False
         self._inventory_revision = 0
-        self._new_position_ids: set[int] = set()
+        self._position_changes = VerifiedPositionChanges()
         self._observation_requires_reload = False
-        self._selected_quantity_change: tuple[int, int, int] | None = None
-        self._verified_position_ids: set[int] = set()
-        self._verified_position_quantities: dict[int, int] = {}
-        self._verified_position_account: str | None = None
         self._observer_retry_at = 0.0
         self._armed_execution: PaperExecutionCandidate | None = None
         self._armed_execution_deadline: float | None = None
@@ -370,7 +367,7 @@ class StarUIWorkbench:
 
     def _inventory_fragment(self) -> HTMLResponse:
         with self._lock:
-            change = self._selected_quantity_change
+            change = self._position_changes.selected_change
             return HTMLResponse(
                 to_xml(self._inventory()),
                 headers={
@@ -590,7 +587,7 @@ class StarUIWorkbench:
                     for con_id, choice in self._position_stop_config.items()
                     if self._drafts.get(con_id)
                 }
-                self._selected_quantity_change = None
+                self._position_changes.clear_selected_change()
                 self._target_presets = values.get(
                     "target_presets", self._target_presets
                 )
@@ -612,7 +609,7 @@ class StarUIWorkbench:
                 self._disarm_execution_locked()
                 if not contract_locked:
                     self._save_form_locked(values)
-                self._selected_quantity_change = None
+                self._position_changes.clear_selected_change()
                 self._select_locked(_positive_int(values.get("con_id"), 0))
             elif action == "select-session-closed":
                 self._disarm_execution_locked()
@@ -624,7 +621,7 @@ class StarUIWorkbench:
                     self._message = "This contract is no longer in session history."
             elif action == "acknowledge-position-change":
                 self._disarm_execution_locked()
-                self._selected_quantity_change = None
+                self._position_changes.clear_selected_change()
             elif action.startswith("market-exit-arm:"):
                 _, _, perm_id = action.partition(":")
                 self._arm_market_exit_locked(_positive_int(perm_id, 0))
@@ -777,9 +774,9 @@ class StarUIWorkbench:
         preserve_invalid_drafts: bool = False,
     ) -> None:
         """Apply an already-read portfolio snapshot while holding the UI lock."""
-        if preserve_invalid_drafts and state.status is UiStatus.READY:
-            self._record_selected_quantity_change_locked(state)
-        self._record_verified_positions_locked(state)
+        self._record_verified_positions_locked(
+            state, track_selected_quantity=preserve_invalid_drafts
+        )
         previous_con_id = self._selected_con_id
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
@@ -799,53 +796,15 @@ class StarUIWorkbench:
             )
         self._preferred_con_id = None
         if target is None:
-            self._selected_quantity_change = None
+            self._position_changes.clear_selected_change()
             return
         self._select_locked(target, preserve_invalid_draft=preserve_invalid_drafts)
         if self._selected_con_id != previous_con_id:
-            self._selected_quantity_change = None
+            self._position_changes.clear_selected_change()
 
-    def _record_selected_quantity_change_locked(self, current_state: ViewState) -> None:
-        con_id = self._selected_con_id
-        if (
-            con_id is None
-            or self._verified_position_account != current_state.account
-            or con_id not in self._verified_position_quantities
-        ):
-            return
-        after = next(
-            (
-                position
-                for position in current_state.positions
-                if position.con_id == con_id and position.eligible
-            ),
-            None,
-        )
-        if after is None:
-            return
-        try:
-            new_quantity = Decimal(after.quantity)
-        except InvalidOperation:
-            return
-        if (
-            not new_quantity.is_finite()
-            or new_quantity <= 0
-            or new_quantity != new_quantity.to_integral_value()
-        ):
-            return
-        baseline = (
-            self._selected_quantity_change[1]
-            if self._selected_quantity_change is not None
-            and self._selected_quantity_change[0] == con_id
-            else self._verified_position_quantities[con_id]
-        )
-        self._selected_quantity_change = (
-            (con_id, baseline, int(new_quantity))
-            if int(new_quantity) != baseline
-            else None
-        )
-
-    def _record_verified_positions_locked(self, state: ViewState) -> None:
+    def _record_verified_positions_locked(
+        self, state: ViewState, *, track_selected_quantity: bool = False
+    ) -> None:
         if state.status is not UiStatus.READY:
             return
         if self._session_position_account != self._settings.account:
@@ -861,31 +820,12 @@ class StarUIWorkbench:
         for con_id, position in current.items():
             self._session_seen_positions[con_id] = position
             self._session_closed_positions.pop(con_id, None)
-        quantities: dict[int, int] = {}
-        for position in state.positions:
-            if not position.eligible:
-                continue
-            try:
-                quantity = Decimal(position.quantity)
-            except InvalidOperation:
-                continue
-            if (
-                quantity.is_finite()
-                and quantity > 0
-                and quantity == quantity.to_integral_value()
-            ):
-                quantities[position.con_id] = int(quantity)
-        verified_ids = {
-            position.con_id for position in state.positions if position.eligible
-        }
-        if self._verified_position_account == state.account:
-            self._new_position_ids.update(verified_ids - self._verified_position_ids)
-        else:
-            self._new_position_ids.clear()
-        self._new_position_ids.intersection_update(verified_ids)
-        self._verified_position_ids = verified_ids
-        self._verified_position_quantities = quantities
-        self._verified_position_account = state.account
+        self._position_changes.observe(
+            state.account,
+            state.positions,
+            selected_con_id=self._selected_con_id,
+            track_selected_quantity=track_selected_quantity,
+        )
 
     def _select_locked(
         self, con_id: int, *, preserve_invalid_draft: bool = False
@@ -895,7 +835,7 @@ class StarUIWorkbench:
             return
         self._selected_con_id = con_id
         self._selected_closed_con_id = None
-        self._new_position_ids.discard(con_id)
+        self._position_changes.select(con_id)
         state = self._view_model.select_position(
             con_id, self._plan_form(self._drafts.get(con_id, ()))
         )
@@ -3104,7 +3044,7 @@ class StarUIWorkbench:
                                     cls="new-position-badge",
                                     data_new_position=True,
                                 )
-                                if position.con_id in self._new_position_ids
+                                if position.con_id in self._position_changes.new_ids
                                 else None,
                                 cls="flex min-w-0 items-center gap-1.5",
                                 data_position_name=True,
@@ -3400,7 +3340,7 @@ class StarUIWorkbench:
         )
 
     def _selected_quantity_notice(self) -> Any:
-        change = self._selected_quantity_change
+        change = self._position_changes.selected_change
         delta = change[2] - change[1] if change else 0
         count = abs(delta)
         if delta > 0:

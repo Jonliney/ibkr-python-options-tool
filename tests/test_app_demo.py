@@ -415,10 +415,10 @@ def test_observed_new_position_updates_sidebar_without_changing_selection() -> N
         assert workbench._pending_observation is False
         workbench._position_hint(1)
         for _ in range(100):
-            if 987654321 in workbench._new_position_ids:
+            if 987654321 in workbench._position_changes.new_ids:
                 break
             Event().wait(0.01)
-        assert 987654321 in workbench._new_position_ids
+        assert 987654321 in workbench._position_changes.new_ids
         assert workbench._selected_con_id == original_selection
         assert workbench._drafts == original_drafts
         assert workbench._observation_requires_reload is False
@@ -506,7 +506,7 @@ def test_selected_position_quantity_change_offers_update_without_losing_draft() 
         data={"action": "acknowledge-position-change", "quantity_1": "99"},
     )
     assert acknowledged.status_code == 200
-    assert workbench._selected_quantity_change is None
+    assert workbench._position_changes.selected_change is None
     assert workbench._current_layers() == draft
 
 
@@ -556,7 +556,7 @@ def test_observed_quantity_decrease_does_not_reload_or_discard_invalid_draft() -
         assert workbench._inventory_revision > 0
         assert workbench._observation_requires_reload is False
         assert workbench._current_layers() == draft
-        assert workbench._selected_quantity_change == (
+        assert workbench._position_changes.selected_change == (
             con_id,
             int(Decimal(original_position.quantity)),
             1,
@@ -605,7 +605,7 @@ def test_position_becomes_new_when_contract_verification_completes() -> None:
                     break
                 Event().wait(0.01)
             assert workbench._inventory_revision >= expected_revision
-        assert 987654321 in workbench._new_position_ids
+        assert 987654321 in workbench._position_changes.new_ids
     finally:
         workbench.close()
         worker.join(timeout=1)
@@ -645,7 +645,7 @@ def test_reconnect_does_not_hide_a_new_verified_position() -> None:
                 break
             Event().wait(0.01)
         assert workbench._inventory_revision > 0
-        assert 987654321 in workbench._new_position_ids
+        assert 987654321 in workbench._position_changes.new_ids
     finally:
         workbench.close()
         worker.join(timeout=1)
@@ -675,7 +675,7 @@ def test_manual_refresh_marks_a_new_verified_position() -> None:
     )
 
     assert response.status_code == 200
-    assert 987654321 in workbench._new_position_ids
+    assert 987654321 in workbench._position_changes.new_ids
     assert "data-new-position" in response.text
     assert re.search(
         r"<div data-position-name[^>]*>\s*<span[^>]*>SPX</span><span data-new-position",

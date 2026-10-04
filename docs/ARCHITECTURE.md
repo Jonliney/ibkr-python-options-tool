@@ -42,6 +42,7 @@ construct IBKR contracts or orders.
 | `portfolio` | `PortfolioCoordinator.refresh/current` | Publishes only a coherent option inventory and expires cached inventory by monotonic age. |
 | `snapshot` | `SnapshotCoordinator.refresh/current` | Resolves one exact option and publishes only a complete coherent domain snapshot. |
 | `app.view_model` | presentation commands returning immutable `ViewState` | Owns UI state transitions, redaction, snapshot invalidation, form parsing, and planner invocation. A failed or stale selected-position result clears the cached snapshot. |
+| `app.position_observation` | `VerifiedPositionChanges.observe/select/clear_selected_change` | Tracks account-scoped verified-position baselines, NEW badges, and selected-quantity notices. It receives only complete READY portfolio inventories; callback hints and stale reads never advance its baseline. |
 | `app.web.surface` | local StarHTML workbench | Primary desktop surface. It renders state and stages explicit paper actions but does not talk to IBKR directly. |
 | `app.window` | PySide workbench | Retained native surface using the same view-model interface. |
 | `execution` | `PaperExecutionService` and `ExecutionJournal` | Re-verifies ownership and safety, journals before writes, rejects automatic retry after an unknown outcome, and exposes narrow management operations. |
@@ -76,6 +77,14 @@ The two desktop surfaces share the view-model interface. Their rendering code
 is intentionally separate because the widget and HTML runtimes have different
 lifecycle models. Pure behavior should move below that seam when both surfaces
 need it; visual construction should remain local to each adapter.
+
+The web workbench publishes only complete READY inventories to
+`VerifiedPositionChanges`. Its one observation transition compares eligible
+option contract IDs and whole positive quantities with the prior inventory for
+the same account. Account changes establish a new baseline. Selecting a
+position clears its NEW badge; acknowledging a quantity notice clears only the
+notice, so the next verified change uses the latest observed quantity. These
+presentation notices never authorize a paper write or extend snapshot freshness.
 
 ## Deferred restructuring
 
