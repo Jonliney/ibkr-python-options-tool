@@ -15,6 +15,7 @@ from typing import Any
 from starhtml import (
     H1,
     H3,
+    Circle,
     Div,
     Fieldset,
     Form,
@@ -26,7 +27,6 @@ from starhtml import (
     Signal,
     Span,
     Svg,
-    Circle,
     star_app,
     to_xml,
 )
@@ -73,12 +73,6 @@ from ..view_model import (
 from .components.ui.alert import Alert, AlertDescription, AlertTitle
 from .components.ui.badge import Badge
 from .components.ui.button import Button
-from .components.ui.card import (
-    Card,
-    CardContent,
-    CardHeader,
-    CardTitle,
-)
 from .components.ui.checkbox import Checkbox
 from .components.ui.dialog import (
     Dialog,
@@ -368,7 +362,11 @@ class StarUIWorkbench:
                 yield f"data: {payload}\n\n"
                 await asyncio.sleep(2)
 
-        return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store"})
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store"},
+        )
 
     def _inventory_fragment(self) -> HTMLResponse:
         with self._lock:
@@ -378,8 +376,12 @@ class StarUIWorkbench:
                 headers={
                     "Cache-Control": "no-store",
                     "X-Inventory-Revision": str(self._inventory_revision),
-                    "X-Selected-Changed": "1" if self._observation_requires_reload else "0",
-                    "X-Selected-Quantity-Change": str(change[2] - change[1]) if change else "0",
+                    "X-Selected-Changed": "1"
+                    if self._observation_requires_reload
+                    else "0",
+                    "X-Selected-Quantity-Change": str(change[2] - change[1])
+                    if change
+                    else "0",
                 },
             )
 
@@ -412,7 +414,9 @@ class StarUIWorkbench:
         ):
             return
         if self._observer is None:
-            self._observer = PositionObserver(self._position_hint, self._position_health)
+            self._observer = PositionObserver(
+                self._position_hint, self._position_health
+            )
         self._observer_settings = settings
         self._observer_generation = -1
         self._observer.start(
@@ -424,7 +428,11 @@ class StarUIWorkbench:
         self._observer_health = "connecting"
         self._observer_retry_at = monotonic() + 5
         if self._observation_thread is None:
-            self._observation_thread = Thread(target=self._observation_loop, name="ibkr-observation-reconcile", daemon=True)
+            self._observation_thread = Thread(
+                target=self._observation_loop,
+                name="ibkr-observation-reconcile",
+                daemon=True,
+            )
             self._observation_thread.start()
 
     def _position_hint(self, generation: int) -> None:
@@ -471,9 +479,13 @@ class StarUIWorkbench:
                 previous_selected = self._selected_con_id
                 self._suppress_toasts = True
                 try:
-                    self._refresh_locked(auto_select=False, preserve_invalid_drafts=True)
+                    self._refresh_locked(
+                        auto_select=False, preserve_invalid_drafts=True
+                    )
                     if self._state.status in {UiStatus.READY, UiStatus.BLOCKED}:
-                        self._observation_requires_reload = previous_selected != self._selected_con_id
+                        self._observation_requires_reload = (
+                            previous_selected != self._selected_con_id
+                        )
                     else:
                         self._observation_requires_reload = True
                 except Exception:
@@ -509,7 +521,10 @@ class StarUIWorkbench:
             self._toast = None
             contract_locked = bool(self._unresolved_management_entries())
             if contract_locked and action not in {
-                "refresh", "select", "select-session-closed", "verify-management"
+                "refresh",
+                "select",
+                "select-session-closed",
+                "verify-management",
             }:
                 self._disarm_execution_locked()
                 self._message = (
@@ -554,9 +569,15 @@ class StarUIWorkbench:
                 self._projection_comparison = None
             if action == "refresh":
                 stop_type = values.get("global_stop_type", self._default_stop_type)
-                offset = values.get("global_stop_limit_offset", self._default_stop_limit_offset)
-                unit = values.get("global_stop_limit_unit", self._default_stop_limit_unit)
-                if stop_type not in {"STP", "STP LMT"} or not _valid_stop_limit_offset(offset, unit):
+                offset = values.get(
+                    "global_stop_limit_offset", self._default_stop_limit_offset
+                )
+                unit = values.get(
+                    "global_stop_limit_unit", self._default_stop_limit_unit
+                )
+                if stop_type not in {"STP", "STP LMT"} or not _valid_stop_limit_offset(
+                    offset, unit
+                ):
                     self._message = "Choose STP or STP LMT and enter an offset above zero (and below 100% for percentages)."
                     return self._page()
                 self._default_stop_type = stop_type
@@ -626,7 +647,10 @@ class StarUIWorkbench:
                 self._resolve_cancelled_bracket_locked(values)
             elif action.startswith("verify-cancelled-bracket:"):
                 self._recovery_requested_fingerprint = action.partition(":")[2]
-                if self._cancelled_bracket_recovery(self._submission_outcomes()) is None:
+                if (
+                    self._cancelled_bracket_recovery(self._submission_outcomes())
+                    is None
+                ):
                     self._recovery_requested_fingerprint = None
                     self._message = (
                         "Bracket verification is unavailable; refresh the selected "
@@ -656,7 +680,9 @@ class StarUIWorkbench:
                     else None
                 )
                 if action == "build-draft" and self._current_layers():
-                    self._message = "A draft already exists. Edit its layers or remove them first."
+                    self._message = (
+                        "A draft already exists. Edit its layers or remove them first."
+                    )
                     return self._page()
                 if not self._save_form_locked(values, removing_index=removing_index):
                     return self._page()
@@ -689,7 +715,9 @@ class StarUIWorkbench:
         self._disarm_execution_locked()
         state = self._view_model.refresh_portfolio(self._settings)
         self._apply_refreshed_portfolio_locked(
-            state, auto_select=auto_select, preserve_invalid_drafts=preserve_invalid_drafts
+            state,
+            auto_select=auto_select,
+            preserve_invalid_drafts=preserve_invalid_drafts,
         )
         self._refresh_closed_history_locked()
 
@@ -701,7 +729,9 @@ class StarUIWorkbench:
             if baseline is None:
                 continue
             try:
-                snapshot = self._view_model.refresh_closed_history(self._settings, baseline)
+                snapshot = self._view_model.refresh_closed_history(
+                    self._settings, baseline
+                )
                 if snapshot is None:
                     continue
                 self._paper_execution.record_completed_orders(snapshot)
@@ -764,7 +794,9 @@ class StarUIWorkbench:
             target = previous_con_id
         available_con_ids = {position.con_id for position in state.positions}
         if target not in available_con_ids:
-            target = state.positions[0].con_id if auto_select and state.positions else None
+            target = (
+                state.positions[0].con_id if auto_select and state.positions else None
+            )
         self._preferred_con_id = None
         if target is None:
             self._selected_quantity_change = None
@@ -782,7 +814,11 @@ class StarUIWorkbench:
         ):
             return
         after = next(
-            (position for position in current_state.positions if position.con_id == con_id and position.eligible),
+            (
+                position
+                for position in current_state.positions
+                if position.con_id == con_id and position.eligible
+            ),
             None,
         )
         if after is None:
@@ -804,7 +840,9 @@ class StarUIWorkbench:
             else self._verified_position_quantities[con_id]
         )
         self._selected_quantity_change = (
-            (con_id, baseline, int(new_quantity)) if int(new_quantity) != baseline else None
+            (con_id, baseline, int(new_quantity))
+            if int(new_quantity) != baseline
+            else None
         )
 
     def _record_verified_positions_locked(self, state: ViewState) -> None:
@@ -841,9 +879,7 @@ class StarUIWorkbench:
             position.con_id for position in state.positions if position.eligible
         }
         if self._verified_position_account == state.account:
-            self._new_position_ids.update(
-                verified_ids - self._verified_position_ids
-            )
+            self._new_position_ids.update(verified_ids - self._verified_position_ids)
         else:
             self._new_position_ids.clear()
         self._new_position_ids.intersection_update(verified_ids)
@@ -851,7 +887,9 @@ class StarUIWorkbench:
         self._verified_position_quantities = quantities
         self._verified_position_account = state.account
 
-    def _select_locked(self, con_id: int, *, preserve_invalid_draft: bool = False) -> None:
+    def _select_locked(
+        self, con_id: int, *, preserve_invalid_draft: bool = False
+    ) -> None:
         if con_id not in {position.con_id for position in self._state.positions}:
             self._message = "The selected contract is not in the verified portfolio."
             return
@@ -893,10 +931,18 @@ class StarUIWorkbench:
 
     def _stop_configuration(self) -> tuple[str, str, str]:
         if self._selected_con_id is None:
-            return self._default_stop_type, self._default_stop_limit_offset, self._default_stop_limit_unit
+            return (
+                self._default_stop_type,
+                self._default_stop_limit_offset,
+                self._default_stop_limit_unit,
+            )
         return self._position_stop_config.get(
             self._selected_con_id,
-            (self._default_stop_type, self._default_stop_limit_offset, self._default_stop_limit_unit),
+            (
+                self._default_stop_type,
+                self._default_stop_limit_offset,
+                self._default_stop_limit_unit,
+            ),
         )
 
     def _disarm_execution_locked(self) -> None:
@@ -935,7 +981,9 @@ class StarUIWorkbench:
             # Keep the selected active-layer action available for a new Execute.
             self._active_action_verified = False
             self._armed_execution_deadline = None
-        self._status_message = "Review expired. Review the action again with fresh TWS data."
+        self._status_message = (
+            "Review expired. Review the action again with fresh TWS data."
+        )
         return True
 
     def _set_review_status_locked(self, message: str) -> None:
@@ -974,9 +1022,13 @@ class StarUIWorkbench:
         )
 
     def _confirm_execution_locked(self) -> None:
-        if self._armed_execution is not None and self._expire_confirmation_locked(require_deadline=True):
+        if self._armed_execution is not None and self._expire_confirmation_locked(
+            require_deadline=True
+        ):
             self._disarm_execution_locked()
-            self._message = "Paper bracket confirmation expired. Review the order again."
+            self._message = (
+                "Paper bracket confirmation expired. Review the order again."
+            )
             return
         drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
         if not 0 < drafted <= self._planning_available_quantity():
@@ -1106,7 +1158,9 @@ class StarUIWorkbench:
         target_ids = self._active_target_perm_ids()
         snapshot = self._view_model.latest_snapshot()
         if not target_ids or snapshot is None:
-            self._message = "Bracket cancellation blocked: no active layers are available."
+            self._message = (
+                "Bracket cancellation blocked: no active layers are available."
+            )
             return
         try:
             candidates = self._paper_execution.prepare_market_exits(
@@ -1155,27 +1209,33 @@ class StarUIWorkbench:
                 if set(self._active_target_perm_ids()) != {
                     candidate.target_perm_id for candidate in cancellations
                 }:
-                    raise ExecutionBlocked("the set of active OCA layers changed after review")
-                refreshed = self._paper_execution.prepare_market_exits(
+                    raise ExecutionBlocked(
+                        "the set of active OCA layers changed after review"
+                    )
+                refreshed_cancellations = self._paper_execution.prepare_market_exits(
                     snapshot,
-                    target_perm_ids=tuple(candidate.target_perm_id for candidate in cancellations),
+                    target_perm_ids=tuple(
+                        candidate.target_perm_id for candidate in cancellations
+                    ),
                     expected_client_id=self._settings.client_id,
                 )
-                if refreshed != cancellations:
+                if refreshed_cancellations != cancellations:
                     raise ExecutionBlocked("the OCA layers changed after review")
             elif cancellation is not None:
-                refreshed = self._paper_execution.prepare_market_exit(
+                refreshed_cancellation = self._paper_execution.prepare_market_exit(
                     snapshot,
                     target_perm_id=cancellation.target_perm_id,
                     expected_client_id=self._settings.client_id,
                 )
-                if refreshed != cancellation:
+                if refreshed_cancellation != cancellation:
                     raise ExecutionBlocked("the OCA bracket changed after review")
             else:
                 if self._review_all_active_exits and set(
                     self._active_target_perm_ids()
                 ) != {candidate.target_perm_id for candidate in market_exits}:
-                    raise ExecutionBlocked("the set of active OCA layers changed after review")
+                    raise ExecutionBlocked(
+                        "the set of active OCA layers changed after review"
+                    )
                 refreshed_exits = self._paper_execution.prepare_market_exits(
                     snapshot,
                     target_perm_ids=tuple(
@@ -1187,7 +1247,9 @@ class StarUIWorkbench:
                     raise ExecutionBlocked("the OCA layers changed after review")
         except ExecutionBlocked as error:
             self._disarm_execution_locked()
-            self._message = f"Execution blocked: {error}. Review the latest state again."
+            self._message = (
+                f"Execution blocked: {error}. Review the latest state again."
+            )
             return
         self._active_action_verified = True
         self._armed_execution_deadline = monotonic() + 10
@@ -1249,20 +1311,19 @@ class StarUIWorkbench:
         except Exception as error:
             self._message = f"Bracket cancellation outcome is unknown: {error}"
         else:
-            refreshed = self._refresh_after_acknowledged_write_locked(
+            refresh_succeeded = self._refresh_after_acknowledged_write_locked(
                 "TWS confirmed both OCA legs were cancelled."
             )
             observed = self._view_model.latest_snapshot()
             cancelled_ids = {candidate.target_perm_id, candidate.stop_perm_id}
-            if refreshed and not (
+            if refresh_succeeded and not (
                 observed is not None
                 and observed.selected.account == candidate.account
                 and observed.selected.con_id == candidate.con_id
                 and observed.complete
                 and observed.fresh
                 and not any(
-                    order.perm_id in cancelled_ids
-                    for order in observed.working_orders
+                    order.perm_id in cancelled_ids for order in observed.working_orders
                 )
             ):
                 self._message = (
@@ -1364,7 +1425,9 @@ class StarUIWorkbench:
             return
         fingerprint = values.get("fingerprint", "")
         self._recovery_requested_fingerprint = fingerprint
-        state = self._view_model.select_position(self._selected_con_id, self._plan_form(()))
+        state = self._view_model.select_position(
+            self._selected_con_id, self._plan_form(())
+        )
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
         snapshot = self._view_model.latest_snapshot()
@@ -1376,18 +1439,22 @@ class StarUIWorkbench:
             or snapshot.selected.account != self._settings.account
             or snapshot.selected.con_id != self._selected_con_id
         ):
-            self._message = "Bracket not verified: a fresh, complete broker read is required."
+            self._message = (
+                "Bracket not verified: a fresh, complete broker read is required."
+            )
             return
         self._announce_reconciliation_locked()
         outcomes = [
-            outcome for entry, _index, outcome in self._submission_outcomes()
+            outcome
+            for entry, _index, outcome in self._submission_outcomes()
             if entry.fingerprint == fingerprint
         ]
-        if outcomes and all(outcome.status == "ACTIVE" for outcome in outcomes):
-            self._recovery_requested_fingerprint = None
-        elif outcomes and all(
-            outcome.status == "ACTIVE" or outcome.status.startswith("CLOSED_")
-            for outcome in outcomes
+        if (outcomes and all(outcome.status == "ACTIVE" for outcome in outcomes)) or (
+            outcomes
+            and all(
+                outcome.status == "ACTIVE" or outcome.status.startswith("CLOSED_")
+                for outcome in outcomes
+            )
         ):
             self._recovery_requested_fingerprint = None
         else:
@@ -1421,7 +1488,9 @@ class StarUIWorkbench:
             self._message = f"Order status not verified: {error}"
             return
         except Exception:
-            self._message = "Order status not verified: TWS read failed. Refresh and try again."
+            self._message = (
+                "Order status not verified: TWS read failed. Refresh and try again."
+            )
             return
         self._disarm_execution_locked()
 
@@ -1544,7 +1613,9 @@ class StarUIWorkbench:
             if self._review_all_active_exits and set(
                 self._active_target_perm_ids()
             ) != {candidate.target_perm_id for candidate in armed}:
-                raise ExecutionBlocked("the set of active OCA layers changed after review")
+                raise ExecutionBlocked(
+                    "the set of active OCA layers changed after review"
+                )
             candidates = self._paper_execution.prepare_market_exits(
                 snapshot,
                 target_perm_ids=tuple(candidate.target_perm_id for candidate in armed),
@@ -1660,7 +1731,9 @@ class StarUIWorkbench:
                     basis * (Decimal("1") + stop_percentage / Decimal("100")),
                     calculator.bands,
                 )
-                exact_stop_text = values.get(f"active_stop_price_{layer.target_perm_id}")
+                exact_stop_text = values.get(
+                    f"active_stop_price_{layer.target_perm_id}"
+                )
                 if exact_stop_text:
                     exact_stop = _decimal_value(exact_stop_text)
                     if (
@@ -1670,32 +1743,53 @@ class StarUIWorkbench:
                         or abs((exact_stop / basis - 1) * 100 - stop_percentage)
                         > Decimal("0.005001")
                     ):
-                        raise ExecutionBlocked("bulk stop price does not match its displayed return")
+                        raise ExecutionBlocked(
+                            "bulk stop price does not match its displayed return"
+                        )
                     desired_stop = exact_stop
-                shown_target = _decimal_value(_active_percentage_for_price(
-                    target.limit_price, basis, target=True,
-                    bands=calculator.bands,
-                    presets=_parse_presets(self._target_presets, maximum=Decimal("1000")) or (),
-                ))
-                shown_stop = _decimal_value(_active_percentage_for_price(
-                    stop.stop_price, basis, target=True,
-                    bands=calculator.bands,
-                    presets=_parse_presets(self._stop_presets, maximum=Decimal("100")) or (),
-                ))
+                shown_target = _decimal_value(
+                    _active_percentage_for_price(
+                        target.limit_price,
+                        basis,
+                        target=True,
+                        bands=calculator.bands,
+                        presets=_parse_presets(
+                            self._target_presets, maximum=Decimal("1000")
+                        )
+                        or (),
+                    )
+                )
+                shown_stop = _decimal_value(
+                    _active_percentage_for_price(
+                        stop.stop_price,
+                        basis,
+                        target=True,
+                        bands=calculator.bands,
+                        presets=_parse_presets(
+                            self._stop_presets, maximum=Decimal("100")
+                        )
+                        or (),
+                    )
+                )
                 updates.append(
                     PriceUpdateCandidate(
                         layer=layer,
                         target_price=(
                             _edited_active_price(
-                                target.limit_price, desired_target,
-                                target_percentage, shown_target,
+                                target.limit_price,
+                                desired_target,
+                                target_percentage,
+                                shown_target,
                             )
                         ),
                         stop_price=(
-                            desired_stop if exact_stop_text and desired_stop != stop.stop_price
+                            desired_stop
+                            if exact_stop_text and desired_stop != stop.stop_price
                             else _edited_active_price(
-                                stop.stop_price, desired_stop,
-                                stop_percentage, shown_stop,
+                                stop.stop_price,
+                                desired_stop,
+                                stop_percentage,
+                                shown_stop,
                             )
                         ),
                         prior_target_price=target.limit_price,
@@ -1847,7 +1941,9 @@ class StarUIWorkbench:
                 and not self._unresolved_management_entries()
             ):
                 self._message = f"Price update blocked: {error}"
-                record_price_update_event("ui_result", outcome="blocked", reason=str(error))
+                record_price_update_event(
+                    "ui_result", outcome="blocked", reason=str(error)
+                )
                 return
             # A marketable amended limit can fill while TWS cancels its OCA
             # sibling. A 202 callback or a missing open order cannot establish
@@ -1868,13 +1964,17 @@ class StarUIWorkbench:
                     self._message = f"Price update outcome is unknown: {journal_error}. Check TWS and refresh."
                     return
                 self._message = "Price update filled: the selected exit sold in TWS."
-                record_price_update_event("ui_result", outcome="filled", reason=str(error))
+                record_price_update_event(
+                    "ui_result", outcome="filled", reason=str(error)
+                )
             else:
                 self._message = (
                     f"Price update outcome is unknown: {error}. Check TWS and refresh "
                     "before another action."
                 )
-                record_price_update_event("ui_result", outcome="unknown", reason=str(error))
+                record_price_update_event(
+                    "ui_result", outcome="unknown", reason=str(error)
+                )
         else:
             try:
                 self._paper_execution.record_verified_price_updates(
@@ -1893,7 +1993,7 @@ class StarUIWorkbench:
                     target_price=update.target_price,
                     stop_price=update.stop_price,
                 )
-            refreshed = self._refresh_after_acknowledged_write_locked(
+            refresh_succeeded = self._refresh_after_acknowledged_write_locked(
                 f"{'Simulated broker' if self._demo_mode else 'TWS'} acknowledged "
                 f"{len(receipt.entry.order_ids)} app-owned OCA "
                 "price amendment(s)."
@@ -1920,11 +2020,12 @@ class StarUIWorkbench:
             )
             self._show_success_toast_locked(
                 "Simulated price update acknowledged"
-                if self._demo_mode else "Price update acknowledged by TWS",
+                if self._demo_mode
+                else "Price update acknowledged by TWS",
                 "Demo order state refreshed; no TWS order was sent."
-                if refreshed and self._demo_mode
+                if refresh_succeeded and self._demo_mode
                 else "Latest TWS state loaded. Check TWS for any required Transmit."
-                if refreshed
+                if refresh_succeeded
                 else "The automatic refresh could not verify broker state. Refresh before another order change.",
             )
         finally:
@@ -2079,16 +2180,24 @@ class StarUIWorkbench:
             return True
         if "draft_stop_type" in values:
             stop_type = values["draft_stop_type"]
-            offset = values.get("draft_stop_limit_offset", self._stop_configuration()[1])
+            offset = values.get(
+                "draft_stop_limit_offset", self._stop_configuration()[1]
+            )
             unit = values.get("draft_stop_limit_unit", self._stop_configuration()[2])
             if stop_type not in {"STP", "STP LMT"} or (
                 stop_type == "STP LMT" and not _valid_stop_limit_offset(offset, unit)
             ):
-                self._message = "Enter a valid stop-limit offset before reviewing the draft."
+                self._message = (
+                    "Enter a valid stop-limit offset before reviewing the draft."
+                )
                 return False
             if stop_type == "STP" and not _valid_stop_limit_offset(offset, unit):
                 offset, unit = self._stop_configuration()[1:]
-            self._position_stop_config[self._selected_con_id] = (stop_type, offset, unit)
+            self._position_stop_config[self._selected_con_id] = (
+                stop_type,
+                offset,
+                unit,
+            )
         available = self._planning_available_quantity()
         quantities = [
             values.get(f"quantity_{index}", previous.quantity)
@@ -2134,7 +2243,8 @@ class StarUIWorkbench:
                 basis = self._state.unit_basis or Decimal("0")
                 bands = (
                     self._state.quote_calculator.bands
-                    if self._state.quote_calculator is not None else ()
+                    if self._state.quote_calculator is not None
+                    else ()
                 )
                 if exact_stop is not None and (
                     not exact_stop.is_finite()
@@ -2147,7 +2257,9 @@ class StarUIWorkbench:
                     )
                 ):
                     raise ValueError("draft stop price and percentage disagree")
-                chosen_stop = exact_stop if exact_stop is not None else prices.stop_price
+                chosen_stop = (
+                    exact_stop if exact_stop is not None else prices.stop_price
+                )
                 actual_target = (
                     Decimal(previous.target_price)
                     if target_value == Decimal(previous.target_percentage)
@@ -2156,13 +2268,25 @@ class StarUIWorkbench:
                 if chosen_stop >= actual_target:
                     raise ValueError("stop must remain below target")
             except (InvalidOperation, ValueError):
-                self._message = "Targets must be above 0%; stops must be below their targets."
+                self._message = (
+                    "Targets must be above 0%; stops must be below their targets."
+                )
                 return False
             layers.append(
                 DraftLayerForm(
                     quantity=quantity,
-                    target_price=(previous.target_price if target_value == Decimal(previous.target_percentage) else format(prices.target_price, "f")),
-                    stop_price=(format(chosen_stop, "f") if exact_stop is not None else previous.stop_price if stop_value == Decimal(previous.stop_percentage) else format(prices.stop_price, "f")),
+                    target_price=(
+                        previous.target_price
+                        if target_value == Decimal(previous.target_percentage)
+                        else format(prices.target_price, "f")
+                    ),
+                    stop_price=(
+                        format(chosen_stop, "f")
+                        if exact_stop is not None
+                        else previous.stop_price
+                        if stop_value == Decimal(previous.stop_percentage)
+                        else format(prices.stop_price, "f")
+                    ),
                     target_percentage=format(target_value, "f"),
                     stop_percentage=format(stop_value, "f"),
                     tif=tif if tif in {"GTC", "DAY"} else previous.tif,
@@ -2203,14 +2327,18 @@ class StarUIWorkbench:
                     for entry, index, _outcome in pending
                 ) + tuple(Decimal(layer.target_price) for layer in layers)
             except InvalidOperation:
-                self._message = "A pending target price is invalid; review TWS and Refresh."
+                self._message = (
+                    "A pending target price is invalid; review TWS and Refresh."
+                )
                 return
             if any(not price.is_finite() or price <= 0 for price in previous_targets):
-                self._message = "A pending target price is invalid; review TWS and Refresh."
+                self._message = (
+                    "A pending target price is invalid; review TWS and Refresh."
+                )
                 return
-            target_presets = _parse_presets(
-                self._target_presets, maximum=Decimal("1000")
-            ) or ()
+            target_presets = (
+                _parse_presets(self._target_presets, maximum=Decimal("1000")) or ()
+            )
             higher_target = _next_target_preset_above(
                 previous_targets,
                 basis=basis,
@@ -2248,10 +2376,14 @@ class StarUIWorkbench:
         con_id = self._selected_con_id
         available = self._planning_available_quantity()
         if con_id is None or self._state.status is not UiStatus.READY or available <= 0:
-            self._message = "Refresh a position with available contracts before building a draft."
+            self._message = (
+                "Refresh a position with available contracts before building a draft."
+            )
             return
         if self._current_layers():
-            self._message = "A draft already exists. Edit its layers or remove them first."
+            self._message = (
+                "A draft already exists. Edit its layers or remove them first."
+            )
             return
         if any(
             outcome.status != "PENDING"
@@ -2288,7 +2420,9 @@ class StarUIWorkbench:
                     )
                 )
         except ValueError:
-            self._message = "The selected position does not have a usable price increment."
+            self._message = (
+                "The selected position does not have a usable price increment."
+            )
             return
         self._drafts[con_id] = tuple(layers)
 
@@ -2345,7 +2479,11 @@ class StarUIWorkbench:
                 closed_review,
                 cls="grid h-[calc(100vh-3.5rem)] min-h-0 grid-cols-[16rem_minmax(0,1fr)_19rem] overflow-hidden border-t border-border",
             )
-        elif state.status is UiStatus.READY and not state.positions and not self._session_closed_positions:
+        elif (
+            state.status is UiStatus.READY
+            and not state.positions
+            and not self._session_closed_positions
+        ):
             content = self._empty_positions()
         else:
             snapshot = self._view_model.latest_snapshot()
@@ -2476,7 +2614,9 @@ class StarUIWorkbench:
                     connectStream();
                   }}, 2000);
                 }})();"""
-            ) if self._observe_positions else None,
+            )
+            if self._observe_positions
+            else None,
             self._header(),
             content,
             self._toast_component(),
@@ -2527,7 +2667,10 @@ class StarUIWorkbench:
         return Div(
             Div(
                 Icon("lucide:link-2", cls="size-7 text-primary", aria_hidden="true"),
-                H1("No option positions detected", cls="mt-6 text-2xl font-semibold tracking-tight"),
+                H1(
+                    "No option positions detected",
+                    cls="mt-6 text-2xl font-semibold tracking-tight",
+                ),
                 P(
                     "Buy a long option contract in TWS, then refresh to load it here.",
                     cls="mt-3 max-w-md text-sm leading-6 text-muted-foreground",
@@ -2550,7 +2693,11 @@ class StarUIWorkbench:
         )
 
     def _toast_component(self) -> Any:
-        notice = self._toast if self._toast_revision > self._toast_rendered_revision else None
+        notice = (
+            self._toast
+            if self._toast_revision > self._toast_rendered_revision
+            else None
+        )
         if notice is not None:
             self._toast_rendered_revision = self._toast_revision
         # Keep the official Toaster mounted on every response so the embedded
@@ -2704,7 +2851,11 @@ class StarUIWorkbench:
             connection = _header_status("TWS not connected", "link-2", "muted")
         elif self._launch_connection == "connecting":
             connection = _header_status("Connecting to TWS", "link-2", "muted")
-        elif self._observe_positions and self._observer_health in {"error", "disconnected", "client-id-in-use"}:
+        elif self._observe_positions and self._observer_health in {
+            "error",
+            "disconnected",
+            "client-id-in-use",
+        }:
             label = (
                 "Observer client ID in use"
                 if self._observer_health == "client-id-in-use"
@@ -2749,18 +2900,33 @@ class StarUIWorkbench:
         else:
             account_mode = _header_status("Account unverified", "shield-off", "muted")
         if self._observe_positions:
-            if self._observer_health in {"error", "disconnected", "client-id-in-use"} or self._launch_connection == "failed":
+            if (
+                self._observer_health in {"error", "disconnected", "client-id-in-use"}
+                or self._launch_connection == "failed"
+            ):
                 initial_label = "TWS updates unavailable"
                 initial_state = "warning"
-            elif self._launch_connection == "connecting" or self._observer_health == "connecting":
+            elif (
+                self._launch_connection == "connecting"
+                or self._observer_health == "connecting"
+            ):
                 initial_label = "Connecting to TWS"
                 initial_state = "starting"
             else:
                 initial_label = "Checking TWS updates"
                 initial_state = "starting"
             connection = Div(
-                Icon("lucide:radio", cls="size-4 shrink-0 tws-updates-icon", aria_hidden="true"),
-                Span(initial_label, id="tws-updates-label", cls="text-xs font-medium whitespace-nowrap", aria_live="polite"),
+                Icon(
+                    "lucide:radio",
+                    cls="size-4 shrink-0 tws-updates-icon",
+                    aria_hidden="true",
+                ),
+                Span(
+                    initial_label,
+                    id="tws-updates-label",
+                    cls="text-xs font-medium whitespace-nowrap",
+                    aria_live="polite",
+                ),
                 id="tws-updates-status",
                 cls="flex shrink-0 items-center gap-1.5",
                 data_connection_state=initial_state,
@@ -2781,13 +2947,16 @@ class StarUIWorkbench:
                 cls="text-xs text-muted-foreground",
             ),
             Form(
-                _button_tooltip(Button(
-                    "Refresh",
-                    variant="outline",
-                    size="sm",
-                    type="submit",
-                    data_busy_text="Refreshing…",
-                ), "Get the latest positions and orders from TWS"),
+                _button_tooltip(
+                    Button(
+                        "Refresh",
+                        variant="outline",
+                        size="sm",
+                        type="submit",
+                        data_busy_text="Refreshing…",
+                    ),
+                    "Get the latest positions and orders from TWS",
+                ),
                 HTMLInput(type="hidden", name="action", value="refresh"),
                 HTMLInput(type="hidden", name="account", value=self._settings.account),
                 HTMLInput(type="hidden", name="port", value=str(self._settings.port)),
@@ -2809,36 +2978,55 @@ class StarUIWorkbench:
     def _closed_session_workspace(self, con_id: int) -> Any:
         position = self._session_closed_positions[con_id]
         reader = getattr(self._paper_execution, "submission_entries", None)
-        entries = reader(account=self._settings.account, con_id=con_id) if callable(reader) else ()
+        entries = (
+            reader(account=self._settings.account, con_id=con_id)
+            if callable(reader)
+            else ()
+        )
         rows: list[Any] = []
         realized = Decimal("0")
         pnl_verified = True
         for entry in entries:
             for index in range(len(entry.layers)):
                 outcome = classify_journal_layer(
-                    entry, index, active_perm_ids=frozenset(),
+                    entry,
+                    index,
+                    active_perm_ids=frozenset(),
                     observed_perm_ids=frozenset(),
                 )
                 if outcome.status == "CANCELLED":
                     continue
                 if outcome.status.startswith("CLOSED_"):
-                    rows.append(self._closed_layer_row(
-                        len(rows) + 1, entry, index, outcome,
-                        recover_legacy=False,
-                    ))
+                    rows.append(
+                        self._closed_layer_row(
+                            len(rows) + 1,
+                            entry,
+                            index,
+                            outcome,
+                            recover_legacy=False,
+                        )
+                    )
                     if outcome.realized_pnl is not None and outcome.currency == "USD":
                         realized += outcome.realized_pnl
                     else:
                         pnl_verified = False
                 else:
-                    rows.append(self._pending_layer_row(
-                        len(rows) + 1, entry, index, outcome, read_only=True,
-                    ))
+                    rows.append(
+                        self._pending_layer_row(
+                            len(rows) + 1,
+                            entry,
+                            index,
+                            outcome,
+                            read_only=True,
+                        )
+                    )
         symbol, contract_detail = _position_identity(position.local_symbol)
         title = f"{symbol} {contract_detail}".strip()
-        result = _header_pnl(realized, "USD") if pnl_verified and any(
-            entry.fills for entry in entries
-        ) else "—"
+        result = (
+            _header_pnl(realized, "USD")
+            if pnl_verified and any(entry.fills for entry in entries)
+            else "—"
+        )
         center = self._workspace_content(
             Div(
                 H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
@@ -2864,7 +3052,9 @@ class StarUIWorkbench:
                         aria_label="Closed OCA layer rows",
                         orientation="horizontal",
                         cls="w-full",
-                    ) if rows else P(
+                    )
+                    if rows
+                    else P(
                         "No closed fills or unresolved layers to show.",
                         cls="pt-8 text-sm text-muted-foreground",
                     ),
@@ -2878,7 +3068,10 @@ class StarUIWorkbench:
         )
         review = Div(
             Div(
-                Span("ACTION REVIEW", cls="text-xs font-semibold tracking-wide text-muted-foreground"),
+                Span(
+                    "ACTION REVIEW",
+                    cls="text-xs font-semibold tracking-wide text-muted-foreground",
+                ),
                 cls="flex items-center justify-between px-4 py-4",
             ),
             Div(
@@ -2974,16 +3167,25 @@ class StarUIWorkbench:
                             Badge("0", variant="secondary"),
                             cls="flex w-full items-center justify-between",
                         ),
-                        P(contract_detail, cls="mt-1.5 w-full text-xs text-muted-foreground"),
+                        P(
+                            contract_detail,
+                            cls="mt-1.5 w-full text-xs text-muted-foreground",
+                        ),
                         variant="ghost",
                         type="submit",
                         cls=(
                             "h-auto min-h-20 w-full flex-col items-stretch justify-center gap-0 "
                             "rounded-none border-l-2 px-4 py-4 text-left hover:bg-accent "
-                            + ("border-emerald-400 bg-emerald-500/10" if position.con_id == self._selected_closed_con_id else "border-transparent")
+                            + (
+                                "border-emerald-400 bg-emerald-500/10"
+                                if position.con_id == self._selected_closed_con_id
+                                else "border-transparent"
+                            )
                         ),
                     ),
-                    HTMLInput(type="hidden", name="action", value="select-session-closed"),
+                    HTMLInput(
+                        type="hidden", name="action", value="select-session-closed"
+                    ),
                     HTMLInput(type="hidden", name="con_id", value=str(position.con_id)),
                     action=f"/{self.session_token}/action",
                     method="post",
@@ -3001,9 +3203,14 @@ class StarUIWorkbench:
             ScrollArea(
                 *rows,
                 Div(
-                    Span("CLOSED THIS SESSION", cls="text-xs font-semibold tracking-wide text-muted-foreground"),
+                    Span(
+                        "CLOSED THIS SESSION",
+                        cls="text-xs font-semibold tracking-wide text-muted-foreground",
+                    ),
                     cls="border-t border-border px-3 py-4",
-                ) if closed_rows else None,
+                )
+                if closed_rows
+                else None,
                 *closed_rows,
                 aria_label="Open option positions",
                 cls="min-h-0 flex-1",
@@ -3013,118 +3220,182 @@ class StarUIWorkbench:
 
     def _settings_dialog(self) -> Any:
         return Tooltip(
-            TooltipTrigger(Dialog(
-            DialogTrigger("Settings", variant="outline", size="sm"),
-            DialogContent(
-                DialogHeader(
-                    DialogTitle("Connection & layer defaults"),
-                    DialogDescription(
-                        "Changing these values refreshes the verified portfolio and clears the current preview."
-                    ),
-                ),
-                Form(
-                    Div(
-                        _field(
-                            "Account",
-                            Input(name="account", value=self._settings.account),
-                        ),
-                        _field(
-                            "Port",
-                            Input(
-                                name="port",
-                                type="number",
-                                value=str(self._settings.port),
+            TooltipTrigger(
+                Dialog(
+                    DialogTrigger("Settings", variant="outline", size="sm"),
+                    DialogContent(
+                        DialogHeader(
+                            DialogTitle("Connection & layer defaults"),
+                            DialogDescription(
+                                "Changing these values refreshes the verified portfolio and clears the current preview."
                             ),
                         ),
-                        _field(
-                            "Client ID",
-                            Input(
-                                name="client_id",
-                                type="number",
-                                value=str(self._settings.client_id),
-                            ),
-                        ),
-                        _field(
-                            "Timeout",
-                            Input(
-                                name="timeout",
-                                type="number",
-                                value=str(self._settings.timeout_seconds),
-                                step="0.5",
-                            ),
-                        ),
-                        cls="grid grid-cols-2 gap-4",
-                    ),
-                    Separator(cls="my-5"),
-                    H3("Layer defaults", cls="text-sm font-semibold"),
-                    Div(
-                        _field(
-                            "LMT targets",
-                            Input(name="target_presets", value=self._target_presets),
-                        ),
-                        _field(
-                            "STP losses",
-                            Input(name="stop_presets", value=self._stop_presets),
-                        ),
-                        cls="mt-3 grid grid-cols-2 gap-4",
-                    ),
-                    P(
-                        "Comma-separated percentages. The final value repeats for later layers.",
-                        cls="mt-3 text-xs leading-5 text-muted-foreground",
-                    ),
-                    Separator(cls="my-5"),
-                    H3("Stop order for new layers", cls="text-sm font-semibold"),
-                    Div(
-                        Div(
-                            Button("STP", type="button", variant="outline", size="sm", aria_pressed="true" if self._default_stop_type == "STP" else "false", data_global_stop_choice="STP", cls="rounded-r-none border-primary bg-primary/10" if self._default_stop_type == "STP" else "rounded-r-none"),
-                            Button("STP LMT", type="button", variant="outline", size="sm", aria_pressed="true" if self._default_stop_type == "STP LMT" else "false", data_global_stop_choice="STP LMT", cls="-ml-px rounded-l-none border-primary bg-primary/10" if self._default_stop_type == "STP LMT" else "-ml-px rounded-l-none"),
-                            cls="inline-flex",
-                        ),
-                        Div(
-                            Label("How far below the stop?", fr="global-stop-limit-offset", cls="text-xs font-medium text-muted-foreground"),
+                        Form(
                             Div(
-                                Input(id="global-stop-limit-offset", name="global_stop_limit_offset", type="number", min="0.1" if self._default_stop_limit_unit == "percent" else "0.01", max="99.9" if self._default_stop_limit_unit == "percent" else None, step="any", value=self._default_stop_limit_offset, disabled=self._default_stop_type != "STP LMT", cls="w-24"),
-                                Fieldset(
-                                    ToggleGroup(
-                                        ("percent", "%"),
-                                        ("dollars", "$"),
-                                        type="single",
-                                        value=self._default_stop_limit_unit,
+                                _field(
+                                    "Account",
+                                    Input(name="account", value=self._settings.account),
+                                ),
+                                _field(
+                                    "Port",
+                                    Input(
+                                        name="port",
+                                        type="number",
+                                        value=str(self._settings.port),
+                                    ),
+                                ),
+                                _field(
+                                    "Client ID",
+                                    Input(
+                                        name="client_id",
+                                        type="number",
+                                        value=str(self._settings.client_id),
+                                    ),
+                                ),
+                                _field(
+                                    "Timeout",
+                                    Input(
+                                        name="timeout",
+                                        type="number",
+                                        value=str(self._settings.timeout_seconds),
+                                        step="0.5",
+                                    ),
+                                ),
+                                cls="grid grid-cols-2 gap-4",
+                            ),
+                            Separator(cls="my-5"),
+                            H3("Layer defaults", cls="text-sm font-semibold"),
+                            Div(
+                                _field(
+                                    "LMT targets",
+                                    Input(
+                                        name="target_presets",
+                                        value=self._target_presets,
+                                    ),
+                                ),
+                                _field(
+                                    "STP losses",
+                                    Input(
+                                        name="stop_presets", value=self._stop_presets
+                                    ),
+                                ),
+                                cls="mt-3 grid grid-cols-2 gap-4",
+                            ),
+                            P(
+                                "Comma-separated percentages. The final value repeats for later layers.",
+                                cls="mt-3 text-xs leading-5 text-muted-foreground",
+                            ),
+                            Separator(cls="my-5"),
+                            H3(
+                                "Stop order for new layers", cls="text-sm font-semibold"
+                            ),
+                            Div(
+                                Div(
+                                    Button(
+                                        "STP",
+                                        type="button",
                                         variant="outline",
                                         size="sm",
-                                        aria_label="Default stop-limit offset unit",
-                                        data_global_stop_unit_group=True,
+                                        aria_pressed="true"
+                                        if self._default_stop_type == "STP"
+                                        else "false",
+                                        data_global_stop_choice="STP",
+                                        cls="rounded-r-none border-primary bg-primary/10"
+                                        if self._default_stop_type == "STP"
+                                        else "rounded-r-none",
                                     ),
-                                    id="global-stop-limit-units",
-                                    disabled=self._default_stop_type != "STP LMT",
-                                    cls="contents",
+                                    Button(
+                                        "STP LMT",
+                                        type="button",
+                                        variant="outline",
+                                        size="sm",
+                                        aria_pressed="true"
+                                        if self._default_stop_type == "STP LMT"
+                                        else "false",
+                                        data_global_stop_choice="STP LMT",
+                                        cls="-ml-px rounded-l-none border-primary bg-primary/10"
+                                        if self._default_stop_type == "STP LMT"
+                                        else "-ml-px rounded-l-none",
+                                    ),
+                                    cls="inline-flex",
                                 ),
-                                cls="mt-2 flex items-center gap-2",
+                                Div(
+                                    Label(
+                                        "How far below the stop?",
+                                        fr="global-stop-limit-offset",
+                                        cls="text-xs font-medium text-muted-foreground",
+                                    ),
+                                    Div(
+                                        Input(
+                                            id="global-stop-limit-offset",
+                                            name="global_stop_limit_offset",
+                                            type="number",
+                                            min="0.1"
+                                            if self._default_stop_limit_unit
+                                            == "percent"
+                                            else "0.01",
+                                            max="99.9"
+                                            if self._default_stop_limit_unit
+                                            == "percent"
+                                            else None,
+                                            step="any",
+                                            value=self._default_stop_limit_offset,
+                                            disabled=self._default_stop_type
+                                            != "STP LMT",
+                                            cls="w-24",
+                                        ),
+                                        Fieldset(
+                                            ToggleGroup(
+                                                ("percent", "%"),
+                                                ("dollars", "$"),
+                                                type="single",
+                                                value=self._default_stop_limit_unit,
+                                                variant="outline",
+                                                size="sm",
+                                                aria_label="Default stop-limit offset unit",
+                                                data_global_stop_unit_group=True,
+                                            ),
+                                            id="global-stop-limit-units",
+                                            disabled=self._default_stop_type
+                                            != "STP LMT",
+                                            cls="contents",
+                                        ),
+                                        cls="mt-2 flex items-center gap-2",
+                                    ),
+                                    cls="min-w-0",
+                                ),
+                                cls="mt-3 flex flex-wrap items-end gap-3",
                             ),
-                            cls="min-w-0",
+                            HTMLInput(
+                                type="hidden",
+                                name="global_stop_type",
+                                value=self._default_stop_type,
+                            ),
+                            HTMLInput(
+                                type="hidden",
+                                name="global_stop_limit_unit",
+                                value=self._default_stop_limit_unit,
+                            ),
+                            Script(_global_stop_type_visual_script()),
+                            DialogFooter(
+                                DialogClose("Cancel", variant="outline"),
+                                Button(
+                                    "Refresh with settings",
+                                    type="submit",
+                                    data_busy_text="Refreshing…",
+                                ),
+                                cls="mt-6",
+                            ),
+                            HTMLInput(type="hidden", name="action", value="refresh"),
+                            action=f"/{self.session_token}/action",
+                            method="post",
                         ),
-                        cls="mt-3 flex flex-wrap items-end gap-3",
                     ),
-                    HTMLInput(type="hidden", name="global_stop_type", value=self._default_stop_type),
-                    HTMLInput(type="hidden", name="global_stop_limit_unit", value=self._default_stop_limit_unit),
-                    Script(_global_stop_type_visual_script()),
-                    DialogFooter(
-                        DialogClose("Cancel", variant="outline"),
-                        Button(
-                            "Refresh with settings",
-                            type="submit",
-                            data_busy_text="Refreshing…",
-                        ),
-                        cls="mt-6",
-                    ),
-                    HTMLInput(type="hidden", name="action", value="refresh"),
-                    action=f"/{self.session_token}/action",
-                    method="post",
+                    signal="connection_settings",
+                    size="lg",
                 ),
+                delay_duration=250,
             ),
-            signal="connection_settings",
-            size="lg",
-            ), delay_duration=250),
             TooltipContent("Change connection and new layer defaults"),
         )
 
@@ -3193,13 +3464,17 @@ class StarUIWorkbench:
             ),
             Form(
                 Label(
-                    HTMLInput(type="checkbox", name="confirmed", value="yes", required=True),
+                    HTMLInput(
+                        type="checkbox", name="confirmed", value="yes", required=True
+                    ),
                     "I checked TWS: no change is awaiting Transmit, and the displayed "
                     "orders and fills match this contract.",
                     cls="mt-3 flex items-start gap-2 text-sm",
                 ),
                 HTMLInput(type="hidden", name="action", value="verify-management"),
-                HTMLInput(type="hidden", name="fingerprint", value=entries[0].fingerprint),
+                HTMLInput(
+                    type="hidden", name="fingerprint", value=entries[0].fingerprint
+                ),
                 Button("Verify order status", type="submit", cls="mt-3"),
                 action=f"/{self.session_token}/action",
                 method="post",
@@ -3237,7 +3512,13 @@ class StarUIWorkbench:
             item
             for item in outcomes
             if item[2].status
-            in {"PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"}
+            in {
+                "PENDING",
+                "UNKNOWN",
+                "PARTIAL",
+                "NO_EXECUTION_EVIDENCE",
+                "GROUP_COLLISION",
+            }
             or (
                 item[2].status.startswith("CLOSED_")
                 and _journal_target_perm_id(item[0], item[1]) in active_target_ids
@@ -3267,7 +3548,12 @@ class StarUIWorkbench:
             else None
         )
         for _entry, _index, outcome in outcomes:
-            if outcome.status in {"PARTIAL", "UNKNOWN", "NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"}:
+            if outcome.status in {
+                "PARTIAL",
+                "UNKNOWN",
+                "NO_EXECUTION_EVIDENCE",
+                "GROUP_COLLISION",
+            }:
                 realized = None
                 break
             if not outcome.status.startswith("CLOSED_"):
@@ -3283,7 +3569,14 @@ class StarUIWorkbench:
                 H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
                 Div(
                     Div(
-                        self._set_stops_dialog(active_pairs, basis, quote, selected_snapshot.fresh if selected_snapshot is not None else False)
+                        self._set_stops_dialog(
+                            active_pairs,
+                            basis,
+                            quote,
+                            selected_snapshot.fresh
+                            if selected_snapshot is not None
+                            else False,
+                        )
                         if basis is not None
                         else None,
                         Tooltip(
@@ -3298,20 +3591,30 @@ class StarUIWorkbench:
                                     aria_label="Move all active stops to B/E",
                                     disabled=self._paper_execution is None
                                     or bool(self._armed_price_updates)
-                                    or any(stop.order_type == "STP LMT" for _group, _target, stop in active_pairs),
+                                    or any(
+                                        stop.order_type == "STP LMT"
+                                        for _group, _target, stop in active_pairs
+                                    ),
                                 ),
                                 delay_duration=250,
                             ),
                             TooltipContent(
                                 "STP LMT prices are view-only; cancel and recreate the bracket to change them."
-                                if any(stop.order_type == "STP LMT" for _group, _target, stop in active_pairs)
+                                if any(
+                                    stop.order_type == "STP LMT"
+                                    for _group, _target, stop in active_pairs
+                                )
                                 else "Move every active stop to break even"
                             ),
                         ),
                         Tooltip(
                             TooltipTrigger(
                                 Button(
-                                    Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
+                                    Icon(
+                                        "lucide:trash-2",
+                                        cls="size-4",
+                                        aria_hidden="true",
+                                    ),
                                     variant="outline",
                                     size="icon",
                                     type="submit",
@@ -3329,7 +3632,11 @@ class StarUIWorkbench:
                         Tooltip(
                             TooltipTrigger(
                                 Button(
-                                    Icon("lucide:log-out", cls="size-4", aria_hidden="true"),
+                                    Icon(
+                                        "lucide:log-out",
+                                        cls="size-4",
+                                        aria_hidden="true",
+                                    ),
                                     variant="outline",
                                     size="icon",
                                     type="submit",
@@ -3400,7 +3707,8 @@ class StarUIWorkbench:
                     self._header_quantity(outcomes, selected_snapshot),
                 ),
                 _contract_header_metric(
-                    "Available", f"{planning_available:g}" if draft_allowed else "—",
+                    "Available",
+                    f"{planning_available:g}" if draft_allowed else "—",
                     adornment=self._coverage_dialog(
                         coverage,
                         selected_snapshot,
@@ -3433,7 +3741,9 @@ class StarUIWorkbench:
                     if active_pairs or outcomes
                     else None,
                     Div(
-                        self._draft_panel(show_empty_state=not (active_pairs or outcomes)),
+                        self._draft_panel(
+                            show_empty_state=not (active_pairs or outcomes)
+                        ),
                         cls=(
                             "mt-5 border-t border-border pt-4"
                             if (active_pairs or outcomes) and self._current_layers()
@@ -3457,21 +3767,35 @@ class StarUIWorkbench:
     def _cancelled_bracket_recovery(
         self, outcomes: tuple[tuple[JournalEntry, int, LayerOutcome], ...]
     ) -> Any:
-        if not callable(getattr(self._paper_execution, "confirm_cancelled_unknown", None)):
+        if not callable(
+            getattr(self._paper_execution, "confirm_cancelled_unknown", None)
+        ):
             return None
         requested = self._recovery_requested_fingerprint
-        entry = next((
-            candidate
-            for candidate, _index, outcome in outcomes
-            if candidate.fingerprint == requested
-            and candidate.state in {
-                "SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED", "SUBMITTED", "RECONCILED"
-            }
-            and outcome.status in {
-                "PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE",
-                "GROUP_COLLISION", "CONFLICT",
-            }
-        ), None)
+        entry = next(
+            (
+                candidate
+                for candidate, _index, outcome in outcomes
+                if candidate.fingerprint == requested
+                and candidate.state
+                in {
+                    "SUBMISSION_UNKNOWN",
+                    "PARTIALLY_RECONCILED",
+                    "SUBMITTED",
+                    "RECONCILED",
+                }
+                and outcome.status
+                in {
+                    "PENDING",
+                    "UNKNOWN",
+                    "PARTIAL",
+                    "NO_EXECUTION_EVIDENCE",
+                    "GROUP_COLLISION",
+                    "CONFLICT",
+                }
+            ),
+            None,
+        )
         if entry is None:
             self._recovery_requested_fingerprint = None
             return None
@@ -3491,7 +3815,10 @@ class StarUIWorkbench:
                     Div(
                         *(
                             Div(
-                                P("Tranche ID · OCA group", cls="text-xs text-muted-foreground"),
+                                P(
+                                    "Tranche ID · OCA group",
+                                    cls="text-xs text-muted-foreground",
+                                ),
                                 P(
                                     _journal_oca_group(entry, index),
                                     cls="mt-1 break-all text-sm",
@@ -3504,10 +3831,17 @@ class StarUIWorkbench:
                                     cls="mt-3 flex justify-between gap-3 text-sm",
                                 ),
                                 Div(
-                                    Span(f"{layer.stop_order_type} loss", cls="text-muted-foreground"),
+                                    Span(
+                                        f"{layer.stop_order_type} loss",
+                                        cls="text-muted-foreground",
+                                    ),
                                     Span(
                                         f"{layer.stop_price}"
-                                        + (f" (LMT {layer.stop_limit_price})" if layer.stop_limit_price else "")
+                                        + (
+                                            f" (LMT {layer.stop_limit_price})"
+                                            if layer.stop_limit_price
+                                            else ""
+                                        )
                                         + f" · {layer.quantity} contracts",
                                     ),
                                     cls="mt-2 flex justify-between gap-3 text-sm",
@@ -3523,24 +3857,38 @@ class StarUIWorkbench:
                         role="alert",
                         cls="text-sm text-destructive",
                     )
-                    if self._message.startswith((
-                        "Cancellation verification blocked:", "Bracket not verified:",
-                        "Confirm neither bracket leg",
-                    ))
+                    if self._message.startswith(
+                        (
+                            "Cancellation verification blocked:",
+                            "Bracket not verified:",
+                            "Confirm neither bracket leg",
+                        )
+                    )
                     else None,
                     Form(
-                        P("If either order filled, refresh to recover the execution. "
-                          "If the fill still does not appear here, investigate it in TWS "
-                          "and leave this layer unverified.",
-                          cls="text-sm text-muted-foreground"),
+                        P(
+                            "If either order filled, refresh to recover the execution. "
+                            "If the fill still does not appear here, investigate it in TWS "
+                            "and leave this layer unverified.",
+                            cls="text-sm text-muted-foreground",
+                        ),
                         Label(
-                            Checkbox(name="confirmed", value="yes", required=True,
-                                     signal="bracket_absence_confirmed"),
-                            Span("I confirm neither order is working in TWS and neither filled"),
+                            Checkbox(
+                                name="confirmed",
+                                value="yes",
+                                required=True,
+                                signal="bracket_absence_confirmed",
+                            ),
+                            Span(
+                                "I confirm neither order is working in TWS and neither filled"
+                            ),
                             cls="mt-3 flex items-start gap-2 text-sm",
                         ),
-                        HTMLInput(type="hidden", name="action",
-                                  value="resolve-cancelled-bracket"),
+                        HTMLInput(
+                            type="hidden",
+                            name="action",
+                            value="resolve-cancelled-bracket",
+                        ),
                         HTMLInput(type="hidden", name="fingerprint", value=fingerprint),
                         action=f"/{self.session_token}/action",
                         method="post",
@@ -3548,23 +3896,36 @@ class StarUIWorkbench:
                     ),
                     Div(
                         Form(
-                            Button("Refresh layers", type="submit", variant="outline",
-                                   data_busy_text="Refreshing layers…"),
-                            HTMLInput(type="hidden", name="action",
-                                      value="verify-bracket-exists"),
-                            HTMLInput(type="hidden", name="fingerprint",
-                                      value=fingerprint),
+                            Button(
+                                "Refresh layers",
+                                type="submit",
+                                variant="outline",
+                                data_busy_text="Refreshing layers…",
+                            ),
+                            HTMLInput(
+                                type="hidden",
+                                name="action",
+                                value="verify-bracket-exists",
+                            ),
+                            HTMLInput(
+                                type="hidden", name="fingerprint", value=fingerprint
+                            ),
                             action=f"/{self.session_token}/action",
                             method="post",
                             id="bracket-refresh-form",
                         ),
                         Div(
                             DialogClose("Cancel", variant="outline"),
-                            Button("Clear unverified bracket", type="submit",
-                                   form="bracket-clear-form",
-                                   disabled=True,
-                                   data_attr_disabled=~Signal("bracket_absence_confirmed", False),
-                                   data_busy_text="Checking absence…"),
+                            Button(
+                                "Clear unverified bracket",
+                                type="submit",
+                                form="bracket-clear-form",
+                                disabled=True,
+                                data_attr_disabled=~Signal(
+                                    "bracket_absence_confirmed", False
+                                ),
+                                data_busy_text="Checking absence…",
+                            ),
                             cls="flex gap-2",
                         ),
                         cls="flex w-full flex-wrap items-center justify-between gap-3",
@@ -3588,7 +3949,12 @@ class StarUIWorkbench:
         held = snapshot.position.quantity
         sold = Decimal("0")
         for _entry, _index, outcome in outcomes:
-            if outcome.status in {"PARTIAL", "UNKNOWN", "NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"}:
+            if outcome.status in {
+                "PARTIAL",
+                "UNKNOWN",
+                "NO_EXECUTION_EVIDENCE",
+                "GROUP_COLLISION",
+            }:
                 return f"{held:g} / —"
             if outcome.status.startswith("CLOSED_"):
                 sold += outcome.filled_quantity
@@ -3613,15 +3979,21 @@ class StarUIWorkbench:
         return "external", 0, len(orders)
 
     def _set_stops_dialog(
-        self, pairs: tuple[tuple[str, Any, Any], ...], basis: Decimal,
-        quote: Any, snapshot_fresh: bool,
+        self,
+        pairs: tuple[tuple[str, Any, Any], ...],
+        basis: Decimal,
+        quote: Any,
+        snapshot_fresh: bool,
     ) -> Any:
-        has_stop_limit = any(stop.order_type == "STP LMT" for _group, _target, stop in pairs)
+        has_stop_limit = any(
+            stop.order_type == "STP LMT" for _group, _target, stop in pairs
+        )
         current_prices = {stop.stop_price for _group, _target, stop in pairs}
         initial_price = next(iter(current_prices)) if len(current_prices) == 1 else None
         initial_return = (
             _price_percentage(initial_price, basis, target=True)
-            if initial_price is not None else ""
+            if initial_price is not None
+            else ""
         )
         live_ask = (
             quote.ask
@@ -3636,15 +4008,20 @@ class StarUIWorkbench:
         )
         ask_text = (
             f"${live_ask:,.{max(2, -live_ask.normalize().as_tuple().exponent)}f}"
-            if live_ask is not None else "Unavailable"
+            if live_ask is not None
+            else "Unavailable"
         )
         return Tooltip(
             TooltipTrigger(
                 Dialog(
                     DialogTrigger(
                         Icon("lucide:arrow-up", cls="size-4", aria_hidden="true"),
-                        variant="outline", size="icon", aria_label="Set all active stops",
-                        disabled=self._paper_execution is None or bool(self._armed_price_updates) or has_stop_limit,
+                        variant="outline",
+                        size="icon",
+                        aria_label="Set all active stops",
+                        disabled=self._paper_execution is None
+                        or bool(self._armed_price_updates)
+                        or has_stop_limit,
                         data_on_click=evt.currentTarget.blur(),
                     ),
                     DialogContent(
@@ -3656,41 +4033,113 @@ class StarUIWorkbench:
                         ),
                         Div(
                             Div(
-                                Label("Stop price", fr="all-stop-value", data_stop_input_label=True, cls="text-xs font-medium text-muted-foreground"),
-                                Span(f"{initial_return}% from entry" if initial_return else "—", data_stop_dialog_inverse=True, aria_live="polite", cls="text-xs font-semibold text-foreground"),
+                                Label(
+                                    "Stop price",
+                                    fr="all-stop-value",
+                                    data_stop_input_label=True,
+                                    cls="text-xs font-medium text-muted-foreground",
+                                ),
+                                Span(
+                                    f"{initial_return}% from entry"
+                                    if initial_return
+                                    else "—",
+                                    data_stop_dialog_inverse=True,
+                                    aria_live="polite",
+                                    cls="text-xs font-semibold text-foreground",
+                                ),
                                 cls="flex items-center justify-between gap-2",
                             ),
                             Div(
                                 ToggleGroup(
-                                    ToggleGroupItem("%", value="return", aria_label="Enter return percentage from entry"),
-                                    ToggleGroupItem("$", value="price", aria_label="Enter stop price in dollars"),
-                                    type="single", value="price", variant="outline", size="default",
-                                    aria_label="Stop value unit", data_stop_mode_group=True,
+                                    ToggleGroupItem(
+                                        "%",
+                                        value="return",
+                                        aria_label="Enter return percentage from entry",
+                                    ),
+                                    ToggleGroupItem(
+                                        "$",
+                                        value="price",
+                                        aria_label="Enter stop price in dollars",
+                                    ),
+                                    type="single",
+                                    value="price",
+                                    variant="outline",
+                                    size="default",
+                                    aria_label="Stop value unit",
+                                    data_stop_mode_group=True,
                                 ),
                                 Input(
-                                    id="all-stop-value", type="number", min="0", step="any",
-                                    value=_price_text(initial_price) if initial_price is not None else "",
-                                    data_stop_dialog_value=True, cls="min-w-0 flex-1",
+                                    id="all-stop-value",
+                                    type="number",
+                                    min="0",
+                                    step="any",
+                                    value=_price_text(initial_price)
+                                    if initial_price is not None
+                                    else "",
+                                    data_stop_dialog_value=True,
+                                    cls="min-w-0 flex-1",
                                 ),
                                 cls="mt-1 flex items-center gap-2",
                             ),
                             cls="space-y-0.5",
                         ),
                         Div(
-                            *(Button(f"{pct:+d}%" if pct > 0 else f"{pct}%", type="button", variant="outline", data_stop_preset=str(pct))
-                              for pct in (20, 0, -20, -25, -35)),
+                            *(
+                                Button(
+                                    f"{pct:+d}%" if pct > 0 else f"{pct}%",
+                                    type="button",
+                                    variant="outline",
+                                    data_stop_preset=str(pct),
+                                )
+                                for pct in (20, 0, -20, -25, -35)
+                            ),
                             cls="flex flex-wrap gap-2",
                         ),
                         Div(
-                            Div(Span("Active layers", cls="text-xs text-muted-foreground"), Span(str(len(pairs)), cls="text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
-                            Div(Span("Entry cost", cls="text-xs text-muted-foreground"), Span(f"${basis.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}", cls="text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
-                            Div(Span("Latest ask at refresh" if live_ask is not None else "Latest ask", cls="text-xs text-muted-foreground"), Span(ask_text, cls="text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
-                            Div(Span("Stop price", cls="text-xs text-muted-foreground"), Span("—", data_stop_dialog_summary=True, aria_live="polite", cls="text-right text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
+                            Div(
+                                Span(
+                                    "Active layers", cls="text-xs text-muted-foreground"
+                                ),
+                                Span(str(len(pairs)), cls="text-sm font-semibold"),
+                                cls="flex items-center justify-between gap-4",
+                            ),
+                            Div(
+                                Span("Entry cost", cls="text-xs text-muted-foreground"),
+                                Span(
+                                    f"${basis.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}",
+                                    cls="text-sm font-semibold",
+                                ),
+                                cls="flex items-center justify-between gap-4",
+                            ),
+                            Div(
+                                Span(
+                                    "Latest ask at refresh"
+                                    if live_ask is not None
+                                    else "Latest ask",
+                                    cls="text-xs text-muted-foreground",
+                                ),
+                                Span(ask_text, cls="text-sm font-semibold"),
+                                cls="flex items-center justify-between gap-4",
+                            ),
+                            Div(
+                                Span("Stop price", cls="text-xs text-muted-foreground"),
+                                Span(
+                                    "—",
+                                    data_stop_dialog_summary=True,
+                                    aria_live="polite",
+                                    cls="text-right text-sm font-semibold",
+                                ),
+                                cls="flex items-center justify-between gap-4",
+                            ),
                             cls="space-y-2 rounded-md border border-border bg-muted/20 px-4 py-3",
                         ),
                         DialogFooter(
                             DialogClose("Cancel", variant="outline"),
-                            Button("Apply to active layers", type="button", data_apply_all_stops=True),
+                            Button(
+                                "Apply to active layers",
+                                type="button",
+                                data_apply_all_stops=True,
+                            ),
                             cls="mt-4",
                         ),
                         data_stop_dialog=True,
@@ -3703,7 +4152,8 @@ class StarUIWorkbench:
             ),
             TooltipContent(
                 "STP LMT prices are view-only; cancel and recreate the bracket to change them."
-                if has_stop_limit else "Set every active stop to one price"
+                if has_stop_limit
+                else "Set every active stop to one price"
             ),
         )
 
@@ -3725,7 +4175,9 @@ class StarUIWorkbench:
         for group in sorted(groups):
             orders = groups[group]
             targets = [order for order in orders if order.order_type == "LMT"]
-            stops = [order for order in orders if order.order_type in {"STP", "STP LMT"}]
+            stops = [
+                order for order in orders if order.order_type in {"STP", "STP LMT"}
+            ]
             if (
                 len(targets) == 1
                 and len(stops) == 1
@@ -3782,7 +4234,8 @@ class StarUIWorkbench:
                     entry.account,
                     entry.con_id,
                     entry.oca_prefix or entry.fingerprint[:12],
-                ) in ambiguous
+                )
+                in ambiguous
             ):
                 return LayerOutcome("GROUP_COLLISION")
             outcome = classify_journal_layer(
@@ -3810,7 +4263,8 @@ class StarUIWorkbench:
                     index,
                     active_perm_ids=active_ids,
                     observed_perm_ids=observed_ids,
-                ).status == "CANCELLED"
+                ).status
+                == "CANCELLED"
             )
         )
 
@@ -3832,7 +4286,13 @@ class StarUIWorkbench:
             item
             for item in self._submission_outcomes()
             if item[2].status
-            in {"PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE", "GROUP_COLLISION"}
+            in {
+                "PENDING",
+                "UNKNOWN",
+                "PARTIAL",
+                "NO_EXECUTION_EVIDENCE",
+                "GROUP_COLLISION",
+            }
         )
 
     def _planning_available_quantity(self) -> int:
@@ -3853,8 +4313,13 @@ class StarUIWorkbench:
         return max(0, self._state.available_quantity - unobserved)
 
     def _pending_layer_row(
-        self, number: int, entry: JournalEntry, index: int, outcome: LayerOutcome,
-        *, read_only: bool = False,
+        self,
+        number: int,
+        entry: JournalEntry,
+        index: int,
+        outcome: LayerOutcome,
+        *,
+        read_only: bool = False,
     ) -> Any:
         layer = entry.layers[index]
         heading = {
@@ -3916,38 +4381,54 @@ class StarUIWorkbench:
                 Input(id=f"verify-tif-{number}", value=layer.tif, disabled=True),
                 input_id=f"verify-tif-{number}",
             ),
-            _button_tooltip(Button(
-                Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
-                variant="outline",
-                size="icon",
-                type="submit",
-                name="action",
-                value=(
-                    f"dismiss-cancelled:{entry.fingerprint}:"
-                    f"{entry.snapshot_captured_at}:{index}"
+            _button_tooltip(
+                Button(
+                    Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
+                    variant="outline",
+                    size="icon",
+                    type="submit",
+                    name="action",
+                    value=(
+                        f"dismiss-cancelled:{entry.fingerprint}:"
+                        f"{entry.snapshot_captured_at}:{index}"
+                    ),
+                    aria_label=f"Remove cancelled layer {number} from view",
+                    cls="relative z-[3] mt-5",
                 ),
-                aria_label=f"Remove cancelled layer {number} from view",
-                cls="relative z-[3] mt-5",
-            ), "Remove this cancelled layer from view")
+                "Remove this cancelled layer from view",
+            )
             if outcome.status == "CANCELLED" and not read_only
-            else _button_tooltip(Button(
-                Icon("lucide:check", cls="size-4", aria_hidden="true"),
-                variant="outline",
-                size="icon",
-                type="submit",
-                name="action",
-                value=f"verify-cancelled-bracket:{entry.fingerprint}",
-                aria_label=f"Verify bracket status of layer {number}",
-                cls="relative z-[3] mt-5",
-            ), "Check this layer in TWS")
-            if outcome.status in {
-                "PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE",
-                "GROUP_COLLISION", "CONFLICT",
-            } and not read_only
+            else _button_tooltip(
+                Button(
+                    Icon("lucide:check", cls="size-4", aria_hidden="true"),
+                    variant="outline",
+                    size="icon",
+                    type="submit",
+                    name="action",
+                    value=f"verify-cancelled-bracket:{entry.fingerprint}",
+                    aria_label=f"Verify bracket status of layer {number}",
+                    cls="relative z-[3] mt-5",
+                ),
+                "Check this layer in TWS",
+            )
+            if outcome.status
+            in {
+                "PENDING",
+                "UNKNOWN",
+                "PARTIAL",
+                "NO_EXECUTION_EVIDENCE",
+                "GROUP_COLLISION",
+                "CONFLICT",
+            }
+            and not read_only
             else Div(cls="min-w-0"),
             Div(
                 Span(
-                    "CANCELLED" if outcome.status == "CANCELLED" else "RESOLVE IN TWS" if outcome.status == "GROUP_COLLISION" else "VERIFY IN TWS",
+                    "CANCELLED"
+                    if outcome.status == "CANCELLED"
+                    else "RESOLVE IN TWS"
+                    if outcome.status == "GROUP_COLLISION"
+                    else "VERIFY IN TWS",
                     cls="sold-layer-status",
                 ),
                 Span(heading, cls="sold-layer-result"),
@@ -3960,15 +4441,22 @@ class StarUIWorkbench:
         )
 
     def _closed_layer_row(
-        self, number: int, entry: JournalEntry, index: int, outcome: LayerOutcome,
-        *, recover_legacy: bool = True,
+        self,
+        number: int,
+        entry: JournalEntry,
+        index: int,
+        outcome: LayerOutcome,
+        *,
+        recover_legacy: bool = True,
     ) -> Any:
         layer = entry.layers[index]
         recovered = None
         calculator = self._state.quote_calculator
-        if recover_legacy and (
-            not layer.target_percentage or not layer.stop_percentage
-        ) and calculator is not None:
+        if (
+            recover_legacy
+            and (not layer.target_percentage or not layer.stop_percentage)
+            and calculator is not None
+        ):
             recovered = _recover_legacy_layer_percentages(
                 target_price=layer.target_price,
                 stop_price=layer.stop_price,
@@ -4173,7 +4661,8 @@ class StarUIWorkbench:
                     value=target_percentage,
                     min="0.1",
                     step="0.1",
-                    disabled=bool(self._armed_price_updates) or stop.order_type == "STP LMT",
+                    disabled=bool(self._armed_price_updates)
+                    or stop.order_type == "STP LMT",
                     data_active_input="target",
                     data_active_perm_id=target.perm_id,
                     data_active_original=display_target_price,
@@ -4199,16 +4688,19 @@ class StarUIWorkbench:
                         value=stop_percentage,
                         min="-99.9",
                         step="any",
-                        disabled=bool(self._armed_price_updates) or stop.order_type == "STP LMT",
+                        disabled=bool(self._armed_price_updates)
+                        or stop.order_type == "STP LMT",
                         data_active_input="stop",
                         data_active_perm_id=target.perm_id,
                         data_active_original=display_stop_price,
-                        data_active_stop_limit_price=stop.limit_price if stop.order_type == "STP LMT" else None,
+                        data_active_stop_limit_price=stop.limit_price
+                        if stop.order_type == "STP LMT"
+                        else None,
                         data_active_initial=initial_stop_percentage,
                         data_live_layer=index,
                         cls="pr-8",
                     ),
-                    Input(
+                    HTMLInput(
                         type="hidden",
                         name=f"active_stop_price_{target.perm_id}",
                         value="",
@@ -4248,17 +4740,20 @@ class StarUIWorkbench:
                 ),
                 input_id=f"active-tif-{index}",
             ),
-            action_field=_button_tooltip(Button(
-                Icon("lucide:trash-2"),
-                variant="outline",
-                size="icon",
-                type="submit",
-                name="action",
-                value=f"cancel-pair-arm:{target.perm_id}",
-                disabled=self._paper_execution is None,
-                aria_label=f"Delete OCA layer {index}",
-                cls="mt-5",
-            ), "Cancel this active layer"),
+            action_field=_button_tooltip(
+                Button(
+                    Icon("lucide:trash-2"),
+                    variant="outline",
+                    size="icon",
+                    type="submit",
+                    name="action",
+                    value=f"cancel-pair-arm:{target.perm_id}",
+                    disabled=self._paper_execution is None,
+                    aria_label=f"Delete OCA layer {index}",
+                    cls="mt-5",
+                ),
+                "Cancel this active layer",
+            ),
         )
 
     def _active_layer_projection(
@@ -4304,31 +4799,34 @@ class StarUIWorkbench:
             else f"{available:g} {'contract remains' if available == 1 else 'contracts remain'} available for new brackets. "
         )
         return Tooltip(
-            TooltipTrigger(Dialog(
-            DialogTrigger(
-                Icon("lucide:triangle-alert", cls="size-4", aria_hidden="true"),
-                variant="ghost",
-                aria_label="Why are fewer contracts available?",
-                cls="available-warning-trigger",
-            ),
-            DialogContent(
-                DialogHeader(
-                    DialogTitle("Existing TWS exit orders"),
-                    DialogDescription(
-                        message
-                        + (
-                            "An app submission is still unverified. Inspect TWS before "
-                            "changing these orders."
-                            if uncertain_app_orders
-                            else "Orders placed outside this app are view-only here."
-                        )
+            TooltipTrigger(
+                Dialog(
+                    DialogTrigger(
+                        Icon("lucide:triangle-alert", cls="size-4", aria_hidden="true"),
+                        variant="ghost",
+                        aria_label="Why are fewer contracts available?",
+                        cls="available-warning-trigger",
                     ),
+                    DialogContent(
+                        DialogHeader(
+                            DialogTitle("Existing TWS exit orders"),
+                            DialogDescription(
+                                message
+                                + (
+                                    "An app submission is still unverified. Inspect TWS before "
+                                    "changing these orders."
+                                    if uncertain_app_orders
+                                    else "Orders placed outside this app are view-only here."
+                                )
+                            ),
+                        ),
+                        DialogFooter(DialogClose("Done", variant="outline")),
+                    ),
+                    signal="existing_exit_orders",
+                    size="sm",
                 ),
-                DialogFooter(DialogClose("Done", variant="outline")),
+                delay_duration=250,
             ),
-            signal="existing_exit_orders",
-            size="sm",
-            ), delay_duration=250),
             TooltipContent("See exit orders already in TWS"),
         )
 
@@ -4364,7 +4862,7 @@ class StarUIWorkbench:
 
     def _draft_panel(self, *, show_empty_state: bool = True) -> Any:
         layers = self._current_layers()
-        stop_type, offset, unit = self._stop_configuration()
+        stop_type, _offset, unit = self._stop_configuration()
         return Form(
             Div(
                 H3("Build your exit draft", cls="text-lg font-semibold"),
@@ -4455,48 +4953,130 @@ class StarUIWorkbench:
                     TooltipTrigger(
                         Dialog(
                             DialogTrigger(
-                                Icon("lucide:arrow-up", cls="size-4", aria_hidden="true"),
-                                variant="outline", size="icon", aria_label="Set all draft stops",
+                                Icon(
+                                    "lucide:arrow-up", cls="size-4", aria_hidden="true"
+                                ),
+                                variant="outline",
+                                size="icon",
+                                aria_label="Set all draft stops",
                                 disabled=locked or basis is None,
                                 data_on_click=evt.currentTarget.blur(),
                             ),
-                    DialogContent(
-                        DialogHeader(
-                            DialogTitle("Set all draft stops"),
-                            DialogDescription("Choose a stop price or return from entry for every draft layer."),
-                        ),
-                        Div(
-                            Label("Return from entry", fr="all-draft-stop-value", data_draft_stop_input_label=True, cls="text-xs font-medium text-muted-foreground"),
-                            Span("—", data_draft_stop_dialog_inverse=True, aria_live="polite", cls="text-xs font-semibold"),
-                            cls="flex items-center justify-between gap-2",
-                        ),
-                        Div(
-                            ToggleGroup(
-                                ToggleGroupItem("%", value="return", aria_label="Enter return percentage from entry"),
-                                ToggleGroupItem("$", value="price", aria_label="Enter stop price in dollars"),
-                                type="single", value="return", variant="outline", size="default",
-                                aria_label="Stop value unit", data_draft_stop_mode_group=True,
+                            DialogContent(
+                                DialogHeader(
+                                    DialogTitle("Set all draft stops"),
+                                    DialogDescription(
+                                        "Choose a stop price or return from entry for every draft layer."
+                                    ),
+                                ),
+                                Div(
+                                    Label(
+                                        "Return from entry",
+                                        fr="all-draft-stop-value",
+                                        data_draft_stop_input_label=True,
+                                        cls="text-xs font-medium text-muted-foreground",
+                                    ),
+                                    Span(
+                                        "—",
+                                        data_draft_stop_dialog_inverse=True,
+                                        aria_live="polite",
+                                        cls="text-xs font-semibold",
+                                    ),
+                                    cls="flex items-center justify-between gap-2",
+                                ),
+                                Div(
+                                    ToggleGroup(
+                                        ToggleGroupItem(
+                                            "%",
+                                            value="return",
+                                            aria_label="Enter return percentage from entry",
+                                        ),
+                                        ToggleGroupItem(
+                                            "$",
+                                            value="price",
+                                            aria_label="Enter stop price in dollars",
+                                        ),
+                                        type="single",
+                                        value="return",
+                                        variant="outline",
+                                        size="default",
+                                        aria_label="Stop value unit",
+                                        data_draft_stop_mode_group=True,
+                                    ),
+                                    Input(
+                                        id="all-draft-stop-value",
+                                        type="number",
+                                        step="any",
+                                        value=default_return,
+                                        data_draft_stop_dialog_value=True,
+                                        cls="min-w-0 flex-1",
+                                    ),
+                                    cls="mt-1 flex items-center gap-2",
+                                ),
+                                Div(
+                                    *(
+                                        Button(
+                                            f"{pct:+d}%" if pct > 0 else f"{pct}%",
+                                            type="button",
+                                            variant="outline",
+                                            data_draft_stop_preset=str(pct),
+                                        )
+                                        for pct in (20, 0, -20, -25, -35)
+                                    ),
+                                    cls="mt-4 flex flex-wrap gap-2",
+                                ),
+                                Div(
+                                    Div(
+                                        Span(
+                                            "Draft layers",
+                                            cls="text-xs text-muted-foreground",
+                                        ),
+                                        Span(
+                                            str(len(layers)),
+                                            cls="text-sm font-semibold",
+                                        ),
+                                        cls="flex items-center justify-between gap-4",
+                                    ),
+                                    Div(
+                                        Span(
+                                            "Entry cost",
+                                            cls="text-xs text-muted-foreground",
+                                        ),
+                                        Span(
+                                            f"${basis:,.2f}"
+                                            if basis is not None
+                                            else "—",
+                                            cls="text-sm font-semibold",
+                                        ),
+                                        cls="flex items-center justify-between gap-4",
+                                    ),
+                                    Div(
+                                        Span(
+                                            "Stop price",
+                                            cls="text-xs text-muted-foreground",
+                                        ),
+                                        Span(
+                                            "—",
+                                            data_draft_stop_dialog_summary=True,
+                                            aria_live="polite",
+                                            cls="text-right text-sm font-semibold",
+                                        ),
+                                        cls="flex items-center justify-between gap-4",
+                                    ),
+                                    cls="mt-4 space-y-2 rounded-md border border-border bg-muted/20 px-4 py-3",
+                                ),
+                                DialogFooter(
+                                    DialogClose("Cancel", variant="outline"),
+                                    Button(
+                                        "Apply to draft layers",
+                                        type="button",
+                                        data_apply_all_draft_stops=True,
+                                        disabled=True,
+                                    ),
+                                    cls="mt-4",
+                                ),
+                                data_draft_stop_dialog=True,
                             ),
-                            Input(id="all-draft-stop-value", type="number", step="any", value=default_return, data_draft_stop_dialog_value=True, cls="min-w-0 flex-1"),
-                            cls="mt-1 flex items-center gap-2",
-                        ),
-                        Div(
-                            *(Button(f"{pct:+d}%" if pct > 0 else f"{pct}%", type="button", variant="outline", data_draft_stop_preset=str(pct)) for pct in (20, 0, -20, -25, -35)),
-                            cls="mt-4 flex flex-wrap gap-2",
-                        ),
-                        Div(
-                            Div(Span("Draft layers", cls="text-xs text-muted-foreground"), Span(str(len(layers)), cls="text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
-                            Div(Span("Entry cost", cls="text-xs text-muted-foreground"), Span(f"${basis:,.2f}" if basis is not None else "—", cls="text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
-                            Div(Span("Stop price", cls="text-xs text-muted-foreground"), Span("—", data_draft_stop_dialog_summary=True, aria_live="polite", cls="text-right text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
-                            cls="mt-4 space-y-2 rounded-md border border-border bg-muted/20 px-4 py-3",
-                        ),
-                        DialogFooter(
-                            DialogClose("Cancel", variant="outline"),
-                            Button("Apply to draft layers", type="button", data_apply_all_draft_stops=True, disabled=True),
-                            cls="mt-4",
-                        ),
-                        data_draft_stop_dialog=True,
-                    ),
                             data_on_focusin=evt.stopPropagation(),
                             data_on_focusout=evt.stopPropagation(),
                         ),
@@ -4508,9 +5088,12 @@ class StarUIWorkbench:
                     TooltipTrigger(
                         Button(
                             Icon("lucide:equal", cls="size-4", aria_hidden="true"),
-                            type="button", variant="outline", size="icon",
+                            type="button",
+                            variant="outline",
+                            size="icon",
                             aria_label="Move all draft stops to B/E",
-                            data_move_draft_stops_to_be=True, disabled=locked or basis is None,
+                            data_move_draft_stops_to_be=True,
+                            disabled=locked or basis is None,
                         ),
                         delay_duration=250,
                     ),
@@ -4520,59 +5103,85 @@ class StarUIWorkbench:
             ),
             Div(
                 ToggleGroup(
-                ("STP", "STP"),
-                ("STP LMT", "STP LMT"),
-                type="single",
-                value=stop_type,
-                variant="outline",
-                size="default",
-                disabled=locked,
-                aria_label="Protective order type for new layers",
-                data_draft_stop_type_group=True,
-            ),
+                    ("STP", "STP"),
+                    ("STP LMT", "STP LMT"),
+                    type="single",
+                    value=stop_type,
+                    variant="outline",
+                    size="default",
+                    disabled=locked,
+                    aria_label="Protective order type for new layers",
+                    data_draft_stop_type_group=True,
+                ),
                 Tooltip(
                     TooltipTrigger(
-                Dialog(
-                    DialogTrigger(
-                        Svg(
-                            Polygon(points="10 2 14 2 14.5 4 17 5 19 4 21 6 20 8 21 10 23 10 23 14 21 14 20 16 21 18 19 20 17 19 14.5 20 14 22 10 22 9.5 20 7 19 5 20 3 18 4 16 3 14 1 14 1 10 3 10 4 8 3 6 5 4 7 5 9.5 4"),
-                            Circle(cx="12", cy="12", r="3"),
-                            viewBox="0 0 24 24", fill="none", stroke="currentColor",
-                            stroke_width="2", stroke_linejoin="round",
-                            cls="size-4", aria_hidden="true",
-                        ),
-                        variant="outline", size="icon",
-                        aria_label="Stop-limit settings", disabled=locked or stop_type != "STP LMT",
-                        data_stop_limit_settings_trigger=True,
-                    ),
-                    DialogContent(
-                        DialogHeader(
-                            DialogTitle("Stop-limit settings"),
-                            DialogDescription("Set the minimum sell price below each layer’s stop trigger."),
-                        ),
-                        Div(
-                            Label("How far below the stop?", fr="stop-limit-offset", cls="text-sm font-medium"),
-                            Div(
-                                Input(id="stop-limit-offset", name="draft_stop_limit_offset", type="number", min="0.1", step="any", value=offset, disabled=locked, data_stop_limit_offset=True, cls="min-w-0 flex-1"),
-                                ToggleGroup(
-                                    ("percent", "%"),
-                                    ("dollars", "$"),
-                                    type="single",
-                                    value=unit,
-                                    variant="outline",
-                                    size="default",
-                                    disabled=locked,
-                                    aria_label="Stop-limit offset unit",
-                                    data_stop_limit_unit_group=True,
-                                    data_selected_unit=unit,
+                        Dialog(
+                            DialogTrigger(
+                                Svg(
+                                    Polygon(
+                                        points="10 2 14 2 14.5 4 17 5 19 4 21 6 20 8 21 10 23 10 23 14 21 14 20 16 21 18 19 20 17 19 14.5 20 14 22 10 22 9.5 20 7 19 5 20 3 18 4 16 3 14 1 14 1 10 3 10 4 8 3 6 5 4 7 5 9.5 4"
+                                    ),
+                                    Circle(cx="12", cy="12", r="3"),
+                                    viewBox="0 0 24 24",
+                                    fill="none",
+                                    stroke="currentColor",
+                                    stroke_width="2",
+                                    stroke_linejoin="round",
+                                    cls="size-4",
+                                    aria_hidden="true",
                                 ),
-                                cls="mt-2 flex items-center gap-2",
+                                variant="outline",
+                                size="icon",
+                                aria_label="Stop-limit settings",
+                                disabled=locked or stop_type != "STP LMT",
+                                data_stop_limit_settings_trigger=True,
                             ),
-                            cls="mt-5",
+                            DialogContent(
+                                DialogHeader(
+                                    DialogTitle("Stop-limit settings"),
+                                    DialogDescription(
+                                        "Set the minimum sell price below each layer's stop trigger."
+                                    ),
+                                ),
+                                Div(
+                                    Label(
+                                        "How far below the stop?",
+                                        fr="stop-limit-offset",
+                                        cls="text-sm font-medium",
+                                    ),
+                                    Div(
+                                        Input(
+                                            id="stop-limit-offset",
+                                            name="draft_stop_limit_offset",
+                                            type="number",
+                                            min="0.1",
+                                            step="any",
+                                            value=offset,
+                                            disabled=locked,
+                                            data_stop_limit_offset=True,
+                                            cls="min-w-0 flex-1",
+                                        ),
+                                        ToggleGroup(
+                                            ("percent", "%"),
+                                            ("dollars", "$"),
+                                            type="single",
+                                            value=unit,
+                                            variant="outline",
+                                            size="default",
+                                            disabled=locked,
+                                            aria_label="Stop-limit offset unit",
+                                            data_stop_limit_unit_group=True,
+                                            data_selected_unit=unit,
+                                        ),
+                                        cls="mt-2 flex items-center gap-2",
+                                    ),
+                                    cls="mt-5",
+                                ),
+                                DialogFooter(
+                                    DialogClose("Done", variant="outline"), cls="mt-6"
+                                ),
+                            ),
                         ),
-                        DialogFooter(DialogClose("Done", variant="outline"), cls="mt-6"),
-                    ),
-                ),
                         delay_duration=250,
                     ),
                     TooltipContent("Set how far below the stop a limit order can sell"),
@@ -4649,29 +5258,38 @@ class StarUIWorkbench:
                 layer_index=index,
                 kind="target",
             ),
-            stop_field=Div(_percentage_price_field(
-                "STP loss",
-                Input(
-                    name=f"stop_{index}",
-                    id=f"stop_{index}",
-                    type="number",
-                    value=layer.stop_percentage,
-                    max="99.999999",
-                    step="any",
-                    data_live_input="stop",
-                    data_live_layer=index,
-                    data_live_initial=layer.stop_percentage,
-                    data_live_original=layer.stop_price,
-                    cls="pr-8",
+            stop_field=Div(
+                _percentage_price_field(
+                    "STP loss",
+                    Input(
+                        name=f"stop_{index}",
+                        id=f"stop_{index}",
+                        type="number",
+                        value=layer.stop_percentage,
+                        max="99.999999",
+                        step="any",
+                        data_live_input="stop",
+                        data_live_layer=index,
+                        data_live_initial=layer.stop_percentage,
+                        data_live_original=layer.stop_price,
+                        cls="pr-8",
+                    ),
+                    input_id=f"stop_{index}",
+                    price=layer.stop_price,
+                    outcome=loss,
+                    outcome_label="at stop trigger"
+                    if self._stop_configuration()[0] == "STP LMT"
+                    else "max loss",
+                    tone="text-rose-400",
+                    layer_index=index,
+                    kind="stop",
                 ),
-                input_id=f"stop_{index}",
-                price=layer.stop_price,
-                outcome=loss,
-                outcome_label="at stop trigger" if self._stop_configuration()[0] == "STP LMT" else "max loss",
-                tone="text-rose-400",
-                layer_index=index,
-                kind="stop",
-            ), HTMLInput(type="hidden", name=f"draft_stop_price_{index}", data_draft_exact_stop=index)),
+                HTMLInput(
+                    type="hidden",
+                    name=f"draft_stop_price_{index}",
+                    data_draft_exact_stop=index,
+                ),
+            ),
             quantity_field=_field(
                 "Quantity",
                 Div(
@@ -4725,16 +5343,19 @@ class StarUIWorkbench:
                 ),
                 input_id=f"tif_{index}_trigger",
             ),
-            action_field=_button_tooltip(Button(
-                Icon("lucide:trash-2"),
-                variant="outline",
-                size="icon",
-                type="submit",
-                name="action",
-                value=f"remove-layer:{index}",
-                aria_label=f"Remove layer {index}",
-                cls="mt-5",
-            ), "Remove this draft layer"),
+            action_field=_button_tooltip(
+                Button(
+                    Icon("lucide:trash-2"),
+                    variant="outline",
+                    size="icon",
+                    type="submit",
+                    name="action",
+                    value=f"remove-layer:{index}",
+                    aria_label=f"Remove layer {index}",
+                    cls="mt-5",
+                ),
+                "Remove this draft layer",
+            ),
         )
 
     def _layer_projection(self, layer: DraftLayerForm) -> tuple[str, str]:
@@ -4913,11 +5534,11 @@ class StarUIWorkbench:
                 }
             )
         draft_config: list[dict[str, Any]] = []
-        for layer in self._current_layers():
+        for draft_layer in self._current_layers():
             try:
-                quantity = Decimal(layer.quantity)
-                target_price = Decimal(layer.target_price)
-                stop_price = Decimal(layer.stop_price)
+                quantity = Decimal(draft_layer.quantity)
+                target_price = Decimal(draft_layer.target_price)
+                stop_price = Decimal(draft_layer.stop_price)
             except InvalidOperation:
                 unresolved = True
                 continue
@@ -4965,7 +5586,9 @@ class StarUIWorkbench:
             proposed_outcome,
             {
                 "held": format(held, "f"),
-                "unitCost": format(basis * multiplier, "f") if basis is not None and multiplier is not None else None,
+                "unitCost": format(basis * multiplier, "f")
+                if basis is not None and multiplier is not None
+                else None,
                 "soldQuantity": format(sold_quantity, "f"),
                 "realized": format(realized, "f"),
                 "unresolved": unresolved,
@@ -5003,7 +5626,9 @@ class StarUIWorkbench:
             and outcome.covered_quantity > 0
             and outcome.covered_quantity <= outcome.held_quantity
         )
-        gain_value = outcome.covered_gain if partial or estimate else outcome.expected_gain
+        gain_value = (
+            outcome.covered_gain if partial or estimate else outcome.expected_gain
+        )
         loss_value = outcome.covered_loss if partial or estimate else outcome.max_loss
         baseline_gain = baseline.covered_gain if partial else baseline.expected_gain
         baseline_loss = baseline.covered_loss if partial else baseline.max_loss
@@ -5013,11 +5638,16 @@ class StarUIWorkbench:
         if partial and baseline.covered_quantity != outcome.covered_quantity:
             baseline_gain = None
             baseline_loss = None
-        unit_cost = Decimal(config["unitCost"]) if config["unitCost"] is not None else None
-        covered_cost = unit_cost * outcome.covered_quantity if unit_cost is not None else None
+        unit_cost = (
+            Decimal(config["unitCost"]) if config["unitCost"] is not None else None
+        )
+        covered_cost = (
+            unit_cost * outcome.covered_quantity if unit_cost is not None else None
+        )
         gain_cost = (
             covered_cost + unit_cost * Decimal(config["soldQuantity"])
-            if covered_cost is not None else None
+            if covered_cost is not None and unit_cost is not None
+            else None
         )
         gain_delta = (
             gain_value - baseline_gain
@@ -5033,42 +5663,42 @@ class StarUIWorkbench:
             H3("Outcome projection", cls="mb-3 text-sm font-semibold"),
             Div(
                 _metric(
-                        "Expected gain",
-                        _projection_gain_value(gain_value, gain_delta, gain_cost),
-                        "text-emerald-400",
-                        live_key="gain",
-                        help_text=(
-                            "Return percentage uses the cost of shown contracts and verified sold contracts. "
-                            "Realised P&L plus projected target results from shown "
-                            "layers. Pending bracket prices assume TWS accepts "
-                            "the submitted exits; other contracts are excluded."
-                            if Decimal(config["pendingQuantity"]) else
-                            "Return percentage uses the cost of shown contracts and verified sold contracts. "
-                            "Realised P&L plus projected gains from the shown layers. "
-                            "Excludes contracts without a verified target and stop."
-                            if partial else
-                            "Return percentage uses the cost of held and verified sold contracts. "
-                            "Realised P&L plus projected gains from the current layer plan."
-                        ),
+                    "Expected gain",
+                    _projection_gain_value(gain_value, gain_delta, gain_cost),
+                    "text-emerald-400",
+                    live_key="gain",
+                    help_text=(
+                        "Return percentage uses the cost of shown contracts and verified sold contracts. "
+                        "Realised P&L plus projected target results from shown "
+                        "layers. Pending bracket prices assume TWS accepts "
+                        "the submitted exits; other contracts are excluded."
+                        if Decimal(config["pendingQuantity"])
+                        else "Return percentage uses the cost of shown contracts and verified sold contracts. "
+                        "Realised P&L plus projected gains from the shown layers. "
+                        "Excludes contracts without a verified target and stop."
+                        if partial
+                        else "Return percentage uses the cost of held and verified sold contracts. "
+                        "Realised P&L plus projected gains from the current layer plan."
                     ),
+                ),
                 _metric(
-                        "Max loss",
-                        _projection_loss_value(loss_value, loss_delta, covered_cost),
-                        "text-rose-400",
-                        live_key="loss",
-                        help_text=(
-                            "Return percentage uses the cost of shown held contracts. "
-                            "Projected stop results from shown layers; excludes "
-                            "realised P&L. Pending stops may not be working in TWS."
-                            if Decimal(config["pendingQuantity"]) else
-                            "Return percentage uses the cost of shown held contracts. "
-                            "Projected result at the shown layer stops; excludes "
-                            "realised P&L and contracts without a verified target and stop."
-                            if partial else
-                            "Return percentage uses the cost of held contracts. "
-                            "Projected losses at the current layer stops; excludes realised P&L."
-                        ),
+                    "Max loss",
+                    _projection_loss_value(loss_value, loss_delta, covered_cost),
+                    "text-rose-400",
+                    live_key="loss",
+                    help_text=(
+                        "Return percentage uses the cost of shown held contracts. "
+                        "Projected stop results from shown layers; excludes "
+                        "realised P&L. Pending stops may not be working in TWS."
+                        if Decimal(config["pendingQuantity"])
+                        else "Return percentage uses the cost of shown held contracts. "
+                        "Projected result at the shown layer stops; excludes "
+                        "realised P&L and contracts without a verified target and stop."
+                        if partial
+                        else "Return percentage uses the cost of held contracts. "
+                        "Projected losses at the current layer stops; excludes realised P&L."
                     ),
+                ),
                 cls="outcome-projection-pair grid grid-cols-2",
             ),
             data_outcome_projection=True,
@@ -5211,7 +5841,9 @@ class StarUIWorkbench:
         )
         return Alert(
             AlertTitle(
-                "Draft exceeds available contracts" if over else "Your stop may not sell the option",
+                "Draft exceeds available contracts"
+                if over
+                else "Your stop may not sell the option",
                 data_review_alert_title=True,
             ),
             AlertDescription(
@@ -5226,8 +5858,11 @@ class StarUIWorkbench:
             live=True,
             cls=(
                 "mx-4 mb-3 w-[calc(100%-2rem)] min-w-0 break-words "
-                + ("border-destructive/70 bg-red-950 text-red-50 [&_p]:text-red-100/90"
-                   if over else "border-amber-500/40 bg-amber-500/10 text-amber-100")
+                + (
+                    "border-destructive/70 bg-red-950 text-red-50 [&_p]:text-red-100/90"
+                    if over
+                    else "border-amber-500/40 bg-amber-500/10 text-amber-100"
+                )
                 + ("" if over or stop_limit else " hidden")
             ),
         )
@@ -5235,7 +5870,9 @@ class StarUIWorkbench:
     def _execution_control(self) -> Any:
         if self._unresolved_management_entries():
             return Div(
-                Button("Order changes locked", type="button", disabled=True, cls="w-full"),
+                Button(
+                    "Order changes locked", type="button", disabled=True, cls="w-full"
+                ),
                 cls="mx-4 mb-4 w-[calc(100%-2rem)]",
             )
         if self._pending_submissions():
@@ -5252,7 +5889,11 @@ class StarUIWorkbench:
         market_exits = self._armed_market_exits or (
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
-        if (self._armed_cancellation is not None or self._armed_cancellations or market_exits) and not self._active_action_verified:
+        if (
+            self._armed_cancellation is not None
+            or self._armed_cancellations
+            or market_exits
+        ) and not self._active_action_verified:
             return self._reviewed_active_action_controls()
         if self._armed_cancellations:
             return self._staged_action_controls(
@@ -5303,14 +5944,10 @@ class StarUIWorkbench:
         available = self._planning_available_quantity()
         drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
         can_execute_draft = (
-            self._paper_execution is not None
-            and available > 0
-            and has_draft_layers
+            self._paper_execution is not None and available > 0 and has_draft_layers
         )
         return Div(
-            self._cancel_changes_control(staged=False)
-            if has_active_layers
-            else None,
+            self._cancel_changes_control(staged=False) if has_active_layers else None,
             Div(
                 Button(
                     "Review order",
@@ -5453,7 +6090,8 @@ class StarUIWorkbench:
                 ),
                 Button(
                     f"Confirm ({(countdown_ms + 999) // 1000}s)"
-                    if countdown_ms is not None else "Confirm",
+                    if countdown_ms is not None
+                    else "Confirm",
                     variant="destructive",
                     type="submit",
                     name="action",
@@ -5559,7 +6197,9 @@ class StarUIWorkbench:
             ),
             *rows,
             data_active_review=True,
-            cls="hidden min-h-full flex-1 flex-col" if hidden else "flex min-h-full flex-1 flex-col",
+            cls="hidden min-h-full flex-1 flex-col"
+            if hidden
+            else "flex min-h-full flex-1 flex-col",
         )
 
     def _new_layer_review_empty(self, *, overlay: bool = True) -> Any:
@@ -5607,7 +6247,9 @@ class StarUIWorkbench:
                 and preview_pair.quantity == _int_or_zero(layer.quantity)
             ):
                 reviewed_limit = preview_pair.stop_limit_price
-        if self._armed_execution is not None and index <= len(self._armed_execution.plan.pairs):
+        if self._armed_execution is not None and index <= len(
+            self._armed_execution.plan.pairs
+        ):
             locked_limit = self._armed_execution.plan.pairs[index - 1].stop.limit_price
             reviewed_limit = locked_limit
         return self._review_oca_pair(
@@ -5644,9 +6286,13 @@ class StarUIWorkbench:
                 self._review_order_line(
                     "SELL STP LMT",
                     Span(
-                        f"${_price_text(reviewed_limit)}" if reviewed_limit is not None else "—",
+                        f"${_price_text(reviewed_limit)}"
+                        if reviewed_limit is not None
+                        else "—",
                         data_live_review_price=f"stop-limit-{index}",
-                        data_reviewed_limit_price=_price_text(locked_limit) if locked_limit is not None else None,
+                        data_reviewed_limit_price=_price_text(locked_limit)
+                        if locked_limit is not None
+                        else None,
                         aria_live="polite",
                         cls="text-sm font-semibold text-rose-400",
                     ),
@@ -6434,7 +7080,9 @@ def _percentage_price_field(
                     "",
                     data_live_stop_limit_price=layer_index if kind == "stop" else None,
                     aria_live="polite" if kind == "stop" else None,
-                    cls="hidden text-xs text-muted-foreground" if kind == "stop" else "hidden",
+                    cls="hidden text-xs text-muted-foreground"
+                    if kind == "stop"
+                    else "hidden",
                 ),
                 cls="flex flex-wrap items-baseline justify-end gap-x-1",
             ),
@@ -6462,8 +7110,13 @@ def _percentage_price_field(
 
 
 def _sold_percentage_price_field(
-    label: str, *, value: str, price: str, input_id: str,
-    inferred: bool = False, limit_price: str | None = None,
+    label: str,
+    *,
+    value: str,
+    price: str,
+    input_id: str,
+    inferred: bool = False,
+    limit_price: str | None = None,
 ) -> Any:
     """Retain the active field geometry without inventing old percentages."""
     return Div(
@@ -6674,25 +7327,35 @@ def _price_update_fills_verified(
 ) -> bool:
     """Confirm every amended layer exited via a new, exact broker execution."""
     if (
-        snapshot is None or not snapshot.connected or not snapshot.complete
-        or not snapshot.fresh or not snapshot.executions_complete
+        snapshot is None
+        or not snapshot.connected
+        or not snapshot.complete
+        or not snapshot.fresh
+        or not snapshot.executions_complete
     ):
         return False
     for update in updates:
         fills = (
-            fill for fill in snapshot.executions
+            fill
+            for fill in snapshot.executions
             if fill.exec_id not in prior_execution_ids
             and fill.account == update.layer.account
             and fill.con_id == update.layer.con_id
             and fill.side.upper() in {"SLD", "SELL"}
-            and fill.perm_id in {
-                perm_id for perm_id, price in (
+            and fill.perm_id
+            in {
+                perm_id
+                for perm_id, price in (
                     (update.layer.target_perm_id, update.target_price),
                     (update.layer.stop_perm_id, update.stop_price),
-                ) if price is not None
+                )
+                if price is not None
             }
         )
-        if sum((fill.quantity for fill in fills), Decimal("0")) != update.layer.quantity:
+        if (
+            sum((fill.quantity for fill in fills), Decimal("0"))
+            != update.layer.quantity
+        ):
             return False
     return bool(updates)
 
@@ -6794,9 +7457,9 @@ def _contract_header_metric(label: str, value: str, *, adornment: Any = None) ->
             Span(value, cls="block text-sm font-medium tabular-nums"),
             adornment,
             cls="mt-1 flex items-center gap-1",
-        ) if adornment is not None else Span(
-            value, cls="mt-1 block text-sm font-medium tabular-nums"
-        ),
+        )
+        if adornment is not None
+        else Span(value, cls="mt-1 block text-sm font-medium tabular-nums"),
         cls="min-w-0",
     )
 
@@ -6893,9 +7556,7 @@ def _valid_stop_limit_offset(value: str, unit: str) -> bool:
         offset = Decimal(value)
     except InvalidOperation:
         return False
-    return offset.is_finite() and offset > 0 and (
-        unit != "percent" or offset < 100
-    )
+    return offset.is_finite() and offset > 0 and (unit != "percent" or offset < 100)
 
 
 def _positive_int(value: str | None, default: int) -> int:
@@ -6933,24 +7594,37 @@ def _money(value: Decimal) -> str:
     return f"{'+' if value >= 0 else '-'}${abs(value):,.2f}"
 
 
-def _projection_gain_value(value: Decimal | None, delta: Decimal | None, cost: Decimal | None = None) -> Any:
+def _projection_gain_value(
+    value: Decimal | None, delta: Decimal | None, cost: Decimal | None = None
+) -> Any:
     return _projection_change_value(value, delta, metric="gain", cost=cost)
 
 
-def _projection_loss_value(value: Decimal | None, delta: Decimal | None, cost: Decimal | None = None) -> Any:
+def _projection_loss_value(
+    value: Decimal | None, delta: Decimal | None, cost: Decimal | None = None
+) -> Any:
     return _projection_change_value(value, delta, metric="loss", cost=cost)
 
 
 def _projection_change_value(
-    value: Decimal | None, delta: Decimal | None, *, metric: str, cost: Decimal | None = None
+    value: Decimal | None,
+    delta: Decimal | None,
+    *,
+    metric: str,
+    cost: Decimal | None = None,
 ) -> Any:
     changed = value is not None and delta is not None and bool(delta)
-    up = changed and (delta > 0 if metric == "gain" else delta < 0)
-    amount = f"${abs(delta):,.2f}" if changed else "—"
-    baseline = value - delta if changed else None
+    up = (delta > 0 if metric == "gain" else delta < 0) if delta is not None else False
+    amount = f"${abs(delta):,.2f}" if changed and delta is not None else "—"
+    baseline = value - delta if value is not None and delta is not None else None
     if metric == "gain":
         direction = "Expected gain increased" if up else "Expected gain decreased"
-    elif changed and (value < 0 or baseline < 0):
+    elif (
+        changed
+        and value is not None
+        and baseline is not None
+        and (value < 0 or baseline < 0)
+    ):
         direction = "More loss" if up else "Less loss"
     else:
         direction = "Lower stop outcome" if up else "Higher stop outcome"
@@ -6999,7 +7673,9 @@ def _projection_change_value(
 def _projection_percent(value: Decimal | None, cost: Decimal | None) -> str | None:
     if value is None or cost is None or not cost.is_finite() or cost <= 0:
         return None
-    percent = (value / cost * Decimal("100")).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    percent = (value / cost * Decimal("100")).quantize(
+        Decimal("0.1"), rounding=ROUND_HALF_UP
+    )
     return f"{percent:+,.1f}%"
 
 
@@ -7100,12 +7776,27 @@ def _toast_notice(message: str) -> _ToastNotice | None:
     if not any(
         term in lowered
         for term in (
-            "blocked", "failed", "unavailable", "unknown", "disabled",
-            "invalid", "not in the verified", "could not", "needs attention",
-            "refresh required", "must be", "enter valid", "does not have a usable",
-            "select at least", "press execute", "start execution first",
-            "start a price update first", "state changed", "quote changes",
-            "earlier price amendment", "targets must",
+            "blocked",
+            "failed",
+            "unavailable",
+            "unknown",
+            "disabled",
+            "invalid",
+            "not in the verified",
+            "could not",
+            "needs attention",
+            "refresh required",
+            "must be",
+            "enter valid",
+            "does not have a usable",
+            "select at least",
+            "press execute",
+            "start execution first",
+            "start a price update first",
+            "state changed",
+            "quote changes",
+            "earlier price amendment",
+            "targets must",
         )
     ):
         return None

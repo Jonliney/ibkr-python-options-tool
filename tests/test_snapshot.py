@@ -102,10 +102,15 @@ def request() -> SnapshotRequest:
     )
 
 
-def test_closed_history_capture_accepts_zero_position_only_with_complete_history() -> None:
+def test_closed_history_capture_accepts_zero_position_only_with_complete_history() -> (
+    None
+):
     capture = replace(
-        complete_capture(), positions=(), read_only_api=False,
-        completed_orders_complete=True, executions_complete=True,
+        complete_capture(),
+        positions=(),
+        read_only_api=False,
+        completed_orders_complete=True,
+        executions_complete=True,
     )
     broker = FakeReadOnlyBroker(capture)
     coordinator = SnapshotCoordinator(

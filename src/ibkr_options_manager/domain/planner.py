@@ -214,8 +214,7 @@ def _stop_limit_price(
         # A sell limit cannot be zero. Use the smallest positive price on the
         # verified market rule, including its price-dependent tick bands.
         rounded = min(
-            _round_up(max(band.low_edge, band.increment), bands)
-            for band in bands
+            _round_up(max(band.low_edge, band.increment), bands) for band in bands
         )
     if rounded <= 0 or rounded >= stop_price:
         raise ValueError("stop-limit price must be below the stop trigger")
@@ -441,9 +440,8 @@ def closing_order_allocation(
         elif (
             len(orders) != 2
             or len(selected_orders) != 2
-            or {order.order_type for order in selected_orders} not in (
-                {"LMT", "STP"}, {"LMT", "STP LMT"}
-            )
+            or {order.order_type for order in selected_orders}
+            not in ({"LMT", "STP"}, {"LMT", "STP LMT"})
             or any(
                 order.order_type == "STP LMT"
                 and (
@@ -884,11 +882,13 @@ def _fingerprint(
                 "order_type": order.order_type,
                 "limit_price": (
                     _decimal_text(order.limit_price)
-                    if order.limit_price is not None else None
+                    if order.limit_price is not None
+                    else None
                 ),
                 "stop_price": (
                     _decimal_text(order.stop_price)
-                    if order.stop_price is not None else None
+                    if order.stop_price is not None
+                    else None
                 ),
                 "remaining": _decimal_text(order.remaining),
                 "status": order.status,

@@ -102,8 +102,11 @@ class PositionObserver:
             return generation == self._generation
 
     def _run(
-        self, settings: ObservationSettings, generation: int,
-        reconnecting: bool, stop: Event,
+        self,
+        settings: ObservationSettings,
+        generation: int,
+        reconnecting: bool,
+        stop: Event,
     ) -> None:
         try:
             imports = _load_ibapi()
@@ -159,9 +162,8 @@ class PositionObserver:
                 def error(self, reqId: int, *args: Any) -> None:
                     del reqId
                     code, _message = _parse_error_arguments(args)
-                    if (
-                        code not in _INFORMATIONAL_ERROR_CODES
-                        and owner._current(generation)
+                    if code not in _INFORMATIONAL_ERROR_CODES and owner._current(
+                        generation
                     ):
                         self.fatal = True
                         owner._on_health(

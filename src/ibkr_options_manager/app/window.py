@@ -3,7 +3,7 @@ from __future__ import annotations
 # ruff: noqa: E501
 from collections.abc import Callable
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Protocol
 
 from PySide6.QtCore import (
@@ -402,9 +402,7 @@ class PlannerWindow(QMainWindow):
         self.settings_button = QToolButton()
         self.settings_button.setObjectName("settingsButton")
         self.settings_button.setText("Settings")
-        self.settings_button.setToolButtonStyle(
-            Qt.ToolButtonStyle.ToolButtonTextOnly
-        )
+        self.settings_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.settings_button.setCheckable(True)
         self.settings_button.setAccessibleName("Connection settings")
         self.settings_button.setToolTip("Show connection settings")
@@ -821,7 +819,9 @@ class PlannerWindow(QMainWindow):
         """Populate the simulated workbench without using the refresh worker."""
         if not self._demo_mode:
             return
-        portfolio_state = self._view_model.refresh_portfolio(self._connection_settings())
+        portfolio_state = self._view_model.refresh_portfolio(
+            self._connection_settings()
+        )
         self._apply_state(portfolio_state)
         target_con_id = self._preferred_con_id
         if target_con_id is None and self._state.positions:
@@ -1023,7 +1023,9 @@ class PlannerWindow(QMainWindow):
                     con_id
                 )
             )
-            self.positions_layout.insertWidget(self.positions_layout.count() - 1, button)
+            self.positions_layout.insertWidget(
+                self.positions_layout.count() - 1, button
+            )
 
     def _clear_position_buttons(self) -> None:
         while self.positions_layout.count() > 1:
@@ -1198,7 +1200,9 @@ class PlannerWindow(QMainWindow):
                     maximum=1000,
                 )
                 target_percentage.setObjectName("layerTargetPercentageInput")
-                target_percentage.setAccessibleName(f"Layer {index} limit target percentage")
+                target_percentage.setAccessibleName(
+                    f"Layer {index} limit target percentage"
+                )
                 stop_percentage = _percentage_spin_box(
                     layer.stop_percentage or self._stop_percentage_text(layer),
                     maximum=100,
@@ -1207,7 +1211,9 @@ class PlannerWindow(QMainWindow):
                 stop_percentage.setAccessibleName(f"Layer {index} stop loss percentage")
                 target_price = QLabel(_price_text_from_raw(layer.target_price))
                 target_price.setObjectName("layerTargetPrice")
-                target_price.setAccessibleName(f"Layer {index} calculated limit target price")
+                target_price.setAccessibleName(
+                    f"Layer {index} calculated limit target price"
+                )
                 stop_price = QLabel(_price_text_from_raw(layer.stop_price))
                 stop_price.setObjectName("layerStopPrice")
                 stop_price.setAccessibleName(f"Layer {index} calculated stop price")
@@ -1497,7 +1503,9 @@ class PlannerWindow(QMainWindow):
         _clear_layout(self.review_actions_layout)
         forms = self._draft_layer_forms()
         if not forms:
-            empty = QLabel("Select an eligible position to see its read-only action plan.")
+            empty = QLabel(
+                "Select an eligible position to see its read-only action plan."
+            )
             empty.setObjectName("reviewEmpty")
             empty.setWordWrap(True)
             self.review_actions_layout.addWidget(empty)

@@ -130,23 +130,30 @@ def seed_demo_journal(path: Path) -> ExecutionJournal:
     journal = ExecutionJournal(path)
     fingerprint = sha256(b"demo-nvda-unverified-bracket-v1").hexdigest()
     if journal.find(fingerprint) is None:
-        journal._write((*journal._entries(), JournalEntry(
-            fingerprint=fingerprint,
-            account=DEMO_ACCOUNT,
-            con_id=1_002_100_161,
-            state="SUBMISSION_UNKNOWN",
-            expected_order_count=2,
-            snapshot_captured_at="0",
-            oca_prefix="demo-nvda-unverified",
-            layers=(JournalLayer(
-                quantity=3,
-                target_price="8.40",
-                stop_price="3.15",
-                tif="GTC",
-                target_percentage="100",
-                stop_percentage="25",
-            ),),
-        )))
+        journal._write(
+            (
+                *journal._entries(),
+                JournalEntry(
+                    fingerprint=fingerprint,
+                    account=DEMO_ACCOUNT,
+                    con_id=1_002_100_161,
+                    state="SUBMISSION_UNKNOWN",
+                    expected_order_count=2,
+                    snapshot_captured_at="0",
+                    oca_prefix="demo-nvda-unverified",
+                    layers=(
+                        JournalLayer(
+                            quantity=3,
+                            target_price="8.40",
+                            stop_price="3.15",
+                            tif="GTC",
+                            target_percentage="100",
+                            stop_percentage="25",
+                        ),
+                    ),
+                ),
+            )
+        )
     return journal
 
 
@@ -176,7 +183,8 @@ class DemoReadOnlyBroker:
                 account=account, con_id=position.contract.con_id
             ):
                 if (
-                    entry.state not in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"}
+                    entry.state
+                    not in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"}
                     or len(entry.order_ids) != len(entry.layers) * 2
                     or len(entry.perm_ids) != len(entry.order_ids)
                     or any(value <= 0 for value in (*entry.order_ids, *entry.perm_ids))
@@ -187,31 +195,38 @@ class DemoReadOnlyBroker:
                 for index, layer in enumerate(entry.layers):
                     if layer.cancelled:
                         continue
-                    group = f"{entry.oca_prefix or entry.fingerprint[:12]}/tranche-{index + 1}"
+                    group = (
+                        f"{entry.oca_prefix or entry.fingerprint[:12]}"
+                        f"/tranche-{index + 1}"
+                    )
                     for leg, order_type, price in (
                         (0, "LMT", Decimal(layer.target_price)),
                         (1, layer.stop_order_type, Decimal(layer.stop_price)),
                     ):
-                        orders.append(CapturedOrder(
-                            perm_id=entry.perm_ids[index * 2 + leg],
-                            client_id=17,
-                            order_id=entry.order_ids[index * 2 + leg],
-                            account=account,
-                            con_id=entry.con_id,
-                            action="SELL",
-                            order_type=order_type,
-                            remaining=Decimal(layer.quantity),
-                            status="Submitted",
-                            oca_group=group,
-                            parent_id=0,
-                            limit_price=(
-                                price if leg == 0 else
-                                Decimal(layer.stop_limit_price)
-                                if layer.stop_order_type == "STP LMT" else None
-                            ),
-                            stop_price=price if leg == 1 else None,
-                            tif=layer.tif,
-                        ))
+                        orders.append(
+                            CapturedOrder(
+                                perm_id=entry.perm_ids[index * 2 + leg],
+                                client_id=17,
+                                order_id=entry.order_ids[index * 2 + leg],
+                                account=account,
+                                con_id=entry.con_id,
+                                action="SELL",
+                                order_type=order_type,
+                                remaining=Decimal(layer.quantity),
+                                status="Submitted",
+                                oca_group=group,
+                                parent_id=0,
+                                limit_price=(
+                                    price
+                                    if leg == 0
+                                    else Decimal(layer.stop_limit_price)
+                                    if layer.stop_order_type == "STP LMT"
+                                    else None
+                                ),
+                                stop_price=price if leg == 1 else None,
+                                tif=layer.tif,
+                            )
+                        )
         return tuple(orders)
 
     def capture(
@@ -254,9 +269,7 @@ class DemoReadOnlyBroker:
             ),
             market_rule=CapturedMarketRule(
                 exchange="SMART",
-                bands=(
-                    PriceBand(Decimal("0"), Decimal("0.01")),
-                ),
+                bands=(PriceBand(Decimal("0"), Decimal("0.01")),),
             ),
             completed=REQUIRED_COMPLETIONS,
             completion_times=tuple(
@@ -296,6 +309,9 @@ class DemoSnapshotSource:
             return self._coordinator.refresh(self._request)
         return self._coordinator.current()
 
+    def capture_closed_history(self, request: SnapshotRequest) -> BrokerCapture | None:
+        return self._coordinator.capture_closed_history(request)
+
 
 class DemoPaperExecutionTransport:
     """Safe local acknowledgement simulator for the paper execution UI."""
@@ -323,10 +339,20 @@ class DemoPaperExecutionTransport:
                     account=snapshot.selected.account,
                     con_id=position.contract.con_id,
                 )
-            ) if self._journal is not None else ()
+            )
+            if self._journal is not None
+            else ()
         )
-        next_order_id = max((value for entry in prior for value in entry.order_ids), default=900_000) + 1
-        next_perm_id = max((value for entry in prior for value in entry.perm_ids), default=800_000) + 1
+        next_order_id = (
+            max(
+                (value for entry in prior for value in entry.order_ids), default=900_000
+            )
+            + 1
+        )
+        next_perm_id = (
+            max((value for entry in prior for value in entry.perm_ids), default=800_000)
+            + 1
+        )
         return PaperSubmission(
             order_ids=tuple(range(next_order_id, next_order_id + count)),
             perm_ids=tuple(range(next_perm_id, next_perm_id + count)),
@@ -364,16 +390,28 @@ class DemoPaperExecutionTransport:
         acknowledged: list[tuple[int, int]] = []
         for candidate in candidates:
             for order_id, perm_id, price in (
-                (candidate.layer.target_order_id, candidate.layer.target_perm_id,
-                 candidate.target_price),
-                (candidate.layer.stop_order_id, candidate.layer.stop_perm_id,
-                 candidate.stop_price),
+                (
+                    candidate.layer.target_order_id,
+                    candidate.layer.target_perm_id,
+                    candidate.target_price,
+                ),
+                (
+                    candidate.layer.stop_order_id,
+                    candidate.layer.stop_perm_id,
+                    candidate.stop_price,
+                ),
             ):
                 if price is None:
                     continue
                 order = orders.get(order_id)
-                if order is None or order.perm_id != perm_id or order.key != snapshot.selected:
-                    raise ValueError("the simulated OCA leg changed before acknowledgement")
+                if (
+                    order is None
+                    or order.perm_id != perm_id
+                    or order.key != snapshot.selected
+                ):
+                    raise ValueError(
+                        "the simulated OCA leg changed before acknowledgement"
+                    )
                 acknowledged.append((order_id, perm_id))
         return PaperSubmission(
             order_ids=tuple(order_id for order_id, _ in acknowledged),

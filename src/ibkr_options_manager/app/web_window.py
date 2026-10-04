@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-# ruff: noqa: E501
 from collections.abc import Callable
 from threading import Thread
 from time import monotonic, sleep
@@ -89,7 +88,9 @@ class StarUIPlannerWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def _start_local_server(app: Callable[..., object]) -> tuple[uvicorn.Server, Thread, int]:
+def _start_local_server(
+    app: Callable[..., object],
+) -> tuple[uvicorn.Server, Thread, int]:
     """Start StarHTML on loopback only and wait until the port is serving."""
     import socket
 
@@ -97,7 +98,9 @@ def _start_local_server(app: Callable[..., object]) -> tuple[uvicorn.Server, Thr
         probe.bind(("127.0.0.1", 0))
         port = int(probe.getsockname()[1])
     server = uvicorn.Server(
-        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", access_log=False)
+        uvicorn.Config(
+            app, host="127.0.0.1", port=port, log_level="warning", access_log=False
+        )
     )
     thread = Thread(target=server.run, name="starui-workbench", daemon=True)
     thread.start()

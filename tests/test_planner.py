@@ -100,8 +100,12 @@ def test_reference_price_preview_tick_rounds_the_illustrative_prices() -> None:
 
 def test_reference_price_preview_supports_break_even_and_stop_above_entry() -> None:
     bands = (PriceBand(Decimal("0"), Decimal("0.05")),)
-    assert preview_reference_prices(Decimal("2"), Decimal("20"), Decimal("0"), bands).stop_price == Decimal("2")
-    assert preview_reference_prices(Decimal("2"), Decimal("20"), Decimal("-5"), bands).stop_price == Decimal("2.10")
+    assert preview_reference_prices(
+        Decimal("2"), Decimal("20"), Decimal("0"), bands
+    ).stop_price == Decimal("2")
+    assert preview_reference_prices(
+        Decimal("2"), Decimal("20"), Decimal("-5"), bands
+    ).stop_price == Decimal("2.10")
 
 
 def test_explicit_layer_draft_preserves_individual_prices_and_quantities() -> None:
@@ -157,9 +161,12 @@ def test_stop_limit_plan_rounds_limit_down_and_fingerprints_settings(
     assert all(pair.stop.order_type == "STP LMT" for pair in result.pairs)
     assert all(pair.stop.limit_price == expected for pair in result.pairs)
     assert all(pair.stop.limit_price < pair.stop.rounded_price for pair in result.pairs)
-    assert result.fingerprint != build_exit_plan(
-        complete_snapshot(), replace(request, stop_order_type="STP")
-    ).fingerprint
+    assert (
+        result.fingerprint
+        != build_exit_plan(
+            complete_snapshot(), replace(request, stop_order_type="STP")
+        ).fingerprint
+    )
 
 
 @pytest.mark.parametrize(
@@ -174,10 +181,15 @@ def test_stop_limit_plan_rounds_limit_down_and_fingerprints_settings(
 def test_stop_limit_plan_fails_closed_on_invalid_offset(
     unit: str, offset: Decimal
 ) -> None:
-    result = build_exit_plan(complete_snapshot(), replace(
-        canonical_request(), stop_order_type="STP LMT",
-        stop_limit_offset=offset, stop_limit_unit=unit,
-    ))
+    result = build_exit_plan(
+        complete_snapshot(),
+        replace(
+            canonical_request(),
+            stop_order_type="STP LMT",
+            stop_limit_offset=offset,
+            stop_limit_unit=unit,
+        ),
+    )
     assert result.status is PlanStatus.BLOCKED
     assert result.pairs == ()
 
@@ -186,10 +198,15 @@ def test_stop_limit_plan_fails_closed_on_invalid_offset(
 def test_stop_limit_plan_uses_lowest_positive_market_rule_price(
     offset: Decimal,
 ) -> None:
-    result = build_exit_plan(complete_snapshot(), replace(
-        canonical_request(), stop_order_type="STP LMT",
-        stop_limit_offset=offset, stop_limit_unit="dollars",
-    ))
+    result = build_exit_plan(
+        complete_snapshot(),
+        replace(
+            canonical_request(),
+            stop_order_type="STP LMT",
+            stop_limit_offset=offset,
+            stop_limit_unit="dollars",
+        ),
+    )
 
     assert result.status is PlanStatus.VALID
     assert {pair.stop.limit_price for pair in result.pairs} == {Decimal("0.05")}
@@ -199,10 +216,14 @@ def test_stop_limit_plan_uses_lowest_positive_market_rule_price(
 def test_stop_limit_minimum_still_must_be_below_trigger() -> None:
     request = replace(
         canonical_request(),
-        layers=(LayerRequest(
-            quantity=1, target_price=Decimal("1.20"),
-            stop_price=Decimal("0.05"), tif="GTC",
-        ),),
+        layers=(
+            LayerRequest(
+                quantity=1,
+                target_price=Decimal("1.20"),
+                stop_price=Decimal("0.05"),
+                tif="GTC",
+            ),
+        ),
         stop_order_type="STP LMT",
         stop_limit_offset=Decimal("2"),
         stop_limit_unit="dollars",
@@ -216,16 +237,21 @@ def test_stop_limit_minimum_still_must_be_below_trigger() -> None:
 
 def test_stop_limit_floor_uses_lowest_valid_price_across_market_rule_bands() -> None:
     snapshot = complete_snapshot()
-    snapshot = replace(snapshot, market_rule=replace(
-        snapshot.market_rule,
-        bands=(
-            PriceBand(Decimal("0"), Decimal("0.10")),
-            PriceBand(Decimal("0.05"), Decimal("0.01")),
+    snapshot = replace(
+        snapshot,
+        market_rule=replace(
+            snapshot.market_rule,
+            bands=(
+                PriceBand(Decimal("0"), Decimal("0.10")),
+                PriceBand(Decimal("0.05"), Decimal("0.01")),
+            ),
         ),
-    ))
+    )
     request = replace(
-        canonical_request(), stop_order_type="STP LMT",
-        stop_limit_offset=Decimal("2"), stop_limit_unit="dollars",
+        canonical_request(),
+        stop_order_type="STP LMT",
+        stop_limit_offset=Decimal("2"),
+        stop_limit_unit="dollars",
     )
 
     result = build_exit_plan(snapshot, request)
@@ -236,7 +262,8 @@ def test_stop_limit_floor_uses_lowest_valid_price_across_market_rule_bands() -> 
 
 def test_five_dollar_offset_does_not_turn_into_five_percent() -> None:
     request = replace(
-        canonical_request(), stop_order_type="STP LMT",
+        canonical_request(),
+        stop_order_type="STP LMT",
         stop_limit_offset=Decimal("5"),
     )
 
@@ -255,12 +282,24 @@ def test_five_dollar_offset_does_not_turn_into_five_percent() -> None:
 def test_existing_stop_limit_oca_pair_reserves_one_layer_quantity() -> None:
     key = ContractKey("DU1234567", 917864414)
     target = WorkingOrder(
-        41, 17, 101, key, "SELL", "LMT", Decimal("2"), "Submitted",
-        oca_group="owned/tranche-1", limit_price=Decimal("1.2"),
+        41,
+        17,
+        101,
+        key,
+        "SELL",
+        "LMT",
+        Decimal("2"),
+        "Submitted",
+        oca_group="owned/tranche-1",
+        limit_price=Decimal("1.2"),
     )
     stop = replace(
-        target, perm_id=42, order_id=102, order_type="STP LMT",
-        limit_price=Decimal("0.7"), stop_price=Decimal("0.8"),
+        target,
+        perm_id=42,
+        order_id=102,
+        order_type="STP LMT",
+        limit_price=Decimal("0.7"),
+        stop_price=Decimal("0.8"),
     )
     result = build_exit_plan(
         complete_snapshot(working_orders=(target, stop)), canonical_request()
@@ -277,19 +316,34 @@ def test_existing_stop_limit_oca_pair_reserves_one_layer_quantity() -> None:
 def test_manual_tws_stop_limit_price_change_changes_new_plan_fingerprint() -> None:
     key = ContractKey("DU1234567", 917864414)
     target = WorkingOrder(
-        41, 17, 101, key, "SELL", "LMT", Decimal("2"), "Submitted",
-        oca_group="owned/tranche-1", limit_price=Decimal("1.2"),
+        41,
+        17,
+        101,
+        key,
+        "SELL",
+        "LMT",
+        Decimal("2"),
+        "Submitted",
+        oca_group="owned/tranche-1",
+        limit_price=Decimal("1.2"),
     )
     stop = replace(
-        target, perm_id=42, order_id=102, order_type="STP LMT",
-        limit_price=Decimal("0.7"), stop_price=Decimal("0.8"),
+        target,
+        perm_id=42,
+        order_id=102,
+        order_type="STP LMT",
+        limit_price=Decimal("0.7"),
+        stop_price=Decimal("0.8"),
     )
     request = canonical_request()
     before = build_exit_plan(
-        complete_snapshot(working_orders=(target, stop)), request,
+        complete_snapshot(working_orders=(target, stop)),
+        request,
     )
     after = build_exit_plan(
-        complete_snapshot(working_orders=(target, replace(stop, limit_price=Decimal("0.65")))),
+        complete_snapshot(
+            working_orders=(target, replace(stop, limit_price=Decimal("0.65")))
+        ),
         request,
     )
     assert before.status is after.status is PlanStatus.VALID
@@ -378,9 +432,7 @@ def test_existing_bracket_reserves_quantity_but_allows_a_new_available_layer() -
         target_percentages=(Decimal("20"),),
     )
 
-    result = build_exit_plan(
-        complete_snapshot(working_orders=(target, stop)), request
-    )
+    result = build_exit_plan(complete_snapshot(working_orders=(target, stop)), request)
 
     assert result.status is PlanStatus.VALID
     assert result.available_quantity == 4

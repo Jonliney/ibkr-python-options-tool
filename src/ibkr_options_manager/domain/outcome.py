@@ -36,9 +36,7 @@ def project_position_outcome(
     unresolved: bool = False,
 ) -> PositionOutcome:
     covered_quantity = sum((item.quantity for item in exits), Decimal("0"))
-    covered_gain = realized_pnl + sum(
-        (item.target_pnl for item in exits), Decimal("0")
-    )
+    covered_gain = realized_pnl + sum((item.target_pnl for item in exits), Decimal("0"))
     covered_loss = sum((item.stop_pnl for item in exits), Decimal("0"))
     uncovered_quantity = max(held_quantity - covered_quantity, Decimal("0"))
     complete = (

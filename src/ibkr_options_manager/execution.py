@@ -362,14 +362,19 @@ class ExecutionJournal:
             if (
                 entry.account == account
                 and entry.con_id == con_id
-                and entry.fingerprint.startswith((
-                    "price-update:", "market-exit:", "market-exit-many:",
-                    "cancel-bracket:",
-                ))
+                and entry.fingerprint.startswith(
+                    (
+                        "price-update:",
+                        "market-exit:",
+                        "market-exit-many:",
+                        "cancel-bracket:",
+                    )
+                )
             ):
                 latest[entry.fingerprint.split(":retry-", 1)[0]] = entry
         return tuple(
-            entry for entry in latest.values()
+            entry
+            for entry in latest.values()
             if entry.state in {"PREPARED", "SUBMISSION_UNKNOWN"}
         )
 
@@ -381,19 +386,23 @@ class ExecutionJournal:
             raise ExecutionBlocked("confirm the contract's orders and fills in TWS")
         entries = list(self._entries())
         unresolved = {
-            entry.fingerprint for entry in self.unresolved_management_entries(
+            entry.fingerprint
+            for entry in self.unresolved_management_entries(
                 account=snapshot.selected.account, con_id=snapshot.selected.con_id
             )
         }
         matches = [
-            index for index, entry in enumerate(entries)
+            index
+            for index, entry in enumerate(entries)
             if entry.fingerprint == fingerprint
             and entry.account == snapshot.selected.account
             and entry.con_id == snapshot.selected.con_id
             and entry.fingerprint in unresolved
         ]
         if len(matches) != 1:
-            raise ExecutionBlocked("the uncertain management attempt is missing or ambiguous")
+            raise ExecutionBlocked(
+                "the uncertain management attempt is missing or ambiguous"
+            )
         index = matches[0]
         entry = entries[index]
         try:
@@ -411,7 +420,8 @@ class ExecutionJournal:
             or any(order.status != "Submitted" for order in snapshot.working_orders)
         ):
             raise ExecutionBlocked(
-                "a later, complete TWS read with stable working orders and fills is required"
+                "a later, complete TWS read with stable working orders "
+                "and fills is required"
             )
         updated = replace(
             entry, state="RESOLVED", resolution_captured_at=str(snapshot.captured_at)
@@ -463,7 +473,8 @@ class ExecutionJournal:
         """Hide a verified cancelled row without erasing its safety history."""
         entries = list(self._entries())
         matches = [
-            index for index, entry in enumerate(entries)
+            index
+            for index, entry in enumerate(entries)
             if entry.fingerprint == fingerprint
             and entry.snapshot_captured_at == attempt_captured_at
             and entry.account == snapshot.selected.account
@@ -485,7 +496,9 @@ class ExecutionJournal:
         layer_perm_ids = (
             entry.perm_ids[layer_index * 2 : layer_index * 2 + 2]
             if len(entry.perm_ids) == len(entry.layers) * 2
-            else entry.perm_ids if len(entry.layers) == 1 else ()
+            else entry.perm_ids
+            if len(entry.layers) == 1
+            else ()
         )
         ids = {
             *layer_perm_ids,
@@ -520,7 +533,9 @@ class ExecutionJournal:
         if self.unresolved_management_entries(
             account=snapshot.selected.account, con_id=snapshot.selected.con_id
         ):
-            raise ExecutionBlocked("this contract is locked by an uncertain order outcome")
+            raise ExecutionBlocked(
+                "this contract is locked by an uncertain order outcome"
+            )
         entries = list(self._entries())
         prior_index = next(
             (
@@ -579,7 +594,8 @@ class ExecutionJournal:
                     stop_order_type=pair.stop.order_type,
                     stop_limit_price=(
                         format(pair.stop.limit_price, "f")
-                        if pair.stop.limit_price is not None else ""
+                        if pair.stop.limit_price is not None
+                        else ""
                     ),
                     target_percentage=format(pair.target_percentage, "f"),
                     stop_percentage=(
@@ -628,7 +644,9 @@ class ExecutionJournal:
             return False
         if entry.state == "SUBMISSION_UNKNOWN":
             if (
-                entry.account, entry.con_id, _entry_oca_prefix(entry)
+                entry.account,
+                entry.con_id,
+                _entry_oca_prefix(entry),
             ) in ambiguous_oca_prefixes(entries):
                 return False
             return ExecutionJournal._cancelled_submission_attempt(entry, snapshot)
@@ -718,25 +736,25 @@ class ExecutionJournal:
                 for perm_id in (layer.target_perm_id, layer.stop_perm_id)
                 if perm_id > 0
             )
-        for order in snapshot.completed_orders:
-            if order.oca_group in groups or order.order_id in entry.order_ids:
-                entry_ids.add(order.perm_id)
-            elif order.perm_id > 0:
-                other_ids.add(order.perm_id)
-        for order in snapshot.working_orders:
-            if order.oca_group in groups or order.order_id in entry.order_ids:
-                entry_ids.add(order.perm_id)
-            elif order.perm_id > 0:
-                other_ids.add(order.perm_id)
-        return tuple(sorted({
-            fill.perm_id
-            for fill in snapshot.executions
-            if fill.perm_id in entry_ids
-            or (
-                fill.side.upper() not in {"BOT", "BUY"}
-                and fill.perm_id not in other_ids
+        for orders in (snapshot.completed_orders, snapshot.working_orders):
+            for order in orders:
+                if order.oca_group in groups or order.order_id in entry.order_ids:
+                    entry_ids.add(order.perm_id)
+                elif order.perm_id > 0:
+                    other_ids.add(order.perm_id)
+        return tuple(
+            sorted(
+                {
+                    fill.perm_id
+                    for fill in snapshot.executions
+                    if fill.perm_id in entry_ids
+                    or (
+                        fill.side.upper() not in {"BOT", "BUY"}
+                        and fill.perm_id not in other_ids
+                    )
+                }
             )
-        }))
+        )
 
     @staticmethod
     def _cancelled_submission_attempt(
@@ -767,7 +785,8 @@ class ExecutionJournal:
             ]
             if (
                 len(legs) != 2
-                or {leg.order_type for leg in legs} != {"LMT", entry.layers[index].stop_order_type}
+                or {leg.order_type for leg in legs}
+                != {"LMT", entry.layers[index].stop_order_type}
                 or any(
                     leg.action != "SELL"
                     or leg.status not in {"Cancelled", "ApiCancelled"}
@@ -795,13 +814,13 @@ class ExecutionJournal:
             raise ExecutionBlocked("confirm both bracket legs are cancelled in TWS")
         entries = list(self._entries())
         matches = [
-            index for index, entry in enumerate(entries)
+            index
+            for index, entry in enumerate(entries)
             if entry.fingerprint == fingerprint
             and entry.account == snapshot.selected.account
             and entry.con_id == snapshot.selected.con_id
-            and entry.state in {
-                "SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED", "SUBMITTED", "RECONCILED"
-            }
+            and entry.state
+            in {"SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED", "SUBMITTED", "RECONCILED"}
         ]
         if len(matches) != 1:
             raise ExecutionBlocked("the unresolved bracket is missing or ambiguous")
@@ -900,7 +919,9 @@ class ExecutionJournal:
         if self.unresolved_management_entries(
             account=snapshot.selected.account, con_id=snapshot.selected.con_id
         ):
-            raise ExecutionBlocked("this contract is locked by an uncertain order outcome")
+            raise ExecutionBlocked(
+                "this contract is locked by an uncertain order outcome"
+            )
         fingerprint = self._management_fingerprint(snapshot, operation, material)
         previous = self.latest_management_attempt(
             snapshot, operation=operation, material=material
@@ -1007,13 +1028,27 @@ class ExecutionJournal:
             entry_index, layer_index = matches[0]
             layer = entries[entry_index].layers[layer_index]
             target_percent, stop_percent = percentages[update.layer.target_perm_id]
-            replacements.append((entry_index, layer_index, replace(
-                layer,
-                target_price=format(update.target_price, "f") if update.target_price is not None else layer.target_price,
-                stop_price=format(update.stop_price, "f") if update.stop_price is not None else layer.stop_price,
-                target_percentage=target_percent if update.target_price is not None else layer.target_percentage,
-                stop_percentage=stop_percent if update.stop_price is not None else layer.stop_percentage,
-            )))
+            replacements.append(
+                (
+                    entry_index,
+                    layer_index,
+                    replace(
+                        layer,
+                        target_price=format(update.target_price, "f")
+                        if update.target_price is not None
+                        else layer.target_price,
+                        stop_price=format(update.stop_price, "f")
+                        if update.stop_price is not None
+                        else layer.stop_price,
+                        target_percentage=target_percent
+                        if update.target_price is not None
+                        else layer.target_percentage,
+                        stop_percentage=stop_percent
+                        if update.stop_price is not None
+                        else layer.stop_percentage,
+                    ),
+                )
+            )
         for entry_index, layer_index, replacement in replacements:
             layers = list(entries[entry_index].layers)
             layers[layer_index] = replacement
@@ -1021,9 +1056,7 @@ class ExecutionJournal:
         if replacements:
             self._write(tuple(entries))
 
-    def record_pair_cancellation(
-        self, candidate: MarketExitCandidate
-    ) -> None:
+    def record_pair_cancellation(self, candidate: MarketExitCandidate) -> None:
         """Retain confirmed cancellation on the exact app-owned source layer."""
         entries = list(self._entries())
         matches: list[tuple[int, int]] = []
@@ -1044,11 +1077,10 @@ class ExecutionJournal:
                     pair_ids = entry.perm_ids[layer_index * 2 : layer_index * 2 + 2]
                     if len(pair_ids) == 2:
                         target_id, stop_id = pair_ids
-                if (
-                    (not target_id or not stop_id)
-                    and {candidate.target_perm_id, candidate.stop_perm_id}
-                    <= set(entry.perm_ids)
-                ):
+                if (not target_id or not stop_id) and {
+                    candidate.target_perm_id,
+                    candidate.stop_perm_id,
+                } <= set(entry.perm_ids):
                     target_id, stop_id = (
                         candidate.target_perm_id,
                         candidate.stop_perm_id,
@@ -1112,8 +1144,7 @@ class ExecutionJournal:
                 or len(entry.fingerprint) != 64
                 or not entry.layers
                 or (
-                    (entry.account, entry.con_id, _entry_oca_prefix(entry))
-                    in ambiguous
+                    (entry.account, entry.con_id, _entry_oca_prefix(entry)) in ambiguous
                     and not entry.perm_ids
                 )
             ):
@@ -1207,8 +1238,7 @@ class ExecutionJournal:
                 or entry.con_id != snapshot.selected.con_id
                 or len(entry.fingerprint) != 64
                 or (
-                    (entry.account, entry.con_id, _entry_oca_prefix(entry))
-                    in ambiguous
+                    (entry.account, entry.con_id, _entry_oca_prefix(entry)) in ambiguous
                     and not entry.perm_ids
                 )
             ):
@@ -1285,9 +1315,7 @@ class ExecutionJournal:
                 }
                 or entry.account != snapshot.selected.account
                 or entry.con_id != snapshot.selected.con_id
-                or (
-                    entry.account, entry.con_id, _entry_oca_prefix(entry)
-                ) in ambiguous
+                or (entry.account, entry.con_id, _entry_oca_prefix(entry)) in ambiguous
             ):
                 continue
             if self._cancelled_submission_attempt(entry, snapshot):
@@ -1422,11 +1450,12 @@ def require_paper_execution_snapshot(
         raise ExecutionBlocked("the refreshed plan is not valid")
     outside_rth = supports_outside_rth(snapshot)
     if any(
-        pair.target.outside_rth != outside_rth
-        or pair.stop.outside_rth != outside_rth
+        pair.target.outside_rth != outside_rth or pair.stop.outside_rth != outside_rth
         for pair in plan.pairs
     ):
-        raise ExecutionBlocked("the bracket Outside RTH setting does not match the verified contract")
+        raise ExecutionBlocked(
+            "the bracket Outside RTH setting does not match the verified contract"
+        )
     if any(
         pair.target.order_type != "LMT"
         or pair.stop.order_type not in {"STP", "STP LMT"}
@@ -1477,7 +1506,9 @@ def require_paper_execution_snapshot(
             ):
                 raise ValueError("price is not on the verified market rule")
         except (InvalidOperation, ValueError) as error:
-            raise ExecutionBlocked("the bracket contains an invalid price increment") from error
+            raise ExecutionBlocked(
+                "the bracket contains an invalid price increment"
+            ) from error
     require_paper_management_snapshot(snapshot)
     reserved, failures = closing_order_allocation(snapshot)
     if failures or reserved != plan.allocated_quantity:
@@ -1622,7 +1653,9 @@ class PaperExecutionService:
     def unresolved_management_entries(
         self, *, account: str, con_id: int
     ) -> tuple[JournalEntry, ...]:
-        return self._journal.unresolved_management_entries(account=account, con_id=con_id)
+        return self._journal.unresolved_management_entries(
+            account=account, con_id=con_id
+        )
 
     def confirm_unknown_management(
         self, snapshot: BrokerSnapshot, fingerprint: str, *, confirmed_in_tws: bool
@@ -1680,13 +1713,16 @@ class PaperExecutionService:
             for order in peers
             if order.action == "SELL"
             and order.order_type in {"STP", "STP LMT"}
-            and (order.order_type != "STP LMT" or (
-                order.stop_price is not None
-                and order.limit_price is not None
-                and order.stop_price.is_finite()
-                and order.limit_price.is_finite()
-                and 0 < order.limit_price < order.stop_price
-            ))
+            and (
+                order.order_type != "STP LMT"
+                or (
+                    order.stop_price is not None
+                    and order.limit_price is not None
+                    and order.stop_price.is_finite()
+                    and order.limit_price.is_finite()
+                    and 0 < order.limit_price < order.stop_price
+                )
+            )
             and order.perm_id in owned
             and order.order_id > 0
             and order.client_id == expected_client_id
@@ -1776,7 +1812,10 @@ class PaperExecutionService:
             if target is None or stop is None:
                 raise ExecutionBlocked("the selected OCA layer is no longer complete")
             if stop.order_type == "STP LMT":
-                raise ExecutionBlocked("active STP LMT price changes are not supported; cancel and recreate the bracket")
+                raise ExecutionBlocked(
+                    "active STP LMT price changes are not supported; "
+                    "cancel and recreate the bracket"
+                )
             if (
                 update.prior_target_price is not None
                 and target.limit_price != update.prior_target_price
@@ -2148,7 +2187,8 @@ def _complete_app_oca_orders(
             expected_stop = Decimal(layer.stop_price)
             expected_limit = (
                 Decimal(layer.stop_limit_price)
-                if layer.stop_order_type == "STP LMT" else None
+                if layer.stop_order_type == "STP LMT"
+                else None
             )
         except InvalidOperation:
             return ()

@@ -37,7 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--con-id", type=int, help="option conId to prefill")
     parser.add_argument("--max-age", type=float, default=15.0)
     parser.add_argument(
-        "--observer-client-id", type=int, default=18,
+        "--observer-client-id",
+        type=int,
+        default=18,
         help="dedicated nonzero TWS client ID for position observation",
     )
     parser.add_argument(
@@ -103,7 +105,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             journal_path = journal_path.with_name("demo-execution-journal.json")
         journal = (
             seed_demo_journal(journal_path)
-            if args.demo_data else ExecutionJournal(journal_path)
+            if args.demo_data
+            else ExecutionJournal(journal_path)
         )
         if isinstance(broker, DemoReadOnlyBroker):
             broker.use_journal(journal)

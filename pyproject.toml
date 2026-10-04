@@ -55,6 +55,9 @@ extend-exclude = ["src/ibkr_options_manager/app/web/components"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/test_app_demo.py" = ["E402"]
+
 [tool.starui]
 component_dir = "src/ibkr_options_manager/app/web/components/ui"
 css_output = "src/ibkr_options_manager/app/web/static/starui.css"

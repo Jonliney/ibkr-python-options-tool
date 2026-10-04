@@ -126,9 +126,14 @@ def test_empty_initial_position_baseline_does_not_trigger_repeat_capture(
             self.active = False
             connected.set()
 
-    monkeypatch.setattr(observation, "_load_ibapi",
-                        lambda: SimpleNamespace(EWrapper=Wrapper, EClient=Client))
-    observer = PositionObserver(changes.append, lambda _generation, value: health.append(value))
+    monkeypatch.setattr(
+        observation,
+        "_load_ibapi",
+        lambda: SimpleNamespace(EWrapper=Wrapper, EClient=Client),
+    )
+    observer = PositionObserver(
+        changes.append, lambda _generation, value: health.append(value)
+    )
     observer.start(ObservationSettings("DU1234567", 7497, 18, 17, 2))
     try:
         for _ in range(100):

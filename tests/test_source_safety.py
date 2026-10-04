@@ -92,8 +92,7 @@ class ProductionSourceSafetyTests(unittest.TestCase):
         cancel_calls = [
             call
             for call in ast.walk(tree)
-            if isinstance(call, ast.Call)
-            and _called_name(call.func) == "cancelOrder"
+            if isinstance(call, ast.Call) and _called_name(call.func) == "cancelOrder"
         ]
         cancel_arguments = {
             _attribute_name(call.args[0])

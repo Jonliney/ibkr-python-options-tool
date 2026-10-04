@@ -6,8 +6,8 @@ from decimal import Decimal
 from enum import StrEnum
 
 from .broker import (
-    REQUIRED_COMPLETIONS,
     PORTFOLIO_COMPLETIONS,
+    REQUIRED_COMPLETIONS,
     BrokerCapture,
     ReadOnlyBroker,
     SnapshotRequest,
@@ -71,12 +71,20 @@ class SnapshotCoordinator:
             or capture.localhost_only is not True
             or request.expected_account not in capture.managed_accounts
             or capture.errors
-            or not (PORTFOLIO_COMPLETIONS | {"contract_details"}).issubset(capture.completed)
+            or not (PORTFOLIO_COMPLETIONS | {"contract_details"}).issubset(
+                capture.completed
+            )
             or not capture.completed_orders_complete
             or not capture.executions_complete
             or self._clock() - capture.captured_at > self._max_age_seconds
-            or len([contract for contract in capture.contract_details
-                    if contract.con_id == request.option_con_id]) != 1
+            or len(
+                [
+                    contract
+                    for contract in capture.contract_details
+                    if contract.con_id == request.option_con_id
+                ]
+            )
+            != 1
         ):
             return None
         return capture

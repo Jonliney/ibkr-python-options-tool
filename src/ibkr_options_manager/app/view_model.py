@@ -11,9 +11,9 @@ from typing import Protocol
 from ..broker import BrokerCapture, PortfolioRequest, SnapshotRequest
 from ..domain import (
     BrokerSnapshot,
+    LayerRequest,
     ObservedCompletedOrder,
     ObservedExecution,
-    LayerRequest,
     PlanRequest,
     PlanResult,
     PlanStatus,
@@ -206,7 +206,9 @@ class ViewState:
 class SnapshotSource(Protocol):
     def refresh(self, request: SnapshotRequest) -> SnapshotResult: ...
 
-    def capture_closed_history(self, request: SnapshotRequest) -> BrokerCapture | None: ...
+    def capture_closed_history(
+        self, request: SnapshotRequest
+    ) -> BrokerCapture | None: ...
 
     def current(self) -> SnapshotResult: ...
 
@@ -249,40 +251,78 @@ class PlannerViewModel:
         self, settings: ConnectionSettings, baseline: BrokerSnapshot
     ) -> BrokerSnapshot | None:
         """Fetch exact-contract history for journal display only."""
-        capture = self._snapshots.capture_closed_history(SnapshotRequest(
-            host="127.0.0.1", port=settings.port, client_id=settings.client_id,
-            expected_account=settings.account, option_con_id=baseline.selected.con_id,
-            timeout_seconds=settings.timeout_seconds,
-        ))
+        capture = self._snapshots.capture_closed_history(
+            SnapshotRequest(
+                host="127.0.0.1",
+                port=settings.port,
+                client_id=settings.client_id,
+                expected_account=settings.account,
+                option_con_id=baseline.selected.con_id,
+                timeout_seconds=settings.timeout_seconds,
+            )
+        )
         if capture is None or baseline.selected.account != settings.account:
             return None
-        contract = next(contract for contract in capture.contract_details
-                        if contract.con_id == baseline.selected.con_id)
-        identity = ("sec_type", "expiry", "strike", "right", "multiplier",
-                    "currency", "trading_class", "exchange", "local_symbol")
-        if any(getattr(contract, field) != getattr(baseline.contract, field)
-               for field in identity):
+        contract = next(
+            contract
+            for contract in capture.contract_details
+            if contract.con_id == baseline.selected.con_id
+        )
+        identity = (
+            "sec_type",
+            "expiry",
+            "strike",
+            "right",
+            "multiplier",
+            "currency",
+            "trading_class",
+            "exchange",
+            "local_symbol",
+        )
+        if any(
+            getattr(contract, field) != getattr(baseline.contract, field)
+            for field in identity
+        ):
             return None
         return replace(
-            baseline, complete=False, fresh=False,
+            baseline,
+            complete=False,
+            fresh=False,
             working_orders=(),
-            executions=tuple(ObservedExecution(
-                exec_id=fill.exec_id, account=fill.account, con_id=fill.con_id,
-                perm_id=fill.perm_id, side=fill.side, quantity=fill.quantity,
-                price=fill.price, time=fill.time, realized_pnl=fill.realized_pnl,
-                currency=fill.currency,
-            ) for fill in capture.executions
+            executions=tuple(
+                ObservedExecution(
+                    exec_id=fill.exec_id,
+                    account=fill.account,
+                    con_id=fill.con_id,
+                    perm_id=fill.perm_id,
+                    side=fill.side,
+                    quantity=fill.quantity,
+                    price=fill.price,
+                    time=fill.time,
+                    realized_pnl=fill.realized_pnl,
+                    currency=fill.currency,
+                )
+                for fill in capture.executions
                 if fill.account == settings.account
-                and fill.con_id == baseline.selected.con_id),
+                and fill.con_id == baseline.selected.con_id
+            ),
             executions_complete=True,
-            completed_orders=tuple(ObservedCompletedOrder(
-                account=order.account, con_id=order.con_id, perm_id=order.perm_id,
-                order_id=order.order_id, client_id=order.client_id,
-                action=order.action, order_type=order.order_type,
-                oca_group=order.oca_group, status=order.status,
-            ) for order in capture.completed_orders
+            completed_orders=tuple(
+                ObservedCompletedOrder(
+                    account=order.account,
+                    con_id=order.con_id,
+                    perm_id=order.perm_id,
+                    order_id=order.order_id,
+                    client_id=order.client_id,
+                    action=order.action,
+                    order_type=order.order_type,
+                    oca_group=order.oca_group,
+                    status=order.status,
+                )
+                for order in capture.completed_orders
                 if order.account == settings.account
-                and order.con_id == baseline.selected.con_id),
+                and order.con_id == baseline.selected.con_id
+            ),
             completed_orders_complete=True,
         )
 
@@ -366,9 +406,7 @@ class PlannerViewModel:
         )
         self._latest_snapshot = None
         chosen = (
-            form
-            if form is not None
-            else self._bracket_forms.get(con_id, PlanForm())
+            form if form is not None else self._bracket_forms.get(con_id, PlanForm())
         )
         try:
             result = self._snapshots.refresh(
@@ -521,11 +559,7 @@ class PlannerViewModel:
         selection = self._selection
         if selection is None:
             return state
-        snapshot = (
-            result.snapshot
-            if result.status is SnapshotStatus.READY
-            else None
-        )
+        snapshot = result.snapshot if result.status is SnapshotStatus.READY else None
         if snapshot is not None:
             self._bracket_forms[selection.con_id] = form
         return self._decorate(
@@ -543,11 +577,7 @@ class PlannerViewModel:
         form: PlanForm,
         snapshot: BrokerSnapshot | None = None,
     ) -> ViewState:
-        orders = (
-            ()
-            if snapshot is None
-            else _working_order_lines(snapshot)
-        )
+        orders = () if snapshot is None else _working_order_lines(snapshot)
         return replace(
             state,
             positions=self._portfolio_lines,
@@ -557,9 +587,7 @@ class PlannerViewModel:
             if state.bracket_form != PlanForm()
             else form,
             quote_calculator=(
-                None
-                if snapshot is None
-                else _quote_calculator_line(snapshot)
+                None if snapshot is None else _quote_calculator_line(snapshot)
             ),
         )
 
@@ -979,7 +1007,8 @@ def _parse_plan_form(
         stop = Decimal(form.stop_loss_percentage.strip())
         stop_limit_offset = (
             Decimal(form.stop_limit_offset.strip())
-            if form.stop_order_type == "STP LMT" else Decimal("5")
+            if form.stop_order_type == "STP LMT"
+            else Decimal("5")
         )
     except (InvalidOperation, ValueError):
         return None, ValidationLine(

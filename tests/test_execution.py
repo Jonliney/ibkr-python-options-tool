@@ -137,17 +137,24 @@ def _plan(
 def test_outside_rth_defaults_on_only_for_documented_index_options() -> None:
     supported = _plan(_snapshot())
     assert supported.status.value == "VALID"
-    assert all(pair.target.outside_rth and pair.stop.outside_rth for pair in supported.pairs)
+    assert all(
+        pair.target.outside_rth and pair.stop.outside_rth for pair in supported.pairs
+    )
 
     for changes in (
-        {"trading_class": "AAPL"}, {"exchange": "ISE"}, {"currency": "EUR"},
+        {"trading_class": "AAPL"},
+        {"exchange": "ISE"},
+        {"currency": "EUR"},
     ):
         snapshot = _snapshot()
         contract = replace(snapshot.contract, **changes)
-        unsupported = _plan(replace(
-            snapshot, contract=contract,
-            market_rule=replace(snapshot.market_rule, exchange=contract.exchange),
-        ))
+        unsupported = _plan(
+            replace(
+                snapshot,
+                contract=contract,
+                market_rule=replace(snapshot.market_rule, exchange=contract.exchange),
+            )
+        )
         assert unsupported.status.value == "VALID"
         assert all(
             not pair.target.outside_rth and not pair.stop.outside_rth
@@ -159,29 +166,35 @@ def test_mismatched_outside_rth_pair_is_blocked_before_any_tws_write() -> None:
     snapshot = _snapshot()
     plan = _plan(snapshot)
     pair = plan.pairs[0]
-    inconsistent = replace(plan, pairs=(replace(
-        pair, stop=replace(pair.stop, outside_rth=False)
-    ),))
+    inconsistent = replace(
+        plan, pairs=(replace(pair, stop=replace(pair.stop, outside_rth=False)),)
+    )
 
     with pytest.raises(ExecutionBlocked, match="Outside RTH"):
         require_paper_execution_snapshot(snapshot, inconsistent)
     with pytest.raises(ExecutionBlocked, match="Outside RTH"):
         IbkrPaperExecutionBroker().submit(
-            snapshot, inconsistent, host="127.0.0.1", port=7497,
-            client_id=17, timeout_seconds=1,
+            snapshot,
+            inconsistent,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
         )
 
 
 @pytest.mark.parametrize("supported", [True, False])
 def test_paper_bracket_writer_sends_matching_outside_rth_flags(
-    monkeypatch, supported: bool,
+    monkeypatch,
+    supported: bool,
 ) -> None:
     from ibkr_options_manager.broker import execution as broker_execution
 
     snapshot = _snapshot()
     if not supported:
         snapshot = replace(
-            snapshot, contract=replace(snapshot.contract, trading_class="AAPL"),
+            snapshot,
+            contract=replace(snapshot.contract, trading_class="AAPL"),
         )
     plan = _plan(snapshot)
     sent = []
@@ -214,13 +227,20 @@ def test_paper_bracket_writer_sends_matching_outside_rth_flags(
             self.wrapper.openOrder(order_id, None, order, None)
 
     monkeypatch.setattr(
-        broker_execution, "_load_ibapi",
-        lambda: _IbapiImports(FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace),
+        broker_execution,
+        "_load_ibapi",
+        lambda: _IbapiImports(
+            FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace
+        ),
     )
 
     result = IbkrPaperExecutionBroker().submit(
-        snapshot, plan, host="127.0.0.1", port=7497,
-        client_id=17, timeout_seconds=1,
+        snapshot,
+        plan,
+        host="127.0.0.1",
+        port=7497,
+        client_id=17,
+        timeout_seconds=1,
     )
 
     assert result.order_ids == (500, 501)
@@ -229,7 +249,8 @@ def test_paper_bracket_writer_sends_matching_outside_rth_flags(
 
 @pytest.mark.parametrize("rejected", [False, True])
 def test_paper_writer_sends_one_stop_limit_leg_with_trigger_limit_and_oca(
-    monkeypatch, rejected: bool,
+    monkeypatch,
+    rejected: bool,
 ) -> None:
     from ibkr_options_manager.broker import execution as broker_execution
 
@@ -261,8 +282,18 @@ def test_paper_writer_sends_one_stop_limit_leg_with_trigger_limit_and_oca(
             self.connected = False
 
         def placeOrder(self, order_id, _contract, order) -> None:
-            sent.append((order_id, order.orderType, order.auxPrice, order.lmtPrice,
-                         order.ocaGroup, order.ocaType, order.outsideRth, order.transmit))
+            sent.append(
+                (
+                    order_id,
+                    order.orderType,
+                    order.auxPrice,
+                    order.lmtPrice,
+                    order.ocaGroup,
+                    order.ocaType,
+                    order.outsideRth,
+                    order.transmit,
+                )
+            )
             if rejected and order.orderType == "STP LMT":
                 self.wrapper.error(order_id, 109, "TWS price precaution")
                 return
@@ -270,23 +301,35 @@ def test_paper_writer_sends_one_stop_limit_leg_with_trigger_limit_and_oca(
             self.wrapper.openOrder(order_id, None, order, None)
 
     monkeypatch.setattr(
-        broker_execution, "_load_ibapi",
-        lambda: _IbapiImports(FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace),
+        broker_execution,
+        "_load_ibapi",
+        lambda: _IbapiImports(
+            FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace
+        ),
     )
     if rejected:
         with pytest.raises(ExecutionBlocked, match="TWS price precaution"):
             IbkrPaperExecutionBroker().submit(
-                snapshot, plan, host="127.0.0.1", port=7497,
-                client_id=17, timeout_seconds=1,
+                snapshot,
+                plan,
+                host="127.0.0.1",
+                port=7497,
+                client_id=17,
+                timeout_seconds=1,
             )
     else:
         receipt = IbkrPaperExecutionBroker().submit(
-            snapshot, plan, host="127.0.0.1", port=7497,
-            client_id=17, timeout_seconds=1,
+            snapshot,
+            plan,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
         )
         assert receipt.order_ids == (500, 501)
     assert [(row[1], row[5], row[6], row[7]) for row in sent] == [
-        ("LMT", 2, True, False), ("STP LMT", 2, True, True),
+        ("LMT", 2, True, False),
+        ("STP LMT", 2, True, True),
     ]
     assert sent[0][4] == sent[1][4]
     assert sent[1][2:4] == (0.75, 0.7)
@@ -296,15 +339,20 @@ def test_stop_limit_off_tick_price_is_blocked_before_writer_connects() -> None:
     snapshot = _snapshot()
     plan = _plan(snapshot, stop_order_type="STP LMT")
     pair = plan.pairs[0]
-    invalid = replace(plan, pairs=(replace(
-        pair, stop=replace(pair.stop, limit_price=Decimal("0.72"))
-    ),))
+    invalid = replace(
+        plan,
+        pairs=(replace(pair, stop=replace(pair.stop, limit_price=Decimal("0.72"))),),
+    )
     with pytest.raises(ExecutionBlocked, match="invalid price increment"):
         require_paper_execution_snapshot(snapshot, invalid)
     with pytest.raises(ExecutionBlocked, match="invalid price increment"):
         IbkrPaperExecutionBroker().submit(
-            snapshot, invalid, host="127.0.0.1", port=7497,
-            client_id=17, timeout_seconds=1,
+            snapshot,
+            invalid,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
         )
 
 
@@ -479,7 +527,8 @@ def test_paper_execution_journals_before_and_after_one_acknowledged_submission(
 
 @pytest.mark.parametrize("stop_order_type", ["STP", "STP LMT"])
 def test_indeterminate_transport_outcome_is_durably_blocked_from_retry(
-    tmp_path, stop_order_type: str,
+    tmp_path,
+    stop_order_type: str,
 ) -> None:
     snapshot = _snapshot()
     plan = _plan(snapshot, stop_order_type=stop_order_type)
@@ -998,18 +1047,24 @@ def test_cancel_pair_removes_only_a_fresh_complete_app_owned_oca_bracket(
         account=snapshot.selected.account, con_id=snapshot.selected.con_id
     )[0]
     assert source.layers[0].cancelled is True
-    assert classify_journal_layer(
-        source,
-        0,
-        active_perm_ids=frozenset(),
-        observed_perm_ids=frozenset(),
-    ).status == "CANCELLED"
-    assert classify_journal_layer(
-        source,
-        0,
-        active_perm_ids=frozenset(),
-        observed_perm_ids=frozenset({201}),
-    ).status == "UNKNOWN"
+    assert (
+        classify_journal_layer(
+            source,
+            0,
+            active_perm_ids=frozenset(),
+            observed_perm_ids=frozenset(),
+        ).status
+        == "CANCELLED"
+    )
+    assert (
+        classify_journal_layer(
+            source,
+            0,
+            active_perm_ids=frozenset(),
+            observed_perm_ids=frozenset({201}),
+        ).status
+        == "UNKNOWN"
+    )
     with pytest.raises(ExecutionBlocked, match="already journaled"):
         service.cancel_pair(
             active_snapshot,
@@ -1300,14 +1355,25 @@ def test_unknown_price_amendment_needs_explicit_fresh_retry(tmp_path) -> None:
     )
     group = f"{plan.fingerprint[:12]}/tranche-1"
     target = WorkingOrder(
-        perm_id=201, client_id=17, order_id=101, key=snapshot.selected,
-        action="SELL", order_type="LMT", remaining=Decimal("2"),
-        status="Submitted", oca_group=group, tif="GTC",
+        perm_id=201,
+        client_id=17,
+        order_id=101,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("2"),
+        status="Submitted",
+        oca_group=group,
+        tif="GTC",
         limit_price=Decimal("1.20"),
     )
     stop = replace(
-        target, perm_id=202, order_id=102, order_type="STP",
-        limit_price=None, stop_price=Decimal("0.75"),
+        target,
+        perm_id=202,
+        order_id=102,
+        order_type="STP",
+        limit_price=None,
+        stop_price=Decimal("0.75"),
     )
     active = replace(snapshot, working_orders=(target, stop))
 
@@ -1328,15 +1394,20 @@ def test_unknown_price_amendment_needs_explicit_fresh_retry(tmp_path) -> None:
         active, target_perm_id=201, expected_client_id=17
     )
     update = PriceUpdateCandidate(
-        layer=layer, target_price=Decimal("1.40"),
+        layer=layer,
+        target_price=Decimal("1.40"),
         prior_target_price=Decimal("1.20"),
         prior_stop_price=Decimal("0.75"),
     )
 
     def amend(current, *, allow_unknown_retry=False):
         return service.modify_prices(
-            current, (update,), host="127.0.0.1", port=7497,
-            client_id=17, timeout_seconds=1,
+            current,
+            (update,),
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
             allow_unknown_retry=allow_unknown_retry,
         )
 
@@ -1348,16 +1419,22 @@ def test_unknown_price_amendment_needs_explicit_fresh_retry(tmp_path) -> None:
         amend(active, allow_unknown_retry=True)
     with pytest.raises(ExecutionBlocked, match="contract is locked"):
         service.modify_prices(
-            active, (replace(update, target_price=Decimal("1.50")),),
-            host="127.0.0.1", port=7497, client_id=17, timeout_seconds=1,
+            active,
+            (replace(update, target_price=Decimal("1.50")),),
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
         )
     with pytest.raises(ExecutionBlocked, match="contract is locked"):
         journal.begin(active, plan)
     assert transport.attempts == 1
 
     refreshed = replace(
-        active, captured_at=Decimal("1"),
-        executions_complete=True, completed_orders_complete=True,
+        active,
+        captured_at=Decimal("1"),
+        executions_complete=True,
+        completed_orders_complete=True,
     )
     unknown = service.unresolved_management_entries(
         account=snapshot.selected.account, con_id=snapshot.selected.con_id
@@ -1376,10 +1453,15 @@ def test_unknown_price_amendment_needs_explicit_fresh_retry(tmp_path) -> None:
         )
     with pytest.raises(ExecutionBlocked, match="stable working orders"):
         service.confirm_unknown_management(
-            replace(refreshed, working_orders=(
-                replace(target, status="PendingSubmit"), stop,
-            )),
-            unknown[0].fingerprint, confirmed_in_tws=True,
+            replace(
+                refreshed,
+                working_orders=(
+                    replace(target, status="PendingSubmit"),
+                    stop,
+                ),
+            ),
+            unknown[0].fingerprint,
+            confirmed_in_tws=True,
         )
     service.confirm_unknown_management(
         refreshed, unknown[0].fingerprint, confirmed_in_tws=True
@@ -1399,7 +1481,8 @@ def test_unknown_price_amendment_needs_explicit_fresh_retry(tmp_path) -> None:
     assert receipt.entry.order_ids == (101,)
     assert transport.attempts == 2
     attempts = [
-        entry for entry in journal._entries()
+        entry
+        for entry in journal._entries()
         if entry.fingerprint.startswith("price-update:")
     ]
     assert [entry.state for entry in attempts] == ["RESOLVED", "SUBMITTED"]
@@ -1608,25 +1691,47 @@ def test_stop_limit_unknown_submission_recovers_after_restart_only_with_exact_pr
     journal = ExecutionJournal(path)
     group = f"{plan.fingerprint[:12]}/tranche-1"
     target = WorkingOrder(
-        201, 17, 101, snapshot.selected, "SELL", "LMT", Decimal("1"),
-        "Submitted", oca_group=group, limit_price=Decimal("1.20"),
+        201,
+        17,
+        101,
+        snapshot.selected,
+        "SELL",
+        "LMT",
+        Decimal("1"),
+        "Submitted",
+        oca_group=group,
+        limit_price=Decimal("1.20"),
     )
     stop = replace(
-        target, perm_id=202, order_id=102, order_type="STP LMT",
-        limit_price=Decimal("0.70"), stop_price=Decimal("0.75"),
+        target,
+        perm_id=202,
+        order_id=102,
+        order_type="STP LMT",
+        limit_price=Decimal("0.70"),
+        stop_price=Decimal("0.75"),
     )
-    assert journal.reconcile_snapshot(replace(
-        snapshot, working_orders=(target, replace(stop, limit_price=Decimal("0.65")))
-    )) == ()
-    assert journal.reconcile_snapshot(replace(
-        snapshot, working_orders=(target, stop)
-    ))[0].state == "RECONCILED"
+    assert (
+        journal.reconcile_snapshot(
+            replace(
+                snapshot,
+                working_orders=(target, replace(stop, limit_price=Decimal("0.65"))),
+            )
+        )
+        == ()
+    )
+    assert (
+        journal.reconcile_snapshot(replace(snapshot, working_orders=(target, stop)))[
+            0
+        ].state
+        == "RECONCILED"
+    )
     entry = journal.find(plan.fingerprint)
     assert entry is not None
     assert entry.layers[0].stop_order_type == "STP LMT"
     assert entry.layers[0].stop_limit_price == "0.70"
     assert journal.owned_perm_ids(
-        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
     ) == frozenset({201, 202})
 
 
@@ -1639,56 +1744,105 @@ def test_active_stop_limit_pair_can_be_selected_for_cancel_but_not_price_amendme
     journal = ExecutionJournal(tmp_path / "journal.json")
     journal.begin(snapshot, plan)
     journal.record_submission(
-        plan.fingerprint, order_ids=(101, 102), perm_ids=(201, 202),
+        plan.fingerprint,
+        order_ids=(101, 102),
+        perm_ids=(201, 202),
     )
     group = f"{plan.fingerprint[:12]}/tranche-1"
     target = WorkingOrder(
-        201, 17, 101, snapshot.selected, "SELL", "LMT", Decimal("2"),
-        "Submitted", oca_group=group, limit_price=Decimal("1.20"), tif="GTC",
+        201,
+        17,
+        101,
+        snapshot.selected,
+        "SELL",
+        "LMT",
+        Decimal("2"),
+        "Submitted",
+        oca_group=group,
+        limit_price=Decimal("1.20"),
+        tif="GTC",
     )
     stop = replace(
-        target, perm_id=202, order_id=102, order_type="STP LMT",
-        limit_price=Decimal("0.70"), stop_price=Decimal("0.75"),
+        target,
+        perm_id=202,
+        order_id=102,
+        order_type="STP LMT",
+        limit_price=Decimal("0.70"),
+        stop_price=Decimal("0.75"),
     )
     active = replace(snapshot, working_orders=(target, stop))
     service = PaperExecutionService(_RecordingTransport(), journal)
     candidate = service.prepare_market_exit(
-        active, target_perm_id=201, expected_client_id=17,
+        active,
+        target_perm_id=201,
+        expected_client_id=17,
     )
     assert candidate.stop_perm_id == 202
-    changed = replace(active, working_orders=(
-        target, replace(stop, limit_price=Decimal("0.65")),
-    ))
-    assert service.prepare_market_exit(
-        changed, target_perm_id=201, expected_client_id=17,
-    ) != candidate
+    changed = replace(
+        active,
+        working_orders=(
+            target,
+            replace(stop, limit_price=Decimal("0.65")),
+        ),
+    )
+    assert (
+        service.prepare_market_exit(
+            changed,
+            target_perm_id=201,
+            expected_client_id=17,
+        )
+        != candidate
+    )
     with pytest.raises(ExecutionBlocked, match="active STP LMT price changes"):
         service.prepare_price_updates(
             active,
-            updates=(PriceUpdateCandidate(
-                layer=candidate, target_price=Decimal("1.25"),
-                prior_target_price=Decimal("1.20"),
-            ),),
+            updates=(
+                PriceUpdateCandidate(
+                    layer=candidate,
+                    target_price=Decimal("1.25"),
+                    prior_target_price=Decimal("1.20"),
+                ),
+            ),
             expected_client_id=17,
         )
 
 
 def test_stop_limit_partial_fill_remains_a_review_state() -> None:
     entry = JournalEntry(
-        fingerprint="a" * 64, account="DU1234567", con_id=917_864_414,
-        state="RECONCILED", perm_ids=(201, 202),
-        layers=(JournalLayer(
-            quantity=2, target_price="1.20", stop_price="0.75", tif="GTC",
-            target_perm_id=201, stop_perm_id=202,
-            stop_order_type="STP LMT", stop_limit_price="0.70",
-        ),),
-        fills=(JournalFill(
-            exec_id="fill-1", perm_id=202, side="SLD", quantity="1",
-            price="0.70", time="now", realized_pnl="-5", currency="USD",
-        ),),
+        fingerprint="a" * 64,
+        account="DU1234567",
+        con_id=917_864_414,
+        state="RECONCILED",
+        perm_ids=(201, 202),
+        layers=(
+            JournalLayer(
+                quantity=2,
+                target_price="1.20",
+                stop_price="0.75",
+                tif="GTC",
+                target_perm_id=201,
+                stop_perm_id=202,
+                stop_order_type="STP LMT",
+                stop_limit_price="0.70",
+            ),
+        ),
+        fills=(
+            JournalFill(
+                exec_id="fill-1",
+                perm_id=202,
+                side="SLD",
+                quantity="1",
+                price="0.70",
+                time="now",
+                realized_pnl="-5",
+                currency="USD",
+            ),
+        ),
     )
     outcome = classify_journal_layer(
-        entry, 0, active_perm_ids=frozenset({201, 202}),
+        entry,
+        0,
+        active_perm_ids=frozenset({201, 202}),
         observed_perm_ids=frozenset({201, 202}),
     )
     assert outcome.status == "PARTIAL"
@@ -1790,23 +1944,35 @@ def test_recreates_a_cancelled_partially_reconciled_draft_fingerprint(tmp_path) 
     assert journal.find(plan.fingerprint) == replacement
 
 
-def test_repeated_plan_uses_new_oca_groups_without_adopting_old_orders(tmp_path) -> None:
+def test_repeated_plan_uses_new_oca_groups_without_adopting_old_orders(
+    tmp_path,
+) -> None:
     snapshot = _snapshot()
     plan = _plan(snapshot)
     assert plan.fingerprint is not None
     journal = ExecutionJournal(tmp_path / "journal.json")
     journal.begin(snapshot, plan)
     journal.record_submission(
-        plan.fingerprint, order_ids=(101, 102), perm_ids=(201, 202),
+        plan.fingerprint,
+        order_ids=(101, 102),
+        perm_ids=(201, 202),
     )
     original = journal.find(plan.fingerprint)
     assert original is not None
-    journal._write((replace(
-        original, state="CANCELLED_CONFIRMED", resolution_captured_at="1",
-    ),))
+    journal._write(
+        (
+            replace(
+                original,
+                state="CANCELLED_CONFIRMED",
+                resolution_captured_at="1",
+            ),
+        )
+    )
     refreshed = replace(
-        snapshot, captured_at=Decimal("2"),
-        completed_orders_complete=True, executions_complete=True,
+        snapshot,
+        captured_at=Decimal("2"),
+        completed_orders_complete=True,
+        executions_complete=True,
     )
 
     class CapturingTransport(_RecordingTransport):
@@ -1821,43 +1987,83 @@ def test_repeated_plan_uses_new_oca_groups_without_adopting_old_orders(tmp_path)
 
     transport = CapturingTransport()
     receipt = PaperExecutionService(transport, journal).submit(
-        refreshed, plan, host="127.0.0.1", port=7497,
-        client_id=17, timeout_seconds=1,
+        refreshed,
+        plan,
+        host="127.0.0.1",
+        port=7497,
+        client_id=17,
+        timeout_seconds=1,
     )
     old_group = plan.pairs[0].target.logical_oca_group
     assert transport.groups is not None
     assert transport.groups[0] == transport.groups[1]
     assert transport.groups[0] != old_group
-    assert receipt.entry.oca_prefix and transport.groups[0].startswith(receipt.entry.oca_prefix)
+    assert receipt.entry.oca_prefix and transport.groups[0].startswith(
+        receipt.entry.oca_prefix
+    )
 
     old_target = ObservedCompletedOrder(
-        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
-        perm_id=201, order_id=101, client_id=17, action="SELL",
-        order_type="LMT", oca_group=old_group, status="Cancelled",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=201,
+        order_id=101,
+        client_id=17,
+        action="SELL",
+        order_type="LMT",
+        oca_group=old_group,
+        status="Cancelled",
     )
-    journal.record_completed_orders(replace(refreshed, completed_orders=(
-        old_target, replace(old_target, perm_id=202, order_id=102, order_type="STP"),
-    )))
+    journal.record_completed_orders(
+        replace(
+            refreshed,
+            completed_orders=(
+                old_target,
+                replace(old_target, perm_id=202, order_id=102, order_type="STP"),
+            ),
+        )
+    )
     latest = journal.find(plan.fingerprint)
     assert latest is not None
     assert latest.layers[0].target_perm_id == 203
     assert latest.layers[0].stop_perm_id == 204
     new_target = WorkingOrder(
-        perm_id=203, client_id=17, order_id=103, key=snapshot.selected,
-        action="SELL", order_type="LMT", remaining=Decimal("2"),
-        status="Submitted", oca_group=transport.groups[0], tif="GTC",
+        perm_id=203,
+        client_id=17,
+        order_id=103,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("2"),
+        status="Submitted",
+        oca_group=transport.groups[0],
+        tif="GTC",
     )
-    assert journal.reconcile_snapshot(replace(
-        refreshed, working_orders=(
-            new_target, replace(new_target, perm_id=204, order_id=104, order_type="STP"),
-        ),
-    ))[0].state == "RECONCILED"
-    journal.record_pair_cancellation(MarketExitCandidate(
-        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
-        target_order_id=103, target_perm_id=203, client_id=17,
-        quantity=Decimal("2"), tif="GTC", oca_group=transport.groups[0],
-        stop_order_id=104, stop_perm_id=204,
-    ))
+    assert (
+        journal.reconcile_snapshot(
+            replace(
+                refreshed,
+                working_orders=(
+                    new_target,
+                    replace(new_target, perm_id=204, order_id=104, order_type="STP"),
+                ),
+            )
+        )[0].state
+        == "RECONCILED"
+    )
+    journal.record_pair_cancellation(
+        MarketExitCandidate(
+            account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id,
+            target_order_id=103,
+            target_perm_id=203,
+            client_id=17,
+            quantity=Decimal("2"),
+            tif="GTC",
+            oca_group=transport.groups[0],
+            stop_order_id=104,
+            stop_perm_id=204,
+        )
+    )
     assert journal.find(plan.fingerprint).layers[0].cancelled
 
 
@@ -1867,29 +2073,49 @@ def test_legacy_reused_oca_group_cannot_adopt_older_working_pair(tmp_path) -> No
     assert plan.fingerprint is not None
     group = plan.pairs[0].target.logical_oca_group
     journal = ExecutionJournal(tmp_path / "journal.json")
-    journal._write((
-        JournalEntry(
-            fingerprint=plan.fingerprint, account=snapshot.selected.account,
-            con_id=snapshot.selected.con_id, state="SUPERSEDED",
-            order_ids=(101, 102), perm_ids=(201, 202),
-            snapshot_captured_at="1",
-            layers=(JournalLayer(2, "1.20", "0.75", "GTC", 201, 202),),
-        ),
-        JournalEntry(
-            fingerprint=plan.fingerprint, account=snapshot.selected.account,
-            con_id=snapshot.selected.con_id, state="SUBMISSION_UNKNOWN",
-            snapshot_captured_at="2", expected_order_count=2,
-            layers=(JournalLayer(2, "1.20", "0.75", "GTC"),),
-        ),
-    ))
-    target = WorkingOrder(
-        perm_id=201, client_id=17, order_id=101, key=snapshot.selected,
-        action="SELL", order_type="LMT", remaining=Decimal("2"),
-        status="Submitted", oca_group=group, tif="GTC",
+    journal._write(
+        (
+            JournalEntry(
+                fingerprint=plan.fingerprint,
+                account=snapshot.selected.account,
+                con_id=snapshot.selected.con_id,
+                state="SUPERSEDED",
+                order_ids=(101, 102),
+                perm_ids=(201, 202),
+                snapshot_captured_at="1",
+                layers=(JournalLayer(2, "1.20", "0.75", "GTC", 201, 202),),
+            ),
+            JournalEntry(
+                fingerprint=plan.fingerprint,
+                account=snapshot.selected.account,
+                con_id=snapshot.selected.con_id,
+                state="SUBMISSION_UNKNOWN",
+                snapshot_captured_at="2",
+                expected_order_count=2,
+                layers=(JournalLayer(2, "1.20", "0.75", "GTC"),),
+            ),
+        )
     )
-    observed = replace(snapshot, captured_at=Decimal("3"), working_orders=(
-        target, replace(target, perm_id=202, order_id=102, order_type="STP"),
-    ))
+    target = WorkingOrder(
+        perm_id=201,
+        client_id=17,
+        order_id=101,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("2"),
+        status="Submitted",
+        oca_group=group,
+        tif="GTC",
+    )
+    observed = replace(
+        snapshot,
+        captured_at=Decimal("3"),
+        working_orders=(
+            target,
+            replace(target, perm_id=202, order_id=102, order_type="STP"),
+        ),
+    )
 
     journal.record_completed_orders(observed)
     assert journal.reconcile_snapshot(observed) == ()
@@ -1907,9 +2133,15 @@ def test_repeated_two_layer_plan_uses_one_new_group_per_pair(tmp_path) -> None:
     assert plan.fingerprint is not None
     journal = ExecutionJournal(tmp_path / "journal.json")
     old = journal.begin(snapshot, plan)
-    journal._write((replace(
-        old, state="CANCELLED_CONFIRMED", resolution_captured_at="1",
-    ),))
+    journal._write(
+        (
+            replace(
+                old,
+                state="CANCELLED_CONFIRMED",
+                resolution_captured_at="1",
+            ),
+        )
+    )
 
     class CapturingTransport(_RecordingTransport):
         def __init__(self) -> None:
@@ -1928,9 +2160,17 @@ def test_repeated_two_layer_plan_uses_one_new_group_per_pair(tmp_path) -> None:
 
     transport = CapturingTransport()
     PaperExecutionService(transport, journal).submit(
-        replace(snapshot, captured_at=Decimal("2"),
-                completed_orders_complete=True, executions_complete=True),
-        plan, host="127.0.0.1", port=7497, client_id=17, timeout_seconds=1,
+        replace(
+            snapshot,
+            captured_at=Decimal("2"),
+            completed_orders_complete=True,
+            executions_complete=True,
+        ),
+        plan,
+        host="127.0.0.1",
+        port=7497,
+        client_id=17,
+        timeout_seconds=1,
     )
     assert len(transport.groups) == 2
     assert all(target == stop for target, stop in transport.groups)
@@ -1972,13 +2212,18 @@ def test_unknown_bracket_cancelled_in_tws_can_be_rebuilt(tmp_path) -> None:
     )
 
     assert journal.reconcile_snapshot(refreshed) == ()
-    assert journal.submission_entries(
-        account=snapshot.selected.account, con_id=snapshot.selected.con_id
-    ) == ()
+    assert (
+        journal.submission_entries(
+            account=snapshot.selected.account, con_id=snapshot.selected.con_id
+        )
+        == ()
+    )
     assert journal.begin(refreshed, plan).state == "PREPARED"
 
 
-def test_immediately_filled_unknown_bracket_recovers_from_completed_history(tmp_path) -> None:
+def test_immediately_filled_unknown_bracket_recovers_from_completed_history(
+    tmp_path,
+) -> None:
     snapshot = _snapshot()
     plan = _plan(snapshot)
     assert plan.fingerprint is not None
@@ -1987,27 +2232,48 @@ def test_immediately_filled_unknown_bracket_recovers_from_completed_history(tmp_
     journal.mark_unknown(plan.fingerprint)
     group = f"{plan.fingerprint[:12]}/tranche-1"
     target = ObservedCompletedOrder(
-        account=snapshot.selected.account, con_id=snapshot.selected.con_id,
-        perm_id=201, order_id=101, client_id=17, action="SELL",
-        order_type="LMT", oca_group=group, status="Filled",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=201,
+        order_id=101,
+        client_id=17,
+        action="SELL",
+        order_type="LMT",
+        oca_group=group,
+        status="Filled",
     )
-    stop = replace(target, perm_id=202, order_id=102,
-                   order_type="STP", status="Cancelled")
+    stop = replace(
+        target, perm_id=202, order_id=102, order_type="STP", status="Cancelled"
+    )
     fill = ObservedExecution(
-        exec_id="fill.01", account=snapshot.selected.account,
-        con_id=snapshot.selected.con_id, perm_id=201, side="SLD",
-        quantity=Decimal(str(plan.pairs[0].quantity)), price=Decimal("20"),
-        time="now", realized_pnl=Decimal("125"), currency="USD",
+        exec_id="fill.01",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=201,
+        side="SLD",
+        quantity=Decimal(str(plan.pairs[0].quantity)),
+        price=Decimal("20"),
+        time="now",
+        realized_pnl=Decimal("125"),
+        currency="USD",
     )
-    history = replace(snapshot, complete=False, fresh=False, working_orders=(),
-                      completed_orders=(target, stop), completed_orders_complete=True,
-                      executions=(fill,), executions_complete=True)
+    history = replace(
+        snapshot,
+        complete=False,
+        fresh=False,
+        working_orders=(),
+        completed_orders=(target, stop),
+        completed_orders_complete=True,
+        executions=(fill,),
+        executions_complete=True,
+    )
     journal.record_completed_orders(history)
     journal.record_executions(history)
     entry = journal.find(plan.fingerprint)
     assert entry is not None
-    outcome = classify_journal_layer(entry, 0, active_perm_ids=frozenset(),
-                                     observed_perm_ids=frozenset())
+    outcome = classify_journal_layer(
+        entry, 0, active_perm_ids=frozenset(), observed_perm_ids=frozenset()
+    )
     assert outcome.status == "CLOSED_PROFIT"
     assert outcome.realized_pnl == Decimal("125")
 
@@ -2036,17 +2302,19 @@ def test_operator_confirmed_unknown_bracket_requires_clean_fresh_tws_read(
     clean = replace(
         snapshot,
         captured_at=snapshot.captured_at + 1,
-        completed_orders=(ObservedCompletedOrder(
-            account=snapshot.selected.account,
-            con_id=snapshot.selected.con_id,
-            perm_id=201,
-            order_id=101,
-            client_id=17,
-            action="SELL",
-            order_type="LMT",
-            oca_group=f"{plan.fingerprint[:12]}/tranche-1",
-            status="Inactive",
-        ),),
+        completed_orders=(
+            ObservedCompletedOrder(
+                account=snapshot.selected.account,
+                con_id=snapshot.selected.con_id,
+                perm_id=201,
+                order_id=101,
+                client_id=17,
+                action="SELL",
+                order_type="LMT",
+                oca_group=f"{plan.fingerprint[:12]}/tranche-1",
+                status="Inactive",
+            ),
+        ),
         completed_orders_complete=True,
         executions_complete=True,
     )
@@ -2116,14 +2384,18 @@ def test_operator_confirmed_unknown_bracket_requires_clean_fresh_tws_read(
 
     assert resolved.state == "CANCELLED_CONFIRMED"
     assert resolved.resolution_captured_at == str(clean.captured_at)
-    assert journal.submission_entries(
-        account=snapshot.selected.account, con_id=snapshot.selected.con_id
-    ) == ()
+    assert (
+        journal.submission_entries(
+            account=snapshot.selected.account, con_id=snapshot.selected.con_id
+        )
+        == ()
+    )
     with pytest.raises(ExecutionBlocked, match="already journaled"):
         journal.begin(clean, plan)
-    assert journal.begin(
-        replace(clean, captured_at=clean.captured_at + 1), plan
-    ).state == "PREPARED"
+    assert (
+        journal.begin(replace(clean, captured_at=clean.captured_at + 1), plan).state
+        == "PREPARED"
+    )
 
 
 def test_cancelled_unknown_ignores_other_tranches_on_same_contract(tmp_path) -> None:
@@ -2161,17 +2433,19 @@ def test_cancelled_unknown_ignores_other_tranches_on_same_contract(tmp_path) -> 
         working_orders=(other_order,),
         executions=(other_fill,),
         executions_complete=True,
-        completed_orders=(ObservedCompletedOrder(
-            account=snapshot.selected.account,
-            con_id=snapshot.selected.con_id,
-            perm_id=902,
-            order_id=802,
-            client_id=17,
-            action="SELL",
-            order_type="STP",
-            oca_group=other_group,
-            status="Filled",
-        ),),
+        completed_orders=(
+            ObservedCompletedOrder(
+                account=snapshot.selected.account,
+                con_id=snapshot.selected.con_id,
+                perm_id=902,
+                order_id=802,
+                client_id=17,
+                action="SELL",
+                order_type="STP",
+                oca_group=other_group,
+                status="Filled",
+            ),
+        ),
         completed_orders_complete=True,
     )
 
@@ -2179,9 +2453,12 @@ def test_cancelled_unknown_ignores_other_tranches_on_same_contract(tmp_path) -> 
         refreshed, plan.fingerprint, confirmed_in_tws=True
     )
     assert resolved.state == "CANCELLED_CONFIRMED"
-    assert journal.begin(
-        replace(refreshed, captured_at=refreshed.captured_at + 1), plan
-    ).state == "PREPARED"
+    assert (
+        journal.begin(
+            replace(refreshed, captured_at=refreshed.captured_at + 1), plan
+        ).state
+        == "PREPARED"
+    )
 
 
 def test_cancelled_unknown_uses_other_journal_ids_and_ignores_buy_fill(
@@ -2193,13 +2470,18 @@ def test_cancelled_unknown_uses_other_journal_ids_and_ignores_buy_fill(
     journal = ExecutionJournal(tmp_path / "journal.json")
     journal.begin(snapshot, plan)
     journal.mark_unknown(plan.fingerprint)
-    journal._write((*journal._entries(), JournalEntry(
-        fingerprint="f" * 64,
-        account=snapshot.selected.account,
-        con_id=snapshot.selected.con_id,
-        state="SUBMITTED",
-        perm_ids=(902,),
-    )))
+    journal._write(
+        (
+            *journal._entries(),
+            JournalEntry(
+                fingerprint="f" * 64,
+                account=snapshot.selected.account,
+                con_id=snapshot.selected.con_id,
+                state="SUBMITTED",
+                perm_ids=(902,),
+            ),
+        )
+    )
     other_sell = ObservedExecution(
         exec_id="other.01",
         account=snapshot.selected.account,
@@ -2218,12 +2500,18 @@ def test_cancelled_unknown_uses_other_journal_ids_and_ignores_buy_fill(
         executions_complete=True,
         completed_orders_complete=True,
     )
-    assert journal.confirm_cancelled_unknown(
-        refreshed, plan.fingerprint, confirmed_in_tws=True
-    ).state == "CANCELLED_CONFIRMED"
-    assert journal.begin(
-        replace(refreshed, captured_at=refreshed.captured_at + 1), plan
-    ).state == "PREPARED"
+    assert (
+        journal.confirm_cancelled_unknown(
+            refreshed, plan.fingerprint, confirmed_in_tws=True
+        ).state
+        == "CANCELLED_CONFIRMED"
+    )
+    assert (
+        journal.begin(
+            replace(refreshed, captured_at=refreshed.captured_at + 1), plan
+        ).state
+        == "PREPARED"
+    )
 
 
 def test_dismiss_cancelled_layer_keeps_journal_and_rejects_working_leg(
@@ -2239,15 +2527,17 @@ def test_dismiss_cancelled_layer_keeps_journal_and_rejects_working_leg(
         state="RECONCILED",
         snapshot_captured_at="101",
         perm_ids=(201, 202),
-        layers=(JournalLayer(
-            quantity=2,
-            target_price="1.20",
-            stop_price="0.75",
-            tif="GTC",
-            target_perm_id=201,
-            stop_perm_id=202,
-            cancelled=True,
-        ),),
+        layers=(
+            JournalLayer(
+                quantity=2,
+                target_price="1.20",
+                stop_price="0.75",
+                tif="GTC",
+                target_perm_id=201,
+                stop_perm_id=202,
+                cancelled=True,
+            ),
+        ),
     )
     earlier = replace(
         entry,
@@ -2255,9 +2545,7 @@ def test_dismiss_cancelled_layer_keeps_journal_and_rejects_working_leg(
         snapshot_captured_at="100",
         order_ids=(301, 302),
         perm_ids=(401, 402),
-        layers=(replace(
-            entry.layers[0], target_perm_id=401, stop_perm_id=402
-        ),),
+        layers=(replace(entry.layers[0], target_perm_id=401, stop_perm_id=402),),
     )
     journal._write((earlier, entry))
     stale = replace(snapshot, complete=False, fresh=False)

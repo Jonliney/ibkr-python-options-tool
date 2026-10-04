@@ -145,11 +145,11 @@ def state(
             if blocked or not selected or not working_orders
             else (
                 WorkingOrderLine(
-                perm_id=1197098753,
-                action="SELL",
-                order_type="LMT",
-                remaining="1",
-                status="Submitted",
+                    perm_id=1197098753,
+                    action="SELL",
+                    order_type="LMT",
+                    remaining="1",
+                    status="Submitted",
                 ),
             )
         ),

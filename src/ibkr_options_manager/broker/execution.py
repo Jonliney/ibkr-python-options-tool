@@ -125,9 +125,7 @@ class IbkrPaperExecutionBroker:
                     ids.append(order_id)
 
             while (
-                len(app.acks) < len(ids)
-                and not app.errors
-                and monotonic() < deadline
+                len(app.acks) < len(ids) and not app.errors and monotonic() < deadline
             ):
                 sleep(0.02)
             if app.errors:
@@ -380,11 +378,7 @@ class IbkrPaperExecutionBroker:
 
             _cancel_order(app, candidate.target_order_id)
             _cancel_order(app, candidate.stop_order_id)
-            while (
-                len(app.cancelled) != 2
-                and not app.errors
-                and monotonic() < deadline
-            ):
+            while len(app.cancelled) != 2 and not app.errors and monotonic() < deadline:
                 sleep(0.02)
             if app.errors:
                 raise ExecutionBlocked("; ".join(app.errors))
@@ -672,6 +666,7 @@ class IbkrPaperExecutionBroker:
 
         expected: dict[int, tuple[str, Decimal, int]] = {}
         from ibapi.const import UNSET_DOUBLE, UNSET_INTEGER
+
         for candidate in candidates:
             if candidate.target_price is not None:
                 expected[candidate.layer.target_order_id] = (
@@ -831,9 +826,7 @@ class IbkrPaperExecutionBroker:
                 raise ExecutionBlocked(
                     "selected app-owned OCA orders are no longer open"
                 )
-            app.trace(
-                "prewrite_orders_verified", order_ids=sorted(app.orders)
-            )
+            app.trace("prewrite_orders_verified", order_ids=sorted(app.orders))
 
             contract = _build_submission_contract(imports, snapshot)
             app.phase = "submit"
@@ -881,9 +874,7 @@ class IbkrPaperExecutionBroker:
                 raise ExecutionOutcomeUnknown(
                     "TWS did not acknowledge every selected price amendment"
                 )
-            app.trace(
-                "write_callbacks_complete", matching_price_ids=sorted(app.acks)
-            )
+            app.trace("write_callbacks_complete", matching_price_ids=sorted(app.acks))
             acknowledged = dict(app.acks)
             app.acks.clear()
             app.orders.clear()
