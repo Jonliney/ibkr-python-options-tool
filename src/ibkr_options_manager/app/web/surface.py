@@ -562,6 +562,13 @@ class StarUIWorkbench:
                 self._default_stop_type = stop_type
                 self._default_stop_limit_offset = offset
                 self._default_stop_limit_unit = unit
+                # Position choices belong to existing drafts. An empty draft
+                # must inherit the new session default for its next layer.
+                self._position_stop_config = {
+                    con_id: choice
+                    for con_id, choice in self._position_stop_config.items()
+                    if self._drafts.get(con_id)
+                }
                 self._selected_quantity_change = None
                 self._target_presets = values.get(
                     "target_presets", self._target_presets
@@ -2138,6 +2145,8 @@ class StarUIWorkbench:
                 )
             )
         self._drafts[self._selected_con_id] = tuple(layers)
+        if not layers:
+            self._position_stop_config.pop(self._selected_con_id, None)
         return True
 
     def _add_layer_locked(self) -> None:
@@ -4899,9 +4908,6 @@ class StarUIWorkbench:
             if loss_value is not None and baseline_loss is not None
             else None
         )
-        status = _projection_status(
-            outcome, config["unresolved"], config["marketExit"], estimate,
-        )
         return Card(
             CardHeader(
                 CardTitle("Outcome projection", cls="text-sm"),
@@ -4941,12 +4947,6 @@ class StarUIWorkbench:
                         ),
                     ),
                     cls="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] items-baseline gap-x-3 gap-y-3",
-                ),
-                P(
-                    status,
-                    data_projection_status=True,
-                    cls="mt-3 text-xs leading-5 text-muted-foreground"
-                    + (" hidden" if not status else ""),
                 ),
                 cls="px-4",
             ),
@@ -5064,48 +5064,50 @@ class StarUIWorkbench:
                 ),
                 cls="flex min-h-0 flex-1 items-center justify-center px-6",
             ),
-            Div(self._draft_quantity_alert(), cls="mx-4 mb-3 min-w-0")
-            if draft_rows and not has_staged_action
-            else None,
             Div(self._outcome_projection(projection), cls="mx-4 mb-3"),
-            Alert(
-                AlertTitle("Your stop may not sell the option"),
-                AlertDescription(
-                    "If the stop price is reached, the order will only sell at "
-                    "your limit price or higher. If the market drops below that "
-                    "price, you may still own the option and lose more than shown above. "
-                    "If your offset reaches $0 or less, the limit uses the lowest positive "
-                    "price allowed by this option's price increments."
-                ),
-                data_stop_limit_warning=True,
-                cls="mx-4 mb-3 w-[calc(100%-2rem)] border-amber-500/40 "
-                "bg-amber-500/10 text-amber-100"
-                + ("" if self._stop_configuration()[0] == "STP LMT" else " hidden"),
-            )
+            self._review_alert()
             if draft_rows
             else None,
             self._execution_control(),
             cls="flex min-h-0 flex-col overflow-hidden border-l border-border bg-card/30",
         )
 
-    def _draft_quantity_alert(self) -> Any:
+    def _review_alert(self) -> Any:
         available = self._planning_available_quantity()
         drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
+        over = drafted > available
+        stop_limit = self._stop_configuration()[0] == "STP LMT"
+        stop_description = (
+            "If the stop price is reached, the order will only sell at "
+            "your limit price or higher. If the market drops below that "
+            "price, you may still own the option and lose more than shown above. "
+            "If your offset reaches $0 or less, the limit uses the lowest positive "
+            "price allowed by this option's price increments."
+        )
+        quantity_description = (
+            f"{drafted} contracts drafted; {available} available. "
+            "Reduce a layer's quantity."
+        )
         return Alert(
-            Icon("lucide:circle-alert"),
-            AlertTitle("Draft exceeds available contracts"),
-            AlertDescription(
-                f"{drafted} contracts drafted; {available} available. "
-                "Reduce a layer's quantity.",
-                data_draft_quantity_message=True,
+            AlertTitle(
+                "Draft exceeds available contracts" if over else "Your stop may not sell the option",
+                data_review_alert_title=True,
             ),
-            variant="destructive",
-            data_draft_quantity_alert=True,
+            AlertDescription(
+                quantity_description if over else stop_description,
+                data_review_alert_description=True,
+            ),
+            data_review_alert=True,
+            data_quantity_over="true" if over else "false",
+            data_quantity_description=quantity_description,
+            data_stop_description=stop_description,
+            data_stop_limit_warning=True,
             live=True,
             cls=(
-                "min-w-0 break-words border-destructive/70 "
-                "bg-red-950 text-red-50 [&_p]:text-red-100/90"
-                + ("" if drafted > available else " hidden")
+                "mx-4 mb-3 w-[calc(100%-2rem)] min-w-0 break-words "
+                + ("border-destructive/70 bg-red-950 text-red-50 [&_p]:text-red-100/90"
+                   if over else "border-amber-500/40 bg-amber-500/10 text-amber-100")
+                + ("" if over or stop_limit else " hidden")
             ),
         )
 
@@ -5747,11 +5749,31 @@ def _stop_type_visual_script() -> str:
     const group = form.querySelector('[data-draft-stop-type-group]');
     const unitGroup = form.querySelector('[data-stop-limit-unit-group]');
     const refreshPrices = () => form.dispatchEvent(new Event('stop-limit-settings-change'));
+    const reviewAlert = document.querySelector('[data-review-alert]');
+    const refreshAlert = () => {
+      if (!reviewAlert) return;
+      const over = reviewAlert.dataset.quantityOver === 'true';
+      const stopLimit = mode.value === 'STP LMT';
+      reviewAlert.classList.toggle('hidden', !over && !stopLimit);
+      reviewAlert.classList.toggle('border-destructive/70', over);
+      reviewAlert.classList.toggle('bg-red-950', over);
+      reviewAlert.classList.toggle('text-red-50', over);
+      reviewAlert.classList.toggle('[&_p]:text-red-100/90', over);
+      reviewAlert.classList.toggle('border-amber-500/40', !over);
+      reviewAlert.classList.toggle('bg-amber-500/10', !over);
+      reviewAlert.classList.toggle('text-amber-100', !over);
+      reviewAlert.querySelector('[data-review-alert-title]').textContent = over
+        ? 'Draft exceeds available contracts' : 'Your stop may not sell the option';
+      reviewAlert.querySelector('[data-review-alert-description]').textContent = over
+        ? reviewAlert.dataset.quantityDescription : reviewAlert.dataset.stopDescription;
+    };
+    document.addEventListener('draft-quantity-change', refreshAlert);
+    refreshAlert();
     group?.querySelectorAll('[data-value]').forEach((button) => {
       button.addEventListener('click', () => {
         mode.value = button.dataset.value;
         if (settings) settings.disabled = mode.value !== 'STP LMT';
-        document.querySelector('[data-stop-limit-warning]')?.classList.toggle('hidden', mode.value !== 'STP LMT');
+        refreshAlert();
         refreshPrices();
       });
     });
@@ -5868,10 +5890,11 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         else invalid = true;
       }});
       const over = assignedQuantity > config.available;
-      const quantityAlert = document.querySelector('[data-draft-quantity-alert]');
+      const quantityAlert = document.querySelector('[data-review-alert]');
       if (quantityAlert) {{
-        quantityAlert.classList.toggle('hidden', !over);
-        if (over) quantityAlert.querySelector('[data-draft-quantity-message]').textContent = `${{assignedQuantity}} contracts drafted; ${{config.available}} available. Reduce a layer's quantity.`;
+        quantityAlert.dataset.quantityOver = over ? 'true' : 'false';
+        quantityAlert.dataset.quantityDescription = `${{assignedQuantity}} contracts drafted; ${{config.available}} available. Reduce a layer's quantity.`;
+        document.dispatchEvent(new Event('draft-quantity-change'));
       }}
       const executeButton = document.querySelector('[data-draft-execute] [data-execute-enabled]');
       if (executeButton) executeButton.disabled = executeButton.dataset.executeEnabled !== 'true' || assignedQuantity <= 0 || over || !quantitiesValid || !limitsValid;
@@ -6775,25 +6798,6 @@ def _projection_change_value(
     )
 
 
-def _projection_status(
-    outcome: PositionOutcome,
-    unresolved: bool,
-    market_exit: bool,
-    estimate: bool = False,
-) -> str:
-    if market_exit:
-        return ""
-    if unresolved:
-        if outcome.covered_quantity > outcome.held_quantity:
-            return "Proposed exits exceed the held quantity."
-        if estimate:
-            return ""
-        return "Refresh TWS to calculate an outcome."
-    if outcome.covered_quantity > outcome.held_quantity:
-        return "Proposed exits exceed the held quantity."
-    return ""
-
-
 def _projection_script(configuration: dict[str, Any]) -> str:
     """Fast local preview; server-rendered Decimal projection is authoritative."""
     payload = json.dumps(configuration, separators=(",", ":"))
@@ -6846,11 +6850,6 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       const lossBaseline = estimate ? null : partial ? (comparablePartial ? Number(config.baselineCoveredLoss) : null) : config.baselineLoss === null ? null : Number(config.baselineLoss);
       updateMetric(gainNode, projected ? (config.marketExit ? (config.baselineGain === null ? null : Number(config.baselineGain)) : gain) : null, gainBaseline, 'gain');
       updateMetric(lossNode, projected ? (config.marketExit ? (config.baselineLoss === null ? null : Number(config.baselineLoss)) : loss) : null, lossBaseline, 'loss');
-      const status = document.querySelector('[data-projection-status]');
-      if (status) {{
-        status.textContent = config.marketExit ? '' : invalidDraft || invalidActive ? 'Complete valid prices and quantities for every edited layer.' : overallocated ? 'Proposed exits exceed the held quantity.' : estimate ? '' : config.unresolved ? 'Refresh TWS to calculate an outcome.' : '';
-        status.classList.toggle('hidden', !status.textContent);
-      }}
     }};
     window.ibkrProjection = {{
       updateDraft(items, invalid) {{

@@ -228,6 +228,24 @@ def test_stop_limit_floor_uses_lowest_valid_price_across_market_rule_bands() -> 
     assert {pair.stop.limit_price for pair in result.pairs} == {Decimal("0.05")}
 
 
+def test_five_dollar_offset_does_not_turn_into_five_percent() -> None:
+    request = replace(
+        canonical_request(), stop_order_type="STP LMT",
+        stop_limit_offset=Decimal("5"),
+    )
+
+    dollars = build_exit_plan(
+        complete_snapshot(), replace(request, stop_limit_unit="dollars")
+    )
+    percent = build_exit_plan(
+        complete_snapshot(), replace(request, stop_limit_unit="percent")
+    )
+
+    assert dollars.status is percent.status is PlanStatus.VALID
+    assert dollars.pairs[0].stop.limit_price == Decimal("0.05")
+    assert percent.pairs[0].stop.limit_price == Decimal("0.75")
+
+
 def test_existing_stop_limit_oca_pair_reserves_one_layer_quantity() -> None:
     key = ContractKey("DU1234567", 917864414)
     target = WorkingOrder(

@@ -2400,7 +2400,7 @@ def test_new_default_replaces_old_position_choice_after_last_draft_is_removed() 
         "draft_stop_limit_unit": "percent",
     })
     assert workbench._current_layers() == ()
-    assert workbench._stop_configuration() == ("STP LMT", "5", "percent")
+    assert workbench._stop_configuration() == ("STP", "5", "percent")
 
     response = client.post(workbench.path + "action", data={
         "action": "refresh",
@@ -2411,8 +2411,49 @@ def test_new_default_replaces_old_position_choice_after_last_draft_is_removed() 
 
     assert response.status_code == 200
     assert workbench._stop_configuration() == ("STP LMT", "5", "dollars")
-    client.post(workbench.path + "action", data={"action": "add-layer"})
+    next_draft = client.post(workbench.path + "action", data={"action": "add-layer"})
     assert workbench._stop_configuration() == ("STP LMT", "5", "dollars")
+    assert 'name="draft_stop_limit_unit" value="dollars"' in next_draft.text
+    assert 'data-selected-unit="dollars"' in next_draft.text
+
+
+def test_settings_refresh_discards_stale_position_choice_without_a_draft() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    con_id = workbench._selected_con_id
+    assert con_id is not None and workbench._current_layers() == ()
+    workbench._position_stop_config[con_id] = ("STP LMT", "5", "percent")
+
+    response = TestClient(workbench.app).post(workbench.path + "action", data={
+        "action": "refresh",
+        "global_stop_type": "STP LMT",
+        "global_stop_limit_offset": "5",
+        "global_stop_limit_unit": "dollars",
+    })
+
+    assert response.status_code == 200
+    assert workbench._stop_configuration() == ("STP LMT", "5", "dollars")
+    assert con_id not in workbench._position_stop_config
+
+
+def test_settings_refresh_preserves_stop_choice_for_existing_draft() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._add_layer_locked()
+    con_id = workbench._selected_con_id
+    assert con_id is not None and workbench._current_layers()
+    workbench._position_stop_config[con_id] = ("STP LMT", "5", "percent")
+
+    response = TestClient(workbench.app).post(workbench.path + "action", data={
+        "action": "refresh",
+        "global_stop_type": "STP LMT",
+        "global_stop_limit_offset": "5",
+        "global_stop_limit_unit": "dollars",
+    })
+
+    assert response.status_code == 200
+    assert workbench._default_stop_limit_unit == "dollars"
+    assert workbench._stop_configuration() == ("STP LMT", "5", "percent")
 
 
 def test_active_stop_limit_layer_shows_both_prices_and_locks_price_edits() -> None:
@@ -4209,6 +4250,7 @@ def test_draft_allocation_rejects_out_of_range_quantity() -> None:
     con_id = workbench._selected_con_id
     assert con_id is not None
     workbench._drafts[con_id] = (replace(workbench._current_layers()[0], quantity="6"),)
+    workbench._position_stop_config[con_id] = ("STP LMT", "5", "percent")
     overallocated = client.get(workbench.path)
     assert 'data-live-allocation-bar' not in overallocated.text
 
@@ -4216,13 +4258,19 @@ def test_draft_allocation_rejects_out_of_range_quantity() -> None:
     blocked = client.get(workbench.path).text
     assert "6 contracts drafted; 5 available." in blocked
     assert "Reduce a layer" in blocked
-    assert blocked.index("6 contracts drafted") < blocked.index("Outcome projection")
-    alert = re.search(r'<div[^>]*data-draft-quantity-alert[^>]*>', blocked)
+    assert blocked.index("Outcome projection") < blocked.index("6 contracts drafted")
+    alert = re.search(r'<div[^>]*data-review-alert[^>]*>', blocked)
     assert alert is not None
     assert "bg-red-950" in alert.group()
     assert "border-destructive/70" in alert.group()
     assert "text-red-50" in alert.group()
     assert "Draft exceeds available contracts" in blocked
+    assert "Complete valid prices and quantities for every edited layer." not in blocked
+    assert 'data-quantity-over="true"' in alert.group()
+    assert "<svg" not in blocked[alert.end():blocked.index('data-slot="alert-title"', alert.end())]
+    assert blocked.count('data-review-alert="true"') == 1
+    alert_text = blocked[alert.end():blocked.index('data-slot="alert-description"', alert.end())]
+    assert "Your stop may not sell the option" not in alert_text
     assert 'data-slot="alert-title"' in blocked
     css = client.get("/layers.css").text
     assert ".draft-quantity-alert" not in css

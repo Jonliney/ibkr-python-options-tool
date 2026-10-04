@@ -115,8 +115,12 @@ invalid market rule. A very low limit can expose the position to much larger
 losses than the stop-trigger projection; TWS may also reject or hold the order
 under its independent precautions. Saving a session default with no draft layers
 does not validate it against the planner's implicit preview layer; the chosen
-stop-limit offset is validated when an explicit layer is planned. The reviewed
-plan, fingerprint, journal, and paper writer all carry both prices. The writer
+stop-limit offset is validated when an explicit layer is planned. Removing the
+last draft layer clears that position's stop choice, so the next layer inherits
+the session default; changing settings also clears stale choices for positions
+without drafts. Existing drafts retain their chosen stop type, offset, and unit.
+The reviewed plan, fingerprint, journal, and paper writer all carry both prices.
+The writer
 sends a single `STP LMT` leg
 with `auxPrice` as the stop trigger and `lmtPrice` as the limit, alongside the
 SELL LMT target in the same two-order OCA group. The writer rechecks price
