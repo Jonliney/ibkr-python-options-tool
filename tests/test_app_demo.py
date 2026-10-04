@@ -2129,6 +2129,126 @@ def test_empty_draft_stays_empty_until_add_layer() -> None:
     assert workbench._current_layers()[0].quantity == "5"
 
 
+def test_draft_bulk_stop_controls_allow_break_even_and_keep_active_controls_separate() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._add_layer_locked()
+    workbench._add_layer_locked()
+
+    page = TestClient(workbench.app).get(workbench.path).text
+    assert 'aria-label="Set all draft stops"' in page
+    assert 'aria-label="Move all draft stops to B/E"' in page
+    assert page.index('aria-label="Move all draft stops to B/E"') < page.index('data-draft-stop-type-group')
+    assert 'mb-3 flex items-center justify-between gap-2' in page
+    assert 'data-slot="tooltip-content"' in page
+    assert "Set every draft stop to one price" in page
+    assert "Move every draft stop to break even" in page
+    assert 'data-apply-all-draft-stops' in page
+    assert 'data-draft-stop-mode-group' in page
+    assert "Choose a percentage or price" not in page
+    assert 'aria-label="Stop value unit"' in page
+    assert 'data-value="return"' in page and 'data-value="price"' in page
+    assert 'name="draft_stop_price_1"' in page
+    assert 'stopLoss.toFixed(1)' in page
+    assert 'data-move-draft-stops-to-be' in page
+
+    assert workbench._save_form_locked({"stop_1": "0", "stop_2": "0"})
+    assert all(layer.stop_percentage == "0" for layer in workbench._current_layers())
+    assert all(Decimal(layer.stop_price) > 0 for layer in workbench._current_layers())
+
+
+def test_set_all_draft_stops_starts_from_first_configured_stop_preset() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._stop_presets = "35,40"
+    workbench._add_layer_locked()
+
+    page = TestClient(workbench.app).get(workbench.path).text
+    stop_value = re.search(r'<input[^>]*id="all-draft-stop-value"[^>]*>', page)
+    assert stop_value is not None
+    assert 'value="-35"' in stop_value.group()
+    assert 'data-draft-stop-mode-group' in page
+    assert re.search(r'data-draft-stop-mode-group[^>]*__ifmissing=\'"return"\'', page)
+
+
+def test_draft_stop_above_entry_must_remain_below_target() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._add_layer_locked()
+
+    assert workbench._save_form_locked({"stop_1": "-5"})
+    assert Decimal(workbench._current_layers()[0].stop_price) > workbench._state.unit_basis
+    assert not workbench._save_form_locked({"stop_1": "-200"})
+
+
+def test_bulk_draft_stop_keeps_exact_tick_with_a_short_display_percentage() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._add_layer_locked()
+    basis = workbench._state.unit_basis
+    calculator = workbench._state.quote_calculator
+    assert basis is not None and calculator is not None
+    from ibkr_options_manager.domain.planner import round_up_price
+
+    exact = round_up_price(basis * Decimal("0.75"), calculator.bands)
+    shown_loss = ((Decimal("1") - exact / basis) * 100).quantize(Decimal("0.1"))
+    assert workbench._save_form_locked({
+        "stop_1": format(shown_loss, "f"),
+        "draft_stop_price_1": format(exact, "f"),
+    })
+    layer = workbench._current_layers()[0]
+    assert Decimal(layer.stop_price) == exact
+    assert Decimal(layer.stop_percentage) == shown_loss
+    assert not workbench._save_form_locked({
+        "stop_1": "10",
+        "draft_stop_price_1": format(exact, "f"),
+    })
+
+
+def test_nvda_demo_draft_stop_keeps_the_selected_twenty_percent() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._select_locked(1_002_100_161)
+    workbench._add_layer_locked()
+    calculator = workbench._state.quote_calculator
+    assert calculator is not None
+    from ibkr_options_manager.domain import preview_reference_prices
+
+    chosen = preview_reference_prices(
+        Decimal("4.20"), Decimal("20"), Decimal("20"), calculator.bands,
+    ).stop_price
+    assert chosen == Decimal("3.36")
+    assert workbench._save_form_locked({
+        "stop_1": "20",
+        "draft_stop_price_1": "3.36",
+    })
+    assert workbench._current_layers()[0].stop_percentage == "20"
+
+
+def test_coarse_tick_draft_stop_retains_requested_percentage() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._select_locked(1_002_100_161)
+    workbench._add_layer_locked()
+    calculator = workbench._state.quote_calculator
+    assert calculator is not None
+    workbench._state = replace(
+        workbench._state,
+        quote_calculator=replace(
+            calculator,
+            bands=(PriceBand(Decimal("0"), Decimal("0.05")),),
+        ),
+    )
+
+    assert workbench._save_form_locked({
+        "stop_1": "20",
+        "draft_stop_price_1": "3.40",
+    })
+    layer = workbench._current_layers()[0]
+    assert layer.stop_percentage == "20"
+    assert layer.stop_price == "3.40"
+
+
 def test_empty_draft_state_shows_when_no_app_layers_exist() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -2547,6 +2667,9 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert 'aria-label="Set all active stops"' in header
     assert "evt.stopPropagation()" in header
     assert 'aria-label="Enter return percentage from entry"' in header
+    assert 'data-stop-mode-group' in header
+    assert "Choose a percentage or price" not in header
+    assert 'aria-label="Stop value unit"' in header
     assert "Enter a stop price or return percentage to be applied to all active layers." in header
     assert "data-stop-dialog-inverse" in header
     assert "Active layers" in header and "Entry cost" in header
@@ -2618,7 +2741,7 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert 'id="active-quantity-1"' in page.text
     assert 'id="active-tif-1"' in page.text
     assert 'value="cancel-pair-arm:101"' in page.text
-    assert 'title="Delete OCA bracket"' in page.text
+    assert "Cancel this active layer" in page.text
     assert ">State<" not in page.text
     assert "requires a second confirmation" not in page.text
     assert 'aria-current="page"' not in page.text

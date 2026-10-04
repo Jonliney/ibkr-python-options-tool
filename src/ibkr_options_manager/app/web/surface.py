@@ -108,7 +108,7 @@ from .components.ui.select import (
 )
 from .components.ui.separator import Separator
 from .components.ui.toast import Toaster
-from .components.ui.toggle_group import ToggleGroup
+from .components.ui.toggle_group import ToggleGroup, ToggleGroupItem
 from .components.ui.tooltip import Tooltip, TooltipContent, TooltipTrigger
 
 _STATIC_DIR = Path(__file__).with_name("static")
@@ -2117,6 +2117,7 @@ class StarUIWorkbench:
                 continue
             target = values.get(f"target_{index}", previous.target_percentage)
             stop = values.get(f"stop_{index}", previous.stop_percentage)
+            exact_stop_text = values.get(f"draft_stop_price_{index}", "").strip()
             quantity = values.get(f"quantity_{index}", previous.quantity)
             tif = values.get(f"tif_{index}", previous.tif)
             try:
@@ -2129,16 +2130,39 @@ class StarUIWorkbench:
                     if self._state.quote_calculator is not None
                     else (),
                 )
-            except (InvalidOperation, ValueError):
-                self._message = (
-                    "Targets must be above 0%; stops must be between 0% and 100%."
+                exact_stop = Decimal(exact_stop_text) if exact_stop_text else None
+                basis = self._state.unit_basis or Decimal("0")
+                bands = (
+                    self._state.quote_calculator.bands
+                    if self._state.quote_calculator is not None else ()
                 )
+                if exact_stop is not None and (
+                    not exact_stop.is_finite()
+                    or exact_stop <= 0
+                    or round_up_price(exact_stop, bands) != exact_stop
+                    or (
+                        exact_stop != prices.stop_price
+                        and abs((Decimal("1") - exact_stop / basis) * 100 - stop_value)
+                        > Decimal("0.051")
+                    )
+                ):
+                    raise ValueError("draft stop price and percentage disagree")
+                chosen_stop = exact_stop if exact_stop is not None else prices.stop_price
+                actual_target = (
+                    Decimal(previous.target_price)
+                    if target_value == Decimal(previous.target_percentage)
+                    else prices.target_price
+                )
+                if chosen_stop >= actual_target:
+                    raise ValueError("stop must remain below target")
+            except (InvalidOperation, ValueError):
+                self._message = "Targets must be above 0%; stops must be below their targets."
                 return False
             layers.append(
                 DraftLayerForm(
                     quantity=quantity,
                     target_price=(previous.target_price if target_value == Decimal(previous.target_percentage) else format(prices.target_price, "f")),
-                    stop_price=(previous.stop_price if stop_value == Decimal(previous.stop_percentage) else format(prices.stop_price, "f")),
+                    stop_price=(format(chosen_stop, "f") if exact_stop is not None else previous.stop_price if stop_value == Decimal(previous.stop_percentage) else format(prices.stop_price, "f")),
                     target_percentage=format(target_value, "f"),
                     stop_percentage=format(stop_value, "f"),
                     tif=tif if tif in {"GTC", "DAY"} else previous.tif,
@@ -2757,13 +2781,13 @@ class StarUIWorkbench:
                 cls="text-xs text-muted-foreground",
             ),
             Form(
-                Button(
+                _button_tooltip(Button(
                     "Refresh",
                     variant="outline",
                     size="sm",
                     type="submit",
                     data_busy_text="Refreshing…",
-                ),
+                ), "Get the latest positions and orders from TWS"),
                 HTMLInput(type="hidden", name="action", value="refresh"),
                 HTMLInput(type="hidden", name="account", value=self._settings.account),
                 HTMLInput(type="hidden", name="port", value=str(self._settings.port)),
@@ -2988,7 +3012,8 @@ class StarUIWorkbench:
         )
 
     def _settings_dialog(self) -> Any:
-        return Dialog(
+        return Tooltip(
+            TooltipTrigger(Dialog(
             DialogTrigger("Settings", variant="outline", size="sm"),
             DialogContent(
                 DialogHeader(
@@ -3099,6 +3124,8 @@ class StarUIWorkbench:
             ),
             signal="connection_settings",
             size="lg",
+            ), delay_duration=250),
+            TooltipContent("Change connection and new layer defaults"),
         )
 
     def _selected_quantity_notice(self) -> Any:
@@ -3198,7 +3225,7 @@ class StarUIWorkbench:
                 ),
                 delay_duration=250,
             ),
-            TooltipContent("Create new OCA bracket"),
+            TooltipContent("Add a draft layer"),
         )
 
     def _workspace(self, title: str) -> Any:
@@ -3278,7 +3305,7 @@ class StarUIWorkbench:
                             TooltipContent(
                                 "STP LMT prices are view-only; cancel and recreate the bracket to change them."
                                 if any(stop.order_type == "STP LMT" for _group, _target, stop in active_pairs)
-                                else "Move all active stops to B/E"
+                                else "Move every active stop to break even"
                             ),
                         ),
                         Tooltip(
@@ -3297,7 +3324,7 @@ class StarUIWorkbench:
                                 ),
                                 delay_duration=250,
                             ),
-                            TooltipContent("Delete all active layers"),
+                            TooltipContent("Cancel every active layer"),
                         ),
                         Tooltip(
                             TooltipTrigger(
@@ -3315,7 +3342,7 @@ class StarUIWorkbench:
                                 ),
                                 delay_duration=250,
                             ),
-                            TooltipContent("Sell all active layers"),
+                            TooltipContent("Sell every active layer now"),
                         ),
                         cls="flex items-center gap-2",
                     )
@@ -3354,7 +3381,7 @@ class StarUIWorkbench:
                                 ),
                                 delay_duration=250,
                             ),
-                            TooltipContent("Split draft layer quantities"),
+                            TooltipContent("Split contracts across draft layers"),
                         ),
                         self._add_layer_control(
                             disabled=not draft_allowed
@@ -3618,6 +3645,7 @@ class StarUIWorkbench:
                         Icon("lucide:arrow-up", cls="size-4", aria_hidden="true"),
                         variant="outline", size="icon", aria_label="Set all active stops",
                         disabled=self._paper_execution is None or bool(self._armed_price_updates) or has_stop_limit,
+                        data_on_click=evt.currentTarget.blur(),
                     ),
                     DialogContent(
                         DialogHeader(
@@ -3633,8 +3661,12 @@ class StarUIWorkbench:
                                 cls="flex items-center justify-between gap-2",
                             ),
                             Div(
-                                Button("%", type="button", variant="outline", size="icon", data_stop_mode="return", aria_label="Enter return percentage from entry", aria_pressed="false", cls="stop-mode-button"),
-                                Button("$", type="button", variant="outline", size="icon", data_stop_mode="price", aria_label="Enter stop price in dollars", aria_pressed="true", cls="stop-mode-button"),
+                                ToggleGroup(
+                                    ToggleGroupItem("%", value="return", aria_label="Enter return percentage from entry"),
+                                    ToggleGroupItem("$", value="price", aria_label="Enter stop price in dollars"),
+                                    type="single", value="price", variant="outline", size="default",
+                                    aria_label="Stop value unit", data_stop_mode_group=True,
+                                ),
                                 Input(
                                     id="all-stop-value", type="number", min="0", step="any",
                                     value=_price_text(initial_price) if initial_price is not None else "",
@@ -3671,7 +3703,7 @@ class StarUIWorkbench:
             ),
             TooltipContent(
                 "STP LMT prices are view-only; cancel and recreate the bracket to change them."
-                if has_stop_limit else "Set all active stops"
+                if has_stop_limit else "Set every active stop to one price"
             ),
         )
 
@@ -3884,7 +3916,7 @@ class StarUIWorkbench:
                 Input(id=f"verify-tif-{number}", value=layer.tif, disabled=True),
                 input_id=f"verify-tif-{number}",
             ),
-            Button(
+            _button_tooltip(Button(
                 Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
                 variant="outline",
                 size="icon",
@@ -3895,11 +3927,10 @@ class StarUIWorkbench:
                     f"{entry.snapshot_captured_at}:{index}"
                 ),
                 aria_label=f"Remove cancelled layer {number} from view",
-                title="Remove cancelled row from view",
                 cls="relative z-[3] mt-5",
-            )
+            ), "Remove this cancelled layer from view")
             if outcome.status == "CANCELLED" and not read_only
-            else Button(
+            else _button_tooltip(Button(
                 Icon("lucide:check", cls="size-4", aria_hidden="true"),
                 variant="outline",
                 size="icon",
@@ -3907,9 +3938,8 @@ class StarUIWorkbench:
                 name="action",
                 value=f"verify-cancelled-bracket:{entry.fingerprint}",
                 aria_label=f"Verify bracket status of layer {number}",
-                title="Check this bracket against TWS",
                 cls="relative z-[3] mt-5",
-            )
+            ), "Check this layer in TWS")
             if outcome.status in {
                 "PENDING", "UNKNOWN", "PARTIAL", "NO_EXECUTION_EVIDENCE",
                 "GROUP_COLLISION", "CONFLICT",
@@ -4218,7 +4248,7 @@ class StarUIWorkbench:
                 ),
                 input_id=f"active-tif-{index}",
             ),
-            action_field=Button(
+            action_field=_button_tooltip(Button(
                 Icon("lucide:trash-2"),
                 variant="outline",
                 size="icon",
@@ -4227,9 +4257,8 @@ class StarUIWorkbench:
                 value=f"cancel-pair-arm:{target.perm_id}",
                 disabled=self._paper_execution is None,
                 aria_label=f"Delete OCA layer {index}",
-                title="Delete OCA bracket",
                 cls="mt-5",
-            ),
+            ), "Cancel this active layer"),
         )
 
     def _active_layer_projection(
@@ -4274,12 +4303,12 @@ class StarUIWorkbench:
             if reserved is not None and reserved >= 0
             else f"{available:g} {'contract remains' if available == 1 else 'contracts remain'} available for new brackets. "
         )
-        return Dialog(
+        return Tooltip(
+            TooltipTrigger(Dialog(
             DialogTrigger(
                 Icon("lucide:triangle-alert", cls="size-4", aria_hidden="true"),
                 variant="ghost",
                 aria_label="Why are fewer contracts available?",
-                title="Show existing TWS exit orders",
                 cls="available-warning-trigger",
             ),
             DialogContent(
@@ -4299,6 +4328,8 @@ class StarUIWorkbench:
             ),
             signal="existing_exit_orders",
             size="sm",
+            ), delay_duration=250),
+            TooltipContent("See exit orders already in TWS"),
         )
 
     def _submission_attention(
@@ -4414,8 +4445,81 @@ class StarUIWorkbench:
     def _position_stop_type_control(self) -> Any:
         stop_type, offset, unit = self._stop_configuration()
         locked = self._armed_execution is not None
+        layers = self._current_layers()
+        basis = self._state.unit_basis
+        stop_presets = _parse_presets(self._stop_presets, maximum=Decimal("100")) or ()
+        default_return = format(-stop_presets[0], "f") if stop_presets else ""
         return Div(
-            ToggleGroup(
+            Div(
+                Tooltip(
+                    TooltipTrigger(
+                        Dialog(
+                            DialogTrigger(
+                                Icon("lucide:arrow-up", cls="size-4", aria_hidden="true"),
+                                variant="outline", size="icon", aria_label="Set all draft stops",
+                                disabled=locked or basis is None,
+                                data_on_click=evt.currentTarget.blur(),
+                            ),
+                    DialogContent(
+                        DialogHeader(
+                            DialogTitle("Set all draft stops"),
+                            DialogDescription("Choose a stop price or return from entry for every draft layer."),
+                        ),
+                        Div(
+                            Label("Return from entry", fr="all-draft-stop-value", data_draft_stop_input_label=True, cls="text-xs font-medium text-muted-foreground"),
+                            Span("—", data_draft_stop_dialog_inverse=True, aria_live="polite", cls="text-xs font-semibold"),
+                            cls="flex items-center justify-between gap-2",
+                        ),
+                        Div(
+                            ToggleGroup(
+                                ToggleGroupItem("%", value="return", aria_label="Enter return percentage from entry"),
+                                ToggleGroupItem("$", value="price", aria_label="Enter stop price in dollars"),
+                                type="single", value="return", variant="outline", size="default",
+                                aria_label="Stop value unit", data_draft_stop_mode_group=True,
+                            ),
+                            Input(id="all-draft-stop-value", type="number", step="any", value=default_return, data_draft_stop_dialog_value=True, cls="min-w-0 flex-1"),
+                            cls="mt-1 flex items-center gap-2",
+                        ),
+                        Div(
+                            *(Button(f"{pct:+d}%" if pct > 0 else f"{pct}%", type="button", variant="outline", data_draft_stop_preset=str(pct)) for pct in (20, 0, -20, -25, -35)),
+                            cls="mt-4 flex flex-wrap gap-2",
+                        ),
+                        Div(
+                            Div(Span("Draft layers", cls="text-xs text-muted-foreground"), Span(str(len(layers)), cls="text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
+                            Div(Span("Entry cost", cls="text-xs text-muted-foreground"), Span(f"${basis:,.2f}" if basis is not None else "—", cls="text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
+                            Div(Span("Stop price", cls="text-xs text-muted-foreground"), Span("—", data_draft_stop_dialog_summary=True, aria_live="polite", cls="text-right text-sm font-semibold"), cls="flex items-center justify-between gap-4"),
+                            cls="mt-4 space-y-2 rounded-md border border-border bg-muted/20 px-4 py-3",
+                        ),
+                        DialogFooter(
+                            DialogClose("Cancel", variant="outline"),
+                            Button("Apply to draft layers", type="button", data_apply_all_draft_stops=True, disabled=True),
+                            cls="mt-4",
+                        ),
+                        data_draft_stop_dialog=True,
+                    ),
+                            data_on_focusin=evt.stopPropagation(),
+                            data_on_focusout=evt.stopPropagation(),
+                        ),
+                        delay_duration=250,
+                    ),
+                    TooltipContent("Set every draft stop to one price"),
+                ),
+                Tooltip(
+                    TooltipTrigger(
+                        Button(
+                            Icon("lucide:equal", cls="size-4", aria_hidden="true"),
+                            type="button", variant="outline", size="icon",
+                            aria_label="Move all draft stops to B/E",
+                            data_move_draft_stops_to_be=True, disabled=locked or basis is None,
+                        ),
+                        delay_duration=250,
+                    ),
+                    TooltipContent("Move every draft stop to break even"),
+                ),
+                cls="flex items-center gap-2",
+            ),
+            Div(
+                ToggleGroup(
                 ("STP", "STP"),
                 ("STP LMT", "STP LMT"),
                 type="single",
@@ -4426,6 +4530,8 @@ class StarUIWorkbench:
                 aria_label="Protective order type for new layers",
                 data_draft_stop_type_group=True,
             ),
+                Tooltip(
+                    TooltipTrigger(
                 Dialog(
                     DialogTrigger(
                         Svg(
@@ -4467,7 +4573,13 @@ class StarUIWorkbench:
                         DialogFooter(DialogClose("Done", variant="outline"), cls="mt-6"),
                     ),
                 ),
-            cls="mb-3 flex items-center justify-end gap-2",
+                        delay_duration=250,
+                    ),
+                    TooltipContent("Set how far below the stop a limit order can sell"),
+                ),
+                cls="flex items-center gap-2",
+            ),
+            cls="mb-3 flex items-center justify-between gap-2",
         )
 
     def _live_draft_configuration(self) -> dict[str, Any] | None:
@@ -4537,16 +4649,15 @@ class StarUIWorkbench:
                 layer_index=index,
                 kind="target",
             ),
-            stop_field=_percentage_price_field(
+            stop_field=Div(_percentage_price_field(
                 "STP loss",
                 Input(
                     name=f"stop_{index}",
                     id=f"stop_{index}",
                     type="number",
                     value=layer.stop_percentage,
-                    min="0.1",
-                    max="100",
-                    step="0.1",
+                    max="99.999999",
+                    step="any",
                     data_live_input="stop",
                     data_live_layer=index,
                     data_live_initial=layer.stop_percentage,
@@ -4560,7 +4671,7 @@ class StarUIWorkbench:
                 tone="text-rose-400",
                 layer_index=index,
                 kind="stop",
-            ),
+            ), HTMLInput(type="hidden", name=f"draft_stop_price_{index}", data_draft_exact_stop=index)),
             quantity_field=_field(
                 "Quantity",
                 Div(
@@ -4614,7 +4725,7 @@ class StarUIWorkbench:
                 ),
                 input_id=f"tif_{index}_trigger",
             ),
-            action_field=Button(
+            action_field=_button_tooltip(Button(
                 Icon("lucide:trash-2"),
                 variant="outline",
                 size="icon",
@@ -4623,7 +4734,7 @@ class StarUIWorkbench:
                 value=f"remove-layer:{index}",
                 aria_label=f"Remove layer {index}",
                 cls="mt-5",
-            ),
+            ), "Remove this draft layer"),
         )
 
     def _layer_projection(self, layer: DraftLayerForm) -> tuple[str, str]:
@@ -5849,6 +5960,7 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
       form.querySelectorAll('[data-live-input="target"]').forEach((input) => {{
         const index = input.dataset.liveLayer;
         const stopInput = form.elements[`stop_${{index}}`];
+        const exactStopInput = form.elements[`draft_stop_price_${{index}}`];
         const target = value('target', index), stop = value('stop', index);
         const quantity = value('quantity', index);
         const quantityValid = Number.isInteger(quantity) && quantity >= 1 && quantity <= config.available;
@@ -5858,9 +5970,10 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         if (share) share.textContent = quantityValid ? `${{quantity}} of ${{config.available}} available contracts (${{Math.round(quantity / config.available * 100)}}%)` : `Enter 1 to ${{config.available}} available contracts`;
         if (Number.isInteger(quantity) && quantity > 0) assignedQuantity += quantity;
         if (!quantityValid) quantitiesValid = false;
-        const valid = Number.isFinite(target) && target > 0 && Number.isFinite(stop) && stop > 0 && stop <= 100 && quantityValid;
-        const targetPrice = valid ? (target === Number(input.dataset.liveInitial) ? Number(input.dataset.liveOriginal) : roundUp(basis * (1 + target / 100))) : NaN;
-        const stopPrice = valid ? (stop === Number(stopInput?.dataset.liveInitial) ? Number(stopInput?.dataset.liveOriginal) : roundUp(basis * (1 - stop / 100))) : NaN;
+        const inputValid = Number.isFinite(target) && target > 0 && Number.isFinite(stop) && stop < 100 && quantityValid;
+        const targetPrice = inputValid ? (target === Number(input.dataset.liveInitial) ? Number(input.dataset.liveOriginal) : roundUp(basis * (1 + target / 100))) : NaN;
+        const stopPrice = inputValid ? (exactStopInput?.value ? Number(exactStopInput.value) : stop === Number(stopInput?.dataset.liveInitial) ? Number(stopInput.dataset.liveOriginal) : roundUp(basis * (1 - stop / 100))) : NaN;
+        const valid = inputValid && Number.isFinite(stopPrice) && Number.isFinite(targetPrice) && stopPrice < targetPrice;
         const rawLimit = unit === 'dollars' ? stopPrice - offset : stopPrice * (1 - offset / 100);
         const roundedLimit = rawLimit > 0 ? roundDown(rawLimit) : 0;
         const limitPrice = stopLimit && Number.isFinite(stopPrice) && Number.isFinite(offset) && offset > 0
@@ -5880,9 +5993,9 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         const gain = valid && Number.isFinite(targetPrice) ? (targetPrice - basis) * multiplier * quantity : NaN;
         const loss = valid && Number.isFinite(stopPrice) ? (stopPrice - basis) * multiplier * quantity : NaN;
         assigned(`[data-live-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? (target === Number(input.dataset.liveInitial) ? `$${{input.dataset.liveOriginal}}` : priceText(targetPrice)) : '—');
-        assigned(`[data-live-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? (stop === Number(stopInput?.dataset.liveInitial) ? `$${{stopInput.dataset.liveOriginal}}` : priceText(stopPrice)) : '—');
+        assigned(`[data-live-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? (exactStopInput?.value ? priceText(stopPrice) : stop === Number(stopInput?.dataset.liveInitial) ? `$${{stopInput.dataset.liveOriginal}}` : priceText(stopPrice)) : '—');
         assigned(`[data-live-review-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? sellPriceText(targetPrice, target === Number(input.dataset.liveInitial) ? `$${{input.dataset.liveOriginal}}` : priceText(targetPrice)) : '—');
-        assigned(`[data-live-review-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? sellPriceText(stopPrice, stop === Number(stopInput?.dataset.liveInitial) ? `$${{stopInput.dataset.liveOriginal}}` : priceText(stopPrice)) : '—');
+        assigned(`[data-live-review-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? sellPriceText(stopPrice, !exactStopInput?.value && stop === Number(stopInput?.dataset.liveInitial) ? `$${{stopInput.dataset.liveOriginal}}` : priceText(stopPrice)) : '—');
         assigned(`[data-live-outcome="target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
         assigned(`[data-live-outcome="stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} ${{stopLimit ? 'at stop trigger' : 'max loss'}}` : `— ${{stopLimit ? 'at stop trigger' : 'max loss'}}`);
         assigned(`[data-live-review-quantity="${{index}}"]`, `${{quantityValid ? quantity : '—'}} contracts · ${{form.elements[`tif_${{index}}`]?.value || 'GTC'}}`);
@@ -5901,7 +6014,72 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
       invalid = invalid || !quantitiesValid || !limitsValid || over;
       window.ibkrProjection?.updateDraft(outcomes, invalid);
     }};
-    form.querySelectorAll('[data-live-input]').forEach((input) => input.addEventListener('input', update));
+    document.querySelectorAll('[data-move-draft-stops-to-be]').forEach((button) => button.addEventListener('click', () => {{
+      form.querySelectorAll('[data-live-input="stop"]').forEach((input) => {{ input.value = '0'; }});
+      form.querySelectorAll('[data-draft-exact-stop]').forEach((input) => {{ input.value = ''; }});
+      update();
+    }}));
+    const draftStopDialog = document.querySelector('[data-draft-stop-dialog]');
+    if (draftStopDialog) {{
+      const valueInput = draftStopDialog.querySelector('[data-draft-stop-dialog-value]');
+      const inputLabel = draftStopDialog.querySelector('[data-draft-stop-input-label]');
+      const inverse = draftStopDialog.querySelector('[data-draft-stop-dialog-inverse]');
+      const summary = draftStopDialog.querySelector('[data-draft-stop-dialog-summary]');
+      const apply = draftStopDialog.querySelector('[data-apply-all-draft-stops]');
+      const modeGroup = draftStopDialog.querySelector('[data-draft-stop-mode-group]');
+      let mode = 'return';
+      const showMode = () => {{
+        inputLabel.textContent = mode === 'price' ? 'Stop price' : 'Return from entry';
+      }};
+      const previewStop = () => {{
+        const raw = valueInput.value;
+        const number = Number(raw);
+        const proposed = mode === 'price' ? number : basis * (1 + number / 100);
+        const rounded = raw.trim() && Number.isFinite(proposed) && proposed > 0 ? roundUp(proposed) : NaN;
+        const rate = Number.isFinite(rounded) ? (rounded / basis - 1) * 100 : NaN;
+        const targets = [...form.querySelectorAll('[data-live-input="target"]')].map((input) => {{
+          const target = Number(input.value);
+          return target === Number(input.dataset.liveInitial) ? Number(input.dataset.liveOriginal) : roundUp(basis * (1 + target / 100));
+        }});
+        const valid = Number.isFinite(rounded) && targets.every((target) => Number.isFinite(target) && rounded < target);
+        inverse.textContent = Number.isFinite(rounded) ? (mode === 'price' ? `${{rate >= 0 ? '+' : ''}}${{Number(rate.toFixed(2))}}% from entry` : priceText(rounded)) : '—';
+        summary.textContent = Number.isFinite(rounded) ? `${{priceText(rounded)}} (${{rate >= 0 ? '+' : ''}}${{Number(rate.toFixed(2))}}%)` : '—';
+        apply.disabled = !valid;
+        return {{ rounded, valid }};
+      }};
+      valueInput.addEventListener('input', previewStop);
+      modeGroup?.querySelectorAll('[data-value]').forEach((button) => button.addEventListener('click', () => {{
+        const current = previewStop();
+        if (Number.isFinite(current.rounded)) valueInput.value = button.dataset.value === 'price'
+          ? String(Number(current.rounded.toFixed(6)))
+          : String(Number(((current.rounded / basis - 1) * 100).toFixed(4)));
+        mode = button.dataset.value;
+        showMode(); previewStop(); valueInput.focus();
+      }}));
+      draftStopDialog.querySelectorAll('[data-draft-stop-preset]').forEach((button) => button.addEventListener('click', () => {{
+        modeGroup?.querySelector('[data-value="return"]')?.click();
+        mode = 'return'; valueInput.value = button.dataset.draftStopPreset;
+        showMode(); previewStop();
+      }}));
+      apply.addEventListener('click', () => {{
+        const choice = previewStop();
+        if (!choice.valid) return;
+        const stopLoss = mode === 'return'
+          ? -Number(valueInput.value)
+          : (1 - choice.rounded / basis) * 100;
+        form.querySelectorAll('[data-live-input="stop"]').forEach((input) => {{
+          input.value = String(Number(stopLoss.toFixed(1)));
+          form.elements[`draft_stop_price_${{input.dataset.liveLayer}}`].value = String(choice.rounded);
+        }});
+        update();
+        draftStopDialog.closest('dialog')?.close();
+      }});
+      showMode(); previewStop();
+    }}
+    form.querySelectorAll('[data-live-input]').forEach((input) => input.addEventListener('input', () => {{
+      if (input.dataset.liveInput === 'stop') form.elements[`draft_stop_price_${{input.dataset.liveLayer}}`].value = '';
+      update();
+    }}));
     form.querySelectorAll('[data-live-input]').forEach((input) => input.addEventListener('change', update));
     form.addEventListener('stop-limit-settings-change', update);
     update();
@@ -6041,14 +6219,12 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       const inverse = stopDialog.querySelector('[data-stop-dialog-inverse]');
       const summary = stopDialog.querySelector('[data-stop-dialog-summary]');
       const apply = stopDialog.querySelector('[data-apply-all-stops]');
+      const modeGroup = stopDialog.querySelector('[data-stop-mode-group]');
       const dialogPriceText = (number) => `$${{number.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 6}})}}`;
       let mode = 'price';
       const showMode = () => {{
         inputLabel.textContent = mode === 'price' ? 'Stop price' : 'Return from entry';
         valueInput.min = mode === 'price' ? '0' : '-99.999999';
-        stopDialog.querySelectorAll('[data-stop-mode]').forEach((button) => {{
-          button.setAttribute('aria-pressed', String(button.dataset.stopMode === mode));
-        }});
       }};
       const previewStop = () => {{
         const raw = valueInput.value;
@@ -6075,19 +6251,20 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
           previewStop();
         }}
       }});
-      stopDialog.querySelectorAll('[data-stop-mode]').forEach((button) => button.addEventListener('click', () => {{
+      modeGroup?.querySelectorAll('[data-value]').forEach((button) => button.addEventListener('click', () => {{
         const value = previewStop();
         if (Number.isFinite(value.rounded)) {{
-          valueInput.value = button.dataset.stopMode === 'price'
+          valueInput.value = button.dataset.value === 'price'
             ? String(Number(value.rounded.toFixed(6)))
             : String(Number(value.rate.toFixed(4)));
         }}
-        mode = button.dataset.stopMode;
+        mode = button.dataset.value;
         showMode();
         previewStop();
         valueInput.focus();
       }}));
       stopDialog.querySelectorAll('[data-stop-preset]').forEach((button) => button.addEventListener('click', () => {{
+        modeGroup?.querySelector('[data-value="return"]')?.click();
         mode = 'return';
         valueInput.value = button.dataset.stopPreset;
         showMode();
@@ -6206,6 +6383,13 @@ def _layer_row_layout(
         # This is deliberately a shared, bundled grid utility: arbitrary
         # Tailwind values are not present in StarUI's precompiled stylesheet.
         cls="grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4 first:border-t-0",
+    )
+
+
+def _button_tooltip(control: Any, description: str) -> Any:
+    return Tooltip(
+        TooltipTrigger(control, delay_duration=250),
+        TooltipContent(description),
     )
 
 
@@ -6921,7 +7105,7 @@ def _toast_notice(message: str) -> _ToastNotice | None:
     if "targets must" in lowered:
         return _ToastNotice(
             "Fix the layer prices",
-            "Target must be above 0%; stop must be between 0% and 100%.",
+            "Target must be above 0%; stop must be below its target.",
             "error",
         )
     if "quote changes" in lowered:

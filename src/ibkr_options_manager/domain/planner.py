@@ -174,11 +174,10 @@ def preview_reference_prices(
         or not target_percentage.is_finite()
         or target_percentage <= 0
         or not stop_loss_percentage.is_finite()
-        or stop_loss_percentage <= 0
-        or stop_loss_percentage > 100
+        or stop_loss_percentage >= 100
         or not bands
     ):
-        raise ValueError("reference-price inputs must be positive and complete")
+        raise ValueError("reference-price inputs must produce positive prices")
     target_raw = reference_price * (Decimal("1") + target_percentage / Decimal("100"))
     stop_raw = reference_price * (Decimal("1") - stop_loss_percentage / Decimal("100"))
     return ReferencePricePreview(

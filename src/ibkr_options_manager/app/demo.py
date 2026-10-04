@@ -256,7 +256,6 @@ class DemoReadOnlyBroker:
                 exchange="SMART",
                 bands=(
                     PriceBand(Decimal("0"), Decimal("0.01")),
-                    PriceBand(Decimal("3"), Decimal("0.05")),
                 ),
             ),
             completed=REQUIRED_COMPLETIONS,

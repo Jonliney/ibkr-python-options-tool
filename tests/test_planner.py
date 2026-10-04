@@ -98,6 +98,12 @@ def test_reference_price_preview_tick_rounds_the_illustrative_prices() -> None:
     assert preview.stop_price == Decimal("0.85")
 
 
+def test_reference_price_preview_supports_break_even_and_stop_above_entry() -> None:
+    bands = (PriceBand(Decimal("0"), Decimal("0.05")),)
+    assert preview_reference_prices(Decimal("2"), Decimal("20"), Decimal("0"), bands).stop_price == Decimal("2")
+    assert preview_reference_prices(Decimal("2"), Decimal("20"), Decimal("-5"), bands).stop_price == Decimal("2.10")
+
+
 def test_explicit_layer_draft_preserves_individual_prices_and_quantities() -> None:
     request = replace(
         canonical_request(),

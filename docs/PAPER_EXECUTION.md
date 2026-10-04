@@ -71,6 +71,25 @@ verified average cost. The proposed stop uses the selected contract and
 exchange's verified IBKR market-rule bands; no symbol-specific tick size is
 assumed for SPX, XSP, SPY, or other options.
 
+Draft layers have separate **Set all draft stops** and **Move all draft stops to
+B/E** controls beside their STP / STP LMT choice. They change local draft fields
+only; the existing draft review and TWS confirmation still govern submission.
+The bulk draft dialog opens in percentage mode with the first configured STP
+loss preset, shown as a negative return from entry (25% loss appears as −25%).
+The bulk price is rounded to the selected contract's verified market rule and
+must stay below every draft target. A draft stop may be at or above entry, but
+its trigger must remain positive and below its target. Draft percentage fields
+express loss from entry, so 0% means B/E and a negative value means a stop
+above entry. These controls do not amend active orders.
+The bulk draft stop editor shows the requested loss percentage to one decimal
+place and keeps the selected tick-rounded price separately. On save, the server
+requires that price to be on the verified market rule and either match the
+requested percentage's tick-rounded result or fall within the displayed
+percentage's rounding range when the user entered a price. Editing a stop
+percentage directly clears the separate price. The demo equity-option feed
+uses penny increments; live contracts always use their fetched IBKR market
+rule, which may differ by contract and price band.
+
 Immediately before either confirmation is armed or confirmed, the application
 requests a new TWS snapshot. Submission is allowed only when that snapshot
 proves all of the following:
