@@ -161,7 +161,6 @@ def test_stop_limit_plan_rounds_limit_down_and_fingerprints_settings(
     [
         ("percent", Decimal("0")),
         ("percent", Decimal("100")),
-        ("dollars", Decimal("2")),
         ("dollars", Decimal("NaN")),
         ("ticks", Decimal("5")),
     ],
@@ -175,6 +174,58 @@ def test_stop_limit_plan_fails_closed_on_invalid_offset(
     ))
     assert result.status is PlanStatus.BLOCKED
     assert result.pairs == ()
+
+
+@pytest.mark.parametrize("offset", (Decimal("2"), Decimal("0.79")))
+def test_stop_limit_plan_uses_lowest_positive_market_rule_price(
+    offset: Decimal,
+) -> None:
+    result = build_exit_plan(complete_snapshot(), replace(
+        canonical_request(), stop_order_type="STP LMT",
+        stop_limit_offset=offset, stop_limit_unit="dollars",
+    ))
+
+    assert result.status is PlanStatus.VALID
+    assert {pair.stop.limit_price for pair in result.pairs} == {Decimal("0.05")}
+    assert all(pair.stop.limit_price < pair.stop.rounded_price for pair in result.pairs)
+
+
+def test_stop_limit_minimum_still_must_be_below_trigger() -> None:
+    request = replace(
+        canonical_request(),
+        layers=(LayerRequest(
+            quantity=1, target_price=Decimal("1.20"),
+            stop_price=Decimal("0.05"), tif="GTC",
+        ),),
+        stop_order_type="STP LMT",
+        stop_limit_offset=Decimal("2"),
+        stop_limit_unit="dollars",
+    )
+
+    result = build_exit_plan(complete_snapshot(), request)
+
+    assert result.status is PlanStatus.BLOCKED
+    assert any(item.code == "STOP_LIMIT_PRICE_INVALID" for item in result.validations)
+
+
+def test_stop_limit_floor_uses_lowest_valid_price_across_market_rule_bands() -> None:
+    snapshot = complete_snapshot()
+    snapshot = replace(snapshot, market_rule=replace(
+        snapshot.market_rule,
+        bands=(
+            PriceBand(Decimal("0"), Decimal("0.10")),
+            PriceBand(Decimal("0.05"), Decimal("0.01")),
+        ),
+    ))
+    request = replace(
+        canonical_request(), stop_order_type="STP LMT",
+        stop_limit_offset=Decimal("2"), stop_limit_unit="dollars",
+    )
+
+    result = build_exit_plan(snapshot, request)
+
+    assert result.status is PlanStatus.VALID
+    assert {pair.stop.limit_price for pair in result.pairs} == {Decimal("0.05")}
 
 
 def test_existing_stop_limit_oca_pair_reserves_one_layer_quantity() -> None:

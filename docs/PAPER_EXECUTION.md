@@ -38,8 +38,8 @@ it does not prove a stop-price amendment. If the automatic read cannot verify
 TWS state, another order change remains gated by a fresh snapshot.
 
 Draft submission, active price updates, bracket cancellation, and market exits
-share the same visible sequence: inspect the action review, choose **Execute
-paper order** to verify a fresh snapshot, then choose **Cancel** or the red
+share the same visible sequence: inspect the action review, choose the relevant
+**Review** action to verify a fresh snapshot, then choose **Cancel** or the red
 **Confirm** action. Confirm always performs another fresh broker-state check
 before a paper write. The active-layer action icons create the initial review;
 draft and price edits update that review as their fields change. A recovery
@@ -108,9 +108,16 @@ The protective leg may be a SELL `STP LMT` for a new paper draft. The
 position-level choice defaults to STP; the connection settings can set a
 session default. One positive percentage or dollar amount below each verified
 stop trigger determines its limit price. The pure planner rounds that limit
-**down** to the selected contract's market-rule increment and blocks a zero,
-invalid, or non-lower result. The reviewed plan, fingerprint, journal, and
-paper writer all carry both prices. The writer sends a single `STP LMT` leg
+**down** to the selected contract's market-rule increment. If rounding would
+produce zero or less, it uses the lowest positive price on the verified market
+rule instead. It still blocks a limit at or above the stop trigger or an
+invalid market rule. A very low limit can expose the position to much larger
+losses than the stop-trigger projection; TWS may also reject or hold the order
+under its independent precautions. Saving a session default with no draft layers
+does not validate it against the planner's implicit preview layer; the chosen
+stop-limit offset is validated when an explicit layer is planned. The reviewed
+plan, fingerprint, journal, and paper writer all carry both prices. The writer
+sends a single `STP LMT` leg
 with `auxPrice` as the stop trigger and `lmtPrice` as the limit, alongside the
 SELL LMT target in the same two-order OCA group. The writer rechecks price
 increments before connecting to TWS. For the documented index-option family,

@@ -2276,6 +2276,14 @@ def test_stop_limit_draft_rejects_invalid_offset_before_arming(offset: str) -> N
 def test_global_stop_limit_default_can_be_saved() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
+    initial = TestClient(workbench.app).get(workbench.path).text
+    assert "Stop order for new layers" in initial
+    assert initial.index('data-global-stop-choice="STP LMT"') < initial.index(
+        "How far below the stop?"
+    )
+    assert 'name="global_stop_limit_unit" value="percent"' in initial
+    assert 'data-global-stop-unit-group' in initial
+    assert 'mt-3 flex flex-wrap items-end gap-3' in initial
     response = TestClient(workbench.app).post(
         f"/{workbench.session_token}/action",
         data={"action": "refresh", "global_stop_type": "STP LMT", "global_stop_limit_offset": "7.5"},
@@ -2285,6 +2293,126 @@ def test_global_stop_limit_default_can_be_saved() -> None:
     assert workbench._default_stop_type == "STP LMT"
     assert workbench._default_stop_limit_offset == "7.5"
     assert workbench._stop_configuration() == ("STP LMT", "7.5", "percent")
+
+
+def test_global_stop_limit_default_accepts_dollar_offset() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    response = TestClient(workbench.app).post(
+        f"/{workbench.session_token}/action",
+        data={
+            "action": "refresh",
+            "global_stop_type": "STP LMT",
+            "global_stop_limit_offset": "1.25",
+            "global_stop_limit_unit": "dollars",
+        },
+    )
+
+    assert response.status_code == 200
+    assert workbench._stop_configuration() == ("STP LMT", "1.25", "dollars")
+    assert workbench._plan_form(()).stop_limit_unit == "dollars"
+    assert 'name="global_stop_limit_unit" value="dollars"' in response.text
+
+
+def test_global_stop_limit_default_rejects_invalid_percent_without_changing_saved_unit() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    client = TestClient(workbench.app)
+    client.post(
+        workbench.path + "action",
+        data={
+            "action": "refresh",
+            "global_stop_type": "STP LMT",
+            "global_stop_limit_offset": "1.25",
+            "global_stop_limit_unit": "dollars",
+        },
+    )
+    rejected = client.post(
+        workbench.path + "action",
+        data={
+            "action": "refresh",
+            "global_stop_type": "STP LMT",
+            "global_stop_limit_offset": "100",
+            "global_stop_limit_unit": "percent",
+        },
+    )
+
+    assert rejected.status_code == 200
+    assert workbench._stop_configuration() == ("STP LMT", "1.25", "dollars")
+    assert "below 100%" in workbench._status_message
+
+
+def test_saving_dollar_stop_limit_default_without_draft_does_not_validate_a_layer() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    assert workbench._current_layers() == ()
+
+    response = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={
+            "action": "refresh",
+            "global_stop_type": "STP LMT",
+            "global_stop_limit_offset": "5",
+            "global_stop_limit_unit": "dollars",
+        },
+    )
+
+    assert response.status_code == 200
+    assert workbench._stop_configuration() == ("STP LMT", "5", "dollars")
+    assert workbench._current_layers() == ()
+    assert workbench._state.status is UiStatus.READY
+    assert not any(
+        validation.code == "STOP_LIMIT_PRICE_INVALID"
+        for validation in workbench._state.validations
+    )
+    assert "Plan needs attention" not in response.text
+
+    workbench._add_layer_locked()
+    assert workbench._current_layers()
+    assert workbench._plan_form(workbench._current_layers()).stop_order_type == "STP LMT"
+    actual_draft = workbench._view_model.select_position(
+        workbench._selected_con_id,
+        workbench._plan_form(workbench._current_layers()),
+    )
+    assert actual_draft.status is UiStatus.READY
+    assert actual_draft.pairs
+    assert all(
+        pair.stop_limit_price is not None
+        and 0 < pair.stop_limit_price < pair.stop_price
+        for pair in actual_draft.pairs
+    )
+    workbench._apply_state_locked(actual_draft)
+    reviewed = TestClient(workbench.app).get(workbench.path).text
+    assert 'data-live-review-price="stop-limit-1"' in reviewed
+    assert f"${actual_draft.pairs[0].stop_limit_price}" in reviewed
+
+
+def test_new_default_replaces_old_position_choice_after_last_draft_is_removed() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    client = TestClient(workbench.app)
+    client.post(workbench.path + "action", data={"action": "add-layer"})
+    assert len(workbench._current_layers()) == 1
+    client.post(workbench.path + "action", data={
+        "action": "remove-layer:1",
+        "draft_stop_type": "STP LMT",
+        "draft_stop_limit_offset": "5",
+        "draft_stop_limit_unit": "percent",
+    })
+    assert workbench._current_layers() == ()
+    assert workbench._stop_configuration() == ("STP LMT", "5", "percent")
+
+    response = client.post(workbench.path + "action", data={
+        "action": "refresh",
+        "global_stop_type": "STP LMT",
+        "global_stop_limit_offset": "5",
+        "global_stop_limit_unit": "dollars",
+    })
+
+    assert response.status_code == 200
+    assert workbench._stop_configuration() == ("STP LMT", "5", "dollars")
+    client.post(workbench.path + "action", data={"action": "add-layer"})
+    assert workbench._stop_configuration() == ("STP LMT", "5", "dollars")
 
 
 def test_active_stop_limit_layer_shows_both_prices_and_locks_price_edits() -> None:

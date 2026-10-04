@@ -209,6 +209,7 @@ class StarUIWorkbench:
         self._drafts: dict[int, tuple[DraftLayerForm, ...]] = {}
         self._default_stop_type = "STP"
         self._default_stop_limit_offset = "5"
+        self._default_stop_limit_unit = "percent"
         self._position_stop_config: dict[int, tuple[str, str, str]] = {}
         self._projection_comparison: PositionOutcome | None = None
         self._settings = ConnectionSettings(account=initial_account)
@@ -554,11 +555,13 @@ class StarUIWorkbench:
             if action == "refresh":
                 stop_type = values.get("global_stop_type", self._default_stop_type)
                 offset = values.get("global_stop_limit_offset", self._default_stop_limit_offset)
-                if stop_type not in {"STP", "STP LMT"} or not _valid_stop_limit_offset(offset, "percent"):
-                    self._message = "Choose STP or STP LMT and enter a limit offset above 0% and below 100%."
+                unit = values.get("global_stop_limit_unit", self._default_stop_limit_unit)
+                if stop_type not in {"STP", "STP LMT"} or not _valid_stop_limit_offset(offset, unit):
+                    self._message = "Choose STP or STP LMT and enter an offset above zero (and below 100% for percentages)."
                     return self._page()
                 self._default_stop_type = stop_type
                 self._default_stop_limit_offset = offset
+                self._default_stop_limit_unit = unit
                 self._selected_quantity_change = None
                 self._target_presets = values.get(
                     "target_presets", self._target_presets
@@ -873,17 +876,20 @@ class StarUIWorkbench:
         return PlanForm(
             layers=layers,
             paper_execution_mode=self._paper_execution is not None,
-            stop_order_type=stop_type,
+            # With no draft, the planner's legacy percentage preview is only
+            # observational. Do not validate a future layer's stop-limit
+            # offset against that implicit preview.
+            stop_order_type=stop_type if layers else "STP",
             stop_limit_offset=offset,
             stop_limit_unit=unit,
         )
 
     def _stop_configuration(self) -> tuple[str, str, str]:
         if self._selected_con_id is None:
-            return self._default_stop_type, self._default_stop_limit_offset, "percent"
+            return self._default_stop_type, self._default_stop_limit_offset, self._default_stop_limit_unit
         return self._position_stop_config.get(
             self._selected_con_id,
-            (self._default_stop_type, self._default_stop_limit_offset, "percent"),
+            (self._default_stop_type, self._default_stop_limit_offset, self._default_stop_limit_unit),
         )
 
     def _disarm_execution_locked(self) -> None:
@@ -3033,22 +3039,40 @@ class StarUIWorkbench:
                         cls="mt-3 text-xs leading-5 text-muted-foreground",
                     ),
                     Separator(cls="my-5"),
-                    H3("Protective order default", cls="text-sm font-semibold"),
+                    H3("Stop order for new layers", cls="text-sm font-semibold"),
                     Div(
-                        Button("STP", type="button", variant="outline", size="sm", aria_pressed="true" if self._default_stop_type == "STP" else "false", data_global_stop_choice="STP", cls="rounded-r-none border-primary bg-primary/10" if self._default_stop_type == "STP" else "rounded-r-none"),
-                        Button("STP LMT", type="button", variant="outline", size="sm", aria_pressed="true" if self._default_stop_type == "STP LMT" else "false", data_global_stop_choice="STP LMT", cls="-ml-px rounded-l-none border-primary bg-primary/10" if self._default_stop_type == "STP LMT" else "-ml-px rounded-l-none"),
-                        cls="mt-3 inline-flex",
-                    ),
-                    Div(
-                        Label("How far below the stop?", fr="global-stop-limit-offset", cls="text-xs font-medium text-muted-foreground"),
                         Div(
-                            Input(id="global-stop-limit-offset", name="global_stop_limit_offset", type="number", min="0.1", max="99.9", step="any", value=self._default_stop_limit_offset, disabled=self._default_stop_type != "STP LMT", cls="w-24"),
-                            Span("%", cls="text-sm text-muted-foreground"),
-                            cls="mt-2 flex items-center gap-2",
+                            Button("STP", type="button", variant="outline", size="sm", aria_pressed="true" if self._default_stop_type == "STP" else "false", data_global_stop_choice="STP", cls="rounded-r-none border-primary bg-primary/10" if self._default_stop_type == "STP" else "rounded-r-none"),
+                            Button("STP LMT", type="button", variant="outline", size="sm", aria_pressed="true" if self._default_stop_type == "STP LMT" else "false", data_global_stop_choice="STP LMT", cls="-ml-px rounded-l-none border-primary bg-primary/10" if self._default_stop_type == "STP LMT" else "-ml-px rounded-l-none"),
+                            cls="inline-flex",
                         ),
-                        cls="mt-4",
+                        Div(
+                            Label("How far below the stop?", fr="global-stop-limit-offset", cls="text-xs font-medium text-muted-foreground"),
+                            Div(
+                                Input(id="global-stop-limit-offset", name="global_stop_limit_offset", type="number", min="0.1" if self._default_stop_limit_unit == "percent" else "0.01", max="99.9" if self._default_stop_limit_unit == "percent" else None, step="any", value=self._default_stop_limit_offset, disabled=self._default_stop_type != "STP LMT", cls="w-24"),
+                                Fieldset(
+                                    ToggleGroup(
+                                        ("percent", "%"),
+                                        ("dollars", "$"),
+                                        type="single",
+                                        value=self._default_stop_limit_unit,
+                                        variant="outline",
+                                        size="sm",
+                                        aria_label="Default stop-limit offset unit",
+                                        data_global_stop_unit_group=True,
+                                    ),
+                                    id="global-stop-limit-units",
+                                    disabled=self._default_stop_type != "STP LMT",
+                                    cls="contents",
+                                ),
+                                cls="mt-2 flex items-center gap-2",
+                            ),
+                            cls="min-w-0",
+                        ),
+                        cls="mt-3 flex flex-wrap items-end gap-3",
                     ),
                     HTMLInput(type="hidden", name="global_stop_type", value=self._default_stop_type),
+                    HTMLInput(type="hidden", name="global_stop_limit_unit", value=self._default_stop_limit_unit),
                     Script(_global_stop_type_visual_script()),
                     DialogFooter(
                         DialogClose("Cancel", variant="outline"),
@@ -5049,7 +5073,9 @@ class StarUIWorkbench:
                 AlertDescription(
                     "If the stop price is reached, the order will only sell at "
                     "your limit price or higher. If the market drops below that "
-                    "price, you may still own the option and lose more than shown above."
+                    "price, you may still own the option and lose more than shown above. "
+                    "If your offset reaches $0 or less, the limit uses the lowest positive "
+                    "price allowed by this option's price increments."
                 ),
                 data_stop_limit_warning=True,
                 cls="mx-4 mb-3 w-[calc(100%-2rem)] border-amber-500/40 "
@@ -5675,6 +5701,9 @@ def _global_stop_type_visual_script() -> str:
     const buttons = document.querySelectorAll('[data-global-stop-choice]');
     const offset = document.getElementById('global-stop-limit-offset');
     const selection = document.querySelector('[name="global_stop_type"]');
+    const unitSelection = document.querySelector('[name="global_stop_limit_unit"]');
+    const unitFieldset = document.getElementById('global-stop-limit-units');
+    const unitButtons = document.querySelectorAll('[data-global-stop-unit-group] [data-value]');
     buttons.forEach((button) => button.addEventListener('click', () => {
       buttons.forEach((choice) => {
         const selected = choice === button;
@@ -5684,6 +5713,20 @@ def _global_stop_type_visual_script() -> str:
       });
       if (selection) selection.value = button.dataset.globalStopChoice;
       if (offset) offset.disabled = button.dataset.globalStopChoice !== 'STP LMT';
+      if (unitFieldset) unitFieldset.disabled = button.dataset.globalStopChoice !== 'STP LMT';
+    }));
+    unitButtons.forEach((button) => button.addEventListener('click', () => {
+      if (unitSelection) unitSelection.value = button.dataset.value;
+      if (offset) {
+        offset.min = button.dataset.value === 'percent' ? '0.1' : '0.01';
+        if (button.dataset.value === 'percent') offset.max = '99.9';
+        else offset.removeAttribute('max');
+      }
+      unitButtons.forEach((choice) => {
+        const selected = choice === button;
+        choice.setAttribute('aria-checked', String(selected));
+        choice.dataset.state = selected ? 'on' : 'off';
+      });
     }));
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
@@ -5772,6 +5815,7 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
       }}
       return NaN;
     }};
+    const minimumPositivePrice = Math.min(...bands.map((band) => roundUp(Math.max(band.low, band.increment))));
     const update = () => {{
       const outcomes = [];
       let invalid = false;
@@ -5796,7 +5840,9 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         const targetPrice = valid ? (target === Number(input.dataset.liveInitial) ? Number(input.dataset.liveOriginal) : roundUp(basis * (1 + target / 100))) : NaN;
         const stopPrice = valid ? (stop === Number(stopInput?.dataset.liveInitial) ? Number(stopInput?.dataset.liveOriginal) : roundUp(basis * (1 - stop / 100))) : NaN;
         const rawLimit = unit === 'dollars' ? stopPrice - offset : stopPrice * (1 - offset / 100);
-        const limitPrice = stopLimit && Number.isFinite(stopPrice) && Number.isFinite(offset) && offset > 0 && rawLimit > 0 ? roundDown(rawLimit) : NaN;
+        const roundedLimit = rawLimit > 0 ? roundDown(rawLimit) : 0;
+        const limitPrice = stopLimit && Number.isFinite(stopPrice) && Number.isFinite(offset) && offset > 0
+          ? (roundedLimit > 0 ? roundedLimit : minimumPositivePrice) : NaN;
         if (stopLimit && (!Number.isFinite(limitPrice) || limitPrice <= 0 || limitPrice >= stopPrice)) limitsValid = false;
         const limitLabel = form.querySelector(`[data-live-stop-limit-price="${{index}}"]`);
         if (limitLabel) {{

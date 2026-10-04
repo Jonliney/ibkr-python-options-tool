@@ -208,9 +208,16 @@ def _stop_limit_price(
         if unit == "percent"
         else stop_price - offset
     )
-    if not raw.is_finite() or raw <= 0:
-        raise ValueError("stop-limit price must be positive")
-    rounded = _round_down(raw, bands)
+    if not raw.is_finite():
+        raise ValueError("stop-limit price must be finite")
+    rounded = _round_down(raw, bands) if raw > 0 else Decimal("0")
+    if rounded <= 0:
+        # A sell limit cannot be zero. Use the smallest positive price on the
+        # verified market rule, including its price-dependent tick bands.
+        rounded = min(
+            _round_up(max(band.low_edge, band.increment), bands)
+            for band in bands
+        )
     if rounded <= 0 or rounded >= stop_price:
         raise ValueError("stop-limit price must be below the stop trigger")
     return rounded
