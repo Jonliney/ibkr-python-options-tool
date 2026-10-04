@@ -40,7 +40,7 @@ already cover the held position. When it is the only blocking validation and
 the selected broker snapshot is coherent, it does not block projection of the
 verified active layers. Other blocking validations still fail closed.
 
-Parenthesized changes compare a proposed value with the plan loaded from the
+Changes compare a proposed value with the plan loaded from the
 current broker snapshot and saved draft rows. For Expected gain, an up arrow
 means the projected result increased and a down arrow means it decreased. For
 Max loss, an up arrow with an unsigned dollar amount means the projected stop
@@ -50,8 +50,8 @@ arithmetic when rendering an action. A new snapshot establishes a new
 comparison baseline. A market exit cannot have a deterministic P&L before its
 fill is observed. Routine coverage and pending-order status text is omitted;
 status text appears only for invalid or unresolved projections. Both comparisons use
-neutral grey on a dedicated line; an unchanged or unavailable comparison shows
-`(—)` to keep the metric height stable.
+neutral grey on a dedicated line. The comparison line is currently hidden in
+the UI, while its calculation and live updates remain available.
 
 Verification: `.venv/bin/python -m pytest -q tests/test_outcome.py
 tests/test_app_demo.py -k 'not reset_active_prices and not embedded_webview and

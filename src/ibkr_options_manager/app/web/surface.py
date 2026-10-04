@@ -5032,7 +5032,7 @@ class StarUIWorkbench:
         return Div(
             H3("Outcome projection", cls="mb-3 text-sm font-semibold"),
             Div(
-                    _metric(
+                _metric(
                         "Expected gain",
                         _projection_gain_value(gain_value, gain_delta, gain_cost),
                         "text-emerald-400",
@@ -5051,7 +5051,7 @@ class StarUIWorkbench:
                             "Realised P&L plus projected gains from the current layer plan."
                         ),
                     ),
-                    _metric(
+                _metric(
                         "Max loss",
                         _projection_loss_value(loss_value, loss_delta, covered_cost),
                         "text-rose-400",
@@ -5069,10 +5069,9 @@ class StarUIWorkbench:
                             "Projected losses at the current layer stops; excludes realised P&L."
                         ),
                     ),
-                cls="grid grid-cols-2 gap-2",
+                cls="outcome-projection-pair grid grid-cols-2",
             ),
             data_outcome_projection=True,
-            cls="border-t border-border pt-3",
         )
 
     def _review(
@@ -5185,11 +5184,12 @@ class StarUIWorkbench:
                 ),
                 cls="flex min-h-0 flex-1 items-center justify-center px-6",
             ),
-            Div(self._outcome_projection(projection), cls="mx-4 mb-3"),
-            self._review_alert()
-            if draft_rows
-            else None,
-            self._execution_control(),
+            Div(
+                Div(self._outcome_projection(projection), cls="mx-4 mb-3"),
+                self._review_alert() if draft_rows else None,
+                self._execution_control(),
+                cls="border-t border-border pt-4",
+            ),
             cls="flex min-h-0 flex-col overflow-hidden border-l border-border bg-card/30",
         )
 
@@ -5703,7 +5703,7 @@ class StarUIWorkbench:
         hidden: bool = False,
     ) -> Any:
         """Shared order-review structure for new drafts and active amendments."""
-        row_cls = "border-b border-border py-4"
+        row_cls = "action-review-layer py-4"
         if hidden:
             row_cls = f"hidden {row_cls}"
         return Div(
@@ -5789,7 +5789,7 @@ class StarUIWorkbench:
                     ),
                     cls="mt-3 border-l-2 border-border pl-3",
                 ),
-                cls="border-b border-border py-4",
+                cls="action-review-layer py-4",
             )
         )
         return rows
@@ -6964,17 +6964,16 @@ def _projection_change_value(
     percent = _projection_percent(value, cost)
     return Span(
         Span(
-            _money(value) if value is not None else "— Incomplete",
+            _money(value) if value is not None else "— Unknown",
             cls="whitespace-nowrap",
             **{f"data_{metric}_value": True},
         ),
         Span(
-            f"({percent})" if percent is not None else "",
+            percent or "",
             cls="text-muted-foreground text-[11px] font-normal leading-4 whitespace-nowrap",
             **{f"data_{metric}_percent": True},
         ),
         Span(
-            "(",
             Span(
                 Span(
                     Icon("lucide:arrow-up", cls="size-3", aria_hidden="true"),
@@ -6989,9 +6988,8 @@ def _projection_change_value(
                 Span(amount, **{f"data_{metric}_amount": True}),
                 cls="inline-flex items-center gap-0.5",
             ),
-            ")",
             aria_label=comparison_label,
-            cls="text-muted-foreground text-[11px] font-normal leading-4 whitespace-nowrap",
+            cls="hidden text-muted-foreground text-[11px] font-normal leading-4 whitespace-nowrap",
             **{f"data_{metric}_change": True},
         ),
         cls="inline-flex flex-col items-start gap-0.5",
@@ -7019,9 +7017,9 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       if (!node) return;
       const select = (part) => node.querySelector('[data-' + kind + '-' + part + ']');
       const change = select('change');
-      select('value').textContent = value === null ? '— Incomplete' : money(value);
+      select('value').textContent = value === null ? '— Unknown' : money(value);
       select('percent').textContent = value !== null && Number.isFinite(cost) && cost > 0
-        ? `(${{new Intl.NumberFormat(undefined, {{minimumFractionDigits: 1, maximumFractionDigits: 1, signDisplay: 'always'}}).format(value / cost * 100)}}%)` : '';
+        ? `${{new Intl.NumberFormat(undefined, {{minimumFractionDigits: 1, maximumFractionDigits: 1, signDisplay: 'always'}}).format(value / cost * 100)}}%` : '';
       const changed = value !== null && baseline !== null && Math.abs(value - baseline) > 0.005;
       if (!changed) {{
         select('amount').textContent = '—';
@@ -7273,9 +7271,9 @@ def _metric(
             value,
             data_live_metric=live_key,
             aria_live="polite" if live_key else None,
-            cls=f"min-w-0 font-mono text-xs font-semibold tabular-nums {tone}",
+            cls=f"min-w-0 font-mono text-sm font-semibold tabular-nums {tone}",
         ),
-        cls="flex min-w-0 flex-col gap-2 rounded-xl border border-border bg-muted/20 px-2.5 py-2.5",
+        cls="outcome-metric-panel flex min-w-0 flex-col gap-3 rounded-md px-3 py-3",
     )
 
 

@@ -25,6 +25,18 @@
   margin-inline: auto;
 }
 
+.outcome-projection-pair {
+  column-gap: 8px;
+}
+
+.outcome-metric-panel {
+  background: var(--card);
+}
+
+.action-review-layer:not(.hidden) ~ .action-review-layer:not(.hidden) {
+  border-top: 1px solid var(--border);
+}
+
 .selected-quantity-notice:not([hidden]) {
   display: flex;
   align-items: center;
