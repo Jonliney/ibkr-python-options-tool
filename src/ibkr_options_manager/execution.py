@@ -512,15 +512,22 @@ class ExecutionJournal:
             layer.target_perm_id,
             layer.stop_perm_id,
         } - {0}
-        order_ids = set(entry.order_ids[layer_index * 2 : layer_index * 2 + 2])
-        if len(entry.layers) == 1:
-            order_ids.update(entry.order_ids)
+        order_ids = (
+            set(entry.order_ids[layer_index * 2 : layer_index * 2 + 2])
+            if len(entry.order_ids) == len(entry.layers) * 2
+            else set(entry.order_ids)
+            if len(entry.layers) == 1
+            else set()
+        )
         if (
             any(fill.perm_id in ids for fill in entry.fills)
             or any(
                 order.perm_id in ids
                 or order.order_id in order_ids
-                or (not ids and not order_ids and order.oca_group == group)
+                or (
+                    (not layer.target_perm_id or not layer.stop_perm_id)
+                    and order.oca_group == group
+                )
                 for order in snapshot.working_orders
             )
             or any(fill.perm_id in ids for fill in snapshot.executions)
@@ -925,6 +932,139 @@ class ExecutionJournal:
             resolution_captured_at=str(snapshot.captured_at),
         )
         entries[index] = updated
+        self._write(tuple(entries))
+        return updated
+
+    def confirm_cancelled_layer(
+        self,
+        snapshot: BrokerSnapshot,
+        fingerprint: str,
+        layer_index: int,
+        *,
+        confirmed_in_tws: bool,
+    ) -> JournalEntry:
+        """Mark only one absent OCA pair cancelled after a complete broker read."""
+        if not confirmed_in_tws:
+            raise ExecutionBlocked("confirm both bracket legs are absent in TWS")
+        entries = list(self._entries())
+        matches = [
+            i
+            for i, entry in enumerate(entries)
+            if entry.fingerprint == fingerprint
+            and entry.account == snapshot.selected.account
+            and entry.con_id == snapshot.selected.con_id
+            and entry.state
+            in {"SUBMISSION_UNKNOWN", "PARTIALLY_RECONCILED", "SUBMITTED", "RECONCILED"}
+            and 0 <= layer_index < len(entry.layers)
+        ]
+        if len(matches) != 1:
+            raise ExecutionBlocked("the bracket layer is missing or ambiguous")
+        entry_index = matches[0]
+        entry = entries[entry_index]
+        layer = entry.layers[layer_index]
+        if layer.cancelled:
+            raise ExecutionBlocked("this bracket layer was already cleared")
+        if (
+            not snapshot.connected
+            or not snapshot.paper_account_verified
+            or not snapshot.complete
+            or not snapshot.fresh
+            or not snapshot.completed_orders_complete
+            or not snapshot.executions_complete
+            or entry.expected_order_count != len(entry.layers) * 2
+            or snapshot.position.quantity < layer.quantity
+        ):
+            raise ExecutionBlocked(
+                "complete TWS order and execution evidence is required"
+            )
+        try:
+            later = snapshot.captured_at > Decimal(entry.snapshot_captured_at)
+        except (InvalidOperation, ValueError):
+            later = False
+        if not later:
+            raise ExecutionBlocked("a later TWS snapshot is required")
+        group = f"{_entry_oca_prefix(entry)}/tranche-{layer_index + 1}"
+        if (
+            entry.account,
+            entry.con_id,
+            _entry_oca_prefix(entry),
+        ) in ambiguous_oca_prefixes(entries):
+            raise ExecutionBlocked("the bracket OCA group is ambiguous")
+        ids = {layer.target_perm_id, layer.stop_perm_id} - {0}
+        if len(entry.perm_ids) == len(entry.layers) * 2:
+            ids.update(entry.perm_ids[layer_index * 2 : layer_index * 2 + 2])
+        order_ids = (
+            set(entry.order_ids[layer_index * 2 : layer_index * 2 + 2])
+            if len(entry.order_ids) == len(entry.layers) * 2
+            else set()
+        )
+        if any(
+            order.oca_group == group
+            or order.perm_id in ids
+            or order.order_id in order_ids
+            for order in snapshot.working_orders
+        ):
+            raise ExecutionBlocked("a bracket leg is still working in TWS")
+        if any(
+            order.oca_group == group
+            and order.status not in {"Cancelled", "ApiCancelled", "Inactive"}
+            for order in snapshot.completed_orders
+        ):
+            raise ExecutionBlocked("TWS completion history conflicts with cancellation")
+        if any(fill.perm_id in ids for fill in entry.fills):
+            raise ExecutionBlocked("a bracket fill is already recorded")
+        # A sell execution without a proven different order identity may be this pair.
+        other_ids = {
+            perm_id
+            for other in entries
+            for perm_id in other.perm_ids
+            if other.account == entry.account
+            and other.con_id == entry.con_id
+            and other is not entry
+            and perm_id > 0
+        }
+        other_ids.update(
+            perm_id
+            for i, other_layer in enumerate(entry.layers)
+            if i != layer_index
+            for perm_id in (other_layer.target_perm_id, other_layer.stop_perm_id)
+            if perm_id > 0
+        )
+        if len(entry.perm_ids) == len(entry.layers) * 2:
+            other_ids.update(
+                perm_id
+                for i, perm_id in enumerate(entry.perm_ids)
+                if i // 2 != layer_index and perm_id > 0
+            )
+        for orders in (snapshot.working_orders, snapshot.completed_orders):
+            for order in orders:
+                if order.oca_group == group or order.order_id in order_ids:
+                    ids.add(order.perm_id)
+                elif order.perm_id > 0:
+                    other_ids.add(order.perm_id)
+        if any(
+            fill.perm_id in ids
+            or (
+                fill.side.upper() not in {"BOT", "BUY"}
+                and fill.perm_id not in other_ids
+            )
+            for fill in snapshot.executions
+        ):
+            raise ExecutionBlocked(
+                "an execution may belong to this bracket; check the TWS trade log"
+            )
+        layers = list(entry.layers)
+        layers[layer_index] = replace(layer, cancelled=True)
+        all_cancelled = all(item.cancelled for item in layers)
+        updated = replace(
+            entry,
+            layers=tuple(layers),
+            state="CANCELLED_CONFIRMED" if all_cancelled else entry.state,
+            resolution_captured_at=str(snapshot.captured_at)
+            if all_cancelled
+            else entry.resolution_captured_at,
+        )
+        entries[entry_index] = updated
         self._write(tuple(entries))
         return updated
 
@@ -1709,6 +1849,18 @@ class PaperExecutionService:
         """Release an unresolved draft only after operator and broker checks agree."""
         return self._journal.confirm_cancelled_unknown(
             snapshot, fingerprint, confirmed_in_tws=confirmed_in_tws
+        )
+
+    def confirm_cancelled_layer(
+        self,
+        snapshot: BrokerSnapshot,
+        fingerprint: str,
+        layer_index: int,
+        *,
+        confirmed_in_tws: bool,
+    ) -> JournalEntry:
+        return self._journal.confirm_cancelled_layer(
+            snapshot, fingerprint, layer_index, confirmed_in_tws=confirmed_in_tws
         )
 
     def dismiss_cancelled_layer(

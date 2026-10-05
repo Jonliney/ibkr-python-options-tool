@@ -344,6 +344,7 @@ def test_seeded_nvda_demo_bracket_can_be_verified_absent_without_reseeding(
             "action": "resolve-cancelled-bracket",
             "confirmed": "yes",
             "fingerprint": entry.fingerprint,
+            "layer_index": "0",
         },
     )
     assert resolved.status_code == 200
@@ -2062,10 +2063,10 @@ def test_manual_tws_confirmation_clears_unknown_only_after_fresh_api_check(
     )
     recovery_page = client.post(
         workbench.path + "action",
-        data={"action": f"verify-cancelled-bracket:{fingerprint}"},
+        data={"action": f"verify-cancelled-bracket:{fingerprint}:0"},
     ).text
     assert "Refresh layers" in recovery_page
-    assert "Clear unverified bracket" in recovery_page
+    assert "Clear layer 1" in recovery_page
     assert 'name="confirmed"' in recovery_page
     assert 'id="cancelled_bracket_recovery"' in recovery_page
     assert "required" in recovery_page
@@ -2098,13 +2099,14 @@ def test_manual_tws_confirmation_clears_unknown_only_after_fresh_api_check(
             "action": "resolve-cancelled-bracket",
             "confirmed": "yes",
             "fingerprint": fingerprint,
+            "layer_index": "0",
         },
     )
 
     assert response.status_code == 200
     assert "Cancelled bracket cleared" not in response.text
-    assert "Clear unverified bracket" not in response.text
-    assert journal.find(fingerprint).state == "CANCELLED_CONFIRMED"
+    assert "Clear layer 1" not in response.text
+    assert journal.find(fingerprint).layers[0].cancelled, workbench._message
 
 
 def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
@@ -2148,7 +2150,7 @@ def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
     page = TestClient(workbench.app).get(workbench.path).text
 
     assert "No fill evidence" in page
-    assert 'value="verify-cancelled-bracket:' + fingerprint + '"' in page
+    assert 'value="verify-cancelled-bracket:' + fingerprint + ':0"' in page
     assert 'aria-label="Verify bracket status of layer 1"' in page
     assert "verify-layer-button" not in page
     assert (
@@ -2161,9 +2163,9 @@ def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
     workbench._view_model._latest_snapshot = None
     requested = TestClient(workbench.app).post(
         workbench.path + "action",
-        data={"action": "verify-cancelled-bracket:" + fingerprint},
+        data={"action": "verify-cancelled-bracket:" + fingerprint + ":0"},
     )
-    assert "Clear unverified bracket" in requested.text
+    assert "Clear layer 1" in requested.text
     assert "data-cancelled-bracket-recovery-dialog" in requested.text
     clean = replace(
         snapshot,
@@ -2189,10 +2191,11 @@ def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
             "action": "resolve-cancelled-bracket",
             "confirmed": "yes",
             "fingerprint": fingerprint,
+            "layer_index": "0",
         },
     )
     assert "Cancelled bracket cleared" not in resolved_page.text
-    assert journal.find(fingerprint).state == "CANCELLED_CONFIRMED"
+    assert journal.find(fingerprint).layers[0].cancelled, workbench._message
 
 
 def test_old_missing_bracket_does_not_interrupt_new_active_brackets(tmp_path) -> None:
@@ -2254,12 +2257,51 @@ def test_old_missing_bracket_does_not_interrupt_new_active_brackets(tmp_path) ->
 
     page = TestClient(workbench.app).get(workbench.path).text
     assert "data-cancelled-bracket-recovery-dialog" not in page
-    assert 'value="verify-cancelled-bracket:' + "d" * 64 + '"' in page
+    assert 'value="verify-cancelled-bracket:' + "d" * 64 + ':0"' in page
     requested = TestClient(workbench.app).post(
         workbench.path + "action",
-        data={"action": "verify-cancelled-bracket:" + "d" * 64},
+        data={"action": "verify-cancelled-bracket:" + "d" * 64 + ":0"},
     )
     assert "data-cancelled-bracket-recovery-dialog" in requested.text
+
+
+def test_verification_dialog_shows_only_selected_layer(tmp_path) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    fingerprint = "e" * 64
+    entry = JournalEntry(
+        fingerprint=fingerprint,
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        state="RECONCILED",
+        expected_order_count=8,
+        snapshot_captured_at="1",
+        layers=tuple(
+            JournalLayer(
+                quantity=1, target_price=f"{i}.02", stop_price="1.89", tif="GTC"
+            )
+            for i in range(3, 7)
+        ),
+    )
+    journal = ExecutionJournal(tmp_path / "paper-journal.json")
+    journal._write((entry,))
+    workbench._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(), journal
+    )
+    workbench._recovery_requested_fingerprint = fingerprint
+    workbench._recovery_requested_layer_index = 0
+    dialog = to_xml(
+        workbench._cancelled_bracket_recovery(
+            ((entry, 0, LayerOutcome("NO_EXECUTION_EVIDENCE")),)
+        )
+    )
+    assert f"{fingerprint[:12]}/tranche-1" in dialog
+    assert f"{fingerprint[:12]}/tranche-2" not in dialog
+    assert "3.02 · 1 contracts" in dialog
+    assert "4.02 · 1 contracts" not in dialog
+    assert 'name="layer_index" value="0"' in dialog
 
 
 def test_reused_legacy_oca_group_shows_tws_conflict_and_confirmed_old_cancellations(
@@ -5908,15 +5950,15 @@ def test_pending_bracket_verify_button_stays_available_and_requires_broker_evide
     )
     client = TestClient(workbench.app)
     page = client.get(workbench.path).text
-    assert 'value="verify-cancelled-bracket:' + fingerprint + '"' in page
+    assert 'value="verify-cancelled-bracket:' + fingerprint + ':0"' in page
     dialog = client.post(
         workbench.path + "action",
         data={
-            "action": "verify-cancelled-bracket:" + fingerprint,
+            "action": "verify-cancelled-bracket:" + fingerprint + ":0",
         },
     ).text
     assert "Refresh layers" in dialog
-    assert "Clear unverified bracket" in dialog
+    assert "Clear layer 1" in dialog
     assert 'name="verification_choice"' not in dialog
     assert 'name="confirmed"' in dialog
     assert 'data-slot="checkbox"' in dialog

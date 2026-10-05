@@ -2729,6 +2729,113 @@ def test_cancelled_unknown_uses_other_journal_ids_and_ignores_buy_fill(
     )
 
 
+def test_confirm_cancelled_layer_preserves_active_siblings(tmp_path) -> None:
+    snapshot = _snapshot()
+    fingerprint = "f" * 64
+    layers = tuple(
+        JournalLayer(
+            quantity=1,
+            target_price=str(i + 2),
+            stop_price="1.00",
+            tif="GTC",
+            target_perm_id=200 + i * 2,
+            stop_perm_id=201 + i * 2,
+        )
+        for i in range(4)
+    )
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal._write(
+        (
+            JournalEntry(
+                fingerprint=fingerprint,
+                account=snapshot.selected.account,
+                con_id=snapshot.selected.con_id,
+                state="RECONCILED",
+                expected_order_count=8,
+                snapshot_captured_at="1",
+                perm_ids=tuple(range(200, 208)),
+                order_ids=tuple(range(100, 108)),
+                layers=layers,
+            ),
+        )
+    )
+
+    def working(index: int, stop: bool) -> WorkingOrder:
+        return WorkingOrder(
+            perm_id=200 + index * 2 + int(stop),
+            client_id=17,
+            order_id=100 + index * 2 + int(stop),
+            key=snapshot.selected,
+            action="SELL",
+            order_type="STP" if stop else "LMT",
+            remaining=Decimal("1"),
+            status="Submitted",
+            oca_group=f"{fingerprint[:12]}/tranche-{index + 1}",
+        )
+
+    clean = replace(
+        snapshot,
+        captured_at=Decimal("2"),
+        position=replace(snapshot.position, quantity=Decimal("4")),
+        working_orders=tuple(
+            working(i, stop) for i in (1, 2, 3) for stop in (False, True)
+        ),
+        completed_orders_complete=True,
+        executions_complete=True,
+    )
+    with pytest.raises(ExecutionBlocked, match="still working"):
+        journal.confirm_cancelled_layer(clean, fingerprint, 1, confirmed_in_tws=True)
+    with pytest.raises(ExecutionBlocked, match="complete TWS"):
+        journal.confirm_cancelled_layer(
+            replace(clean, executions_complete=False),
+            fingerprint,
+            0,
+            confirmed_in_tws=True,
+        )
+    missing_fill = ObservedExecution(
+        exec_id="missing.01",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=200,
+        side="SLD",
+        quantity=Decimal("1"),
+        price=Decimal("2"),
+        time="20260925 12:00:00",
+    )
+    with pytest.raises(ExecutionBlocked, match="execution may belong"):
+        journal.confirm_cancelled_layer(
+            replace(clean, executions=(missing_fill,)),
+            fingerprint,
+            0,
+            confirmed_in_tws=True,
+        )
+    updated = journal.confirm_cancelled_layer(
+        clean, fingerprint, 0, confirmed_in_tws=True
+    )
+    assert updated.state == "RECONCILED"
+    assert [layer.cancelled for layer in updated.layers] == [True, False, False, False]
+    assert (
+        classify_journal_layer(
+            updated,
+            0,
+            active_perm_ids=frozenset(range(202, 208)),
+            observed_perm_ids=frozenset(range(202, 208)),
+        ).status
+        == "CANCELLED"
+    )
+    assert (
+        classify_journal_layer(
+            updated,
+            1,
+            active_perm_ids=frozenset(range(202, 208)),
+            observed_perm_ids=frozenset(range(202, 208)),
+        ).status
+        == "ACTIVE"
+    )
+    with pytest.raises(ExecutionBlocked, match="already cleared"):
+        journal.confirm_cancelled_layer(clean, fingerprint, 0, confirmed_in_tws=True)
+
+
 def test_dismiss_cancelled_layer_keeps_journal_and_rejects_working_leg(
     tmp_path,
 ) -> None:
@@ -2790,6 +2897,60 @@ def test_dismiss_cancelled_layer_keeps_journal_and_rejects_working_leg(
     assert journal.find(fingerprint) == hidden
     assert hidden.perm_ids == entry.perm_ids
     assert not journal._entries()[0].layers[0].hidden_from_workspace
+
+
+def test_dismiss_missing_layer_does_not_match_surviving_sibling_ids(tmp_path) -> None:
+    snapshot = _snapshot()
+    fingerprint = "b" * 64
+    layers = (
+        JournalLayer(1, "3.02", "1.89", "GTC", stop_perm_id=201, cancelled=True),
+        JournalLayer(1, "3.52", "1.89", "GTC", target_perm_id=202, stop_perm_id=203),
+        JournalLayer(1, "4.02", "1.89", "GTC", target_perm_id=204, stop_perm_id=205),
+        JournalLayer(1, "5.02", "1.89", "GTC", target_perm_id=206, stop_perm_id=207),
+    )
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal._write(
+        (
+            JournalEntry(
+                fingerprint=fingerprint,
+                account=snapshot.selected.account,
+                con_id=snapshot.selected.con_id,
+                state="PARTIALLY_RECONCILED",
+                expected_order_count=8,
+                snapshot_captured_at="1",
+                layers=layers,
+                order_ids=(102, 103, 104, 105, 106, 107),
+                perm_ids=(202, 203, 204, 205, 206, 207),
+            ),
+        )
+    )
+    sibling = WorkingOrder(
+        perm_id=202,
+        client_id=17,
+        order_id=102,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("1"),
+        status="Submitted",
+        oca_group=f"{fingerprint[:12]}/tranche-2",
+    )
+    refreshed = replace(snapshot, working_orders=(sibling,))
+    hidden = journal.dismiss_cancelled_layer(refreshed, fingerprint, "1", 0)
+    assert hidden.layers[0].hidden_from_workspace
+    assert not hidden.layers[1].hidden_from_workspace
+    with pytest.raises(ExecutionBlocked, match="working leg or fill"):
+        journal.dismiss_cancelled_layer(
+            replace(
+                refreshed,
+                working_orders=(
+                    replace(sibling, oca_group=f"{fingerprint[:12]}/tranche-1"),
+                ),
+            ),
+            fingerprint,
+            "1",
+            0,
+        )
 
 
 def test_cancelled_bracket_with_a_fill_cannot_be_rebuilt(tmp_path) -> None:

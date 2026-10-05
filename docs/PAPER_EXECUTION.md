@@ -348,8 +348,11 @@ operator must first confirm in TWS that neither leg is working or filled. The ap
 takes a fresh selected-contract snapshot and requires complete current and
 completed order reads, complete execution history, no matching working leg or
 execution, no conflicting completed status, and enough held quantity for the
-original plan. The dialog remains open if these checks fail. The journal records
-the confirmation and snapshot time. Sending
+selected layer. The row dialog displays only that layer's OCA pair, and confirmation
+marks only that layer cancelled in the journal. Sibling layers keep their prior
+working or filled state. An execution whose order identity cannot be attributed
+to a different pair blocks clearance. The dialog remains open if these checks fail.
+Sending
 the same draft again still requires a later clean snapshot; the confirmation
 alone never authorizes an order write.
 Final paper confirmation for new brackets, price updates, bracket cancellation,
@@ -385,6 +388,10 @@ leg or matching fill already visible in the current snapshot or journal. It
 does not require a new complete execution-history read for this display-only
 action. Repeated plans can share a fingerprint and OCA group, so the row action
 also carries the saved attempt capture time and checks that attempt's order IDs.
+For a partially reconciled submission, saved order ID lists contain only the
+surviving pairs; the trash check never treats their positions in that list as
+the missing layer's IDs. It uses exact layer permanent IDs and checks the
+layer's OCA group when one of those IDs is still unknown.
 The full journal entry,
 order IDs, and duplicate-submission history remain durable; a later conflicting
 broker outcome can make the layer visible again.

@@ -177,6 +177,7 @@ class StarUIWorkbench:
         self._armed_execution: PaperExecutionCandidate | None = None
         self._armed_execution_deadline: float | None = None
         self._recovery_requested_fingerprint: str | None = None
+        self._recovery_requested_layer_index: int | None = None
         self._armed_market_exit: MarketExitCandidate | None = None
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
         self._armed_cancellation: MarketExitCandidate | None = None
@@ -703,12 +704,18 @@ class StarUIWorkbench:
             elif action == "resolve-cancelled-bracket":
                 self._resolve_cancelled_bracket_locked(values)
             elif action.startswith("verify-cancelled-bracket:"):
-                self._recovery_requested_fingerprint = action.partition(":")[2]
+                identity = action.partition(":")[2]
+                fingerprint, _, index_text = identity.partition(":")
+                self._recovery_requested_fingerprint = fingerprint
+                self._recovery_requested_layer_index = (
+                    int(index_text) if index_text.isdecimal() else None
+                )
                 if (
                     self._cancelled_bracket_recovery(self._submission_outcomes())
                     is None
                 ):
                     self._recovery_requested_fingerprint = None
+                    self._recovery_requested_layer_index = None
                     self._message = (
                         "Bracket verification is unavailable; refresh the selected "
                         "position and try again."
@@ -769,6 +776,7 @@ class StarUIWorkbench:
             self._session_position_account = self._settings.account
         self._projection_comparison = None
         self._recovery_requested_fingerprint = None
+        self._recovery_requested_layer_index = None
         self._disarm_execution_locked()
         state = self._view_model.refresh_portfolio(self._settings)
         self._apply_refreshed_portfolio_locked(
@@ -1443,6 +1451,10 @@ class StarUIWorkbench:
             return
         fingerprint = values.get("fingerprint", "")
         self._recovery_requested_fingerprint = fingerprint
+        index_text = values.get("layer_index", "")
+        self._recovery_requested_layer_index = (
+            int(index_text) if index_text.isdecimal() else None
+        )
         state = self._view_model.select_position(
             self._selected_con_id, self._plan_form(())
         )
@@ -1464,8 +1476,12 @@ class StarUIWorkbench:
         self._announce_reconciliation_locked()
         outcomes = [
             outcome
-            for entry, _index, outcome in self._submission_outcomes()
+            for entry, index, outcome in self._submission_outcomes()
             if entry.fingerprint == fingerprint
+            and (
+                self._recovery_requested_layer_index is None
+                or index == self._recovery_requested_layer_index
+            )
         ]
         if (outcomes and all(outcome.status == "ACTIVE" for outcome in outcomes)) or (
             outcomes
@@ -1475,6 +1491,7 @@ class StarUIWorkbench:
             )
         ):
             self._recovery_requested_fingerprint = None
+            self._recovery_requested_layer_index = None
         else:
             self._message = (
                 "Bracket not verified: the fresh snapshot did not establish a "
@@ -1531,16 +1548,21 @@ class StarUIWorkbench:
             self._message = "Cancellation verification needs a fresh TWS snapshot."
             return
         try:
-            self._paper_execution.confirm_cancelled_unknown(
-                snapshot,
-                values.get("fingerprint", ""),
-                confirmed_in_tws=True,
-            )
+            index_text = values.get("layer_index", "")
+            if index_text.isdecimal():
+                self._paper_execution.confirm_cancelled_layer(
+                    snapshot,
+                    values.get("fingerprint", ""),
+                    int(index_text),
+                    confirmed_in_tws=True,
+                )
+            else:
+                raise ExecutionBlocked("select one bracket layer to verify")
         except ExecutionBlocked as error:
             self._message = f"Cancellation verification blocked: {error}"
             return
-        self._drafts[con_id] = ()
         self._recovery_requested_fingerprint = None
+        self._recovery_requested_layer_index = None
 
     def _dismiss_cancelled_layer_locked(self, action: str) -> None:
         if self._paper_execution is None or self._selected_con_id is None:
@@ -3856,11 +3878,13 @@ class StarUIWorkbench:
         ):
             return None
         requested = self._recovery_requested_fingerprint
+        requested_index = self._recovery_requested_layer_index
         entry = next(
             (
                 candidate
                 for candidate, _index, outcome in outcomes
                 if candidate.fingerprint == requested
+                and (requested_index is None or _index == requested_index)
                 and candidate.state
                 in {
                     "SUBMISSION_UNKNOWN",
@@ -3884,12 +3908,17 @@ class StarUIWorkbench:
             self._recovery_requested_fingerprint = None
             return None
         fingerprint = entry.fingerprint
+        if requested_index is None and len(entry.layers) != 1:
+            return None
+        selected_index = requested_index if requested_index is not None else 0
 
         return Div(
             Dialog(
                 DialogContent(
                     DialogHeader(
-                        DialogTitle("Verify bracket status"),
+                        DialogTitle(
+                            f"Verify layer {selected_index + 1} bracket status"
+                        ),
                         DialogDescription(
                             "Check both listed orders in TWS. Refresh to check for "
                             "working orders or fills. Only clear this layer if neither "
@@ -3933,6 +3962,7 @@ class StarUIWorkbench:
                                 cls="rounded-md border border-border p-4",
                             )
                             for index, layer in enumerate(entry.layers)
+                            if index == selected_index
                         ),
                         cls="grid max-h-[40vh] gap-3 overflow-y-auto",
                     ),
@@ -3974,6 +4004,9 @@ class StarUIWorkbench:
                             value="resolve-cancelled-bracket",
                         ),
                         HTMLInput(type="hidden", name="fingerprint", value=fingerprint),
+                        HTMLInput(
+                            type="hidden", name="layer_index", value=str(selected_index)
+                        ),
                         action=f"/{self.session_token}/action",
                         method="post",
                         id="bracket-clear-form",
@@ -3994,6 +4027,11 @@ class StarUIWorkbench:
                             HTMLInput(
                                 type="hidden", name="fingerprint", value=fingerprint
                             ),
+                            HTMLInput(
+                                type="hidden",
+                                name="layer_index",
+                                value=str(selected_index),
+                            ),
                             action=f"/{self.session_token}/action",
                             method="post",
                             id="bracket-refresh-form",
@@ -4001,7 +4039,7 @@ class StarUIWorkbench:
                         Div(
                             DialogClose("Cancel", variant="outline"),
                             Button(
-                                "Clear unverified bracket",
+                                f"Clear layer {selected_index + 1}",
                                 type="submit",
                                 form="bracket-clear-form",
                                 disabled=True,
@@ -4545,7 +4583,7 @@ class StarUIWorkbench:
                     size="icon",
                     type="submit",
                     name="action",
-                    value=f"verify-cancelled-bracket:{entry.fingerprint}",
+                    value=f"verify-cancelled-bracket:{entry.fingerprint}:{index}",
                     aria_label=f"Verify bracket status of layer {number}",
                     cls="relative z-[3] mt-5",
                 ),
