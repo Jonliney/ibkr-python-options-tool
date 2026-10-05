@@ -144,10 +144,16 @@ sends a single `STP LMT` leg
 with `auxPrice` as the stop trigger and `lmtPrice` as the limit, alongside the
 SELL LMT target in the same two-order OCA group. The writer rechecks price
 increments before connecting to TWS. For the documented index-option family,
-both legs retain the verified Outside RTH setting. An active STP LMT pair may
-be cancelled or selected for a market exit after the existing ownership and
-freshness checks; price amendments are blocked because changing its trigger
-without jointly reviewing the limit price could alter the intended cushion.
+both legs retain the verified Outside RTH setting. New STP LMT brackets save
+their dollar or percent offset on every journal layer. Active stop edits
+recalculate and review both the stop trigger and sell limit using that saved
+rule and the verified market rule. Moving all stops to break even keeps each
+layer's rule. Set all active stops can optionally replace the rule for the
+selected layers; the replacement is saved only after both prices are verified.
+Older brackets without a saved rule remain view-only for price amendments.
+The paper writer modifies the same app-owned order ID and checks both prices
+in TWS after the write. A multi-layer edit is not atomic; an uncertain or
+partial acknowledgement locks further management until reconciliation.
 As with every stop-limit order, reaching the trigger does not guarantee a fill.
 
 Verification commands for this stack are `.venv/bin/python -m pytest -q

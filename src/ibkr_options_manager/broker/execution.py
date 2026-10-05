@@ -647,6 +647,16 @@ class IbkrPaperExecutionBroker:
             for candidate in candidates
         ):
             raise ExecutionBlocked("a selected price update does not match TWS")
+        if any(
+            candidate.stop_price is not None
+            and candidate.layer.stop_order_type == "STP LMT"
+            and (
+                candidate.stop_limit_price is None
+                or candidate.prior_stop_limit_price is None
+            )
+            for candidate in candidates
+        ):
+            raise ExecutionBlocked("both stop-limit prices are required for amendment")
         selected_ids = {
             order_id
             for candidate in candidates
@@ -664,7 +674,9 @@ class IbkrPaperExecutionBroker:
             raise ExecutionBlocked("selected price amendments are ambiguous")
         imports = _load_ibapi()
 
-        expected: dict[int, tuple[str, Decimal, int]] = {}
+        expected: dict[
+            int, tuple[str, Decimal, int, Decimal | None, Decimal | None]
+        ] = {}
         from ibapi.const import UNSET_DOUBLE, UNSET_INTEGER
 
         for candidate in candidates:
@@ -673,12 +685,16 @@ class IbkrPaperExecutionBroker:
                     "LMT",
                     candidate.target_price,
                     candidate.layer.target_perm_id,
+                    candidate.prior_target_price,
+                    None,
                 )
             if candidate.stop_price is not None:
                 expected[candidate.layer.stop_order_id] = (
-                    "STP",
+                    candidate.layer.stop_order_type,
                     candidate.stop_price,
                     candidate.layer.stop_perm_id,
+                    candidate.prior_stop_price,
+                    candidate.stop_limit_price,
                 )
 
         attempt_id = uuid4().hex[:12]
@@ -689,7 +705,7 @@ class IbkrPaperExecutionBroker:
             client_id=client_id,
             expected={
                 order_id: {"type": kind, "price": str(price), "perm_id": perm_id}
-                for order_id, (kind, price, perm_id) in expected.items()
+                for order_id, (kind, price, perm_id, _prior, limit) in expected.items()
             },
         ):
             raise ExecutionBlocked("price update diagnostic file is unavailable")
@@ -723,7 +739,9 @@ class IbkrPaperExecutionBroker:
                 current_id = int(order_id)
                 if current_id not in expected:
                     return
-                order_type, price, expected_perm_id = expected[current_id]
+                order_type, price, expected_perm_id, _prior, limit = expected[
+                    current_id
+                ]
                 perm_id = int(getattr(order, "permId", 0) or 0)
                 received_type = str(getattr(order, "orderType", ""))
                 raw_price = (
@@ -760,7 +778,13 @@ class IbkrPaperExecutionBroker:
                     )
                     return
                 self.orders[current_id] = order
-                if received_price == price:
+                try:
+                    received_limit = Decimal(str(getattr(order, "lmtPrice", None)))
+                except (InvalidOperation, ValueError):
+                    received_limit = None
+                if received_price == price and (
+                    limit is None or received_limit == limit
+                ):
                     self.acks[current_id] = perm_id
 
             def openOrderEnd(self) -> None:
@@ -826,13 +850,43 @@ class IbkrPaperExecutionBroker:
                 raise ExecutionBlocked(
                     "selected app-owned OCA orders are no longer open"
                 )
+            for order_id, (kind, _price, _perm, prior, limit) in expected.items():
+                order = app.orders[order_id]
+                try:
+                    observed = Decimal(
+                        str(order.lmtPrice if kind == "LMT" else order.auxPrice)
+                    )
+                except (InvalidOperation, ValueError) as error:
+                    raise ExecutionBlocked(
+                        "selected OCA price is invalid before write"
+                    ) from error
+                if prior is not None and observed != prior:
+                    raise ExecutionBlocked("selected OCA price changed before write")
+                if kind == "STP LMT":
+                    candidate = next(
+                        item
+                        for item in candidates
+                        if item.layer.stop_order_id == order_id
+                    )
+                    try:
+                        prior_limit = Decimal(str(order.lmtPrice))
+                    except (InvalidOperation, ValueError):
+                        prior_limit = None
+                    if (
+                        candidate.prior_stop_limit_price is None
+                        or prior_limit != candidate.prior_stop_limit_price
+                        or limit is None
+                    ):
+                        raise ExecutionBlocked(
+                            "selected stop-limit price changed before write"
+                        )
             app.trace("prewrite_orders_verified", order_ids=sorted(app.orders))
 
             contract = _build_submission_contract(imports, snapshot)
             app.phase = "submit"
             for order_id in sorted(selected_ids):
                 order = app.orders[order_id]
-                order_type, price, _perm_id = expected[order_id]
+                order_type, price, _perm_id, _prior, limit = expected[order_id]
                 prior_price = (
                     getattr(order, "lmtPrice", None)
                     if order_type == "LMT"
@@ -843,6 +897,8 @@ class IbkrPaperExecutionBroker:
                     order.lmtPrice = float(price)
                 else:
                     order.auxPrice = float(price)
+                    if order_type == "STP LMT" and limit is not None:
+                        order.lmtPrice = float(limit)
                 # TWS may populate VOL-only fields on an openOrder callback
                 # even for a plain app-owned LMT/STP. Re-sending those values
                 # makes placeOrder fail validation with code 321.

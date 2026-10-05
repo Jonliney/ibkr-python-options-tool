@@ -544,6 +544,8 @@ def test_indeterminate_transport_outcome_is_durably_blocked_from_retry(
             port=7497,
             client_id=17,
             timeout_seconds=1,
+            stop_limit_offset=(Decimal("5") if stop_order_type == "STP LMT" else None),
+            stop_limit_unit="percent",
         )
 
     assert plan.fingerprint is not None
@@ -556,6 +558,8 @@ def test_indeterminate_transport_outcome_is_durably_blocked_from_retry(
             port=7497,
             client_id=17,
             timeout_seconds=1,
+            stop_limit_offset=(Decimal("5") if stop_order_type == "STP LMT" else None),
+            stop_limit_unit="percent",
         )
     assert transport.calls == 1
 
@@ -1793,7 +1797,7 @@ def test_active_stop_limit_pair_can_be_selected_for_cancel_but_not_price_amendme
         )
         != candidate
     )
-    with pytest.raises(ExecutionBlocked, match="active STP LMT price changes"):
+    with pytest.raises(ExecutionBlocked, match="no saved offset rule"):
         service.prepare_price_updates(
             active,
             updates=(
@@ -1805,6 +1809,217 @@ def test_active_stop_limit_pair_can_be_selected_for_cancel_but_not_price_amendme
             ),
             expected_client_id=17,
         )
+
+
+def test_new_stop_limit_layer_saves_rule_and_amends_both_prices(tmp_path) -> None:
+    snapshot = _snapshot()
+    plan = _plan(snapshot, stop_order_type="STP LMT")
+    assert plan.fingerprint is not None
+    journal = ExecutionJournal(tmp_path / "journal.json")
+    journal.begin(
+        snapshot,
+        plan,
+        stop_limit_offset=Decimal("5"),
+        stop_limit_unit="percent",
+    )
+    journal.record_submission(
+        plan.fingerprint, order_ids=(101, 102), perm_ids=(201, 202)
+    )
+    group = f"{plan.fingerprint[:12]}/tranche-1"
+    target = WorkingOrder(
+        201,
+        17,
+        101,
+        snapshot.selected,
+        "SELL",
+        "LMT",
+        Decimal("2"),
+        "Submitted",
+        oca_group=group,
+        limit_price=Decimal("1.20"),
+        tif="GTC",
+    )
+    stop = replace(
+        target,
+        perm_id=202,
+        order_id=102,
+        order_type="STP LMT",
+        stop_price=Decimal("0.75"),
+        limit_price=Decimal("0.70"),
+    )
+    active = replace(snapshot, working_orders=(target, stop))
+    service = PaperExecutionService(_RecordingTransport(), journal)
+    layer = service.prepare_market_exit(
+        active, target_perm_id=201, expected_client_id=17
+    )
+    assert service.stop_limit_rule(active, layer) == (Decimal("5"), "percent")
+    retained = PriceUpdateCandidate(
+        layer=layer,
+        stop_price=Decimal("0.85"),
+        stop_limit_price=Decimal("0.80"),
+        prior_stop_price=Decimal("0.75"),
+        prior_stop_limit_price=Decimal("0.70"),
+    )
+    assert service.prepare_price_updates(
+        active, updates=(retained,), expected_client_id=17
+    ) == (retained,)
+    with pytest.raises(ExecutionBlocked, match="does not match"):
+        service.prepare_price_updates(
+            active,
+            updates=(replace(retained, stop_limit_price=Decimal("0.75")),),
+            expected_client_id=17,
+        )
+    with pytest.raises(ExecutionBlocked, match="invalid stop-limit offset"):
+        service.prepare_price_updates(
+            active,
+            updates=(
+                replace(
+                    retained,
+                    stop_limit_offset=Decimal("0"),
+                    stop_limit_unit="dollars",
+                ),
+            ),
+            expected_client_id=17,
+        )
+    overridden = replace(
+        retained,
+        stop_limit_price=Decimal("0.75"),
+        stop_limit_offset=Decimal("0.10"),
+        stop_limit_unit="dollars",
+    )
+    assert service.prepare_price_updates(
+        active, updates=(overridden,), expected_client_id=17
+    ) == (overridden,)
+    offset_only = replace(
+        overridden,
+        stop_price=Decimal("0.75"),
+        stop_limit_price=Decimal("0.65"),
+    )
+    assert service.prepare_price_updates(
+        active, updates=(offset_only,), expected_client_id=17
+    ) == (offset_only,)
+    service.record_verified_price_updates(active, (overridden,), {201: ("20", "-15")})
+    saved = journal.find(plan.fingerprint)
+    assert saved is not None
+    assert saved.layers[0].stop_limit_price == "0.75"
+    assert saved.layers[0].stop_limit_offset == "0.10"
+    assert saved.layers[0].stop_limit_unit == "dollars"
+
+
+@pytest.mark.parametrize(("post_limit", "confirmed"), [(0.80, True), (0.70, False)])
+def test_paper_broker_amends_and_verifies_both_stop_limit_prices(
+    monkeypatch, tmp_path, post_limit: float, confirmed: bool
+) -> None:
+    from ibkr_options_manager.broker import execution as broker_execution
+
+    monkeypatch.setenv(
+        "IBKR_OPTIONS_MANAGER_PRICE_TRACE", str(tmp_path / "price-amendments.jsonl")
+    )
+    writes: list[tuple[int, float, float, bool]] = []
+
+    class FakeWrapper:
+        def __init__(self) -> None:
+            pass
+
+    class FakeClient:
+        def __init__(self, wrapper) -> None:
+            self.wrapper = wrapper
+            self.connected = False
+            self.open_requests = 0
+
+        def connect(self, *_args) -> None:
+            self.connected = True
+            self.wrapper.nextValidId(500)
+
+        def isConnected(self) -> bool:
+            return self.connected
+
+        def disconnect(self) -> None:
+            self.connected = False
+
+        def run(self) -> None:
+            pass
+
+        def _emit(self, trigger: float, limit: float) -> None:
+            self.wrapper.openOrder(
+                102,
+                None,
+                SimpleNamespace(
+                    permId=202,
+                    action="SELL",
+                    orderType="STP LMT",
+                    auxPrice=trigger,
+                    lmtPrice=limit,
+                    transmit=True,
+                    volatility=0.0,
+                    volatilityType=1,
+                ),
+                SimpleNamespace(status="Submitted"),
+            )
+
+        def reqOpenOrders(self) -> None:
+            self.open_requests += 1
+            self._emit(
+                0.75 if self.open_requests == 1 else 0.85,
+                0.70 if self.open_requests == 1 else post_limit,
+            )
+            self.wrapper.openOrderEnd()
+
+        def placeOrder(self, order_id, _contract, order) -> None:
+            writes.append((order_id, order.auxPrice, order.lmtPrice, order.transmit))
+            self.wrapper.openOrder(
+                order_id, None, order, SimpleNamespace(status="Submitted")
+            )
+
+    monkeypatch.setattr(
+        broker_execution,
+        "_load_ibapi",
+        lambda: _IbapiImports(
+            FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace
+        ),
+    )
+    snapshot = _snapshot()
+    layer = MarketExitCandidate(
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        target_order_id=101,
+        target_perm_id=201,
+        client_id=17,
+        quantity=Decimal("2"),
+        tif="GTC",
+        oca_group="app/tranche-1",
+        stop_order_id=102,
+        stop_perm_id=202,
+        stop_order_type="STP LMT",
+        stop_price=Decimal("0.75"),
+        stop_limit_price=Decimal("0.70"),
+    )
+    update = PriceUpdateCandidate(
+        layer=layer,
+        stop_price=Decimal("0.85"),
+        stop_limit_price=Decimal("0.80"),
+        prior_stop_price=Decimal("0.75"),
+        prior_stop_limit_price=Decimal("0.70"),
+    )
+
+    def amend() -> PaperSubmission:
+        return IbkrPaperExecutionBroker().modify_prices(
+            snapshot,
+            (update,),
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+
+    if confirmed:
+        receipt = amend()
+        assert receipt.order_ids == (102,)
+        assert receipt.perm_ids == (202,)
+    else:
+        with pytest.raises(ExecutionOutcomeUnknown, match="post-update"):
+            amend()
+    assert writes == [(102, 0.85, 0.80, True)]
 
 
 def test_stop_limit_partial_fill_remains_a_review_state() -> None:

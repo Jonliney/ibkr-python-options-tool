@@ -20,6 +20,7 @@ from .domain import (
     WorkingOrder,
     closing_order_allocation,
     round_up_price,
+    stop_limit_price,
     supports_outside_rth,
 )
 
@@ -46,6 +47,8 @@ class JournalLayer:
     hidden_from_workspace: bool = False
     stop_order_type: str = "STP"
     stop_limit_price: str = ""
+    stop_limit_offset: str = ""
+    stop_limit_unit: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +246,10 @@ class PriceUpdateCandidate:
     stop_price: Decimal | None = None
     prior_target_price: Decimal | None = None
     prior_stop_price: Decimal | None = None
+    stop_limit_price: Decimal | None = None
+    prior_stop_limit_price: Decimal | None = None
+    stop_limit_offset: Decimal | None = None
+    stop_limit_unit: str = ""
 
 
 @runtime_checkable
@@ -526,10 +533,39 @@ class ExecutionJournal:
         self._write(tuple(entries))
         return updated
 
-    def begin(self, snapshot: BrokerSnapshot, plan: PlanResult) -> JournalEntry:
+    def begin(
+        self,
+        snapshot: BrokerSnapshot,
+        plan: PlanResult,
+        *,
+        stop_limit_offset: Decimal | None = None,
+        stop_limit_unit: str = "",
+    ) -> JournalEntry:
         fingerprint = plan.fingerprint
         if plan.status is not PlanStatus.VALID or fingerprint is None:
             raise ExecutionBlocked("only a valid, fingerprinted plan may be sent")
+        if stop_limit_offset is not None and any(
+            pair.stop.order_type == "STP LMT" for pair in plan.pairs
+        ):
+            if stop_limit_unit not in {"percent", "dollars"}:
+                raise ExecutionBlocked("a new STP LMT bracket needs its offset rule")
+            try:
+                for pair in plan.pairs:
+                    if (
+                        pair.stop.order_type == "STP LMT"
+                        and stop_limit_price(
+                            pair.stop.rounded_price,
+                            stop_limit_offset,
+                            stop_limit_unit,
+                            snapshot.market_rule.bands,
+                        )
+                        != pair.stop.limit_price
+                    ):
+                        raise ExecutionBlocked(
+                            "STP LMT rule differs from the reviewed plan"
+                        )
+            except ValueError as error:
+                raise ExecutionBlocked(str(error)) from error
         if self.unresolved_management_entries(
             account=snapshot.selected.account, con_id=snapshot.selected.con_id
         ):
@@ -596,6 +632,15 @@ class ExecutionJournal:
                         format(pair.stop.limit_price, "f")
                         if pair.stop.limit_price is not None
                         else ""
+                    ),
+                    stop_limit_offset=(
+                        format(stop_limit_offset, "f")
+                        if pair.stop.order_type == "STP LMT"
+                        and stop_limit_offset is not None
+                        else ""
+                    ),
+                    stop_limit_unit=(
+                        stop_limit_unit if pair.stop.order_type == "STP LMT" else ""
                     ),
                     target_percentage=format(pair.target_percentage, "f"),
                     stop_percentage=(
@@ -1040,6 +1085,13 @@ class ExecutionJournal:
                         stop_price=format(update.stop_price, "f")
                         if update.stop_price is not None
                         else layer.stop_price,
+                        stop_limit_price=format(update.stop_limit_price, "f")
+                        if update.stop_limit_price is not None
+                        else layer.stop_limit_price,
+                        stop_limit_offset=format(update.stop_limit_offset, "f")
+                        if update.stop_limit_offset is not None
+                        else layer.stop_limit_offset,
+                        stop_limit_unit=update.stop_limit_unit or layer.stop_limit_unit,
                         target_percentage=target_percent
                         if update.target_price is not None
                         else layer.target_percentage,
@@ -1098,6 +1150,38 @@ class ExecutionJournal:
         layers[layer_index] = replace(layers[layer_index], cancelled=True)
         entries[entry_index] = replace(entry, layers=tuple(layers))
         self._write(tuple(entries))
+
+    def stop_limit_rule(
+        self, *, account: str, con_id: int, target_perm_id: int, stop_perm_id: int
+    ) -> tuple[Decimal, str] | None:
+        """Return only a rule saved for the exact app-owned bracket layer."""
+        matches = [
+            layer
+            for entry in self._entries()
+            if entry.account == account
+            and entry.con_id == con_id
+            and entry.state in {"SUBMITTED", "RECONCILED", "PARTIALLY_RECONCILED"}
+            for layer in entry.layers
+            if layer.target_perm_id == target_perm_id
+            and layer.stop_perm_id == stop_perm_id
+        ]
+        if len(matches) != 1 or not matches[0].stop_limit_offset:
+            return None
+        layer = matches[0]
+        if layer.stop_order_type != "STP LMT" or layer.stop_limit_unit not in {
+            "percent",
+            "dollars",
+        }:
+            return None
+        try:
+            offset = Decimal(layer.stop_limit_offset)
+        except InvalidOperation:
+            return None
+        return (
+            (offset, layer.stop_limit_unit)
+            if offset.is_finite() and offset > 0
+            else None
+        )
 
     def mark_unknown(self, fingerprint: str) -> JournalEntry:
         """Record an indeterminate outcome; never retry it automatically."""
@@ -1383,6 +1467,8 @@ class ExecutionJournal:
                             tif=str(layer["tif"]),
                             stop_order_type=str(layer.get("stop_order_type", "STP")),
                             stop_limit_price=str(layer.get("stop_limit_price", "")),
+                            stop_limit_offset=str(layer.get("stop_limit_offset", "")),
+                            stop_limit_unit=str(layer.get("stop_limit_unit", "")),
                             target_perm_id=int(layer.get("target_perm_id", 0)),
                             stop_perm_id=int(layer.get("stop_perm_id", 0)),
                             target_percentage=str(layer.get("target_percentage", "")),
@@ -1548,12 +1634,24 @@ class PaperExecutionService:
         port: int,
         client_id: int,
         timeout_seconds: float,
+        stop_limit_offset: Decimal | None = None,
+        stop_limit_unit: str = "",
     ) -> SubmissionReceipt:
         require_paper_execution_snapshot(
             snapshot,
             plan,
         )
-        entry = self._journal.begin(snapshot, plan)
+        if (
+            any(pair.stop.order_type == "STP LMT" for pair in plan.pairs)
+            and stop_limit_offset is None
+        ):
+            raise ExecutionBlocked("a new STP LMT bracket needs its offset rule")
+        entry = self._journal.begin(
+            snapshot,
+            plan,
+            stop_limit_offset=stop_limit_offset,
+            stop_limit_unit=stop_limit_unit,
+        )
         submission_plan = plan
         if entry.oca_prefix:
             submission_plan = replace(
@@ -1783,6 +1881,26 @@ class PaperExecutionService:
             )
         return candidates
 
+    def stop_limit_rule(
+        self, snapshot: BrokerSnapshot, layer: MarketExitCandidate
+    ) -> tuple[Decimal, str] | None:
+        return self._journal.stop_limit_rule(
+            account=snapshot.selected.account,
+            con_id=snapshot.selected.con_id,
+            target_perm_id=layer.target_perm_id,
+            stop_perm_id=layer.stop_perm_id,
+        )
+
+    def saved_stop_limit_rule(
+        self, *, account: str, con_id: int, target_perm_id: int, stop_perm_id: int
+    ) -> tuple[Decimal, str] | None:
+        return self._journal.stop_limit_rule(
+            account=account,
+            con_id=con_id,
+            target_perm_id=target_perm_id,
+            stop_perm_id=stop_perm_id,
+        )
+
     def prepare_price_updates(
         self,
         snapshot: BrokerSnapshot,
@@ -1812,10 +1930,45 @@ class PaperExecutionService:
             if target is None or stop is None:
                 raise ExecutionBlocked("the selected OCA layer is no longer complete")
             if stop.order_type == "STP LMT":
-                raise ExecutionBlocked(
-                    "active STP LMT price changes are not supported; "
-                    "cancel and recreate the bracket"
-                )
+                rule = self.stop_limit_rule(snapshot, update.layer)
+                if rule is None:
+                    raise ExecutionBlocked(
+                        "this STP LMT layer has no saved offset rule"
+                    )
+                if update.stop_limit_offset is not None and not update.stop_limit_unit:
+                    raise ExecutionBlocked("a new stop-limit offset needs its unit")
+                if update.stop_limit_unit and update.stop_limit_offset is None:
+                    raise ExecutionBlocked("a new stop-limit unit needs its offset")
+                if update.stop_limit_offset is not None and update.stop_price is None:
+                    raise ExecutionBlocked("stop-limit rule needs a stop amendment")
+                if update.stop_price is not None:
+                    offset = (
+                        update.stop_limit_offset
+                        if update.stop_limit_offset is not None
+                        else rule[0]
+                    )
+                    unit = update.stop_limit_unit or rule[1]
+                    try:
+                        computed_limit = stop_limit_price(
+                            update.stop_price, offset, unit, snapshot.market_rule.bands
+                        )
+                    except ValueError as error:
+                        raise ExecutionBlocked(str(error)) from error
+                    if update.stop_limit_price != computed_limit:
+                        raise ExecutionBlocked(
+                            "stop-limit price does not match its saved rule"
+                        )
+                    if update.prior_stop_limit_price != stop.limit_price:
+                        raise ExecutionBlocked("stop-limit price changed since review")
+                elif update.stop_limit_price is not None:
+                    raise ExecutionBlocked(
+                        "stop-limit price requires a stop trigger update"
+                    )
+            elif (
+                update.stop_limit_price is not None
+                or update.stop_limit_offset is not None
+            ):
+                raise ExecutionBlocked("a plain stop cannot have a stop-limit offset")
             if (
                 update.prior_target_price is not None
                 and target.limit_price != update.prior_target_price
@@ -1827,6 +1980,12 @@ class PaperExecutionService:
             for price in (update.target_price, update.stop_price):
                 if price is not None and (not price.is_finite() or price <= 0):
                     raise ExecutionBlocked("updated prices must be positive and finite")
+            if (
+                update.stop_price is not None
+                and round_up_price(update.stop_price, snapshot.market_rule.bands)
+                != update.stop_price
+            ):
+                raise ExecutionBlocked("updated stop is not on a valid price increment")
             if update.target_price is None and update.stop_price is None:
                 raise ExecutionBlocked("each selected layer needs a price change")
             validated.append(update)
@@ -1836,20 +1995,30 @@ class PaperExecutionService:
     def _price_update_material(
         updates: tuple[PriceUpdateCandidate, ...],
     ) -> tuple[object, ...]:
-        return tuple(
-            value
-            for update in updates
-            for value in (
-                update.layer.target_order_id,
-                update.layer.target_perm_id,
-                update.prior_target_price,
-                update.target_price,
-                update.layer.stop_order_id,
-                update.layer.stop_perm_id,
-                update.prior_stop_price,
-                update.stop_price,
+        material: list[object] = []
+        for update in updates:
+            material.extend(
+                (
+                    update.layer.target_order_id,
+                    update.layer.target_perm_id,
+                    update.prior_target_price,
+                    update.target_price,
+                    update.layer.stop_order_id,
+                    update.layer.stop_perm_id,
+                    update.prior_stop_price,
+                    update.stop_price,
+                )
             )
-        )
+            if update.layer.stop_order_type == "STP LMT":
+                material.extend(
+                    (
+                        update.prior_stop_limit_price,
+                        update.stop_limit_price,
+                        update.stop_limit_offset,
+                        update.stop_limit_unit,
+                    )
+                )
+        return tuple(material)
 
     def price_update_attempt_state(
         self, snapshot: BrokerSnapshot, updates: tuple[PriceUpdateCandidate, ...]

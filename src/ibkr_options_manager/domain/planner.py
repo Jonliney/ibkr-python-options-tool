@@ -196,6 +196,19 @@ def round_up_price(value: Decimal, bands: tuple[PriceBand, ...]) -> Decimal:
     return _round_up(value, bands)
 
 
+def stop_limit_price(
+    stop_price: Decimal, offset: Decimal, unit: str, bands: tuple[PriceBand, ...]
+) -> Decimal:
+    """Price a sell stop-limit cushion on the verified market rule."""
+    if unit not in {"percent", "dollars"} or not offset.is_finite() or offset <= 0:
+        raise ValueError("invalid stop-limit offset")
+    if unit == "percent" and offset >= 100:
+        raise ValueError("stop-limit percent offset must be below 100")
+    if round_up_price(stop_price, bands) != stop_price:
+        raise ValueError("stop trigger is not on a valid price increment")
+    return _stop_limit_price(stop_price, offset, unit, bands)
+
+
 def _stop_limit_price(
     stop_price: Decimal,
     offset: Decimal,

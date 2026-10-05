@@ -45,6 +45,7 @@ from ...domain import (
     VerifiedOptionContract,
     preview_reference_prices,
     round_up_price,
+    stop_limit_price,
 )
 from ...domain.outcome import ExitScenario, PositionOutcome, project_position_outcome
 from ...execution import (
@@ -191,7 +192,7 @@ class StarUIWorkbench:
         # value until the broker snapshot catches up; execution still always
         # re-verifies the broker snapshot rather than trusting this display.
         self._pending_active_prices: dict[
-            int, tuple[Decimal | None, int, Decimal | None]
+            int, tuple[Decimal | None, int, Decimal | None, Decimal | None]
         ] = {}
         self._preferred_con_id = initial_con_id
         self._selected_con_id: int | None = None
@@ -283,7 +284,9 @@ class StarUIWorkbench:
             settings = self._settings
             if not settings.account.strip().upper().startswith("DU"):
                 self._launch_connection = "failed"
-                self._launch_account_error = "Enter your paper account ID (starts with DU)."
+                self._launch_account_error = (
+                    "Enter your paper account ID (starts with DU)."
+                )
                 return
             self._launch_connection = "connecting"
             self._launch_account_error = ""
@@ -527,7 +530,9 @@ class StarUIWorkbench:
             if not account.upper().startswith("DU"):
                 with self._lock:
                     self._launch_connection = "failed"
-                    self._launch_account_error = "Enter your paper account ID (starts with DU)."
+                    self._launch_account_error = (
+                        "Enter your paper account ID (starts with DU)."
+                    )
                     return self._page()
             with self._lock:
                 if account != self._settings.account:
@@ -1078,6 +1083,12 @@ class StarUIWorkbench:
                 port=candidate.selection.port,
                 client_id=candidate.selection.client_id,
                 timeout_seconds=candidate.selection.timeout_seconds,
+                stop_limit_offset=(
+                    Decimal(self._stop_configuration()[1])
+                    if self._stop_configuration()[0] == "STP LMT"
+                    else None
+                ),
+                stop_limit_unit=self._stop_configuration()[2],
             )
         except ExecutionOutcomeUnknown as error:
             self._drafts.pop(candidate.selection.con_id, None)
@@ -1778,6 +1789,55 @@ class StarUIWorkbench:
                         or (),
                     )
                 )
+                next_stop = (
+                    desired_stop
+                    if exact_stop_text and desired_stop != stop.stop_price
+                    else _edited_active_price(
+                        stop.stop_price, desired_stop, stop_percentage, shown_stop
+                    )
+                )
+                saved_rule = (
+                    self._paper_execution.stop_limit_rule(snapshot, layer)
+                    if stop.order_type == "STP LMT"
+                    else None
+                )
+                override_text = values.get(
+                    f"active_stop_limit_offset_{layer.target_perm_id}", ""
+                )
+                override_offset = (
+                    _decimal_value(override_text) if override_text else None
+                )
+                if override_text and override_offset is None:
+                    raise ExecutionBlocked("new stop-limit offset is invalid")
+                override_unit = values.get(
+                    f"active_stop_limit_unit_{layer.target_perm_id}", ""
+                )
+                if (
+                    stop.order_type == "STP LMT"
+                    and saved_rule is not None
+                    and override_offset is not None
+                    and (
+                        override_offset != saved_rule[0]
+                        or (override_unit or saved_rule[1]) != saved_rule[1]
+                    )
+                    and next_stop is None
+                ):
+                    next_stop = stop.stop_price
+                if next_stop is not None and stop.order_type == "STP LMT":
+                    if saved_rule is None:
+                        raise ExecutionBlocked(
+                            "this STP LMT layer has no saved offset rule"
+                        )
+                    next_limit = stop_limit_price(
+                        next_stop,
+                        override_offset
+                        if override_offset is not None
+                        else saved_rule[0],
+                        override_unit or saved_rule[1],
+                        calculator.bands,
+                    )
+                else:
+                    next_limit = None
                 updates.append(
                     PriceUpdateCandidate(
                         layer=layer,
@@ -1789,18 +1849,17 @@ class StarUIWorkbench:
                                 shown_target,
                             )
                         ),
-                        stop_price=(
-                            desired_stop
-                            if exact_stop_text and desired_stop != stop.stop_price
-                            else _edited_active_price(
-                                stop.stop_price,
-                                desired_stop,
-                                stop_percentage,
-                                shown_stop,
-                            )
-                        ),
+                        stop_price=next_stop,
                         prior_target_price=target.limit_price,
                         prior_stop_price=stop.stop_price,
+                        prior_stop_limit_price=(
+                            stop.limit_price if stop.order_type == "STP LMT" else None
+                        ),
+                        stop_limit_price=next_limit,
+                        stop_limit_offset=override_offset
+                        if next_stop is not None
+                        else None,
+                        stop_limit_unit=override_unit if next_stop is not None else "",
                     )
                 )
             changes = tuple(
@@ -1999,6 +2058,7 @@ class StarUIWorkbench:
                     stop_perm_id=update.layer.stop_perm_id,
                     target_price=update.target_price,
                     stop_price=update.stop_price,
+                    stop_limit_price=update.stop_limit_price,
                 )
             refresh_succeeded = self._refresh_after_acknowledged_write_locked(
                 f"{'Simulated broker' if self._demo_mode else 'TWS'} acknowledged "
@@ -2079,15 +2139,19 @@ class StarUIWorkbench:
         stop_perm_id: int,
         target_price: Decimal | None,
         stop_price: Decimal | None,
+        stop_limit_price: Decimal | None = None,
     ) -> None:
         """Retain a TWS-acknowledged amendment through one lagging snapshot."""
-        if target_price is None and stop_price is None:
+        if target_price is None and stop_price is None and stop_limit_price is None:
             return
         prior = self._pending_active_prices.get(target_perm_id)
         self._pending_active_prices[target_perm_id] = (
             target_price if target_price is not None else (prior[0] if prior else None),
             stop_perm_id,
             stop_price if stop_price is not None else (prior[2] if prior else None),
+            stop_limit_price
+            if stop_limit_price is not None
+            else (prior[3] if prior else None),
         )
 
     def _reconcile_pending_active_prices_locked(self) -> None:
@@ -2095,11 +2159,14 @@ class StarUIWorkbench:
         if not self._pending_active_prices:
             return
         orders_by_perm = {order.perm_id: order for order in self._state.working_orders}
-        pending: dict[int, tuple[Decimal | None, int, Decimal | None]] = {}
+        pending: dict[
+            int, tuple[Decimal | None, int, Decimal | None, Decimal | None]
+        ] = {}
         for target_perm_id, (
             target_price,
             stop_perm_id,
             stop_price,
+            pending_stop_limit_price,
         ) in self._pending_active_prices.items():
             target = orders_by_perm.get(target_perm_id)
             stop = orders_by_perm.get(stop_perm_id)
@@ -2115,11 +2182,21 @@ class StarUIWorkbench:
                 if stop_price is not None and stop.stop_price != stop_price
                 else None
             )
-            if unresolved_target is not None or unresolved_stop is not None:
+            unresolved_limit = (
+                pending_stop_limit_price
+                if pending_stop_limit_price is not None
+                and stop.limit_price != pending_stop_limit_price
+                else None
+            )
+            if any(
+                price is not None
+                for price in (unresolved_target, unresolved_stop, unresolved_limit)
+            ):
                 pending[target_perm_id] = (
                     unresolved_target,
                     stop_perm_id,
                     unresolved_stop,
+                    unresolved_limit,
                 )
         self._pending_active_prices = pending
 
@@ -3606,21 +3683,13 @@ class StarUIWorkbench:
                                     aria_label="Move all active stops to B/E",
                                     disabled=self._paper_execution is None
                                     or bool(self._armed_price_updates)
-                                    or any(
-                                        stop.order_type == "STP LMT"
-                                        for _group, _target, stop in active_pairs
+                                    or not self._active_stop_limits_editable(
+                                        active_pairs
                                     ),
                                 ),
                                 delay_duration=250,
                             ),
-                            TooltipContent(
-                                "STP LMT prices are view-only; cancel and recreate the bracket to change them."
-                                if any(
-                                    stop.order_type == "STP LMT"
-                                    for _group, _target, stop in active_pairs
-                                )
-                                else "Move every active stop to break even"
-                            ),
+                            TooltipContent("Move every active stop to break even"),
                         ),
                         Tooltip(
                             TooltipTrigger(
@@ -4036,7 +4105,7 @@ class StarUIWorkbench:
                         aria_label="Set all active stops",
                         disabled=self._paper_execution is None
                         or bool(self._armed_price_updates)
-                        or has_stop_limit,
+                        or not self._active_stop_limits_editable(pairs),
                         data_on_click=evt.currentTarget.blur(),
                     ),
                     DialogContent(
@@ -4111,6 +4180,42 @@ class StarUIWorkbench:
                             cls="flex flex-wrap gap-2",
                         ),
                         Div(
+                            Label(
+                                HTMLInput(
+                                    type="checkbox", data_stop_limit_override=True
+                                ),
+                                " Use a new STP LMT offset for these layers",
+                                cls="flex items-center gap-2 text-sm",
+                            ),
+                            Div(
+                                Input(
+                                    type="number",
+                                    min="0",
+                                    step="any",
+                                    value="5",
+                                    data_stop_limit_override_value=True,
+                                    aria_label="New stop-limit offset",
+                                    cls="w-24",
+                                ),
+                                ToggleGroup(
+                                    ToggleGroupItem("%", value="percent"),
+                                    ToggleGroupItem("$", value="dollars"),
+                                    type="single",
+                                    value="percent",
+                                    variant="outline",
+                                    size="default",
+                                    data_stop_limit_override_group=True,
+                                    aria_label="New stop-limit offset unit",
+                                ),
+                                cls="mt-2 flex items-center gap-2",
+                            ),
+                            Span(
+                                "Leave unchecked to keep each layer's saved offset rule.",
+                                cls="text-xs text-muted-foreground",
+                            ),
+                            cls="space-y-1" if has_stop_limit else "hidden",
+                        ),
+                        Div(
                             Div(
                                 Span(
                                     "Active layers", cls="text-xs text-muted-foreground"
@@ -4166,11 +4271,31 @@ class StarUIWorkbench:
                 delay_duration=250,
             ),
             TooltipContent(
-                "STP LMT prices are view-only; cancel and recreate the bracket to change them."
-                if has_stop_limit
+                "Older STP LMT layers have no saved offset rule"
+                if not self._active_stop_limits_editable(pairs)
                 else "Set every active stop to one price"
             ),
         )
+
+    def _active_stop_limits_editable(
+        self, pairs: tuple[tuple[str, Any, Any], ...]
+    ) -> bool:
+        lookup = getattr(self._paper_execution, "saved_stop_limit_rule", None)
+        for _group, target, stop in pairs:
+            if stop.order_type != "STP LMT":
+                continue
+            if (
+                not callable(lookup)
+                or lookup(
+                    account=self._verified_selected_account(),
+                    con_id=self._selected_con_id or 0,
+                    target_perm_id=target.perm_id,
+                    stop_perm_id=stop.perm_id,
+                )
+                is None
+            ):
+                return False
+        return True
 
     def _active_oca_pairs(self) -> tuple[tuple[str, Any, Any], ...]:
         """Return complete LMT/STP pairs that the journal proves are app-owned."""
@@ -4631,12 +4756,26 @@ class StarUIWorkbench:
     def _active_layer_row(self, index: int, group: str, target: Any, stop: Any) -> Any:
         calculator = self._state.quote_calculator
         bands = calculator.bands if calculator is not None else ()
+        rule_lookup = getattr(self._paper_execution, "saved_stop_limit_rule", None)
+        saved_rule = (
+            rule_lookup(
+                account=self._verified_selected_account(),
+                con_id=self._selected_con_id or 0,
+                target_perm_id=target.perm_id,
+                stop_perm_id=stop.perm_id,
+            )
+            if callable(rule_lookup) and stop.order_type == "STP LMT"
+            else None
+        )
         pending = self._pending_active_prices.get(target.perm_id)
         display_target_price = (
             pending[0] if pending and pending[0] is not None else target.limit_price
         )
         display_stop_price = (
             pending[2] if pending and pending[2] is not None else stop.stop_price
+        )
+        display_stop_limit_price = (
+            pending[3] if pending and pending[3] is not None else stop.limit_price
         )
         target_percentage = _active_percentage_for_price(
             display_target_price,
@@ -4677,7 +4816,7 @@ class StarUIWorkbench:
                     min="0.1",
                     step="0.1",
                     disabled=bool(self._armed_price_updates)
-                    or stop.order_type == "STP LMT",
+                    or (stop.order_type == "STP LMT" and saved_rule is None),
                     data_active_input="target",
                     data_active_perm_id=target.perm_id,
                     data_active_original=display_target_price,
@@ -4704,12 +4843,18 @@ class StarUIWorkbench:
                         min="-99.9",
                         step="any",
                         disabled=bool(self._armed_price_updates)
-                        or stop.order_type == "STP LMT",
+                        or (stop.order_type == "STP LMT" and saved_rule is None),
                         data_active_input="stop",
                         data_active_perm_id=target.perm_id,
                         data_active_original=display_stop_price,
-                        data_active_stop_limit_price=stop.limit_price
+                        data_active_stop_limit_price=display_stop_limit_price
                         if stop.order_type == "STP LMT"
+                        else None,
+                        data_active_stop_limit_offset=saved_rule[0]
+                        if saved_rule
+                        else None,
+                        data_active_stop_limit_unit=saved_rule[1]
+                        if saved_rule
                         else None,
                         data_active_initial=initial_stop_percentage,
                         data_live_layer=index,
@@ -4721,11 +4866,23 @@ class StarUIWorkbench:
                         value="",
                         data_active_exact_stop=target.perm_id,
                     ),
+                    HTMLInput(
+                        type="hidden",
+                        name=f"active_stop_limit_offset_{target.perm_id}",
+                        value="",
+                        data_active_stop_limit_offset=target.perm_id,
+                    ),
+                    HTMLInput(
+                        type="hidden",
+                        name=f"active_stop_limit_unit_{target.perm_id}",
+                        value="",
+                        data_active_stop_limit_unit=target.perm_id,
+                    ),
                 ),
                 input_id=f"active-stop-{index}",
                 price=(
                     _price_text(display_stop_price)
-                    + f" (LMT ${_price_text(stop.limit_price)})"
+                    + f" (LMT ${_price_text(display_stop_limit_price)})"
                     if stop.order_type == "STP LMT"
                     else _price_text(display_stop_price)
                 ),
@@ -6163,7 +6320,9 @@ class StarUIWorkbench:
                             hidden=True,
                         ),
                         self._review_order_line(
-                            "UPDATE SELL STP",
+                            "UPDATE SELL STP LMT"
+                            if stop.order_type == "STP LMT"
+                            else "UPDATE SELL STP",
                             _price_transition(
                                 stop_price,
                                 None,
@@ -6336,10 +6495,29 @@ class StarUIWorkbench:
         if update.stop_price is not None:
             rows.append(
                 self._review_order_line(
-                    "UPDATE SELL STP",
+                    "UPDATE SELL STP LMT"
+                    if update.layer.stop_order_type == "STP LMT"
+                    else "UPDATE SELL STP",
                     _price_transition(
                         update.prior_stop_price,
                         update.stop_price,
+                        tone="text-rose-400",
+                    ),
+                    "text-rose-400",
+                )
+            )
+        if update.stop_limit_price is not None:
+            rows.append(
+                self._review_order_line(
+                    (
+                        f"STOP LIMIT PRICE ({update.stop_limit_offset:g} "
+                        f"{'%' if update.stop_limit_unit == 'percent' else '$'} offset)"
+                        if update.stop_limit_offset is not None
+                        else "STOP LIMIT PRICE"
+                    ),
+                    _price_transition(
+                        update.prior_stop_limit_price,
+                        update.stop_limit_price,
                         tone="text-rose-400",
                     ),
                     "text-rose-400",
@@ -6784,6 +6962,20 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       }}
       return NaN;
     }};
+    const roundDown = (number) => {{
+      let candidate = number;
+      for (let attempt = 0; attempt <= bands.length; attempt += 1) {{
+        const candidates = bands.filter((item) => item.low <= candidate + 1e-9);
+        const band = candidates[candidates.length - 1];
+        if (!band) return NaN;
+        const rounded = Math.floor(number / band.increment + 1e-9) * band.increment;
+        const roundedCandidates = bands.filter((item) => item.low <= rounded + 1e-9);
+        if (roundedCandidates[roundedCandidates.length - 1] === band) return rounded;
+        candidate = rounded;
+      }}
+      return NaN;
+    }};
+    const minimumPositivePrice = Math.min(...bands.map((band) => roundUp(Math.max(band.low, band.increment))));
     const setHidden = (node, hidden, display = 'flex') => {{
       if (!node) return;
       node.classList.toggle('hidden', hidden);
@@ -6821,8 +7013,18 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         if (Number.isFinite(gain) && Number.isFinite(loss) && quantity > 0) outcomes.push({{ id: Number(permId), quantity, gain, loss }});
         else invalid = true;
         assigned(`[data-live-price="active-target-${{index}}"]`, Number.isFinite(targetPrice) ? (target === Number(targetInput.dataset.activeInitial) ? `$${{targetInput.dataset.activeOriginal}}` : priceText(targetPrice)) : '—');
-        const stopLimitPrice = stopInput?.dataset.activeStopLimitPrice;
-        assigned(`[data-live-price="active-stop-${{index}}"]`, Number.isFinite(stopPrice) ? `${{exactStop?.value || stop !== Number(stopInput?.dataset.activeInitial) ? priceText(stopPrice) : `$${{stopInput.dataset.activeOriginal}}`}}${{stopLimitPrice ? ` (LMT $${{stopLimitPrice}})` : ''}}` : '—');
+        const overrideOffset = form.querySelector(`[data-active-stop-limit-offset="${{permId}}"]`)?.value;
+        const overrideUnit = form.querySelector(`[data-active-stop-limit-unit="${{permId}}"]`)?.value;
+        const offset = Number(overrideOffset || stopInput?.dataset.activeStopLimitOffset);
+        const unit = overrideUnit || stopInput?.dataset.activeStopLimitUnit;
+        const rawLimit = unit === 'percent' ? stopPrice * (1 - offset / 100) : stopPrice - offset;
+        const computedLimit = Number.isFinite(rawLimit) && Number.isFinite(stopPrice)
+          ? (rawLimit > 0 ? roundDown(rawLimit) : minimumPositivePrice) : NaN;
+        const stopLimitPrice = stopInput?.dataset.activeStopLimitPrice
+          ? ((stopPrice !== Number(stopInput.dataset.activeOriginal) || Boolean(overrideOffset)) && Number.isFinite(computedLimit) && computedLimit > 0 && computedLimit < stopPrice
+            ? priceText(computedLimit) : `$${{stopInput.dataset.activeStopLimitPrice}}`)
+          : '';
+        assigned(`[data-live-price="active-stop-${{index}}"]`, Number.isFinite(stopPrice) ? `${{exactStop?.value || stop !== Number(stopInput?.dataset.activeInitial) ? priceText(stopPrice) : `$${{stopInput.dataset.activeOriginal}}`}}${{stopLimitPrice ? ` (LMT ${{stopLimitPrice}})` : ''}}` : '—');
         assigned(`[data-live-outcome="active-target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
         assigned(`[data-live-outcome="active-stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} at stop` : '— at stop');
         const originalTarget = Number(targetInput.dataset.activeOriginal);
@@ -6831,14 +7033,21 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         const stopEdited = Boolean(exactStop?.value) || stopInput?.value.trim() !== (stopInput?.dataset.activeInitial || '').trim();
         edited ||= targetEdited || stopEdited;
         const targetChanged = targetEdited && Number.isFinite(targetPrice) && Math.abs(targetPrice - originalTarget) > 1e-8;
-        const stopChanged = stopEdited && Number.isFinite(stopPrice) && Math.abs(stopPrice - originalStop) > 1e-8;
+        const ruleChanged = Boolean(stopInput?.dataset.activeStopLimitPrice) && Boolean(overrideOffset) &&
+          (Number(overrideOffset) !== Number(stopInput.dataset.activeStopLimitOffset) ||
+           overrideUnit !== stopInput.dataset.activeStopLimitUnit);
+        edited ||= ruleChanged;
+        const stopChanged = (stopEdited && Number.isFinite(stopPrice) && Math.abs(stopPrice - originalStop) > 1e-8)
+          || ruleChanged;
         const row = document.querySelector(`[data-active-review-row="${{permId}}"]`);
         const targetRow = document.querySelector(`[data-active-review-target-row="${{permId}}"]`);
         const stopRow = document.querySelector(`[data-active-review-stop-row="${{permId}}"]`);
         const targetText = document.querySelector(`[data-active-review-target="${{permId}}"]`);
         const stopText = document.querySelector(`[data-active-review-stop="${{permId}}"]`);
         if (targetText) targetText.textContent = targetChanged ? priceText(targetPrice) : '';
-        if (stopText) stopText.textContent = stopChanged ? priceText(stopPrice) : '';
+        if (stopText) stopText.textContent = stopChanged
+          ? `${{priceText(stopPrice)}}${{stopLimitPrice ? ` / LMT ${{stopLimitPrice}}` : ''}}${{ruleChanged ? ` (${{overrideOffset}}${{overrideUnit === 'percent' ? '%' : '$'}} offset)` : ''}}`
+          : '';
         setHidden(targetRow, !targetChanged);
         setHidden(stopRow, !stopChanged);
         setHidden(row, !(targetChanged || stopChanged), 'block');
@@ -6875,6 +7084,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
     document.querySelectorAll('[data-move-stops-to-be]').forEach((button) => button.addEventListener('click', () => {{
       form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{ input.value = '0'; }});
       form.querySelectorAll('[data-active-exact-stop]').forEach((input) => {{ input.value = ''; }});
+      form.querySelectorAll('[data-active-stop-limit-offset], [data-active-stop-limit-unit]').forEach((input) => {{ input.value = ''; }});
       update();
     }}));
     const stopDialog = document.querySelector('[data-stop-dialog]');
@@ -6885,6 +7095,10 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       const summary = stopDialog.querySelector('[data-stop-dialog-summary]');
       const apply = stopDialog.querySelector('[data-apply-all-stops]');
       const modeGroup = stopDialog.querySelector('[data-stop-mode-group]');
+      const offsetOverride = stopDialog.querySelector('[data-stop-limit-override]');
+      const offsetValue = stopDialog.querySelector('[data-stop-limit-override-value]');
+      const offsetGroup = stopDialog.querySelector('[data-stop-limit-override-group]');
+      let offsetUnit = 'percent';
       const dialogPriceText = (number) => `$${{number.toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 6}})}}`;
       let mode = 'price';
       const showMode = () => {{
@@ -6905,10 +7119,19 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         summary.textContent = Number.isFinite(rounded)
           ? `${{dialogPriceText(rounded)}} (${{rate >= 0 ? '+' : ''}}${{Number(rate.toFixed(2))}}%)`
           : '—';
-        apply.disabled = !Number.isFinite(rounded);
+        const offset = Number(offsetValue?.value);
+        apply.disabled = !Number.isFinite(rounded) || (offsetOverride?.checked &&
+          (!offsetValue.value.trim() || !Number.isFinite(offset) || offset <= 0 ||
+           (offsetUnit === 'percent' && offset >= 100)));
         return {{ rounded, rate }};
       }};
       valueInput.addEventListener('input', previewStop);
+      offsetOverride?.addEventListener('change', previewStop);
+      offsetValue?.addEventListener('input', previewStop);
+      offsetGroup?.querySelectorAll('[data-value]').forEach((button) => button.addEventListener('click', () => {{
+        offsetUnit = button.dataset.value;
+        previewStop();
+      }}));
       valueInput.addEventListener('change', () => {{
         const value = previewStop();
         if (mode === 'price' && Number.isFinite(value.rounded)) {{
@@ -6943,6 +7166,10 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
           input.value = rate.toFixed(2);
           const exact = form.querySelector(`[data-active-exact-stop="${{input.dataset.activePermId}}"]`);
           if (exact) exact.value = String(value.rounded);
+          const offsetField = form.querySelector(`[data-active-stop-limit-offset="${{input.dataset.activePermId}}"]`);
+          const unitField = form.querySelector(`[data-active-stop-limit-unit="${{input.dataset.activePermId}}"]`);
+          if (offsetField) offsetField.value = offsetOverride?.checked && input.dataset.activeStopLimitPrice ? offsetValue.value : '';
+          if (unitField) unitField.value = offsetOverride?.checked && input.dataset.activeStopLimitPrice ? offsetUnit : '';
         }});
         update();
         stopDialog.closest('dialog')?.close();
@@ -6955,6 +7182,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         input.value = input.dataset.activeInitial || '';
       }});
       form.querySelectorAll('[data-active-exact-stop]').forEach((input) => {{ input.value = ''; }});
+      form.querySelectorAll('[data-active-stop-limit-offset], [data-active-stop-limit-unit]').forEach((input) => {{ input.value = ''; }});
       update();
     }}));
     update();

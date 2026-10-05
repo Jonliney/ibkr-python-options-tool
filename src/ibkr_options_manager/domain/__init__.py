@@ -26,6 +26,7 @@ from .planner import (
     closing_order_allocation,
     preview_reference_prices,
     round_up_price,
+    stop_limit_price,
     supports_outside_rth,
 )
 
@@ -53,5 +54,6 @@ __all__ = [
     "closing_order_allocation",
     "preview_reference_prices",
     "round_up_price",
+    "stop_limit_price",
     "supports_outside_rth",
 ]

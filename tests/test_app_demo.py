@@ -2813,7 +2813,7 @@ def test_global_stop_limit_default_can_be_saved() -> None:
     workbench.load_demo_data()
     initial = TestClient(workbench.app).get(workbench.path).text
     assert "Stop order for new layers" in initial
-    assert initial.index('data-global-stop-type-group') < initial.index(
+    assert initial.index("data-global-stop-type-group") < initial.index(
         "How far below the stop?"
     )
     assert 'data-value="STP LMT"' in initial
@@ -5798,6 +5798,8 @@ def test_demo_acknowledged_bracket_reappears_as_active_after_refresh_and_restart
     entry = journal.submission_entries(account=DEMO_ACCOUNT, con_id=selected)[0]
     assert len(entry.perm_ids) == 2
     assert entry.layers[0].stop_order_type == "STP LMT"
+    assert entry.layers[0].stop_limit_offset == "5"
+    assert entry.layers[0].stop_limit_unit == "percent"
     refreshed_page = client.post(
         workbench.path + "action", data={"action": "refresh"}
     ).text
@@ -5810,12 +5812,56 @@ def test_demo_acknowledged_bracket_reappears_as_active_after_refresh_and_restart
             for e in journal.submission_entries(account=DEMO_ACCOUNT, con_id=selected)
         ],
     )
+    active_target = entry.perm_ids[0]
+    target_input = re.search(
+        rf'<input[^>]*name="active_target_{active_target}"[^>]*>', refreshed_page
+    )
+    assert target_input is not None
+    target_value = re.search(r'value="([^"]+)"', target_input.group())
+    assert target_value is not None
+    armed_page = client.post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"active_target_{active_target}": target_value.group(1),
+            f"active_stop_{active_target}": "0",
+        },
+    ).text
+    assert workbench._armed_price_updates
+    assert workbench._armed_price_updates[0].stop_limit_price is not None
+    assert "UPDATE SELL STP LMT" in armed_page
+    assert "STOP LIMIT PRICE" in armed_page
+    workbench._disarm_execution_locked()
+    stop_input = re.search(
+        rf'<input[^>]*name="active_stop_{active_target}"[^>]*>', refreshed_page
+    )
+    assert stop_input is not None
+    stop_value = re.search(r'value="([^"]+)"', stop_input.group())
+    assert stop_value is not None
+    client.post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"active_target_{active_target}": target_value.group(1),
+            f"active_stop_{active_target}": stop_value.group(1),
+            f"active_stop_limit_offset_{active_target}": "0.50",
+            f"active_stop_limit_unit_{active_target}": "dollars",
+        },
+    )
+    assert workbench._armed_price_updates[0].stop_limit_offset == Decimal("0.50")
+    assert workbench._armed_price_updates[0].stop_limit_unit == "dollars"
 
     restarted_journal = ExecutionJournal(journal_path)
     restarted_broker = DemoReadOnlyBroker(clock=clock, paper_execution_enabled=True)
     restarted_broker.use_journal(restarted_journal)
     restarted = workbench_for(restarted_broker, restarted_journal)
     restarted.load_demo_data()
+    assert restarted_journal.stop_limit_rule(
+        account=DEMO_ACCOUNT,
+        con_id=selected,
+        target_perm_id=entry.perm_ids[0],
+        stop_perm_id=entry.perm_ids[1],
+    ) == (Decimal("5"), "percent")
     assert (
         'data-layer-state="working"'
         in TestClient(restarted.app).get(restarted.path).text
