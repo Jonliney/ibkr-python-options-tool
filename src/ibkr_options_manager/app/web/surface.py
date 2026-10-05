@@ -3701,6 +3701,7 @@ class StarUIWorkbench:
                                     ),
                                     variant="outline",
                                     size="icon",
+                                    type="button",
                                     data_move_stops_to_be=True,
                                     aria_label="Move all active stops to B/E",
                                     disabled=self._paper_execution is None
@@ -6358,9 +6359,7 @@ class StarUIWorkbench:
                             hidden=True,
                         ),
                         self._review_order_line(
-                            "UPDATE SELL STP LMT"
-                            if stop.order_type == "STP LMT"
-                            else "UPDATE SELL STP",
+                            "SELL STP",
                             _price_transition(
                                 stop_price,
                                 None,
@@ -6375,6 +6374,24 @@ class StarUIWorkbench:
                             },
                             hidden=True,
                         ),
+                        self._review_order_line(
+                            "SELL STP LMT",
+                            _price_transition(
+                                stop.limit_price,
+                                None,
+                                tone="text-rose-400",
+                                current_attributes={
+                                    "data_active_review_stop_limit": target.perm_id
+                                },
+                            ),
+                            "text-rose-400",
+                            row_attributes={
+                                "data_active_review_stop_limit_row": target.perm_id
+                            },
+                            hidden=True,
+                        )
+                        if stop.order_type == "STP LMT"
+                        else None,
                     ),
                     row_attributes={"data_active_review_row": target.perm_id},
                     hidden=True,
@@ -6533,9 +6550,7 @@ class StarUIWorkbench:
         if update.stop_price is not None:
             rows.append(
                 self._review_order_line(
-                    "UPDATE SELL STP LMT"
-                    if update.layer.stop_order_type == "STP LMT"
-                    else "UPDATE SELL STP",
+                    "SELL STP",
                     _price_transition(
                         update.prior_stop_price,
                         update.stop_price,
@@ -6547,12 +6562,7 @@ class StarUIWorkbench:
         if update.stop_limit_price is not None:
             rows.append(
                 self._review_order_line(
-                    (
-                        f"STOP LIMIT PRICE ({update.stop_limit_offset:g} "
-                        f"{'%' if update.stop_limit_unit == 'percent' else '$'} offset)"
-                        if update.stop_limit_offset is not None
-                        else "STOP LIMIT PRICE"
-                    ),
+                    "SELL STP LMT",
                     _price_transition(
                         update.prior_stop_limit_price,
                         update.stop_limit_price,
@@ -7075,21 +7085,24 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
           (Number(overrideOffset) !== Number(stopInput.dataset.activeStopLimitOffset) ||
            overrideUnit !== stopInput.dataset.activeStopLimitUnit);
         edited ||= ruleChanged;
-        const stopChanged = (stopEdited && Number.isFinite(stopPrice) && Math.abs(stopPrice - originalStop) > 1e-8)
-          || ruleChanged;
+        const stopChanged = stopEdited && Number.isFinite(stopPrice) && Math.abs(stopPrice - originalStop) > 1e-8;
         const row = document.querySelector(`[data-active-review-row="${{permId}}"]`);
         const targetRow = document.querySelector(`[data-active-review-target-row="${{permId}}"]`);
         const stopRow = document.querySelector(`[data-active-review-stop-row="${{permId}}"]`);
         const targetText = document.querySelector(`[data-active-review-target="${{permId}}"]`);
         const stopText = document.querySelector(`[data-active-review-stop="${{permId}}"]`);
         if (targetText) targetText.textContent = targetChanged ? priceText(targetPrice) : '';
-        if (stopText) stopText.textContent = stopChanged
-          ? `${{priceText(stopPrice)}}${{stopLimitPrice ? ` / LMT ${{stopLimitPrice}}` : ''}}${{ruleChanged ? ` (${{overrideOffset}}${{overrideUnit === 'percent' ? '%' : '$'}} offset)` : ''}}`
-          : '';
+        const stopLimitRow = document.querySelector(`[data-active-review-stop-limit-row="${{permId}}"]`);
+        const stopLimitText = document.querySelector(`[data-active-review-stop-limit="${{permId}}"]`);
+        const limitChanged = Boolean(stopLimitRow) && Number.isFinite(computedLimit) &&
+          stopLimitPrice !== `$${{stopInput.dataset.activeStopLimitPrice}}`;
+        if (stopText) stopText.textContent = stopChanged ? priceText(stopPrice) : '';
+        if (stopLimitText) stopLimitText.textContent = limitChanged ? stopLimitPrice : '';
         setHidden(targetRow, !targetChanged);
         setHidden(stopRow, !stopChanged);
-        setHidden(row, !(targetChanged || stopChanged), 'block');
-        changed ||= targetChanged || stopChanged;
+        setHidden(stopLimitRow, !limitChanged);
+        setHidden(row, !(targetChanged || stopChanged || limitChanged), 'block');
+        changed ||= targetChanged || stopChanged || limitChanged;
       }});
       const empty = document.querySelector('[data-active-review-empty]');
       if (empty) empty.classList.toggle('hidden', changed);
@@ -7120,10 +7133,12 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
     }}));
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('change', update));
     document.querySelectorAll('[data-move-stops-to-be]').forEach((button) => button.addEventListener('click', () => {{
-      form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{ input.value = '0'; }});
       form.querySelectorAll('[data-active-exact-stop]').forEach((input) => {{ input.value = ''; }});
-      form.querySelectorAll('[data-active-stop-limit-offset], [data-active-stop-limit-unit]').forEach((input) => {{ input.value = ''; }});
-      update();
+      form.querySelectorAll('input[type="hidden"][data-active-stop-limit-offset], input[type="hidden"][data-active-stop-limit-unit]').forEach((input) => {{ input.value = ''; }});
+      form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{
+        input.value = '0';
+        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+      }});
     }}));
     const stopDialog = document.querySelector('[data-stop-dialog]');
     if (stopDialog) {{
@@ -7220,7 +7235,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         input.value = input.dataset.activeInitial || '';
       }});
       form.querySelectorAll('[data-active-exact-stop]').forEach((input) => {{ input.value = ''; }});
-      form.querySelectorAll('[data-active-stop-limit-offset], [data-active-stop-limit-unit]').forEach((input) => {{ input.value = ''; }});
+      form.querySelectorAll('input[type="hidden"][data-active-stop-limit-offset], input[type="hidden"][data-active-stop-limit-unit]').forEach((input) => {{ input.value = ''; }});
       update();
     }}));
     update();
@@ -7463,7 +7478,7 @@ def _price_transition(
             **(current_attributes or {}),
         ),
         aria_live="polite",
-        cls="inline-flex items-center gap-1.5 font-mono text-sm font-semibold tabular-nums",
+        cls="inline-flex items-center gap-1.5 font-mono text-xs font-semibold tabular-nums",
     )
 
 

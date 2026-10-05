@@ -3093,6 +3093,8 @@ def test_active_stop_limit_layer_shows_both_prices_and_locks_price_edits() -> No
     assert re.search(r'<label[^>]*for="active-target-1"[^>]*>\s*LMT\s*</label>', page)
     assert re.search(r'<label[^>]*for="active-stop-1"[^>]*>\s*STP\s*</label>', page)
     assert 'data-active-stop-limit-price="15.55"' in page
+    assert 'data-active-review-stop-limit-row="101"' in page
+    assert 'data-active-review-stop-limit="101"' in page
     stop_input = re.search(r'<input[^>]*name="active_stop_101"[^>]*>', page)
     assert stop_input is not None and "disabled" in stop_input.group()
 
@@ -3181,6 +3183,7 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert header.index('data-stop-preset="-35"') < header.rindex("Active layers")
     assert "Apply to active layers" in header
     assert 'aria-label="Move all active stops to B/E"' in header
+    assert re.search(r'<button[^>]*type="button"[^>]*data-move-stops-to-be', header)
     assert 'aria-label="Delete all active layers"' in header
     assert 'aria-label="Sell all active layers"' in header
     assert 'data-orientation="vertical"' in header
@@ -3250,7 +3253,10 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     active_script = _live_active_script(
         {"basis": "1", "multiplier": "100", "bands": []}
     )
-    assert "setHidden(row, !(targetChanged || stopChanged), 'block')" in active_script
+    assert (
+        "setHidden(row, !(targetChanged || stopChanged || limitChanged), 'block')"
+        in active_script
+    )
     assert "setReviewMode(changed)" in active_script
     assert "input.value = input.dataset.activeInitial || ''" in active_script
     assert "UPDATE SELL LMT" in page.text
@@ -4003,11 +4009,18 @@ def test_reset_active_prices_restores_target_and_stop_after_move_to_be() -> None
         '<input data-active-input="target" data-active-perm-id="1" '
         'data-live-layer="1" data-active-initial="50" '
         'data-active-original="15" value="50">'
-        '<input data-active-input="stop" data-active-perm-id="1" '
+        '<input type="number" data-active-input="stop" data-active-perm-id="1" '
         'data-live-layer="1" data-active-initial="25" '
-        'data-active-original="7.5" value="25">'
+        'data-active-original="7.5" data-active-stop-limit-price="7.0" '
+        'data-active-stop-limit-offset="5" '
+        'data-active-stop-limit-unit="percent" value="25">'
         '<button type="button" data-move-stops-to-be>Move stop to B/E</button>'
-        '</form><div data-price-edit-reset data-reset-visible="false" '
+        '</form><div data-active-review-row="1">'
+        '<div data-active-review-stop-row="1">'
+        '<span data-active-review-stop="1"></span></div>'
+        '<div data-active-review-stop-limit-row="1">'
+        '<span data-active-review-stop-limit="1"></span></div>'
+        '</div><div data-price-edit-reset data-reset-visible="false" '
         'aria-hidden="true">'
         '<button type="button" data-reset-active-prices disabled>'
         "Cancel changes</button>"
@@ -4023,16 +4036,24 @@ def test_reset_active_prices_restores_target_and_stop_after_move_to_be() -> None
             """(() => {
               const target = document.querySelector('[data-active-input="target"]');
               const stop = document.querySelector('[data-active-input="stop"]');
+              let stopEvents = 0;
+              stop.addEventListener('input', () => { stopEvents += 1; });
               const reset = document.querySelector('[data-reset-active-prices]');
               const slot = document.querySelector('[data-price-edit-reset]');
+              const stopReview = document.querySelector(
+                '[data-active-review-stop="1"]');
+              const limitReview = document.querySelector(
+                '[data-active-review-stop-limit="1"]');
               target.value = '60';
               target.dispatchEvent(new Event('input', { bubbles: true }));
               document.querySelector('[data-move-stops-to-be]').click();
-              const afterMove = [target.value, stop.value, reset.disabled,
-                                 slot.dataset.resetVisible];
+              const afterMove = [target.value, stop.value, stopEvents, reset.disabled,
+                                 slot.dataset.resetVisible, stopReview.textContent,
+                                 limitReview.textContent];
               reset.click();
               return JSON.stringify({ afterMove, afterReset: [target.value,
-                stop.value, reset.disabled, slot.dataset.resetVisible] });
+                stop.value, stop.dataset.activeInitial, reset.disabled,
+                slot.dataset.resetVisible] });
             })()""",
             lambda value: (results.append(value), loop.quit()),
         )
@@ -4044,7 +4065,7 @@ def test_reset_active_prices_restores_target_and_stop_after_move_to_be() -> None
     view.close()
 
     assert results == [
-        '{"afterMove":["60","0",false,"true"],"afterReset":["50","25",true,"false"]}'
+        '{"afterMove":["60","0",1,false,"true","$10","$9.5"],"afterReset":["50","25","25",true,"false"]}'
     ]
 
 
@@ -5871,8 +5892,9 @@ def test_demo_acknowledged_bracket_reappears_as_active_after_refresh_and_restart
     ).text
     assert workbench._armed_price_updates
     assert workbench._armed_price_updates[0].stop_limit_price is not None
-    assert "UPDATE SELL STP LMT" in armed_page
-    assert "STOP LIMIT PRICE" in armed_page
+    assert "SELL STP" in armed_page
+    assert "SELL STP LMT" in armed_page
+    assert "STOP LIMIT PRICE" not in armed_page
     workbench._disarm_execution_locked()
     stop_input = re.search(
         rf'<input[^>]*name="active_stop_{active_target}"[^>]*>', refreshed_page
