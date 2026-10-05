@@ -54,6 +54,11 @@ control, launch with:
 .venv/bin/ibkr-options-manager-gui --account DU1234567 --enable-paper-execution
 ```
 
+The desktop app remembers a paper account ID entered in Settings or the TWS
+unavailable dialog. You can omit `--account` on later launches; an explicit
+value overrides the remembered one. Without either, the dialog asks for a
+paper account ID before any TWS connection attempt.
+
 New bracket submission is intentionally blocked unless the fresh pre-send snapshot proves a
 `DU` account, a loopback TWS connection, a complete/fresh position/contract/
 quote/tick/order snapshot, API read-only mode explicitly **disabled**, and

@@ -438,6 +438,62 @@ def test_observed_new_position_updates_sidebar_without_changing_selection() -> N
         worker.join(timeout=1)
 
 
+def test_first_observed_position_is_selected_and_reloads_empty_workbench() -> None:
+    source = _demo_workbench()
+    source.load_demo_data()
+    position = source._state.positions[0]
+    ready = replace(source._state, positions=(position,), selected_con_id=None)
+    workbench = _demo_workbench()
+    workbench._observe_positions = True
+    workbench._observer_generation = 1
+    workbench._view_model.refresh_portfolio = lambda _settings: ready  # type: ignore[method-assign]
+    workbench._view_model.select_position = (  # type: ignore[method-assign]
+        lambda con_id, _form: replace(ready, selected_con_id=con_id)
+    )
+
+    worker = Thread(target=workbench._observation_loop, daemon=True)
+    worker.start()
+    try:
+        workbench._position_hint(1)
+        for _ in range(100):
+            if workbench._inventory_revision:
+                break
+            Event().wait(0.01)
+        assert workbench._inventory_revision > 0
+        assert workbench._selected_con_id == position.con_id
+        fragment = TestClient(workbench.app).get(workbench.path + "inventory-fragment")
+        assert fragment.headers["X-Selected-Changed"] == "1"
+        page = TestClient(workbench.app).get(workbench.path).text
+        assert "Select an option position" not in page
+    finally:
+        workbench.close()
+        worker.join(timeout=1)
+
+
+@pytest.mark.parametrize("multiple", [False, True])
+def test_empty_workbench_does_not_auto_select_ambiguous_or_unverified_arrival(
+    multiple: bool,
+) -> None:
+    source = _demo_workbench()
+    source.load_demo_data()
+    positions = (
+        source._state.positions[:2]
+        if multiple
+        else (replace(source._state.positions[0], eligible=False),)
+    )
+    workbench = _demo_workbench()
+    workbench._view_model.select_position = (  # type: ignore[method-assign]
+        lambda *_args: pytest.fail("arrival must not be selected")
+    )
+
+    workbench._apply_refreshed_portfolio_locked(
+        replace(source._state, positions=positions, selected_con_id=None),
+        auto_select=False,
+    )
+
+    assert workbench._selected_con_id is None
+
+
 def test_selected_position_quantity_change_offers_update_without_losing_draft() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -1048,6 +1104,87 @@ def test_launch_connection_failure_stays_in_the_retry_dialog_without_a_toast() -
     assert "TWS did not respond" not in page.text
 
 
+def test_missing_paper_account_prompts_without_contacting_tws() -> None:
+    workbench = _demo_workbench()
+    workbench._demo_mode = False
+    workbench._settings = replace(workbench._settings, account="")
+    calls: list[object] = []
+    workbench._view_model.refresh_portfolio = lambda settings: calls.append(settings)  # type: ignore[method-assign]
+
+    workbench.refresh_on_launch()
+    page = TestClient(workbench.app).get(workbench.path).text
+
+    assert calls == []
+    assert workbench._launch_connection == "failed"
+    assert "TWS unavailable" in page
+    assert 'name="account"' in page
+    assert "Enter your paper account ID" in page
+
+
+def test_launch_retry_rejects_invalid_account_without_contacting_tws() -> None:
+    workbench = _demo_workbench()
+    workbench._demo_mode = False
+    workbench._settings = replace(workbench._settings, account="")
+    workbench._launch_connection = "failed"
+    calls: list[object] = []
+    workbench._view_model.refresh_portfolio = lambda settings: calls.append(settings)  # type: ignore[method-assign]
+
+    response = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={"action": "launch-refresh", "account": "U123456"},
+    )
+
+    assert calls == []
+    assert workbench._settings.account == ""
+    assert workbench._launch_connection == "failed"
+    assert "Enter your paper account ID (starts with DU)" in response.text
+
+
+def test_launch_retry_saves_paper_account_and_refreshes() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    ready = workbench._state
+    workbench._demo_mode = False
+    workbench._settings = replace(workbench._settings, account="")
+    workbench._launch_connection = "failed"
+    saved: list[str] = []
+    calls: list[object] = []
+    workbench._save_account = saved.append
+
+    def refreshed(settings: object) -> object:
+        calls.append(settings)
+        assert workbench._state.status is UiStatus.EMPTY
+        assert workbench._selected_con_id is None
+        return ready
+
+    workbench._view_model.refresh_portfolio = refreshed  # type: ignore[method-assign]
+    response = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={"action": "launch-refresh", "account": f"  {DEMO_ACCOUNT}  "},
+    )
+
+    assert response.status_code == 200
+    assert saved == [DEMO_ACCOUNT]
+    assert len(calls) == 1
+    assert workbench._settings.account == DEMO_ACCOUNT
+    assert workbench._launch_connection == "success"
+
+
+def test_settings_refresh_saves_paper_account_for_next_launch() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    saved: list[str] = []
+    workbench._save_account = saved.append
+
+    response = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={"action": "refresh", "account": DEMO_ACCOUNT},
+    )
+
+    assert response.status_code == 200
+    assert saved == [DEMO_ACCOUNT]
+
+
 @pytest.mark.parametrize("launch_connection", ["failed", "success"])
 def test_settings_open_in_blocked_desktop_webview(launch_connection: str) -> None:
     workbench = _demo_workbench()
@@ -1159,7 +1296,7 @@ def test_retry_connection_waits_for_one_terminal_refresh_response() -> None:
 
     page = client.post(
         f"/{workbench.session_token}/action",
-        data={"action": "launch-refresh"},
+        data={"action": "launch-refresh", "account": workbench._settings.account},
     )
 
     assert page.status_code == 200
@@ -2676,9 +2813,10 @@ def test_global_stop_limit_default_can_be_saved() -> None:
     workbench.load_demo_data()
     initial = TestClient(workbench.app).get(workbench.path).text
     assert "Stop order for new layers" in initial
-    assert initial.index('data-global-stop-choice="STP LMT"') < initial.index(
+    assert initial.index('data-global-stop-type-group') < initial.index(
         "How far below the stop?"
     )
+    assert 'data-value="STP LMT"' in initial
     assert 'name="global_stop_limit_unit" value="percent"' in initial
     assert "data-global-stop-unit-group" in initial
     assert "mt-3 flex flex-wrap items-end gap-3" in initial
@@ -2910,7 +3048,8 @@ def test_active_stop_limit_layer_shows_both_prices_and_locks_price_edits() -> No
     )
     page = TestClient(workbench.app).get(workbench.path).text
     assert 'data-layer-state="working"' in page
-    assert "STP return from entry" in page
+    assert re.search(r'<label[^>]*for="active-target-1"[^>]*>\s*LMT\s*</label>', page)
+    assert re.search(r'<label[^>]*for="active-stop-1"[^>]*>\s*STP\s*</label>', page)
     assert 'data-active-stop-limit-price="15.55"' in page
     stop_input = re.search(r'<input[^>]*name="active_stop_101"[^>]*>', page)
     assert stop_input is not None and "disabled" in stop_input.group()
@@ -3551,10 +3690,14 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
     assert "Target filled" not in page.text
     assert "WORKING" not in page.text
     assert 'id="sold-target-1"' in page.text
+    assert re.search(
+        r'<label[^>]*for="sold-target-1"[^>]*>\s*LMT\s*</label>', page.text
+    )
     assert 'value="20"' in page.text
     assert "$15.50" in page.text
     assert re.search(r'id="sold-target-1"[^>]*disabled', page.text)
     assert 'id="sold-stop-1"' in page.text
+    assert re.search(r'<label[^>]*for="sold-stop-1"[^>]*>\s*STP\s*</label>', page.text)
     assert 'value="25"' in page.text
     assert "$9.70" in page.text
     assert re.search(r'id="sold-stop-1"[^>]*disabled', page.text)
@@ -3656,6 +3799,12 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
     conflict = TestClient(workbench.app).get(workbench.path)
     assert "Fill and working order conflict" in conflict.text
     assert 'data-layer-state="verify"' in conflict.text
+    assert re.search(
+        r'<label[^>]*for="verify-target-1"[^>]*>\s*LMT\s*</label>', conflict.text
+    )
+    assert re.search(
+        r'<label[^>]*for="verify-stop-1"[^>]*>\s*STP\s*</label>', conflict.text
+    )
     assert 'data-layer-state="draft"' not in conflict.text
 
 
@@ -5081,8 +5230,10 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert "-$340.00 max loss" in draft
     assert ">%</span>" in draft
     assert 'for="target_1"' in draft
+    assert re.search(r'<label[^>]*for="target_1"[^>]*>\s*LMT\s*</label>', draft)
     assert 'id="target_1"' in draft
     assert 'for="stop_1"' in draft
+    assert re.search(r'<label[^>]*for="stop_1"[^>]*>\s*STP\s*</label>', draft)
     assert 'id="stop_1"' in draft
     assert 'for="quantity_1"' in draft
     assert 'id="quantity_1"' in draft
@@ -6269,6 +6420,29 @@ def test_main_builds_the_embedded_starui_window(monkeypatch: object) -> None:
     assert created[0].launch_refresh_requested is True
 
 
+def test_main_prefills_saved_account_without_cli_argument(monkeypatch: object) -> None:
+    QApplication.instance() or QApplication([])
+    created: list[_WindowStub] = []
+
+    def window_factory(*args: object, **kwargs: object) -> _WindowStub:
+        window = _WindowStub(*args, **kwargs)
+        created.append(window)
+        return window
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "ibkr_options_manager.app.main.StarUIPlannerWindow", window_factory
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "ibkr_options_manager.app.main.load_saved_account", lambda: "DU7654321"
+    )
+
+    assert main([]) == 0
+    assert created[0].initial_account == "DU7654321"
+
+    assert main(["--account", "DU1111111"]) == 0
+    assert created[1].initial_account == "DU1111111"
+
+
 def _demo_workbench() -> StarUIWorkbench:
     def clock() -> Decimal:
         return Decimal("100")
@@ -6286,9 +6460,10 @@ def _demo_workbench() -> StarUIWorkbench:
 
 
 class _WindowStub:
-    def __init__(self, *_args: object, **_kwargs: object) -> None:
+    def __init__(self, *_args: object, **kwargs: object) -> None:
         self.demo_loaded = False
         self.launch_refresh_requested = False
+        self.initial_account = kwargs.get("initial_account")
 
     def show(self) -> None:
         pass

@@ -42,6 +42,7 @@ class StarUIPlannerWindow(QMainWindow):
         paper_execution: PaperExecutionService | None = None,
         observe_positions: bool = False,
         observer_client_id: int = 18,
+        save_account: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__()
         self._demo_mode = demo_mode
@@ -53,6 +54,7 @@ class StarUIPlannerWindow(QMainWindow):
             paper_execution=paper_execution,
             observe_positions=observe_positions,
             observer_client_id=observer_client_id,
+            save_account=save_account,
         )
         self._server, self._thread, port = _start_local_server(self._surface.app)
         self._url = QUrl(f"http://127.0.0.1:{port}{self._surface.path}")

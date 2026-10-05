@@ -3,6 +3,7 @@ from __future__ import annotations
 # ruff: noqa: E501
 import asyncio
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
@@ -108,6 +109,8 @@ from .components.ui.tooltip import Tooltip, TooltipContent, TooltipTrigger
 
 _STATIC_DIR = Path(__file__).with_name("static")
 _ASSETS_DIR = Path(__file__).with_name("assets")
+_LAYER_TARGET_LABEL = "LMT"
+_LAYER_STOP_LABEL = "STP"
 # StarHTML 0.7.0's position.js imports Floating UI from a CDN. Keep the same
 # plugin and API, but serve its dependency locally inside the loopback webview.
 _LOCAL_POSITION_PLUGIN = Plugin(  # type: ignore[no-untyped-call]
@@ -149,6 +152,7 @@ class StarUIWorkbench:
         paper_execution: PaperExecutionService | None = None,
         observe_positions: bool = False,
         observer_client_id: int = 18,
+        save_account: Callable[[str], None] | None = None,
     ) -> None:
         _register_bundled_icons()
         self._view_model = view_model
@@ -204,6 +208,7 @@ class StarUIWorkbench:
         self._position_stop_config: dict[int, tuple[str, str, str]] = {}
         self._projection_comparison: PositionOutcome | None = None
         self._settings = ConnectionSettings(account=initial_account)
+        self._save_account = save_account
         self._target_presets = "20, 40, 60, 100"
         self._stop_presets = "25"
         self._last_refreshed_at = "—"
@@ -215,6 +220,7 @@ class StarUIWorkbench:
         self._status_message = ""
         self._message = "Refresh and select a position to build a draft."
         self._launch_connection = "idle"
+        self._launch_account_error = ""
         self._launch_refresh_in_progress = False
         self._submission_review_required = False
         self._lock = RLock()
@@ -275,7 +281,12 @@ class StarUIWorkbench:
         with self._lock:
             self._disarm_execution_locked()
             settings = self._settings
+            if not settings.account.strip().upper().startswith("DU"):
+                self._launch_connection = "failed"
+                self._launch_account_error = "Enter your paper account ID (starts with DU)."
+                return
             self._launch_connection = "connecting"
+            self._launch_account_error = ""
             self._suppress_toasts = True
             self._message = "Connecting to TWS…"
         try:
@@ -509,6 +520,38 @@ class StarUIWorkbench:
             # TWS is contacted; only its terminal response replaces the
             # page.  Starting another background worker here races the
             # connection-status poll and can repeatedly reopen the dialog.
+            with self._lock:
+                if self._launch_connection != "failed":
+                    return self._page()
+            account = values.get("account", "").strip().upper()
+            if not account.upper().startswith("DU"):
+                with self._lock:
+                    self._launch_connection = "failed"
+                    self._launch_account_error = "Enter your paper account ID (starts with DU)."
+                    return self._page()
+            with self._lock:
+                if account != self._settings.account:
+                    self._disarm_execution_locked()
+                    self._state = self._view_model.empty()
+                    self._selected_con_id = None
+                    self._selected_closed_con_id = None
+                    self._drafts.clear()
+                    self._position_stop_config.clear()
+                    self._session_seen_positions.clear()
+                    self._session_closed_positions.clear()
+                    self._session_contract_snapshots.clear()
+                    self._position_changes.clear_selected_change()
+                    self._session_position_account = account
+                self._settings = replace(self._settings, account=account)
+                self._launch_account_error = ""
+            if self._save_account is not None:
+                try:
+                    self._save_account(account)
+                except (OSError, ValueError):
+                    with self._lock:
+                        self._launch_connection = "failed"
+                        self._launch_account_error = "Could not save the account ID. Check your local settings and retry."
+                        return self._page()
             self.refresh_on_launch()
             with self._lock:
                 return self._page()
@@ -592,8 +635,10 @@ class StarUIWorkbench:
                     "target_presets", self._target_presets
                 )
                 self._stop_presets = values.get("stop_presets", self._stop_presets)
-                self._settings = ConnectionSettings(
-                    account=values.get("account", self._settings.account).strip(),
+                new_settings = ConnectionSettings(
+                    account=values.get("account", self._settings.account)
+                    .strip()
+                    .upper(),
                     port=_positive_int(values.get("port"), self._settings.port),
                     client_id=_positive_int(
                         values.get("client_id"), self._settings.client_id
@@ -602,6 +647,16 @@ class StarUIWorkbench:
                         values.get("timeout"), self._settings.timeout_seconds
                     ),
                 )
+                if (
+                    self._save_account is not None
+                    and new_settings.account.upper().startswith("DU")
+                ):
+                    try:
+                        self._save_account(new_settings.account)
+                    except (OSError, ValueError):
+                        self._message = "Could not save the account ID. Check your local settings and retry."
+                        return self._page()
+                self._settings = new_settings
                 self._refresh_locked()
                 self._start_observer_locked()
                 self._submission_review_required = False
@@ -778,6 +833,16 @@ class StarUIWorkbench:
             state, track_selected_quantity=preserve_invalid_drafts
         )
         previous_con_id = self._selected_con_id
+        select_first_arrival = (
+            not auto_select
+            and previous_con_id is None
+            and not self._state.positions
+            and self._selected_closed_con_id is None
+            and self._preferred_con_id is None
+            and state.status is UiStatus.READY
+            and len(state.positions) == 1
+            and state.positions[0].eligible
+        )
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
         if self._selected_closed_con_id in self._session_closed_positions:
@@ -792,7 +857,9 @@ class StarUIWorkbench:
         available_con_ids = {position.con_id for position in state.positions}
         if target not in available_con_ids:
             target = (
-                state.positions[0].con_id if auto_select and state.positions else None
+                state.positions[0].con_id
+                if (auto_select or select_first_arrival) and state.positions
+                else None
             )
         self._preferred_con_id = None
         if target is None:
@@ -2679,7 +2746,11 @@ class StarUIWorkbench:
                 DialogDescription(
                     "Reading the paper account and open option positions."
                     if connecting
-                    else "Open TWS, enable its API, then retry the connection.",
+                    else (
+                        "Enter your paper account ID to connect to TWS."
+                        if not self._settings.account
+                        else "Check the account ID and TWS API settings, then retry."
+                    ),
                 ),
             ),
         ]
@@ -2709,6 +2780,28 @@ class StarUIWorkbench:
                     ),
                     DialogFooter(
                         Form(
+                            Label(
+                                "Paper account ID",
+                                fr="launch-account",
+                                cls="text-sm font-medium",
+                            ),
+                            Input(
+                                id="launch-account",
+                                name="account",
+                                value=self._settings.account,
+                                required=True,
+                                autocomplete="off",
+                                aria_invalid="true"
+                                if self._launch_account_error
+                                else None,
+                            ),
+                            P(
+                                self._launch_account_error,
+                                role="alert",
+                                cls="text-sm text-destructive",
+                            )
+                            if self._launch_account_error
+                            else None,
                             Button(
                                 "Retry connection",
                                 type="submit",
@@ -2719,6 +2812,7 @@ class StarUIWorkbench:
                             ),
                             action=f"/{self.session_token}/action",
                             method="post",
+                            cls="w-full space-y-3",
                         )
                     ),
                 )
@@ -3230,34 +3324,15 @@ class StarUIWorkbench:
                                 "Stop order for new layers", cls="text-sm font-semibold"
                             ),
                             Div(
-                                Div(
-                                    Button(
-                                        "STP",
-                                        type="button",
-                                        variant="outline",
-                                        size="sm",
-                                        aria_pressed="true"
-                                        if self._default_stop_type == "STP"
-                                        else "false",
-                                        data_global_stop_choice="STP",
-                                        cls="rounded-r-none border-primary bg-primary/10"
-                                        if self._default_stop_type == "STP"
-                                        else "rounded-r-none",
-                                    ),
-                                    Button(
-                                        "STP LMT",
-                                        type="button",
-                                        variant="outline",
-                                        size="sm",
-                                        aria_pressed="true"
-                                        if self._default_stop_type == "STP LMT"
-                                        else "false",
-                                        data_global_stop_choice="STP LMT",
-                                        cls="-ml-px rounded-l-none border-primary bg-primary/10"
-                                        if self._default_stop_type == "STP LMT"
-                                        else "-ml-px rounded-l-none",
-                                    ),
-                                    cls="inline-flex",
+                                ToggleGroup(
+                                    ("STP", "STP"),
+                                    ("STP LMT", "STP LMT"),
+                                    type="single",
+                                    value=self._default_stop_type,
+                                    variant="outline",
+                                    size="default",
+                                    aria_label="Default stop order type for new layers",
+                                    data_global_stop_type_group=True,
                                 ),
                                 Div(
                                     Label(
@@ -3291,7 +3366,7 @@ class StarUIWorkbench:
                                                 type="single",
                                                 value=self._default_stop_limit_unit,
                                                 variant="outline",
-                                                size="sm",
+                                                size="default",
                                                 aria_label="Default stop-limit offset unit",
                                                 data_global_stop_unit_group=True,
                                             ),
@@ -4295,13 +4370,13 @@ class StarUIWorkbench:
                 cls="min-w-20",
             ),
             _sold_percentage_price_field(
-                "LMT target",
+                _LAYER_TARGET_LABEL,
                 value=layer.target_percentage,
                 price=layer.target_price,
                 input_id=f"verify-target-{number}",
             ),
             _sold_percentage_price_field(
-                "STP loss",
+                _LAYER_STOP_LABEL,
                 value=layer.stop_percentage,
                 price=layer.stop_price,
                 input_id=f"verify-stop-{number}",
@@ -4432,14 +4507,14 @@ class StarUIWorkbench:
                 cls="min-w-20",
             ),
             _sold_percentage_price_field(
-                "LMT target",
+                _LAYER_TARGET_LABEL,
                 value=target_percentage,
                 price=layer.target_price,
                 input_id=f"sold-target-{number}",
                 inferred=not layer.target_percentage and bool(recovered),
             ),
             _sold_percentage_price_field(
-                "STP loss",
+                _LAYER_STOP_LABEL,
                 value=stop_percentage,
                 price=layer.stop_price,
                 input_id=f"sold-stop-{number}",
@@ -4593,7 +4668,7 @@ class StarUIWorkbench:
             state="working",
             oca_group=group,
             target_field=_percentage_price_field(
-                "LMT target",
+                _LAYER_TARGET_LABEL,
                 Input(
                     name=f"active_target_{target.perm_id}",
                     id=f"active-target-{index}",
@@ -4619,7 +4694,7 @@ class StarUIWorkbench:
                 kind="active-target",
             ),
             stop_field=_percentage_price_field(
-                "STP return from entry",
+                _LAYER_STOP_LABEL,
                 Div(
                     Input(
                         name=f"active_stop_{target.perm_id}",
@@ -5176,7 +5251,7 @@ class StarUIWorkbench:
             index=index,
             state="draft",
             target_field=_percentage_price_field(
-                "LMT target",
+                _LAYER_TARGET_LABEL,
                 Input(
                     name=f"target_{index}",
                     id=f"target_{index}",
@@ -5200,7 +5275,7 @@ class StarUIWorkbench:
             ),
             stop_field=Div(
                 _percentage_price_field(
-                    "STP loss",
+                    _LAYER_STOP_LABEL,
                     Input(
                         name=f"stop_{index}",
                         id=f"stop_{index}",
@@ -6407,22 +6482,16 @@ def _global_stop_type_visual_script() -> str:
     return """
 (() => {
   const start = () => {
-    const buttons = document.querySelectorAll('[data-global-stop-choice]');
+    const buttons = document.querySelectorAll('[data-global-stop-type-group] [data-value]');
     const offset = document.getElementById('global-stop-limit-offset');
     const selection = document.querySelector('[name="global_stop_type"]');
     const unitSelection = document.querySelector('[name="global_stop_limit_unit"]');
     const unitFieldset = document.getElementById('global-stop-limit-units');
     const unitButtons = document.querySelectorAll('[data-global-stop-unit-group] [data-value]');
     buttons.forEach((button) => button.addEventListener('click', () => {
-      buttons.forEach((choice) => {
-        const selected = choice === button;
-        choice.setAttribute('aria-pressed', String(selected));
-        choice.classList.toggle('border-primary', selected);
-        choice.classList.toggle('bg-primary/10', selected);
-      });
-      if (selection) selection.value = button.dataset.globalStopChoice;
-      if (offset) offset.disabled = button.dataset.globalStopChoice !== 'STP LMT';
-      if (unitFieldset) unitFieldset.disabled = button.dataset.globalStopChoice !== 'STP LMT';
+      if (selection) selection.value = button.dataset.value;
+      if (offset) offset.disabled = button.dataset.value !== 'STP LMT';
+      if (unitFieldset) unitFieldset.disabled = button.dataset.value !== 'STP LMT';
     }));
     unitButtons.forEach((button) => button.addEventListener('click', () => {
       if (unitSelection) unitSelection.value = button.dataset.value;

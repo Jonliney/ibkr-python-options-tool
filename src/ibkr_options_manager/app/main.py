@@ -16,6 +16,7 @@ from ..execution import (
 )
 from ..portfolio import PortfolioCoordinator
 from ..snapshot import SnapshotCoordinator
+from .account_preferences import load_saved_account, save_paper_account
 from .demo import (
     DEMO_ACCOUNT,
     DEMO_CON_IDS,
@@ -72,7 +73,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     def clock() -> Decimal:
         return Decimal(str(monotonic()))
 
-    initial_account = args.account or (DEMO_ACCOUNT if args.demo_data else "")
+    initial_account = args.account.strip().upper() or (
+        DEMO_ACCOUNT if args.demo_data else load_saved_account()
+    )
     broker: DemoReadOnlyBroker | IbkrSnapshotBroker
     coordinator: DemoSnapshotSource | SnapshotCoordinator
     if args.demo_data:
@@ -127,6 +130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         paper_execution=paper_execution,
         observe_positions=not args.demo_data,
         observer_client_id=args.observer_client_id,
+        save_account=save_paper_account if not args.demo_data else None,
     )
     window.refresh_on_launch()
     window.show()

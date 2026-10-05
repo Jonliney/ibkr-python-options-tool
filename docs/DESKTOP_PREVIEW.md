@@ -25,6 +25,12 @@ The same entry point can be run without prefilling the selection:
 .venv/bin/python -m ibkr_options_manager.app
 ```
 
+The desktop app remembers a paper account ID entered in Settings or the TWS
+unavailable dialog. On later launches, `--account` is optional; an explicit
+`--account` takes precedence. If no paper account ID is available, the app opens
+the TWS unavailable dialog and asks for one before attempting a connection.
+Only the account identifier is saved locally, not TWS credentials.
+
 ### Simulated data
 
 For interface work or workflow rehearsal outside market hours, use the fully
