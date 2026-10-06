@@ -55,6 +55,51 @@ earlier pair may already be cancelled when a later pair fails; the status
 reports the confirmed count and requires a fresh TWS review before another
 action. No market sell is sent, so the position remains open.
 
+Bulk bracket cancellation writes a local timing trace to
+`~/Library/Application Support/IBKR Options Manager/logs/bracket-cancellations.jsonl`
+on macOS (or beside the platform's paper execution journal). Set
+`IBKR_OPTIONS_MANAGER_CANCEL_TRACE` to choose another path. Each JSONL event
+uses one random `run_id`, a one-based bracket number where applicable, UTC
+time, and monotonic elapsed milliseconds from the server handling the operator's
+bulk-cancel click. It records review and confirmation triggers, fresh snapshot durations,
+pair cancellation durations, TWS connection readiness, both-leg acknowledgement,
+the post-cancellation open-order check, and the final refresh. It omits account,
+contract, and order identifiers and rotates at 2 MB. A trace write failure does
+not change the cancellation outcome.
+
+For snapshots taken during this flow, the same trace also records the capture
+kind and role (`review`, `before_pair`, or `final_refresh`), connection handshake,
+each named TWS callback wait, quote snapshot and market-rule requests, optional
+history waits, local capture assembly, and total capture duration. A callback
+wait's `complete` field distinguishes an acknowledgement from a timeout. These
+measurements identify which part of a fresh snapshot is slow without changing
+the snapshot's completeness requirements.
+
+The current bulk flow rechecks the remaining reviewed pairs after each
+acknowledged cancellation. This detects a fill, manual TWS change, or missing
+acknowledgement before sending the next pair's cancellations. A future batched
+flow would need durable per-pair outcomes and a safe recovery path for partial
+success; elapsed time alone does not justify skipping these checks.
+
+Bulk cancellation review, pre-pair checks, final verification, single-bracket
+cancellation, status recovery, and post-write refreshes use orders-only
+snapshots. They still collect account, position, contract identity, TWS
+configuration, client and all-open-order views, completed orders, executions,
+and market rule. The UI labels market data `NOT_REQUESTED`. A new bracket still
+has a separate quote-bearing review; its immediate pre-send confirmation uses
+an orders-only snapshot and must reproduce the reviewed plan fingerprint.
+
+Quote-bearing reads (including normal Refresh, order review, and price-amendment
+warnings) first open a short-lived TWS streaming market-data subscription. The
+app cancels it after bid and ask arrive, or after a short grace period if only
+another positive price is available. Missing bid/ask remains visible as missing;
+price-amendment risk is reported as unknown in that case. If the stream yields
+no positive price promptly, the reader falls back to the prior one-time quote
+snapshot and its `tickSnapshotEnd` completion. Quote data is never taken from
+the browser as broker evidence. These choices retain fresh order and position
+checks while avoiding the approximately 11-second one-time snapshot wait when
+TWS delivers a usable stream promptly.
+
 For active stop amendments, the editor uses signed return from verified entry
 cost. A positive value places the proposed stop above entry; 0% is B/E. The
 global **Set all active stops** dialog applies one tick-rounded price to every

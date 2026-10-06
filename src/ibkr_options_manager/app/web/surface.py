@@ -12,6 +12,7 @@ from secrets import token_urlsafe
 from threading import Event, RLock, Thread
 from time import monotonic
 from typing import Any
+from uuid import uuid4
 
 from starhtml import (
     H1,
@@ -40,6 +41,11 @@ from starhtml.plugins import Plugin
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from ...cancellation_trace import (
+    current_cancellation_context,
+    current_snapshot_context,
+    record_cancellation_event,
+)
 from ...domain import (
     BrokerSnapshot,
     VerifiedOptionContract,
@@ -182,6 +188,8 @@ class StarUIWorkbench:
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
         self._armed_cancellation: MarketExitCandidate | None = None
         self._armed_cancellations: tuple[MarketExitCandidate, ...] = ()
+        self._bulk_cancel_trace_id: str | None = None
+        self._bulk_cancel_started_at: float | None = None
         self._active_action_verified = False
         self._review_all_active_exits = False
         self._armed_price_updates: tuple[PriceUpdateCandidate, ...] = ()
@@ -765,7 +773,11 @@ class StarUIWorkbench:
             return self._page()
 
     def _refresh_locked(
-        self, *, auto_select: bool = True, preserve_invalid_drafts: bool = False
+        self,
+        *,
+        auto_select: bool = True,
+        preserve_invalid_drafts: bool = False,
+        include_quote: bool = True,
     ) -> None:
         if self._session_position_account != self._settings.account:
             self._position_stop_config.clear()
@@ -783,6 +795,7 @@ class StarUIWorkbench:
             state,
             auto_select=auto_select,
             preserve_invalid_drafts=preserve_invalid_drafts,
+            include_quote=include_quote,
         )
         self._refresh_closed_history_locked()
 
@@ -806,10 +819,12 @@ class StarUIWorkbench:
             except Exception:
                 self._message = "Closed history refresh unavailable. Check TWS connection and Refresh."
 
-    def _refresh_after_acknowledged_write_locked(self, acknowledgement: str) -> bool:
+    def _refresh_after_acknowledged_write_locked(
+        self, acknowledgement: str, *, include_quote: bool = True
+    ) -> bool:
         """Replace optimistic post-write UI state with a fresh broker snapshot."""
         try:
-            self._refresh_locked()
+            self._refresh_locked(include_quote=include_quote)
         except Exception as error:  # keep a confirmed write, never hide it
             self._message = (
                 f"{acknowledgement} Automatic TWS refresh failed; use Refresh before "
@@ -840,6 +855,7 @@ class StarUIWorkbench:
         *,
         auto_select: bool = True,
         preserve_invalid_drafts: bool = False,
+        include_quote: bool = True,
     ) -> None:
         """Apply an already-read portfolio snapshot while holding the UI lock."""
         self._record_verified_positions_locked(
@@ -878,7 +894,11 @@ class StarUIWorkbench:
         if target is None:
             self._position_changes.clear_selected_change()
             return
-        self._select_locked(target, preserve_invalid_draft=preserve_invalid_drafts)
+        self._select_locked(
+            target,
+            preserve_invalid_draft=preserve_invalid_drafts,
+            include_quote=include_quote,
+        )
         if self._selected_con_id != previous_con_id:
             self._position_changes.clear_selected_change()
 
@@ -908,7 +928,11 @@ class StarUIWorkbench:
         )
 
     def _select_locked(
-        self, con_id: int, *, preserve_invalid_draft: bool = False
+        self,
+        con_id: int,
+        *,
+        preserve_invalid_draft: bool = False,
+        include_quote: bool = True,
     ) -> None:
         if con_id not in {position.con_id for position in self._state.positions}:
             self._message = "The selected contract is not in the verified portfolio."
@@ -917,7 +941,9 @@ class StarUIWorkbench:
         self._selected_closed_con_id = None
         self._position_changes.select(con_id)
         state = self._view_model.select_position(
-            con_id, self._plan_form(self._drafts.get(con_id, ()))
+            con_id,
+            self._plan_form(self._drafts.get(con_id, ())),
+            **({"include_quote": False} if not include_quote else {}),
         )
         if not preserve_invalid_draft and any(
             validation.code == "LAYER_QUANTITY_EXCEEDS_AVAILABLE"
@@ -928,7 +954,11 @@ class StarUIWorkbench:
             # longer a draft for the available balance, so replace it rather
             # than trapping the position behind its obsolete allocation.
             self._drafts.pop(con_id, None)
-            state = self._view_model.select_position(con_id, self._plan_form(()))
+            state = self._view_model.select_position(
+                con_id,
+                self._plan_form(()),
+                **({"include_quote": False} if not include_quote else {}),
+            )
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
         self._announce_reconciliation_locked()
@@ -972,12 +1002,26 @@ class StarUIWorkbench:
         self._armed_market_exits = ()
         self._armed_cancellation = None
         self._armed_cancellations = ()
+        self._bulk_cancel_trace_id = None
+        self._bulk_cancel_started_at = None
         self._active_action_verified = False
         self._review_all_active_exits = False
         self._armed_price_updates = ()
         self._warned_price_update_concerns = frozenset()
         self._price_update_retry_required = False
         self._armed_active_percentages = {}
+
+    def _trace_bulk_cancel(self, event: str, **fields: Any) -> None:
+        run_id = self._bulk_cancel_trace_id
+        started = self._bulk_cancel_started_at
+        if run_id is None or started is None:
+            return
+        record_cancellation_event(
+            event,
+            run_id=run_id,
+            elapsed_ms=round(max(0.0, monotonic() - started) * 1000, 1),
+            **fields,
+        )
 
     def _expire_confirmation_locked(self, *, require_deadline: bool = False) -> bool:
         if not (
@@ -1067,8 +1111,12 @@ class StarUIWorkbench:
         ):
             self._message = "Start execution first; every paper order needs a separate confirmation."
             return
+        if armed.snapshot.quote.market_data_type == "NOT_REQUESTED":
+            self._disarm_execution_locked()
+            self._message = "Review the order with market data before confirming it."
+            return
         state, candidate = self._view_model.prepare_paper_execution(
-            self._plan_form(self._current_layers())
+            self._plan_form(self._current_layers()), include_quote=False
         )
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
@@ -1115,7 +1163,8 @@ class StarUIWorkbench:
         else:
             self._drafts.pop(candidate.selection.con_id, None)
             refreshed = self._refresh_after_acknowledged_write_locked(
-                f"Paper submission acknowledged for {len(receipt.entry.order_ids)} orders."
+                f"Paper submission acknowledged for {len(receipt.entry.order_ids)} orders.",
+                include_quote=False,
             )
             self._submission_review_required = True
             if refreshed:
@@ -1178,8 +1227,12 @@ class StarUIWorkbench:
     def _arm_all_cancellations_locked(self) -> None:
         """Stage every active, journal-proven OCA pair on this position."""
         self._disarm_execution_locked()
+        self._bulk_cancel_trace_id = uuid4().hex
+        self._bulk_cancel_started_at = monotonic()
+        self._trace_bulk_cancel("trigger", action="cancel-all-active")
         if self._paper_execution is None or self._selected_con_id is None:
             self._message = "Paper order management is disabled for this launch."
+            self._trace_bulk_cancel("stage_blocked", reason="unavailable")
             return
         target_ids = self._active_target_perm_ids()
         snapshot = self._view_model.latest_snapshot()
@@ -1187,6 +1240,7 @@ class StarUIWorkbench:
             self._message = (
                 "Bracket cancellation blocked: no active layers are available."
             )
+            self._trace_bulk_cancel("stage_blocked", reason="no_active_layers")
             return
         try:
             candidates = self._paper_execution.prepare_market_exits(
@@ -1196,8 +1250,10 @@ class StarUIWorkbench:
             )
         except ExecutionBlocked as error:
             self._message = f"Bracket cancellation blocked: {error}"
+            self._trace_bulk_cancel("stage_blocked", reason="verification")
             return
         self._armed_cancellations = candidates
+        self._trace_bulk_cancel("stage_ready", bracket_count=len(candidates))
         self._set_review_status_locked(
             f"Review cancellation of {len(candidates)} active OCA brackets. "
             "The position will remain open. Review the cancellation to verify a fresh snapshot."
@@ -1218,14 +1274,39 @@ class StarUIWorkbench:
             self._message = "Review an active-layer action before executing it."
             return
         self._active_action_verified = False
-        state = self._view_model.select_position(
-            self._selected_con_id,
-            self._plan_form(self._drafts.get(self._selected_con_id, ())),
+        if cancellations:
+            self._trace_bulk_cancel(
+                "review_triggered", bracket_count=len(cancellations)
+            )
+            self._trace_bulk_cancel("review_snapshot_start")
+        snapshot_started = monotonic()
+        trace_token = current_snapshot_context.set(
+            (self._bulk_cancel_trace_id, "review", None)
+            if cancellations and self._bulk_cancel_trace_id
+            else None
         )
+        try:
+            state = self._view_model.select_position(
+                self._selected_con_id,
+                self._plan_form(self._drafts.get(self._selected_con_id, ())),
+                **(
+                    {"include_quote": False}
+                    if cancellation is not None or cancellations
+                    else {}
+                ),
+            )
+        finally:
+            current_snapshot_context.reset(trace_token)
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
         self._announce_reconciliation_locked()
         snapshot = self._view_model.latest_snapshot()
+        if cancellations:
+            self._trace_bulk_cancel(
+                "review_snapshot_complete",
+                duration_ms=round((monotonic() - snapshot_started) * 1000, 1),
+                available=snapshot is not None,
+            )
         if snapshot is None:
             self._disarm_execution_locked()
             self._message = "Execution blocked: the fresh snapshot is unavailable."
@@ -1278,6 +1359,8 @@ class StarUIWorkbench:
             )
             return
         self._active_action_verified = True
+        if cancellations:
+            self._trace_bulk_cancel("review_verified")
         self._armed_execution_deadline = monotonic() + 10
         self._set_review_status_locked(
             "Fresh paper snapshot verified. Review the action and confirm within 10 seconds."
@@ -1300,6 +1383,7 @@ class StarUIWorkbench:
         state = self._view_model.select_position(
             self._selected_con_id,
             self._plan_form(self._drafts.get(self._selected_con_id, ())),
+            include_quote=False,
         )
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
@@ -1338,7 +1422,8 @@ class StarUIWorkbench:
             self._message = f"Bracket cancellation outcome is unknown: {error}"
         else:
             refresh_succeeded = self._refresh_after_acknowledged_write_locked(
-                "TWS confirmed both OCA legs were cancelled."
+                "TWS confirmed both OCA legs were cancelled.",
+                include_quote=False,
             )
             observed = self._view_model.latest_snapshot()
             cancelled_ids = {candidate.target_perm_id, candidate.stop_perm_id}
@@ -1361,6 +1446,7 @@ class StarUIWorkbench:
 
     def _confirm_all_cancellations_locked(self) -> None:
         """Cancel reviewed pairs one at a time, verifying TWS between writes."""
+        self._trace_bulk_cancel("confirm_triggered")
         if self._expire_confirmation_locked(require_deadline=True):
             self._message = "Review expired. Review the cancellation again."
             return
@@ -1376,14 +1462,32 @@ class StarUIWorkbench:
         cancelled = 0
         try:
             for index, candidate in enumerate(candidates):
-                state = self._view_model.select_position(
-                    self._selected_con_id,
-                    self._plan_form(self._drafts.get(self._selected_con_id, ())),
+                bracket_number = index + 1
+                self._trace_bulk_cancel("snapshot_start", bracket_number=bracket_number)
+                snapshot_started = monotonic()
+                trace_token = current_snapshot_context.set(
+                    (self._bulk_cancel_trace_id, "before_pair", bracket_number)
+                    if self._bulk_cancel_trace_id
+                    else None
                 )
+                try:
+                    state = self._view_model.select_position(
+                        self._selected_con_id,
+                        self._plan_form(self._drafts.get(self._selected_con_id, ())),
+                        include_quote=False,
+                    )
+                finally:
+                    current_snapshot_context.reset(trace_token)
                 self._apply_state_locked(state)
                 self._record_refresh_time_locked()
                 self._announce_reconciliation_locked()
                 snapshot = self._view_model.latest_snapshot()
+                self._trace_bulk_cancel(
+                    "snapshot_complete",
+                    bracket_number=bracket_number,
+                    duration_ms=round((monotonic() - snapshot_started) * 1000, 1),
+                    available=snapshot is not None,
+                )
                 if snapshot is None:
                     raise ExecutionBlocked("the fresh snapshot is unavailable")
                 remaining = candidates[index:]
@@ -1398,29 +1502,71 @@ class StarUIWorkbench:
                 )
                 if refreshed != remaining:
                     raise ExecutionBlocked("an OCA layer changed after review")
-                self._paper_execution.cancel_pair(
-                    snapshot,
-                    candidate,
-                    host="127.0.0.1",
-                    port=self._settings.port,
-                    client_id=self._settings.client_id,
-                    timeout_seconds=self._settings.timeout_seconds,
+                self._trace_bulk_cancel(
+                    "pair_cancel_start", bracket_number=bracket_number
                 )
+                pair_started = monotonic()
+                context_token = current_cancellation_context.set(
+                    (self._bulk_cancel_trace_id or uuid4().hex, bracket_number)
+                )
+                try:
+                    self._paper_execution.cancel_pair(
+                        snapshot,
+                        candidate,
+                        host="127.0.0.1",
+                        port=self._settings.port,
+                        client_id=self._settings.client_id,
+                        timeout_seconds=self._settings.timeout_seconds,
+                    )
+                finally:
+                    current_cancellation_context.reset(context_token)
+                    self._trace_bulk_cancel(
+                        "pair_cancel_complete",
+                        bracket_number=bracket_number,
+                        duration_ms=round((monotonic() - pair_started) * 1000, 1),
+                    )
                 cancelled += 1
         except (ExecutionBlocked, ExecutionOutcomeUnknown) as error:
+            self._trace_bulk_cancel(
+                "stopped", cancelled_count=cancelled, outcome=type(error).__name__
+            )
             self._message = (
                 f"Cancelled {cancelled} of {len(candidates)} brackets. Stopped: {error}. "
                 "Refresh TWS before another action."
             )
         except Exception as error:
+            self._trace_bulk_cancel(
+                "stopped", cancelled_count=cancelled, outcome=type(error).__name__
+            )
             self._message = (
                 f"Cancelled {cancelled} of {len(candidates)} brackets. Outcome is unknown: "
                 f"{error}. Refresh TWS before another action."
             )
         else:
-            if self._refresh_after_acknowledged_write_locked(
-                f"TWS confirmed cancellation of {cancelled} active OCA brackets."
-            ):
+            self._trace_bulk_cancel("final_refresh_start", cancelled_count=cancelled)
+            refresh_started = monotonic()
+            # Refresh disarms the action, including its trace context. Keep the
+            # timing context locally so the final refresh and outcome are logged.
+            trace_id = self._bulk_cancel_trace_id
+            trace_started_at = self._bulk_cancel_started_at
+            trace_token = current_snapshot_context.set(
+                (trace_id, "final_refresh", None) if trace_id else None
+            )
+            try:
+                refresh_succeeded = self._refresh_after_acknowledged_write_locked(
+                    f"TWS confirmed cancellation of {cancelled} active OCA brackets.",
+                    include_quote=False,
+                )
+            finally:
+                current_snapshot_context.reset(trace_token)
+            self._bulk_cancel_trace_id = trace_id
+            self._bulk_cancel_started_at = trace_started_at
+            self._trace_bulk_cancel(
+                "final_refresh_complete",
+                duration_ms=round((monotonic() - refresh_started) * 1000, 1),
+                verified=refresh_succeeded,
+            )
+            if refresh_succeeded:
                 observed = self._view_model.latest_snapshot()
                 cancelled_ids = {
                     perm_id
@@ -1443,6 +1589,7 @@ class StarUIWorkbench:
                         "shows a selected order. Check TWS and refresh."
                     )
         finally:
+            self._trace_bulk_cancel("finished", cancelled_count=cancelled)
             self._disarm_execution_locked()
 
     def _verify_bracket_exists_locked(self, values: dict[str, str]) -> None:
@@ -1456,7 +1603,7 @@ class StarUIWorkbench:
             int(index_text) if index_text.isdecimal() else None
         )
         state = self._view_model.select_position(
-            self._selected_con_id, self._plan_form(())
+            self._selected_con_id, self._plan_form(()), include_quote=False
         )
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
@@ -1510,6 +1657,7 @@ class StarUIWorkbench:
             state = self._view_model.select_position(
                 self._selected_con_id,
                 self._plan_form(self._drafts.get(self._selected_con_id, ())),
+                include_quote=False,
             )
             self._apply_state_locked(state)
             self._record_refresh_time_locked()
@@ -1539,7 +1687,9 @@ class StarUIWorkbench:
             )
             return
         con_id = self._selected_con_id
-        state = self._view_model.select_position(con_id, self._plan_form(()))
+        state = self._view_model.select_position(
+            con_id, self._plan_form(()), include_quote=False
+        )
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
         self._announce_reconciliation_locked()
@@ -1640,6 +1790,7 @@ class StarUIWorkbench:
         state = self._view_model.select_position(
             self._selected_con_id,
             self._plan_form(self._drafts.get(self._selected_con_id, ())),
+            include_quote=False,
         )
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
@@ -1694,7 +1845,8 @@ class StarUIWorkbench:
             refreshed = self._refresh_after_acknowledged_write_locked(
                 f"TWS confirmed both selected OCA legs were cancelled and "
                 f"acknowledged the standalone MKT sell for "
-                f"{sum((candidate.quantity for candidate in candidates), Decimal('0'))} contracts."
+                f"{sum((candidate.quantity for candidate in candidates), Decimal('0'))} contracts.",
+                include_quote=False,
             )
             if refreshed:
                 self._show_success_toast_locked(
@@ -2085,7 +2237,8 @@ class StarUIWorkbench:
             refresh_succeeded = self._refresh_after_acknowledged_write_locked(
                 f"{'Simulated broker' if self._demo_mode else 'TWS'} acknowledged "
                 f"{len(receipt.entry.order_ids)} app-owned OCA "
-                "price amendment(s)."
+                "price amendment(s).",
+                include_quote=False,
             )
             record_price_update_event(
                 "ui_result",

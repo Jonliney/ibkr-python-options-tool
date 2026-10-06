@@ -109,7 +109,10 @@ def _publish(
     now: Decimal,
 ) -> SnapshotResult:
     errors: list[str] = []
-    missing = sorted(REQUIRED_COMPLETIONS - capture.completed)
+    required = REQUIRED_COMPLETIONS - (
+        {"quote"} if not request.include_quote else set()
+    )
+    missing = sorted(required - capture.completed)
     if missing:
         errors.append(f"missing completion barriers: {', '.join(missing)}")
     errors.extend(
@@ -148,7 +151,7 @@ def _publish(
             None,
             ("position contract identity does not match contract details",),
         )
-    if capture.quote is None or capture.market_rule is None:
+    if (request.include_quote and capture.quote is None) or capture.market_rule is None:
         return SnapshotResult(
             SnapshotStatus.BLOCKED,
             None,
@@ -233,13 +236,21 @@ def _publish(
         ),
         completed_orders_complete=capture.completed_orders_complete,
         quote=Quote(
-            bid=quote.bid,
-            ask=quote.ask,
-            last=quote.last,
-            close=quote.close,
-            market_data_type=quote.market_data_type,
-            fresh=now - quote.observed_at <= max_age_seconds,
-            observed_at=quote.observed_at,
+            bid=quote.bid if request.include_quote and quote is not None else None,
+            ask=quote.ask if request.include_quote and quote is not None else None,
+            last=quote.last if request.include_quote and quote is not None else None,
+            close=quote.close if request.include_quote and quote is not None else None,
+            market_data_type=(
+                quote.market_data_type
+                if request.include_quote and quote is not None
+                else "NOT_REQUESTED"
+            ),
+            fresh=(
+                now - quote.observed_at <= max_age_seconds
+                if request.include_quote and quote is not None
+                else False
+            ),
+            observed_at=quote.observed_at if quote is not None else Decimal("0"),
         ),
         market_rule=MarketRule(
             exchange=capture.market_rule.exchange,

@@ -1659,7 +1659,9 @@ def test_quote_movement_without_new_sell_risk_still_sends_amendment(
     monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: after)
     monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
     monkeypatch.setattr(
-        workbench, "_refresh_after_acknowledged_write_locked", lambda *_: refreshed
+        workbench,
+        "_refresh_after_acknowledged_write_locked",
+        lambda *_, **_kwargs: refreshed,
     )
 
     workbench._confirm_price_updates_locked({})
@@ -1795,7 +1797,7 @@ def test_failed_post_write_refresh_does_not_show_a_success_toast() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
 
-    def failed_refresh() -> None:
+    def failed_refresh(**_kwargs) -> None:
         raise RuntimeError("connection lost")
 
     workbench._refresh_locked = failed_refresh  # type: ignore[method-assign]
@@ -1814,7 +1816,7 @@ def test_post_write_snapshot_is_verified_even_if_draft_plan_is_blocked() -> None
     snapshot = workbench._view_model.latest_snapshot()
     assert snapshot is not None and snapshot.complete and snapshot.fresh
 
-    def refreshed_but_plan_blocked() -> None:
+    def refreshed_but_plan_blocked(**_kwargs) -> None:
         workbench._state = replace(workbench._state, status=UiStatus.BLOCKED)
 
     workbench._refresh_locked = refreshed_but_plan_blocked  # type: ignore[method-assign]
@@ -2088,7 +2090,7 @@ def test_manual_tws_confirmation_clears_unknown_only_after_fresh_api_check(
         executions_complete=True,
     )
 
-    def selected(*_args):
+    def selected(*_args, **_kwargs):
         workbench._view_model._latest_snapshot = fresh
         return workbench._state
 
@@ -2180,7 +2182,7 @@ def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
             confirmed_in_tws=False,
         )
 
-    def refreshed(*_args):
+    def refreshed(*_args, **_kwargs):
         workbench._view_model._latest_snapshot = clean
         return workbench._state
 
@@ -4611,7 +4613,7 @@ def test_arming_price_update_preserves_edited_percentage_in_active_input(
 
     writer = PriceWriter()
     workbench._paper_execution = PaperExecutionService(writer, journal)
-    workbench._view_model.select_position = lambda *_args: workbench._state  # type: ignore[method-assign]
+    workbench._view_model.select_position = lambda *_args, **_kwargs: workbench._state  # type: ignore[method-assign]
     workbench._view_model.latest_snapshot = lambda: active_snapshot  # type: ignore[method-assign]
 
     if prior_unknown:
@@ -4858,7 +4860,7 @@ def test_delete_all_active_layers_reviews_every_bracket_and_blocks_changed_set(
     monkeypatch.setattr(
         workbench._view_model,
         "select_position",
-        lambda _con_id, _form: workbench._state,
+        lambda _con_id, _form, **_kwargs: workbench._state,
     )
     client = TestClient(workbench.app)
 
@@ -4895,7 +4897,11 @@ def test_delete_all_active_layers_reviews_every_bracket_and_blocks_changed_set(
     assert 'value="cancel-all-confirm"' not in changed.text
 
 
-def test_delete_all_active_layers_stops_after_a_failed_pair(monkeypatch) -> None:
+def test_delete_all_active_layers_stops_after_a_failed_pair(
+    monkeypatch, tmp_path
+) -> None:
+    trace_path = tmp_path / "bracket-cancellations.jsonl"
+    monkeypatch.setenv("IBKR_OPTIONS_MANAGER_CANCEL_TRACE", str(trace_path))
     workbench = _demo_workbench()
     workbench.load_demo_data()
     snapshot = workbench._view_model.latest_snapshot()
@@ -4930,9 +4936,6 @@ def test_delete_all_active_layers_stops_after_a_failed_pair(monkeypatch) -> None
         ),
         cancel_pair=cancel_pair,
     )
-    workbench._armed_cancellations = candidates
-    workbench._active_action_verified = True
-    workbench._armed_execution_deadline = monotonic() + 10
     monkeypatch.setattr(
         workbench,
         "_active_target_perm_ids",
@@ -4944,14 +4947,101 @@ def test_delete_all_active_layers_stops_after_a_failed_pair(monkeypatch) -> None
     monkeypatch.setattr(
         workbench._view_model,
         "select_position",
-        lambda _con_id, _form: workbench._state,
+        lambda _con_id, _form, **_kwargs: workbench._state,
     )
+    workbench._arm_all_cancellations_locked()
+    assert workbench._armed_cancellations == candidates
+    workbench._active_action_verified = True
+    workbench._armed_execution_deadline = monotonic() + 10
 
     workbench._confirm_all_cancellations_locked()
 
     assert attempts == [101, 103]
     assert "Cancelled 1 of 3 brackets" in workbench._status_message
     assert workbench._armed_cancellations == ()
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert {event["run_id"] for event in events} == {events[0]["run_id"]}
+    assert [
+        event["event"] for event in events if event["event"] == "snapshot_complete"
+    ] == ["snapshot_complete", "snapshot_complete"]
+    assert any(
+        event["event"] == "stopped" and event["cancelled_count"] == 1
+        for event in events
+    )
+    assert any(
+        event["event"] == "finished" and event["cancelled_count"] == 1
+        for event in events
+    )
+    assert all(event.get("elapsed_ms", 0) >= 0 for event in events)
+
+
+def test_delete_all_active_layers_traces_final_refresh_after_disarm(
+    monkeypatch, tmp_path
+) -> None:
+    from ibkr_options_manager.cancellation_trace import current_snapshot_context
+
+    trace_path = tmp_path / "bracket-cancellations.jsonl"
+    monkeypatch.setenv("IBKR_OPTIONS_MANAGER_CANCEL_TRACE", str(trace_path))
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    candidate = MarketExitCandidate(
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        target_order_id=11,
+        target_perm_id=101,
+        client_id=17,
+        quantity=Decimal("2"),
+        tif="GTC",
+        oca_group="example/tranche-1",
+        stop_order_id=12,
+        stop_perm_id=102,
+    )
+    workbench._paper_execution = SimpleNamespace(  # type: ignore[assignment]
+        prepare_market_exits=lambda *_args, **_kwargs: (candidate,),
+        cancel_pair=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(workbench, "_active_target_perm_ids", lambda: (101,))
+    monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
+    capture_contexts = []
+    quote_requests = []
+
+    def select_position(_con_id, _form, **_kwargs):
+        capture_contexts.append(current_snapshot_context.get())
+        quote_requests.append(_kwargs["include_quote"])
+        return workbench._state
+
+    monkeypatch.setattr(workbench._view_model, "select_position", select_position)
+
+    def refresh_after_write(_acknowledgement: str, **_kwargs) -> bool:
+        capture_contexts.append(current_snapshot_context.get())
+        workbench._disarm_execution_locked()
+        return False
+
+    monkeypatch.setattr(
+        workbench, "_refresh_after_acknowledged_write_locked", refresh_after_write
+    )
+    workbench._arm_all_cancellations_locked()
+    workbench._active_action_verified = True
+    workbench._armed_execution_deadline = monotonic() + 10
+
+    workbench._confirm_all_cancellations_locked()
+
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert [event["event"] for event in events[-3:]] == [
+        "final_refresh_start",
+        "final_refresh_complete",
+        "finished",
+    ]
+    assert events[-2]["verified"] is False
+    assert events[-1]["cancelled_count"] == 1
+    assert {event["run_id"] for event in events} == {events[0]["run_id"]}
+    assert capture_contexts == [
+        (events[0]["run_id"], "before_pair", 1),
+        (events[0]["run_id"], "final_refresh", None),
+    ]
+    assert quote_requests == [False]
 
 
 @pytest.mark.parametrize(
@@ -4993,7 +5083,7 @@ def test_active_action_reviews_before_refresh_and_requires_execute(
     monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
     refreshes: list[int] = []
 
-    def refresh_selected(con_id: int, _form: PlanForm) -> object:
+    def refresh_selected(con_id: int, _form: PlanForm, **_kwargs) -> object:
         refreshes.append(con_id)
         return workbench._state
 
@@ -5503,6 +5593,15 @@ def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
         return original_refresh(settings)
 
     workbench._view_model.refresh_portfolio = refreshed  # type: ignore[method-assign]
+    original_capture = broker.capture
+    quote_requests: list[bool] = []
+
+    def capture_with_quote_record(request):
+        if isinstance(request, SnapshotRequest):
+            quote_requests.append(request.include_quote)
+        return original_capture(request)
+
+    broker.capture = capture_with_quote_record  # type: ignore[method-assign]
 
     armed = client.post(
         workbench.path + "action",
@@ -5520,6 +5619,7 @@ def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
     )
 
     assert submitted.status_code == 200
+    assert quote_requests == [True, False, False]
     assert "Orders sent to TWS" in submitted.text
     assert "The orders were sent to TWS." in submitted.text
     assert "Confirm or transmit them" in submitted.text
@@ -6004,7 +6104,7 @@ def test_pending_bracket_verify_button_stays_available_and_requires_broker_evide
     assert "Confirm neither bracket leg is working or filled in TWS first" in no_choice
     assert journal.find(fingerprint).state == "SUBMITTED"
 
-    def unchanged(*_args):
+    def unchanged(*_args, **_kwargs):
         workbench._view_model._latest_snapshot = snapshot
         return workbench._state
 
@@ -6054,7 +6154,7 @@ def test_pending_bracket_verify_button_stays_available_and_requires_broker_evide
 
     from ibkr_options_manager.app.view_model import WorkingOrderLine
 
-    def matching(*_args):
+    def matching(*_args, **_kwargs):
         workbench._view_model._latest_snapshot = matched
         return replace(
             workbench._state,
@@ -6110,7 +6210,7 @@ def test_pending_bracket_verify_button_stays_available_and_requires_broker_evide
     )
     filled_snapshot = replace(matched, captured_at=Decimal("102"), working_orders=())
 
-    def filled(*_args):
+    def filled(*_args, **_kwargs):
         workbench._view_model._latest_snapshot = filled_snapshot
         return replace(workbench._state, working_orders=())
 

@@ -9,6 +9,10 @@ from time import monotonic, sleep
 from typing import Any
 from uuid import uuid4
 
+from ..cancellation_trace import (
+    current_cancellation_context,
+    record_cancellation_event,
+)
 from ..domain import BrokerSnapshot, PlanResult
 from ..execution import (
     ExecutionBlocked,
@@ -217,8 +221,23 @@ class IbkrPaperExecutionBroker:
 
         app = App()
         reader: Thread | None = None
-        deadline = monotonic() + timeout_seconds
+        started = monotonic()
+        context = current_cancellation_context.get()
+        run_id, bracket_number = context if context is not None else (uuid4().hex, 1)
+
+        def trace(event: str, **fields: Any) -> None:
+            record_cancellation_event(
+                event,
+                run_id=run_id,
+                bracket_number=bracket_number,
+                elapsed_ms=round((monotonic() - started) * 1000, 1),
+                **fields,
+            )
+
+        deadline = started + timeout_seconds
+        outcome = "unknown"
         try:
+            trace("transport_connect_start", timeout_seconds=timeout_seconds)
             app.connect(host, port, client_id)
             reader = Thread(
                 target=app.run,
@@ -228,8 +247,10 @@ class IbkrPaperExecutionBroker:
             reader.start()
             if not app.ready.wait(max(0, deadline - monotonic())):
                 raise ExecutionBlocked("TWS did not issue a next valid order ID")
+            trace("transport_ready")
             for order_id in sorted(selected_ids):
                 _cancel_order(app, order_id)
+            trace("cancel_requests_sent", leg_count=len(selected_ids))
             while (
                 len(app.cancelled) != len(selected_ids)
                 and not app.errors
@@ -243,8 +264,10 @@ class IbkrPaperExecutionBroker:
                     "TWS did not acknowledge cancellation of both selected OCA legs "
                     "before the deadline"
                 )
+            trace("cancel_acknowledged", leg_count=len(app.cancelled))
             app.active_order_ids.clear()
             app.open_orders_done.clear()
+            trace("open_orders_check_start")
             app.reqOpenOrders()
             while (
                 not app.open_orders_done.is_set()
@@ -262,8 +285,17 @@ class IbkrPaperExecutionBroker:
                 raise ExecutionBlocked(
                     "the selected OCA pair remains active after cancellation"
                 )
+            trace("open_orders_check_complete", selected_pair_absent=True)
+            outcome = "confirmed"
             return PaperSubmission(order_ids=tuple(sorted(selected_ids)), perm_ids=())
+        except (ExecutionBlocked, ExecutionOutcomeUnknown) as error:
+            outcome = type(error).__name__
+            raise
+        except Exception:
+            outcome = "error"
+            raise
         finally:
+            trace("transport_finished", outcome=outcome)
             if app.isConnected():
                 app.disconnect()
             if reader is not None:

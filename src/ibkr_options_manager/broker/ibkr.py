@@ -6,6 +6,7 @@ from threading import Event, Thread
 from time import monotonic
 from typing import Any
 
+from ..cancellation_trace import current_snapshot_context, record_cancellation_event
 from ..ibkr_probe import (
     IbapiUnavailableError,
     _IbapiImports,
@@ -62,6 +63,10 @@ class _OrderDraft:
     tif: str
 
 
+_QUOTE_STREAM_WAIT_SECONDS = 1.5
+_QUOTE_SIDE_GRACE_SECONDS = 0.4
+
+
 class IbkrSnapshotBroker:
     """Official TWS adapter exposing bounded read-only captures."""
 
@@ -69,6 +74,8 @@ class IbkrSnapshotBroker:
         self._connection_epoch = 0
 
     def capture(self, request: SnapshotRequest | PortfolioRequest) -> BrokerCapture:
+        capture_started = monotonic()
+        _trace_snapshot("capture_start", capture_kind=type(request).__name__)
         imports = _load_ibapi()
         self._connection_epoch += 1
         app = _build_capture_app(imports)
@@ -83,7 +90,14 @@ class IbkrSnapshotBroker:
                 daemon=True,
             )
             reader.start()
-            if not _wait(app.handshake, deadline):
+            handshake_started = monotonic()
+            handshake_complete = _wait(app.handshake, deadline)
+            _trace_snapshot(
+                "handshake_complete",
+                duration_ms=round((monotonic() - handshake_started) * 1000, 1),
+                complete=handshake_complete,
+            )
+            if not handshake_complete:
                 app.errors.append("connection handshake timed out")
                 return _capture(app, self._connection_epoch, connected=False)
 
@@ -181,12 +195,27 @@ class IbkrSnapshotBroker:
                     deadline,
                     "contract-details request timed out",
                 )
-                _request_quote_and_rule(app, deadline)
+                _request_quote_and_rule(
+                    app, deadline, include_quote=request.include_quote
+                )
                 # Execution history informs the UI only. Its absence must not
                 # turn a coherent planning snapshot into a broker-write gate.
-                _wait(app.events["executions"], deadline)
-                _wait(app.events["completed_orders"], deadline)
-            return _capture(app, self._connection_epoch, connected=app.connected)
+                for name in ("executions", "completed_orders"):
+                    wait_started = monotonic()
+                    complete = _wait(app.events[name], deadline)
+                    _trace_snapshot(
+                        "history_wait_complete",
+                        phase=name,
+                        duration_ms=round((monotonic() - wait_started) * 1000, 1),
+                        complete=complete,
+                    )
+            build_started = monotonic()
+            result = _capture(app, self._connection_epoch, connected=app.connected)
+            _trace_snapshot(
+                "capture_build_complete",
+                duration_ms=round((monotonic() - build_started) * 1000, 1),
+            )
+            return result
         except (ConnectionError, OSError) as error:
             app.errors.append(f"connection failed: {error}")
             return _capture(app, self._connection_epoch, connected=False)
@@ -196,6 +225,10 @@ class IbkrSnapshotBroker:
                 app.disconnect()
             if reader is not None and reader.is_alive():
                 reader.join(timeout=0.5)
+            _trace_snapshot(
+                "capture_finished",
+                duration_ms=round((monotonic() - capture_started) * 1000, 1),
+            )
 
 
 def _build_capture_app(imports: _IbapiImports) -> Any:
@@ -230,6 +263,8 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
                 )
             }
             self.completion_times: dict[str, Decimal] = {}
+            self.quote_ready = Event()
+            self.quote_any_price = Event()
             self.connected = False
             self.server_version: int | None = None
             self.server_time: int | None = None
@@ -408,6 +443,7 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
                 self.market_data_type = _MARKET_DATA_TYPES.get(
                     int(marketDataType), "UNKNOWN"
                 )
+                self._maybe_complete_quote_stream()
 
         def tickPrice(
             self, reqId: int, tickType: int, price: float, attrib: Any
@@ -416,6 +452,16 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
             field = _TICK_FIELDS.get(int(tickType))
             if reqId == self.quote_request_id and field and price > 0:
                 self.quote_values[field] = _decimal(price)
+                self.quote_any_price.set()
+                self._maybe_complete_quote_stream()
+
+        def _maybe_complete_quote_stream(self) -> None:
+            if (
+                self.market_data_type != "UNKNOWN"
+                and "bid" in self.quote_values
+                and "ask" in self.quote_values
+            ):
+                self.quote_ready.set()
 
         def tickSnapshotEnd(self, reqId: int) -> None:
             if reqId == self.quote_request_id:
@@ -470,13 +516,50 @@ def _request_configuration(app: Any, imports: _IbapiImports) -> None:
         app._complete("configuration")
 
 
-def _request_quote_and_rule(app: Any, deadline: float) -> None:
+def _request_quote_and_rule(
+    app: Any, deadline: float, *, include_quote: bool = True
+) -> None:
     if len(app.contract_details_raw) != 1:
         return
     details = app.contract_details_raw[0]
-    app.reqMarketDataType(3)
-    app.reqMktData(app.quote_request_id, details.contract, "", True, False, [])
-    _await(app, "quote", deadline, "quote snapshot timed out")
+    if include_quote:
+        # Delayed-frozen mode can provide the last available quote outside
+        # trading hours; TWS returns live data instead when permitted.
+        app.reqMarketDataType(4)
+        app.reqMktData(app.quote_request_id, details.contract, "", False, False, [])
+        _trace_snapshot("quote_stream_requested")
+        stream_started = monotonic()
+        stream_has_price = app.quote_any_price.wait(
+            min(_QUOTE_STREAM_WAIT_SECONDS, max(0.0, deadline - monotonic()))
+        )
+        if stream_has_price and not app.quote_ready.is_set():
+            app.quote_ready.wait(
+                min(_QUOTE_SIDE_GRACE_SECONDS, max(0.0, deadline - monotonic()))
+            )
+        app.cancelMktData(app.quote_request_id)
+        _trace_snapshot(
+            "quote_stream_complete",
+            duration_ms=round((monotonic() - stream_started) * 1000, 1),
+            complete=stream_has_price,
+            bid_present="bid" in app.quote_values,
+            ask_present="ask" in app.quote_values,
+        )
+        if stream_has_price:
+            app._complete("quote")
+        else:
+            # Preserve the previous complete-snapshot behavior when a stream
+            # does not promptly deliver both sides of the market.
+            app.quote_request_id += 2
+            app.quote_values.clear()
+            app.market_data_type = "UNKNOWN"
+            app.reqMarketDataType(3)
+            app.reqMktData(
+                app.quote_request_id, details.contract, "", True, False, []
+            )
+            _trace_snapshot("quote_snapshot_requested")
+            _await(app, "quote", deadline, "quote snapshot timed out")
+    else:
+        _trace_snapshot("quote_snapshot_skipped")
 
     rule_id = _select_market_rule(details)
     if rule_id is None:
@@ -485,6 +568,7 @@ def _request_quote_and_rule(app: Any, deadline: float) -> None:
     app.requested_market_rule_id = rule_id
     app.requested_market_rule_exchange = _market_rule_exchange(details, rule_id)
     app.reqMarketRule(rule_id)
+    _trace_snapshot("market_rule_requested")
     _await(app, "market_rule", deadline, "market-rule request timed out")
 
 
@@ -647,10 +731,31 @@ def _positive_decimal_or_none(value: Any) -> Decimal | None:
 
 
 def _await(app: Any, name: str, deadline: float, message: str) -> bool:
+    wait_started = monotonic()
     complete = _wait(app.events[name], deadline)
+    _trace_snapshot(
+        "request_wait_complete",
+        phase=name,
+        duration_ms=round((monotonic() - wait_started) * 1000, 1),
+        complete=complete,
+    )
     if not complete:
         app.errors.append(message)
     return complete
+
+
+def _trace_snapshot(event: str, **fields: Any) -> None:
+    context = current_snapshot_context.get()
+    if context is None:
+        return
+    run_id, snapshot_role, bracket_number = context
+    record_cancellation_event(
+        f"snapshot_{event}",
+        run_id=run_id,
+        snapshot_role=snapshot_role,
+        bracket_number=bracket_number,
+        **fields,
+    )
 
 
 def _wait(event: Event, deadline: float) -> bool:

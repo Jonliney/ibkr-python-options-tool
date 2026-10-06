@@ -57,6 +57,7 @@ class SnapshotRequest:
     expected_account: str
     option_con_id: int
     timeout_seconds: float = 10.0
+    include_quote: bool = True
 
     def __post_init__(self) -> None:
         validate_paper_connection(

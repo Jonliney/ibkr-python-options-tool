@@ -879,6 +879,16 @@ def test_paper_execution_requires_read_only_api_to_have_been_explicitly_disabled
         require_paper_execution_snapshot(snapshot, plan)
 
 
+def test_paper_order_submission_can_recheck_without_a_quote() -> None:
+    snapshot = _snapshot()
+    orders_only = replace(
+        snapshot,
+        quote=replace(snapshot.quote, market_data_type="NOT_REQUESTED", fresh=False),
+    )
+
+    require_paper_execution_snapshot(orders_only, _plan(snapshot))
+
+
 @pytest.mark.parametrize("oca_pair", [False, True])
 def test_paper_execution_accepts_verified_external_reservation(
     oca_pair: bool,
@@ -1078,6 +1088,100 @@ def test_cancel_pair_removes_only_a_fresh_complete_app_owned_oca_bracket(
             client_id=17,
             timeout_seconds=1,
         )
+
+
+def test_cancel_pair_trace_records_callback_waits_without_order_identity(
+    monkeypatch, tmp_path
+) -> None:
+    from ibkr_options_manager.broker import execution as broker_execution
+
+    trace_path = tmp_path / "bracket-cancellations.jsonl"
+    monkeypatch.setenv("IBKR_OPTIONS_MANAGER_CANCEL_TRACE", str(trace_path))
+
+    class FakeWrapper:
+        pass
+
+    class FakeClient:
+        def __init__(self, wrapper) -> None:
+            self.wrapper = wrapper
+            self.connected = False
+
+        def connect(self, *_args) -> None:
+            self.connected = True
+            self.wrapper.nextValidId(500)
+
+        def run(self) -> None:
+            pass
+
+        def isConnected(self) -> bool:
+            return self.connected
+
+        def disconnect(self) -> None:
+            self.connected = False
+
+        def cancelOrder(self, order_id, _options) -> None:
+            self.wrapper.orderStatus(order_id, "Cancelled")
+
+        def reqOpenOrders(self) -> None:
+            self.wrapper.openOrderEnd()
+
+    monkeypatch.setattr(
+        broker_execution,
+        "_load_ibapi",
+        lambda: _IbapiImports(
+            FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace
+        ),
+    )
+    snapshot = _snapshot()
+    candidate = MarketExitCandidate(
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        target_order_id=101,
+        target_perm_id=201,
+        client_id=17,
+        quantity=Decimal("2"),
+        tif="GTC",
+        oca_group="app/tranche-1",
+        stop_order_id=102,
+        stop_perm_id=202,
+    )
+    result = IbkrPaperExecutionBroker().cancel_pair(
+        snapshot,
+        candidate,
+        host="127.0.0.1",
+        port=7497,
+        client_id=17,
+        timeout_seconds=1,
+    )
+
+    assert result.order_ids == (101, 102)
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert [event["event"] for event in events] == [
+        "transport_connect_start",
+        "transport_ready",
+        "cancel_requests_sent",
+        "cancel_acknowledged",
+        "open_orders_check_start",
+        "open_orders_check_complete",
+        "transport_finished",
+    ]
+    assert all(event["run_id"] == events[0]["run_id"] for event in events)
+    assert all(event["elapsed_ms"] >= 0 for event in events)
+    assert all("order_id" not in event and "account" not in event for event in events)
+    assert trace_path.stat().st_mode & 0o777 == 0o600
+    monkeypatch.setattr(
+        broker_execution,
+        "record_cancellation_event",
+        lambda *_args, **_kwargs: False,
+    )
+    assert IbkrPaperExecutionBroker().cancel_pair(
+        snapshot,
+        candidate,
+        host="127.0.0.1",
+        port=7497,
+        client_id=17,
+        timeout_seconds=1,
+    ).order_ids == (101, 102)
 
 
 def test_refresh_recovers_an_older_completed_bracket_cancellation(tmp_path) -> None:

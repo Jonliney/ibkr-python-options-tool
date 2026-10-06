@@ -259,6 +259,7 @@ class PlannerViewModel:
                 expected_account=settings.account,
                 option_con_id=baseline.selected.con_id,
                 timeout_seconds=settings.timeout_seconds,
+                include_quote=False,
             )
         )
         if capture is None or baseline.selected.account != settings.account:
@@ -381,6 +382,8 @@ class PlannerViewModel:
         self,
         con_id: int,
         form: PlanForm | None = None,
+        *,
+        include_quote: bool = True,
     ) -> ViewState:
         settings = self._settings
         if settings is None:
@@ -417,6 +420,7 @@ class PlannerViewModel:
                     expected_account=settings.account,
                     option_con_id=con_id,
                     timeout_seconds=settings.timeout_seconds,
+                    include_quote=include_quote,
                 )
             )
         except Exception as error:  # the GUI boundary must fail closed
@@ -458,6 +462,8 @@ class PlannerViewModel:
     def prepare_paper_execution(
         self,
         form: PlanForm,
+        *,
+        include_quote: bool = True,
     ) -> tuple[ViewState, PaperExecutionCandidate | None]:
         """Refresh once and return the only snapshot/plan pair eligible to send.
 
@@ -478,6 +484,7 @@ class PlannerViewModel:
                     expected_account=selection.account,
                     option_con_id=selection.con_id,
                     timeout_seconds=selection.timeout_seconds,
+                    include_quote=include_quote,
                 )
             )
         except Exception as error:  # execution must fail closed at the GUI seam
@@ -662,7 +669,13 @@ def _ready_state(
         Fact("Visible orders", str(len(snapshot.working_orders))),
     )
     quote = (
-        Fact("Market data", snapshot.quote.market_data_type, FactState.PASS),
+        Fact(
+            "Market data",
+            snapshot.quote.market_data_type,
+            FactState.INFO
+            if snapshot.quote.market_data_type == "NOT_REQUESTED"
+            else FactState.PASS,
+        ),
         Fact("Bid", _maybe_money(snapshot.quote.bid)),
         Fact("Ask", _maybe_money(snapshot.quote.ask)),
         Fact("Last", _maybe_money(snapshot.quote.last)),

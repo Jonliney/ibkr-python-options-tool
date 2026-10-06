@@ -162,6 +162,36 @@ def test_complete_capture_publishes_one_immutable_domain_snapshot() -> None:
     assert coordinator.current() == result
 
 
+def test_orders_only_snapshot_omits_quote_but_keeps_order_safety_barriers() -> None:
+    capture = replace(
+        complete_capture(),
+        quote=None,
+        completed=REQUIRED_COMPLETIONS - {"quote"},
+    )
+    broker = FakeReadOnlyBroker(capture)
+    coordinator = SnapshotCoordinator(
+        broker, max_age_seconds=Decimal("5"), clock=lambda: Decimal("101")
+    )
+    orders_only = replace(request(), include_quote=False)
+
+    result = coordinator.refresh(orders_only)
+
+    assert result.status is SnapshotStatus.READY
+    assert result.snapshot is not None
+    assert result.snapshot.quote.market_data_type == "NOT_REQUESTED"
+    assert result.snapshot.quote.bid is None
+    assert result.snapshot.quote.ask is None
+    assert not result.snapshot.quote.fresh
+    assert broker.received == orders_only
+
+    broker.capture_value = replace(
+        capture, completed=capture.completed - {"open_orders"}
+    )
+    assert coordinator.refresh(orders_only).status is SnapshotStatus.BLOCKED
+    broker.capture_value = capture
+    assert coordinator.refresh(request()).status is SnapshotStatus.BLOCKED
+
+
 def test_incomplete_refresh_invalidates_previous_snapshot_and_redacts_errors() -> None:
     broker = FakeReadOnlyBroker(complete_capture())
     coordinator = SnapshotCoordinator(
