@@ -210,6 +210,15 @@ bracket protection; a trailing market stop can slip, and a trailing limit may
 remain unfilled. This flow has been built for paper TWS only. Paper results do
 not establish equivalent live stop or complex-order behaviour.
 
+The layer display records trailing fills only from complete execution history
+whose account, contract ID, permanent order ID, and SELL side match the
+app-owned trailing order. It marks the trail sold in the closed-position view
+only when those fills account for its full quantity. A missing or conflicting
+fill remains unresolved. The displayed realised P&L requires a USD
+commission/fees report for every matching execution; until then it remains
+unavailable rather than displaying zero. A broker callback or a disappeared
+position alone is not evidence of the final outcome.
+
 The protective leg may be a SELL `STP LMT` for a new paper draft. The
 position-level choice defaults to STP; the connection settings can set a
 session default. One positive percentage or dollar amount below each verified
@@ -493,3 +502,4 @@ permanent IDs, and reacts correctly to fills/cancellations/reconnects. Also
 test that the selected pair is cancelled without affecting other OCA groups,
 the post-cancel open-order recheck is clean, and the standalone MKT produces
 the expected order/execution callbacks.
+Trailing layer prices are read-only observations. For a working trail, the app records the latest positive `trailStopPrice` reported by TWS for the exact app-owned order; `auxPrice` is the trailing amount and must not be displayed as the stop. For a trail limit, the displayed limit is calculated from that stop and the journaled limit offset. After closure, the row keeps the last recorded values; they may precede the fill and are not a fill-price claim. If no trigger was observed, the row shows an unavailable value rather than deriving one from a later quote.

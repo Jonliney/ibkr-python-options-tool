@@ -30,9 +30,11 @@ from ..domain import BrokerSnapshot, PlanResult, PriceBand
 from ..execution import (
     ExecutionJournal,
     JournalEntry,
+    JournalFill,
     JournalLayer,
     MarketExitCandidate,
     PriceUpdateCandidate,
+    classify_journal_layer,
 )
 from ..snapshot import SnapshotCoordinator, SnapshotResult
 from ..trailing import TrailingPlan
@@ -139,9 +141,7 @@ _POSITIONS = (
 DEMO_CON_IDS = frozenset(position.contract.con_id for position in _POSITIONS)
 
 
-def seed_demo_journal(
-    path: Path, *, scenario: str = "standard"
-) -> ExecutionJournal:
+def seed_demo_journal(path: Path, *, scenario: str = "standard") -> ExecutionJournal:
     """Seed one deterministic example; named scenarios use disposable journals."""
     if scenario not in DEMO_SCENARIOS:
         raise ValueError("unknown demo scenario")
@@ -150,6 +150,10 @@ def seed_demo_journal(
         entry = _scenario_entry(scenario)
         if entry is not None and journal.find(entry.fingerprint) is None:
             journal._write((*journal._entries(), entry))
+        if scenario == "closed-trail":
+            brackets = _closed_trail_brackets()
+            if journal.find(brackets.fingerprint) is None:
+                journal._write((*journal._entries(), brackets))
         return journal
     fingerprint = sha256(b"demo-nvda-unverified-bracket-v1").hexdigest()
     if journal.find(fingerprint) is None:
@@ -211,8 +215,69 @@ def _scenario_entry(scenario: str) -> JournalEntry | None:
             trailing_unit="dollars",
             trailing_limit_offset="0.10",
             trailing_tif="GTC",
+            trailing_last_stop="8.80" if scenario == "closed-trail" else "",
+            trailing_last_limit="8.70" if scenario == "closed-trail" else "",
         )
     return None
+
+
+def _closed_trail_brackets() -> JournalEntry:
+    """Two completed TSLA brackets precede the three-contract trailing exit."""
+    return JournalEntry(
+        fingerprint=sha256(b"demo-closed-trail-brackets-v1").hexdigest(),
+        account=DEMO_ACCOUNT,
+        con_id=DEMO_TRAILING_CON_ID,
+        state="RECONCILED",
+        expected_order_count=4,
+        snapshot_captured_at="0",
+        order_ids=(910_301, 910_302, 910_303, 910_304),
+        perm_ids=(810_301, 810_302, 810_303, 810_304),
+        oca_prefix="demo-closed-trail-brackets",
+        layers=(
+            JournalLayer(
+                1,
+                "12.00",
+                "7.00",
+                "GTC",
+                810_301,
+                810_302,
+                target_percentage="39.53",
+                stop_percentage="-18.60",
+            ),
+            JournalLayer(
+                1,
+                "11.00",
+                "7.50",
+                "GTC",
+                810_303,
+                810_304,
+                target_percentage="27.91",
+                stop_percentage="-12.79",
+            ),
+        ),
+        fills=(
+            JournalFill(
+                "DEMO-BRACKET-TARGET",
+                810_301,
+                "SLD",
+                "1",
+                "12.00",
+                "2026-10-09T14:00:00-04:00",
+                "340",
+                "USD",
+            ),
+            JournalFill(
+                "DEMO-BRACKET-STOP",
+                810_304,
+                "SLD",
+                "1",
+                "7.50",
+                "2026-10-09T14:30:00-04:00",
+                "-110",
+                "USD",
+            ),
+        ),
+    )
 
 
 class DemoReadOnlyBroker:
@@ -256,7 +321,13 @@ class DemoReadOnlyBroker:
                 ):
                     continue
                 for index, layer in enumerate(entry.layers):
-                    if layer.cancelled:
+                    outcome = classify_journal_layer(
+                        entry,
+                        index,
+                        active_perm_ids=frozenset(),
+                        observed_perm_ids=frozenset(),
+                    )
+                    if layer.cancelled or outcome.status.startswith("CLOSED_"):
                         continue
                     group = (
                         f"{entry.oca_prefix or entry.fingerprint[:12]}"
@@ -361,24 +432,63 @@ class DemoReadOnlyBroker:
         filled = self._scenario == "partial-fill" or (
             self._scenario == "closed-trail" and self._portfolio_captures >= 2
         )
-        executions = (
-            CapturedExecution(
-                exec_id=f"DEMO-TRAIL-{self._scenario}",
-                account=account,
-                con_id=DEMO_TRAILING_CON_ID,
-                perm_id=_TRAILING_PERM_ID,
-                side="SLD",
-                quantity=Decimal("2")
-                if self._scenario == "partial-fill"
-                else Decimal("3"),
-                price=Decimal("9.10"),
-                time="2026-10-09T15:30:00-04:00",
-                realized_pnl=Decimal("100")
-                if self._scenario == "partial-fill"
-                else Decimal("150"),
-                currency="USD",
-            ),
-        ) if filled else ()
+        trailing_executions = (
+            (
+                CapturedExecution(
+                    exec_id=f"DEMO-TRAIL-{self._scenario}",
+                    account=account,
+                    con_id=DEMO_TRAILING_CON_ID,
+                    perm_id=_TRAILING_PERM_ID,
+                    side="SLD",
+                    quantity=Decimal("2")
+                    if self._scenario == "partial-fill"
+                    else Decimal("3"),
+                    price=Decimal("9.10"),
+                    time="2026-10-09T15:30:00-04:00",
+                    realized_pnl=Decimal("100")
+                    if self._scenario == "partial-fill"
+                    else Decimal("150"),
+                    currency="USD",
+                ),
+            )
+            if filled
+            else ()
+        )
+        bracket_executions = (
+            (
+                CapturedExecution(
+                    exec_id=exec_id,
+                    account=account,
+                    con_id=DEMO_TRAILING_CON_ID,
+                    perm_id=perm_id,
+                    side="SLD",
+                    quantity=Decimal("1"),
+                    price=Decimal(price),
+                    time=time,
+                    realized_pnl=Decimal(pnl),
+                    currency="USD",
+                )
+                for exec_id, perm_id, price, time, pnl in (
+                    (
+                        "DEMO-BRACKET-TARGET",
+                        810_301,
+                        "12.00",
+                        "2026-10-09T14:00:00-04:00",
+                        "340",
+                    ),
+                    (
+                        "DEMO-BRACKET-STOP",
+                        810_304,
+                        "7.50",
+                        "2026-10-09T14:30:00-04:00",
+                        "-110",
+                    ),
+                )
+            )
+            if self._scenario == "closed-trail"
+            else ()
+        )
+        executions = (*bracket_executions, *trailing_executions)
         return BrokerCapture(
             connection_epoch=1,
             connected=True,

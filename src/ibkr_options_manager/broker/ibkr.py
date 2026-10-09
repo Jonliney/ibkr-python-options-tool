@@ -341,7 +341,7 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
                 oca_group=str(getattr(order, "ocaGroup", "")) or None,
                 parent_id=int(getattr(order, "parentId", 0) or 0),
                 limit_price=_positive_decimal_or_none(getattr(order, "lmtPrice", 0)),
-                stop_price=_positive_decimal_or_none(getattr(order, "auxPrice", 0)),
+                stop_price=_observed_stop_price(order),
                 tif=str(getattr(order, "tif", "")),
             )
             if self.open_order_source == "client":
@@ -553,9 +553,7 @@ def _request_quote_and_rule(
             app.quote_values.clear()
             app.market_data_type = "UNKNOWN"
             app.reqMarketDataType(3)
-            app.reqMktData(
-                app.quote_request_id, details.contract, "", True, False, []
-            )
+            app.reqMktData(app.quote_request_id, details.contract, "", True, False, [])
             _trace_snapshot("quote_snapshot_requested")
             _await(app, "quote", deadline, "quote snapshot timed out")
     else:
@@ -723,6 +721,16 @@ def _decimal(value: Any) -> Decimal:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return Decimal("NaN")
+
+
+def _observed_stop_price(order: Any) -> Decimal | None:
+    """For trails, auxPrice is the trail amount, not the current stop."""
+    field = (
+        "trailStopPrice"
+        if str(getattr(order, "orderType", "")) in {"TRAIL", "TRAIL LIMIT"}
+        else "auxPrice"
+    )
+    return _positive_decimal_or_none(getattr(order, field, 0))
 
 
 def _positive_decimal_or_none(value: Any) -> Decimal | None:

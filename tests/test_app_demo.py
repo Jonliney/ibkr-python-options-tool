@@ -194,6 +194,45 @@ def test_closed_session_hides_cancelled_brackets_and_keeps_verified_pnl() -> Non
     assert "Awaiting TWS review" not in page
 
 
+def test_closed_trail_keeps_row_but_withholds_pnl_without_report() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    con_id = 1_004_470_201
+    workbench._session_closed_positions[con_id] = next(
+        position for position in workbench._state.positions if position.con_id == con_id
+    )
+    workbench._selected_closed_con_id = con_id
+    workbench._selected_con_id = None
+    trailing = JournalEntry(
+        fingerprint="trailing-conversion:" + "a" * 64,
+        account=DEMO_ACCOUNT,
+        con_id=con_id,
+        state="SUBMITTED",
+        perm_ids=(90210,),
+        trailing_quantity=3,
+        trailing_stop="8.80",
+        trailing_value="0.25",
+        trailing_unit="dollars",
+        trailing_limit_offset="0.10",
+        trailing_tif="GTC",
+        fills=(JournalFill("trail.01", 90210, "SLD", "3", "9.10", "now"),),
+    )
+
+    class History:
+        def submission_entries(self, **_kwargs):
+            return ()
+
+        def trailing_entries(self, **_kwargs):
+            return (trailing,)
+
+    workbench._paper_execution = History()  # type: ignore[assignment]
+    page = to_xml(workbench._page())
+    assert 'data-layer-state="sold-trailing"' in page
+    assert "P&amp;L pending" in page or "P&L pending" in page
+    assert "Realised P&amp;L" in page or "Realised P&L" in page
+    assert "+$0.00" not in page
+
+
 def test_closed_history_refresh_records_exact_broker_evidence(monkeypatch) -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -301,6 +340,7 @@ def _trailing_scenario_workbench(tmp_path: Path, scenario: str) -> StarUIWorkben
         initial_account=DEMO_ACCOUNT,
         initial_con_id=1_004_470_201,
         demo_mode=True,
+        demo_scenario=scenario,
         paper_execution=PaperExecutionService(
             DemoPaperExecutionTransport(journal), journal
         ),
@@ -342,6 +382,11 @@ def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) ->
     assert 'data-layer-state="trailing"' in working_page
     assert "TRAIL LIMIT" in working_page
     assert "WORKING" in working_page
+    recorded = working._paper_execution.trailing_entries(
+        account=DEMO_ACCOUNT, con_id=1_004_470_201
+    )
+    assert recorded[0].trailing_last_stop == "8.80"
+    assert recorded[0].trailing_last_limit == "8.70"
 
     partial = _trailing_scenario_workbench(tmp_path / "partial", "partial-fill")
     assert partial._state.positions[-1].quantity == "1"
@@ -378,16 +423,34 @@ def test_closed_trailing_demo_moves_position_to_session_history_on_refresh(
 ) -> None:
     workbench = _trailing_scenario_workbench(tmp_path, "closed-trail")
     client = TestClient(workbench.app)
-    assert 'data-layer-state="trailing"' in client.get(workbench.path).text
-    refreshed = client.post(workbench.path + "action", data={"action": "refresh"})
-    assert refreshed.status_code == 200
+    initial = client.get(workbench.path).text
     assert 1_004_470_201 in workbench._session_closed_positions
-    selected = client.post(
-        workbench.path + "action",
-        data={"action": "select-session-closed", "con_id": "1004470201"},
-    )
     assert workbench._selected_closed_con_id == 1_004_470_201
-    assert "No closed fills or unresolved layers to show." in selected.text
+    assert 'data-layer-state="sold-trailing"' in initial
+    assert initial.count('data-layer-state="sold"') == 2
+    assert "+$340.00" in initial
+    assert "-$110.00" in initial
+    assert "+$150.00" in initial
+    assert 'for="trailing-stop-810201"' in initial
+    assert 'for="trailing-limit-810201"' in initial
+    assert "How was" not in initial
+    assert 'value="8.80"' in initial
+    assert 'value="8.70"' in initial
+    assert "WORKING" not in initial
+    trail = workbench._paper_execution.trailing_entries(
+        account=DEMO_ACCOUNT, con_id=1_004_470_201
+    )[0]
+    closed_row = to_xml(workbench._trailing_layer_row(3, trail, closed_position=True))
+    assert ">Closed<" in closed_row
+    assert ">CLOSED<" not in closed_row
+    assert "TRAIL LIMIT" not in closed_row
+    assert ">STP<" in closed_row
+    assert ">LMT<" in closed_row
+    assert "<details" not in closed_row
+    assert "Last observed in TWS" not in closed_row
+    assert "Derived from recorded stop and offset" not in closed_row
+    assert "trail</p>" not in closed_row
+    assert "Average fill" not in closed_row
 
 
 def test_existing_exit_order_explanation_opens_from_available_metric() -> None:
@@ -3854,6 +3917,7 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
     assert "+$557.44 USD" in page.text
     assert workbench._projection_state()[1].realized_pnl == Decimal("557.44")
     assert "Closed" in page.text
+    assert "How was" not in page.text
     assert "Active" in page.text
     assert "Target filled" not in page.text
     assert "WORKING" not in page.text
@@ -6846,11 +6910,33 @@ def test_submitted_trailing_exit_appears_as_central_layer_row() -> None:
     page = to_xml(workbench._page())
     assert 'data-layer-state="trailing"' in page
     assert "TRAIL LIMIT" in page
-    assert "Limit offset $0.05" in page
+    assert "Last recorded LMT" in page
     assert "CHECK TWS" in page
     trailing_row = to_xml(workbench._trailing_layer_row(1, entry))
     assert 'class="layer-row-grid ' in trailing_row
     assert ">TIF<" not in trailing_row
+    assert "GTC" not in trailing_row
+    assert "font-mono" not in trailing_row
+    assert "disabled" in trailing_row
+    assert "Last recorded STP" in trailing_row
+    assert "Quantity" in trailing_row
+    filled = replace(
+        entry,
+        fills=(JournalFill("trail.01", 90210, "SLD", "2", "0.95", "now"),),
+    )
+    closed_row = to_xml(workbench._trailing_layer_row(1, filled, closed_position=True))
+    assert 'data-layer-state="sold-trailing"' in closed_row
+    assert "Average fill" not in closed_row
+    assert "P&amp;L pending" in closed_row or "P&L pending" in closed_row
+    incomplete = replace(
+        entry,
+        fills=(JournalFill("trail.01", 90210, "SLD", "1", "0.95", "now"),),
+    )
+    unresolved_row = to_xml(
+        workbench._trailing_layer_row(1, incomplete, closed_position=True)
+    )
+    assert 'data-layer-state="sold-trailing"' not in unresolved_row
+    assert "VERIFY IN TWS" in unresolved_row
 
 
 def test_trailing_dialog_has_one_clickable_trigger_button() -> None:
@@ -6865,7 +6951,7 @@ def test_trailing_dialog_has_one_clickable_trigger_button() -> None:
     assert 'name="trail_unit" data-bind="trailing_amount_unit"' in dialog_markup
     assert 'name="trail_limit_unit" data-bind="trailing_limit_unit"' in dialog_markup
     assert 'name="trail_tif"' not in dialog_markup
-    assert '>DAY<' not in dialog_markup
+    assert ">DAY<" not in dialog_markup
     assert dialog_markup.index('aria-label="Trail amount unit"') < dialog_markup.index(
         'name="trail_value"'
     )
@@ -6904,6 +6990,7 @@ def test_demo_entire_position_trailing_conversion_includes_unassigned_contracts(
                 ),
             )
         )
+
     class MovingBidBroker(DemoReadOnlyBroker):
         bid_adjustment = Decimal("0")
         epoch_adjustment = 0
@@ -6988,9 +7075,12 @@ def test_demo_entire_position_trailing_conversion_includes_unassigned_contracts(
     assert 'data-layer-state="trailing"' in result.text
     assert "TRAIL LIMIT" in result.text
     assert "WORKING" in result.text
-    assert journal.trailing_entries(account=DEMO_ACCOUNT, con_id=1_004_470_201)[
-        -1
-    ].trailing_tif == "GTC"
+    assert (
+        journal.trailing_entries(account=DEMO_ACCOUNT, con_id=1_004_470_201)[
+            -1
+        ].trailing_tif
+        == "GTC"
+    )
     if with_bracket:
         original = journal.find("b" * 64)
         assert original is not None and original.layers[0].cancelled

@@ -135,7 +135,13 @@
 }
 
 .trailing-layer-row {
-  background: rgb(14 116 144 / 9%);
+  background: transparent;
+}
+
+.trailing-layer-row input:disabled {
+  opacity: 1;
+  color: var(--foreground);
+  -webkit-text-fill-color: var(--foreground);
 }
 
 [data-position-quantity] {

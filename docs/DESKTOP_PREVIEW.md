@@ -84,7 +84,8 @@ All prices, orders, fills, and P&L values below are illustrative.
 | Working trailing limit | `working-trail` | TSLA has a 3-contract `TRAIL LIMIT` order with initial stop `$8.80` and offset `$0.10`. Inspect the active trailing row. |
 | Partial trailing fill | `partial-fill` | A synthetic 2-contract sale at `$9.10` leaves 1 held contract and 1 working trailing contract. Compare the position, row quantity, and realised P&L display. |
 | Manual cancellation | `manual-cancel` | The app journal still owns a 3-contract trailing limit, but the simulated broker no longer reports its working order. Inspect the unresolved row and available-quantity treatment. |
-| Fully closed position | `closed-trail` | Start with 3 held contracts and a working trail. Press **Refresh** once to simulate a 3-contract fill, then select TSLA from the closed-position list. Inspect the closed workspace and realised P&L. |
+| Fully closed position | `closed-trail` | TSLA opens already closed, with two completed bracket layers (one target fill at $12.00 and one stop fill at $7.50) and a completed trail. Compare all three rows and their realised P&L (+$340, -$110, and +$150). The trail shows its last recorded stop ($8.80) and derived limit ($8.70), rather than a live quote. |
+
 | Missing option bid | `no-bid` | TSLA has no bid. Open **Convert entire position** and review a trail to exercise the blocked message without an order. |
 
 For example:
@@ -94,12 +95,20 @@ For example:
 .venv/bin/ibkr-options-manager-gui --demo-data --demo-scenario closed-trail
 ```
 
-These scenarios expose unfinished follow-ups deliberately: trailing fills are
-not yet reconciled into realised P&L, a closed trailing row is not yet retained,
-and a manually cancelled trailing order currently shows `CHECK TWS`. The
-synthetic fill amounts are evidence for UI iteration only; they do not imply
-broker-verified net P&L. Use one scenario per app launch so the expected state
-is unambiguous.
+The active and closed trailing rows use the bracket layer grid. A completed
+trail remains in the closed-position workspace only after exact, complete
+SELL fill evidence accounts for its full quantity. Its average fill price is
+shown there; realised P&L is shown only when every exact fill has a matching
+USD report. Otherwise the row says `P&L pending`, and the closed-position total
+stays unavailable. A missing or incomplete fill leaves the trail unresolved.
+While a trailing order is partially filled, the active position header leaves
+realised P&L unavailable rather than showing a misleading zero; full partial
+fill accounting remains a follow-up.
+The synthetic fill amounts are evidence for UI iteration only; they do not
+establish broker-verified net P&L or live execution behavior. A manually
+cancelled trailing order still shows `CHECK TWS`; its verification workflow is
+a separate follow-up. Use one scenario per app launch so the expected state is
+unambiguous.
 
 The account must use the project's `DU` paper-account allowlist convention.
 The exact ID is kept only in memory for the current process. The evidence view

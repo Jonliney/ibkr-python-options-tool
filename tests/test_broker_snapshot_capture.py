@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from ibkr_options_manager.broker.ibkr import (
     _await,
     _capture,
+    _observed_stop_price,
     _OrderDraft,
     _request_quote_and_rule,
 )
@@ -32,6 +33,17 @@ def _order(*, order_id: int) -> _OrderDraft:
         stop_price=None,
         tif="GTC",
     )
+
+
+def test_trailing_stop_uses_reported_trigger_not_trailing_amount() -> None:
+    order = SimpleNamespace(orderType="TRAIL LIMIT", auxPrice=0.25, trailStopPrice=0.75)
+    assert _observed_stop_price(order) == Decimal("0.75")
+    assert (
+        _observed_stop_price(SimpleNamespace(orderType="TRAIL", auxPrice=0.25)) is None
+    )
+    assert _observed_stop_price(
+        SimpleNamespace(orderType="STP", auxPrice=0.75)
+    ) == Decimal("0.75")
 
 
 def test_capture_prefers_client_bound_order_over_nonbinding_all_order_view() -> None:

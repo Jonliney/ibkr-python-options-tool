@@ -9,14 +9,14 @@ and trailing stop-limit workflow.
 
 1. [x] Improve the action review sidebar design for trailing stop limits. Make
    the trigger, limit offset, quantity, and risk easy to scan before confirmation.
-2. [ ] Redesign the active trailing stop-limit layer row to follow the bracket
+2. [x] Redesign the active trailing stop-limit layer row to follow the bracket
    layer layout and visual hierarchy while showing its trailing-specific values.
 3. [ ] Allow an app-owned trailing stop-limit order to be modified through a
    reviewed, verified paper-order workflow.
 4. [ ] Capture and display realized P&L when a trailing exit fills. Investigate
    why the completed sale still showed `$0`, and reconcile fills and fees before
    treating the result as realized.
-5. [ ] Show the trailing layer row after it closes, within the closed-position
+5. [x] Show the trailing layer row after it closes, within the closed-position
    state, using its completed outcome rather than dropping the row.
 6. [ ] Add the current bid, ask, and average position price to the **Convert
    entire position** dialog, using the contextual pattern from other dialogs.

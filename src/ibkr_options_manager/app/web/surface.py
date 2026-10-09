@@ -140,6 +140,13 @@ class _PriceUpdateImpact:
     concerns: frozenset[tuple[int, str]]
 
 
+@dataclass(frozen=True, slots=True)
+class _TrailingFillSummary:
+    quantity: Decimal
+    average_price: Decimal | None
+    realized_pnl: Decimal | None
+
+
 class StarUIWorkbench:
     """Server-owned StarUI view over planning and explicitly enabled paper sends."""
 
@@ -150,6 +157,7 @@ class StarUIWorkbench:
         initial_account: str = "",
         initial_con_id: int | None = None,
         demo_mode: bool = False,
+        demo_scenario: str = "standard",
         paper_execution: PaperExecutionService | None = None,
         observe_positions: bool = False,
         observer_client_id: int = 18,
@@ -158,6 +166,10 @@ class StarUIWorkbench:
         _register_bundled_icons()
         self._view_model = view_model
         self._demo_mode = demo_mode
+        self._demo_scenario = demo_scenario
+        self._demo_closed_con_id = (
+            initial_con_id if demo_scenario == "closed-trail" else None
+        )
         self._paper_execution = paper_execution
         self._observe_positions = observe_positions and not demo_mode
         self._observer_client_id = observer_client_id
@@ -277,6 +289,10 @@ class StarUIWorkbench:
             return
         with self._lock:
             self._refresh_locked()
+            if self._demo_scenario == "closed-trail":
+                self._refresh_locked()
+                if self._demo_closed_con_id in self._session_closed_positions:
+                    self._selected_closed_con_id = self._demo_closed_con_id
 
     def refresh_on_launch(self) -> None:
         """Perform the same read-only refresh as the header control at startup."""
@@ -1467,14 +1483,17 @@ class StarUIWorkbench:
                 # The bid can move, and each fresh TWS capture has a new
                 # connection epoch. Show the new stop and limit offset for
                 # confirmation while keeping stable safety inputs identical.
-                if replace(
-                    refreshed_trailing,
-                    reference_price=trailing.reference_price,
-                    initial_stop=trailing.initial_stop,
-                    limit_offset=trailing.limit_offset,
-                    fingerprint=trailing.fingerprint,
-                    connection_epoch=trailing.connection_epoch,
-                ) != trailing:
+                if (
+                    replace(
+                        refreshed_trailing,
+                        reference_price=trailing.reference_price,
+                        initial_stop=trailing.initial_stop,
+                        limit_offset=trailing.limit_offset,
+                        fingerprint=trailing.fingerprint,
+                        connection_epoch=trailing.connection_epoch,
+                    )
+                    != trailing
+                ):
                     raise ExecutionBlocked("the trailing plan changed after review")
                 self._armed_trailing = refreshed_trailing
             elif cancellations:
@@ -2564,6 +2583,11 @@ class StarUIWorkbench:
             )
             if callable(record_executions):
                 record_executions(snapshot)
+            record_trailing_prices = getattr(
+                self._paper_execution, "record_trailing_prices", None
+            )
+            if callable(record_trailing_prices):
+                record_trailing_prices(snapshot)
         except ExecutionBlocked as error:
             self._message = f"Journal reconciliation blocked: {error}"
             return
@@ -3437,6 +3461,7 @@ class StarUIWorkbench:
         rows: list[Any] = []
         realized = Decimal("0")
         pnl_verified = True
+        has_recorded_fill = any(entry.fills for entry in entries)
         for entry in entries:
             for index in range(len(entry.layers)):
                 outcome = classify_journal_layer(
@@ -3471,12 +3496,26 @@ class StarUIWorkbench:
                             read_only=True,
                         )
                     )
+        for entry in self._trailing_entries(con_id):
+            if entry.state != "SUBMITTED" or not entry.perm_ids:
+                continue
+            rows.append(
+                self._trailing_layer_row(len(rows) + 1, entry, closed_position=True)
+            )
+            summary = _trailing_fill_summary(entry)
+            if (
+                summary is None
+                or summary.quantity != entry.trailing_quantity
+                or summary.realized_pnl is None
+            ):
+                pnl_verified = False
+            else:
+                realized += summary.realized_pnl
+            has_recorded_fill = has_recorded_fill or bool(entry.fills)
         symbol, contract_detail = _position_identity(position.local_symbol)
         title = f"{symbol} {contract_detail}".strip()
         result = (
-            _header_pnl(realized, "USD")
-            if pnl_verified and any(entry.fills for entry in entries)
-            else "—"
+            _header_pnl(realized, "USD") if pnl_verified and has_recorded_fill else "—"
         )
         center = self._workspace_content(
             Div(
@@ -3996,6 +4035,10 @@ class StarUIWorkbench:
                 break
             if realized is not None:
                 realized += outcome.realized_pnl
+        if any(entry.fills for entry in trailing_entries):
+            # Partial trailing fills are not included in the held/total and
+            # outcome projection yet; avoid presenting zero as a verified result.
+            realized = None
         return self._workspace_content(
             self._selected_quantity_notice(),
             Div(
@@ -5049,8 +5092,9 @@ class StarUIWorkbench:
             target.perm_id for _group, target, _stop in self._active_oca_pairs()
         )
 
-    def _trailing_entries(self) -> tuple[JournalEntry, ...]:
-        if self._paper_execution is None or self._selected_con_id is None:
+    def _trailing_entries(self, con_id: int | None = None) -> tuple[JournalEntry, ...]:
+        selected = con_id if con_id is not None else self._selected_con_id
+        if self._paper_execution is None or selected is None:
             return ()
         reader = getattr(self._paper_execution, "trailing_entries", None)
         if not callable(reader):
@@ -5059,7 +5103,7 @@ class StarUIWorkbench:
             tuple[JournalEntry, ...],
             reader(
                 account=self._verified_selected_account(),
-                con_id=self._selected_con_id,
+                con_id=selected,
             ),
         )
 
@@ -5097,7 +5141,9 @@ class StarUIWorkbench:
                             HTMLInput(
                                 type="hidden",
                                 name="trail_unit",
-                                data_bind=Signal("trailing_amount_unit", _ref_only=True),
+                                data_bind=Signal(
+                                    "trailing_amount_unit", _ref_only=True
+                                ),
                             ),
                             Input(
                                 name="trail_value",
@@ -5226,55 +5272,129 @@ class StarUIWorkbench:
             method="post",
         )
 
-    def _trailing_layer_row(self, index: int, entry: JournalEntry) -> Any:
+    def _trailing_layer_row(
+        self, index: int, entry: JournalEntry, *, closed_position: bool = False
+    ) -> Any:
         order = next(
             (
                 order
                 for order in self._state.working_orders
-                if order.perm_id == entry.perm_ids[0]
+                if not closed_position
+                and self._selected_con_id == entry.con_id
+                and order.perm_id == entry.perm_ids[0]
                 and order.order_type in {"TRAIL", "TRAIL LIMIT"}
             ),
             None,
         )
         working = order is not None
+        summary = _trailing_fill_summary(entry)
+        sold = (
+            closed_position
+            and summary is not None
+            and summary.quantity == entry.trailing_quantity
+        )
         kind = "TRAIL LIMIT" if entry.trailing_limit_offset else "TRAIL"
-        trail = f"{entry.trailing_value}{'%' if entry.trailing_unit == 'percent' else ' USD'}"
+        recorded_stop = entry.trailing_last_stop
+        recorded_limit = entry.trailing_last_limit
+        result = (
+            f"{_money(summary.realized_pnl)} USD"
+            if sold and summary is not None and summary.realized_pnl is not None
+            else "P&L pending"
+            if sold
+            else "Verify order and fills"
+        )
+        result_tone = (
+            "profit"
+            if summary is not None
+            and summary.realized_pnl is not None
+            and summary.realized_pnl > 0
+            else "loss"
+            if summary is not None
+            and summary.realized_pnl is not None
+            and summary.realized_pnl < 0
+            else "unknown"
+        )
         return Div(
             Div(
-                Span(str(index), cls="font-mono text-muted-foreground"),
-                Badge("WORKING" if working else "CHECK TWS", variant="outline"),
-                cls="flex flex-col items-start gap-2",
-            ),
-            Div(
-                Span(kind, cls="text-xs font-semibold"),
+                Span(f"TRAIL {index}", cls="text-xs font-semibold"),
                 P(
-                    f"Trail {trail}",
-                    cls="mt-2 font-mono text-sm",
+                    "Closed" if sold else "WORKING" if working else "CHECK TWS",
+                    cls="mt-2 text-xs text-muted-foreground",
                 ),
-                cls="min-w-0",
+                cls="min-w-20",
             ),
+            _trailing_readonly_field(
+                "STP" if sold else kind,
+                (recorded_stop or "—") if sold else entry.trailing_value,
+                input_id=(
+                    f"trailing-stop-{entry.perm_ids[0]}"
+                    if sold
+                    else f"trailing-value-{entry.perm_ids[0]}"
+                ),
+                suffix="USD"
+                if sold and recorded_stop
+                else "%"
+                if not sold and entry.trailing_unit == "percent"
+                else "USD"
+                if not sold
+                else None,
+            ),
+            _trailing_readonly_field(
+                "LMT",
+                recorded_limit or "—",
+                input_id=f"trailing-limit-{entry.perm_ids[0]}",
+                suffix="USD" if recorded_limit else None,
+            )
+            if sold and entry.trailing_limit_offset
+            else Div(cls="min-w-0")
+            if sold
+            else Div(
+                _trailing_readonly_field(
+                    "Last recorded STP",
+                    recorded_stop or "—",
+                    input_id=f"trailing-stop-{entry.perm_ids[0]}",
+                    suffix="USD" if recorded_stop else None,
+                ),
+                _trailing_readonly_field(
+                    "Last recorded LMT",
+                    recorded_limit or "—",
+                    input_id=f"trailing-limit-{entry.perm_ids[0]}",
+                    suffix="USD" if recorded_limit else None,
+                )
+                if entry.trailing_limit_offset
+                else None,
+                cls="min-w-0 space-y-2",
+            ),
+            _trailing_readonly_field(
+                "Quantity",
+                format(summary.quantity, "f")
+                if sold and summary is not None
+                else str(order.remaining if order else entry.trailing_quantity),
+                input_id=f"trailing-quantity-{entry.perm_ids[0]}",
+                detail=(
+                    f"{format(summary.quantity, 'f')} sold"
+                    if working and summary is not None and summary.quantity > 0
+                    else "Original order"
+                    if not working and not sold
+                    else None
+                ),
+            ),
+            Div(cls="min-w-0"),
             Div(
-                Span("Initial stop", cls="text-xs text-muted-foreground"),
-                P(f"${entry.trailing_stop}", cls="mt-2 font-mono text-sm"),
-                P(
-                    f"Limit offset ${entry.trailing_limit_offset}"
-                    if entry.trailing_limit_offset
-                    else "Market sell on trigger",
-                    cls="mt-1 text-xs text-muted-foreground",
-                ),
-                cls="min-w-0",
-            ),
-            Div(
-                Span("Quantity", cls="text-xs text-muted-foreground"),
-                P(
-                    str(order.remaining if order else entry.trailing_quantity),
-                    cls="mt-2 font-mono text-sm",
-                ),
-            ),
-            Div(),
-            data_layer_state="trailing",
+                Span("SOLD" if sold else "VERIFY IN TWS", cls="sold-layer-status"),
+                Span(result, cls="sold-layer-result"),
+                cls="sold-layer-badge",
+            )
+            if sold or not working
+            else None,
+            data_layer_state="sold-trailing" if sold else "trailing",
+            data_result_tone=result_tone if sold else "verify",
             data_trailing_perm_id=entry.perm_ids[0],
-            cls="layer-row-grid items-start gap-3 border-t border-border py-4 first:border-t-0 trailing-layer-row",
+            cls=(
+                "layer-row-grid items-start gap-3 border-t border-border py-4 "
+                "first:border-t-0 trailing-layer-row"
+                + (" sold-layer-row" if sold or not working else "")
+            ),
         )
 
     def _active_layer_row(self, index: int, group: str, target: Any, stop: Any) -> Any:
@@ -7818,6 +7938,90 @@ def _field(
             cls="mt-1 flex items-center gap-2",
         ),
         cls="min-w-0 space-y-0.5",
+    )
+
+
+def _trailing_readonly_field(
+    label: str,
+    value: str,
+    *,
+    input_id: str,
+    suffix: str | None = None,
+    detail: str | None = None,
+) -> Any:
+    """Use the same field rhythm as bracket layers for a recorded trail."""
+    return Div(
+        Label(label, fr=input_id, cls="text-xs font-medium text-muted-foreground"),
+        Div(
+            Input(
+                id=input_id,
+                value=value,
+                disabled=True,
+                cls="pr-12" if suffix else "",
+            ),
+            Span(
+                suffix,
+                cls=(
+                    "pointer-events-none absolute right-3 top-1/2 "
+                    "-translate-y-1/2 text-sm text-muted-foreground"
+                ),
+            )
+            if suffix
+            else None,
+            cls="relative mt-1",
+        ),
+        P(detail, cls="mt-1 text-xs text-muted-foreground") if detail else None,
+        cls="min-w-0 space-y-0.5",
+    )
+
+
+def _trailing_fill_summary(entry: JournalEntry) -> _TrailingFillSummary | None:
+    """Accept only exact, nonduplicated SELL fills for this recorded trail."""
+    if (
+        entry.trailing_quantity <= 0
+        or len(entry.perm_ids) != 1
+        or entry.perm_ids[0] <= 0
+    ):
+        return None
+    quantity = Decimal("0")
+    proceeds = Decimal("0")
+    pnl = Decimal("0")
+    pnl_complete = True
+    seen: set[str] = set()
+    for fill in entry.fills:
+        try:
+            filled = Decimal(fill.quantity)
+            price = Decimal(fill.price)
+            reported_pnl = (
+                Decimal(fill.realized_pnl) if fill.realized_pnl is not None else None
+            )
+        except InvalidOperation:
+            return None
+        if (
+            not fill.exec_id
+            or fill.exec_id in seen
+            or fill.perm_id != entry.perm_ids[0]
+            or fill.side.upper() not in {"SLD", "SELL"}
+            or not filled.is_finite()
+            or filled <= 0
+            or not price.is_finite()
+            or price <= 0
+            or (reported_pnl is not None and not reported_pnl.is_finite())
+        ):
+            return None
+        seen.add(fill.exec_id)
+        quantity += filled
+        proceeds += filled * price
+        if reported_pnl is None or fill.currency != "USD":
+            pnl_complete = False
+        else:
+            pnl += reported_pnl
+    if quantity > entry.trailing_quantity:
+        return None
+    return _TrailingFillSummary(
+        quantity=quantity,
+        average_price=proceeds / quantity if quantity else None,
+        realized_pnl=pnl if quantity and pnl_complete else None,
     )
 
 

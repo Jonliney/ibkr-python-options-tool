@@ -95,6 +95,8 @@ class JournalEntry:
     trailing_unit: str = ""
     trailing_limit_offset: str = ""
     trailing_tif: str = ""
+    trailing_last_stop: str = ""
+    trailing_last_limit: str = ""
 
 
 def _entry_oca_prefix(entry: JournalEntry) -> str:
@@ -1527,12 +1529,23 @@ class ExecutionJournal:
         ambiguous = ambiguous_oca_prefixes(entries)
         changed = False
         for index, entry in enumerate(entries):
+            bracket_entry = len(entry.fingerprint) == 64
+            trailing_entry = (
+                entry.fingerprint.startswith("trailing-conversion:")
+                and len(entry.fingerprint.removeprefix("trailing-conversion:")) == 64
+                and entry.state == "SUBMITTED"
+                and entry.trailing_quantity > 0
+                and len(entry.perm_ids) == 1
+                and entry.perm_ids[0] > 0
+            )
             if (
                 entry.account != snapshot.selected.account
                 or entry.con_id != snapshot.selected.con_id
-                or len(entry.fingerprint) != 64
+                or not (bracket_entry or trailing_entry)
                 or (
-                    (entry.account, entry.con_id, _entry_oca_prefix(entry)) in ambiguous
+                    bracket_entry
+                    and (entry.account, entry.con_id, _entry_oca_prefix(entry))
+                    in ambiguous
                     and not entry.perm_ids
                 )
             ):
@@ -1575,6 +1588,52 @@ class ExecutionJournal:
             updated_fills = tuple(sorted(fills.values(), key=lambda fill: fill.exec_id))
             if updated_fills != entry.fills:
                 entries[index] = replace(entry, fills=updated_fills)
+                changed = True
+        if changed:
+            self._write(tuple(entries))
+
+    def record_trailing_prices(self, snapshot: BrokerSnapshot) -> None:
+        """Keep the last positive TWS-reported trigger for an exact owned trail."""
+        entries = list(self._entries())
+        changed = False
+        for index, entry in enumerate(entries):
+            if (
+                entry.state != "SUBMITTED"
+                or entry.account != snapshot.selected.account
+                or entry.con_id != snapshot.selected.con_id
+                or len(entry.perm_ids) != 1
+                or entry.trailing_quantity <= 0
+            ):
+                continue
+            matches = [
+                order
+                for order in snapshot.working_orders
+                if order.perm_id == entry.perm_ids[0]
+                and order.key == snapshot.selected
+                and order.action == "SELL"
+                and order.order_type in {"TRAIL", "TRAIL LIMIT"}
+            ]
+            if len(matches) != 1 or matches[0].stop_price is None:
+                continue
+            stop = matches[0].stop_price
+            if not stop.is_finite() or stop <= 0:
+                continue
+            limit = ""
+            if entry.trailing_limit_offset:
+                try:
+                    offset = Decimal(entry.trailing_limit_offset)
+                except InvalidOperation:
+                    continue
+                if not offset.is_finite() or offset <= 0 or stop <= offset:
+                    continue
+                limit = format(stop - offset, "f")
+            updated = replace(
+                entry,
+                trailing_last_stop=format(stop, "f"),
+                trailing_last_limit=limit,
+            )
+            if updated != entry:
+                entries[index] = updated
                 changed = True
         if changed:
             self._write(tuple(entries))
@@ -1713,6 +1772,8 @@ class ExecutionJournal:
                     trailing_unit=str(item.get("trailing_unit", "")),
                     trailing_limit_offset=str(item.get("trailing_limit_offset", "")),
                     trailing_tif=str(item.get("trailing_tif", "")),
+                    trailing_last_stop=str(item.get("trailing_last_stop", "")),
+                    trailing_last_limit=str(item.get("trailing_last_limit", "")),
                 )
                 for item in payload
             )
@@ -1958,6 +2019,10 @@ class PaperExecutionService:
         """Persist read-only fill and realized P&L observations."""
         self._journal.record_executions(snapshot)
 
+    def record_trailing_prices(self, snapshot: BrokerSnapshot) -> None:
+        """Persist exact app-owned trailing prices observed in TWS."""
+        self._journal.record_trailing_prices(snapshot)
+
     def record_verified_price_updates(
         self,
         snapshot: BrokerSnapshot,
@@ -2083,9 +2148,7 @@ class PaperExecutionService:
             snapshot.position.unit_basis != plan.position_basis
             or snapshot.position.raw_average_cost != plan.position_raw_average_cost
         ):
-            raise ExecutionBlocked(
-                "the position basis changed during conversion"
-            )
+            raise ExecutionBlocked("the position basis changed during conversion")
         if not snapshot.executions_complete or not snapshot.completed_orders_complete:
             raise ExecutionBlocked("complete order and execution history is required")
         if (

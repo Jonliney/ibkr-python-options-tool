@@ -145,10 +145,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     window = StarUIPlannerWindow(
         view_model,
         initial_account=initial_account,
-        initial_con_id=args.con_id or (
-            DEMO_TRAILING_CON_ID if args.demo_scenario != "standard" else None
-        ),
+        initial_con_id=args.con_id
+        or (DEMO_TRAILING_CON_ID if args.demo_scenario != "standard" else None),
         demo_mode=args.demo_data,
+        demo_scenario=args.demo_scenario,
         paper_execution=paper_execution,
         observe_positions=not args.demo_data,
         observer_client_id=args.observer_client_id,

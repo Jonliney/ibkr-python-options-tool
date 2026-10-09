@@ -180,6 +180,50 @@ def test_trailing_plan_rejects_external_order_and_stale_bid() -> None:
         )
 
 
+def test_trailing_fill_journal_records_only_exact_verified_sell_executions(
+    tmp_path,
+) -> None:
+    journal = ExecutionJournal(tmp_path / "trailing.json")
+    snapshot = _trailing_snapshot()
+    entry = JournalEntry(
+        fingerprint="trailing-conversion:" + "a" * 64,
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        state="SUBMITTED",
+        order_ids=(701,),
+        perm_ids=(801,),
+        trailing_quantity=2,
+    )
+    journal._write((entry,))
+    matching = ObservedExecution(
+        exec_id="trail-fill.01",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=801,
+        side="SLD",
+        quantity=Decimal("2"),
+        price=Decimal("1.15"),
+        time="2026-10-09T15:00:00-04:00",
+        realized_pnl=Decimal("25"),
+        currency="USD",
+    )
+    journal.record_executions(
+        replace(
+            snapshot,
+            executions=(
+                replace(matching, perm_id=999),
+                replace(matching, side="BOT", exec_id="buy-fill.01"),
+                matching,
+            ),
+        )
+    )
+    recorded = journal.find(entry.fingerprint)
+    assert recorded is not None
+    assert len(recorded.fills) == 1
+    assert recorded.fills[0].perm_id == 801
+    assert recorded.fills[0].realized_pnl == "25"
+
+
 def test_trailing_plan_rejects_invalid_tick_and_insufficient_stop_room() -> None:
     snapshot = _trailing_snapshot()
     with pytest.raises(ExecutionBlocked, match="valid price increment"):
