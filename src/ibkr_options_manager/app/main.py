@@ -4,6 +4,8 @@ import argparse
 import sys
 from collections.abc import Sequence
 from decimal import Decimal
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import monotonic
 
 from PySide6.QtWidgets import QApplication
@@ -20,6 +22,8 @@ from .account_preferences import load_saved_account, save_paper_account
 from .demo import (
     DEMO_ACCOUNT,
     DEMO_CON_IDS,
+    DEMO_SCENARIOS,
+    DEMO_TRAILING_CON_ID,
     DemoPaperExecutionTransport,
     DemoReadOnlyBroker,
     DemoSnapshotSource,
@@ -49,6 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="launch with deterministic simulated data; never contacts TWS",
     )
     parser.add_argument(
+        "--demo-scenario",
+        choices=DEMO_SCENARIOS,
+        default="standard",
+        help="named, isolated trailing workflow to rehearse with --demo-data",
+    )
+    parser.add_argument(
         "--enable-paper-execution",
         action="store_true",
         help=(
@@ -61,8 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.demo_scenario != "standard" and not args.demo_data:
+        build_parser().error("--demo-scenario requires --demo-data")
     if args.demo_data and args.con_id is not None and args.con_id not in DEMO_CON_IDS:
         build_parser().error("--con-id is not present in the simulated data")
+    demo_execution = args.enable_paper_execution or args.demo_scenario != "standard"
     app = QApplication.instance()
     owns_app = app is None
     if app is None:
@@ -81,7 +94,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.demo_data:
         broker = DemoReadOnlyBroker(
             clock=clock,
-            paper_execution_enabled=args.enable_paper_execution,
+            paper_execution_enabled=demo_execution,
+            scenario=args.demo_scenario,
         )
         coordinator = DemoSnapshotSource(broker, clock=clock)
         portfolio_max_age = Decimal("31536000")
@@ -97,17 +111,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         broker,
         max_age_seconds=portfolio_max_age,
         clock=clock,
-        paper_execution_mode=args.enable_paper_execution,
+        paper_execution_mode=demo_execution,
     )
     view_model = PlannerViewModel(coordinator, portfolio=portfolio, clock=clock)
     paper_execution: PaperExecutionService | None = None
-    if args.enable_paper_execution:
+    demo_journal_dir: TemporaryDirectory[str] | None = None
+    if demo_execution:
         journal_path = default_paper_journal_path()
         if args.demo_data:
-            # Simulated acknowledgements must never share the paper TWS journal.
-            journal_path = journal_path.with_name("demo-execution-journal.json")
+            if args.demo_scenario == "standard":
+                # The original demo retains its separate journal across launches.
+                journal_path = journal_path.with_name("demo-execution-journal.json")
+            else:
+                # Named examples start clean and never touch a saved journal.
+                demo_journal_dir = TemporaryDirectory(prefix="ibkr-trailing-demo-")
+                journal_path = Path(demo_journal_dir.name) / "scenario-journal.json"
         journal = (
-            seed_demo_journal(journal_path)
+            seed_demo_journal(journal_path, scenario=args.demo_scenario)
             if args.demo_data
             else ExecutionJournal(journal_path)
         )
@@ -125,12 +145,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     window = StarUIPlannerWindow(
         view_model,
         initial_account=initial_account,
-        initial_con_id=args.con_id,
+        initial_con_id=args.con_id or (
+            DEMO_TRAILING_CON_ID if args.demo_scenario != "standard" else None
+        ),
         demo_mode=args.demo_data,
         paper_execution=paper_execution,
         observe_positions=not args.demo_data,
         observer_client_id=args.observer_client_id,
         save_account=save_paper_account if not args.demo_data else None,
+        demo_journal_dir=demo_journal_dir,
     )
     window.refresh_on_launch()
     window.show()

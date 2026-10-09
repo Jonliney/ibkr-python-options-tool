@@ -7112,29 +7112,74 @@ class StarUIWorkbench:
             if plan.request.trail_unit == "percent"
             else f"${plan.request.trail_value}"
         )
+        stop_limit = plan.limit_offset is not None
+        initial_limit = (
+            plan.initial_stop - plan.limit_offset
+            if plan.limit_offset is not None
+            else None
+        )
+
+        def term(label: str, value: str, detail: str | None = None) -> Any:
+            return Div(
+                Span(label, cls="text-xs text-muted-foreground"),
+                Span(value, cls="font-mono text-sm font-semibold tabular-nums"),
+                Span(detail, cls="text-xs text-muted-foreground") if detail else None,
+                cls="flex min-w-0 flex-col gap-0.5",
+            )
+
         return Div(
-            H3(
-                f"SELL {kind} · {plan.quantity} contracts",
-                cls="text-base font-semibold",
+            Div(
+                H3(f"SELL {kind}", cls="text-base font-semibold"),
+                Span(
+                    f"{plan.quantity} contracts · {plan.request.tif}",
+                    cls="font-mono text-xs font-semibold tabular-nums",
+                ),
+                cls="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1",
+            ),
+            Div(
+                term("Trail from option premium", trail),
+                term(
+                    "Initial stop estimate",
+                    f"${plan.initial_stop}",
+                    f"from bid ${plan.reference_price}",
+                ),
+                term("Limit offset", f"${plan.limit_offset}", "below moving stop")
+                if stop_limit
+                else None,
+                term("Initial limit estimate", f"${initial_limit}")
+                if stop_limit
+                else None,
+                cls="mt-4 grid grid-cols-2 gap-x-4 gap-y-4 border-y border-border py-4",
             ),
             P(
-                f"Cancel {len(plan.candidates)} app-owned brackets; include "
-                f"{plan.unassigned_quantity} unassigned contracts.",
-                cls="mt-2 text-sm text-muted-foreground",
+                f"Cancel {len(plan.candidates)} app-owned brackets, then place one "
+                f"trailing sell for all {plan.quantity} held contracts. "
+                f"Includes {plan.unassigned_quantity} unassigned contracts."
+                if plan.candidates
+                else f"Place one trailing sell for all {plan.quantity} held contracts. "
+                f"Includes {plan.unassigned_quantity} unassigned contracts.",
+                cls="mt-4 text-xs leading-5 text-muted-foreground",
             ),
-            P(
-                f"Trail {trail} from option premium · initial stop estimate "
-                f"${plan.initial_stop} from bid ${plan.reference_price} · {plan.request.tif}",
-                cls="mt-2 text-sm",
+            Div(
+                P("Fill risk", cls="text-xs font-semibold text-amber-200"),
+                P(
+                    "After the stop triggers, the limit order may remain unfilled "
+                    "if the option falls below its limit. You may still own the "
+                    "contracts and lose more than the initial stop suggests."
+                    if stop_limit
+                    else "The stop submits a market sell. The fill price can "
+                    "differ from the initial stop estimate.",
+                    cls="mt-1 text-xs leading-5 text-amber-100",
+                ),
+                P(
+                    "Cancelling the brackets creates a period without their protection.",
+                    cls="mt-2 text-xs leading-5 text-amber-100",
+                )
+                if plan.candidates
+                else None,
+                cls="mt-4 border border-amber-500/40 bg-amber-500/10 p-3",
             ),
-            P(
-                f"Limit offset ${plan.limit_offset} below the moving stop. "
-                "This is a fixed dollar offset."
-                if plan.limit_offset is not None
-                else "A trigger submits a market sell; the fill price can differ.",
-                cls="mt-2 text-sm text-amber-200",
-            ),
-            cls="rounded-md border border-border bg-card p-4",
+            cls="action-review-layer py-4",
         )
 
     def _review_market_exit_plan(

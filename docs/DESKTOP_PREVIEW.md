@@ -71,6 +71,36 @@ keeps a Verify action: finding both exact orders
 makes it active, while confirming neither exists requires a fresh, complete
 order and execution check before the reserved quantity is released.
 
+### Trailing workflow examples
+
+Named examples use **simulated execution automatically**, never connect to TWS,
+and use a fresh disposable journal for each launch. Close and relaunch to reset
+one. Run any of these from the repository root; TSLA is selected automatically.
+All prices, orders, fills, and P&L values below are illustrative.
+
+| Scenario | Command suffix after `--demo-data --demo-scenario` | What to inspect |
+| --- | --- | --- |
+| Convert an existing bracket | `convert` | TSLA has a 2-contract app-owned bracket and 1 unassigned contract. Open **Convert entire position**, enter a `$0.25` trail and `$0.10` limit offset, then review the 3-contract action and its risk. Confirming only changes this disposable demo. |
+| Working trailing limit | `working-trail` | TSLA has a 3-contract `TRAIL LIMIT` order with initial stop `$8.80` and offset `$0.10`. Inspect the active trailing row. |
+| Partial trailing fill | `partial-fill` | A synthetic 2-contract sale at `$9.10` leaves 1 held contract and 1 working trailing contract. Compare the position, row quantity, and realised P&L display. |
+| Manual cancellation | `manual-cancel` | The app journal still owns a 3-contract trailing limit, but the simulated broker no longer reports its working order. Inspect the unresolved row and available-quantity treatment. |
+| Fully closed position | `closed-trail` | Start with 3 held contracts and a working trail. Press **Refresh** once to simulate a 3-contract fill, then select TSLA from the closed-position list. Inspect the closed workspace and realised P&L. |
+| Missing option bid | `no-bid` | TSLA has no bid. Open **Convert entire position** and review a trail to exercise the blocked message without an order. |
+
+For example:
+
+```sh
+.venv/bin/ibkr-options-manager-gui --demo-data --demo-scenario convert
+.venv/bin/ibkr-options-manager-gui --demo-data --demo-scenario closed-trail
+```
+
+These scenarios expose unfinished follow-ups deliberately: trailing fills are
+not yet reconciled into realised P&L, a closed trailing row is not yet retained,
+and a manually cancelled trailing order currently shows `CHECK TWS`. The
+synthetic fill amounts are evidence for UI iteration only; they do not imply
+broker-verified net P&L. Use one scenario per app launch so the expected state
+is unambiguous.
+
 The account must use the project's `DU` paper-account allowlist convention.
 The exact ID is kept only in memory for the current process. The evidence view
 redacts it, and changing any connection-selection field immediately clears the

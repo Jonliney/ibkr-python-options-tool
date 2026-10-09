@@ -166,9 +166,15 @@ def test_trailing_plan_rejects_external_order_and_stale_bid() -> None:
             (),
             TrailingRequest(Decimal("0.10"), "dollars"),
         )
-    with pytest.raises(ExecutionBlocked, match="fresh option bid"):
+    with pytest.raises(ExecutionBlocked, match="couldn't verify a current bid"):
         plan_entire_position(
             replace(snapshot, quote=replace(snapshot.quote, fresh=False)),
+            (),
+            TrailingRequest(Decimal("0.10"), "dollars"),
+        )
+    with pytest.raises(ExecutionBlocked, match="Check the bid in TWS"):
+        plan_entire_position(
+            replace(snapshot, quote=replace(snapshot.quote, bid=None)),
             (),
             TrailingRequest(Decimal("0.10"), "dollars"),
         )

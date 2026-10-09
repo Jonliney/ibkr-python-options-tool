@@ -84,7 +84,11 @@ def plan_entire_position(
     ):
         raise ExecutionBlocked("enter a positive limit offset below 100%")
     if not snapshot.quote.fresh or snapshot.quote.bid is None:
-        raise ExecutionBlocked("a fresh option bid is required for a trailing order")
+        raise ExecutionBlocked(
+            "The app couldn't verify a current bid for this option. "
+            "This can happen outside trading hours. Check the bid in TWS, "
+            "then refresh and try again."
+        )
     reference = snapshot.quote.bid
     if not reference.is_finite() or reference <= 0:
         raise ExecutionBlocked("the option bid is invalid")

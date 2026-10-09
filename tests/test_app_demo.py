@@ -36,6 +36,7 @@ from starlette.testclient import TestClient
 from ibkr_options_manager.app.demo import (
     DEMO_ACCOUNT,
     DEMO_CON_IDS,
+    DEMO_SCENARIOS,
     DemoPaperExecutionTransport,
     DemoReadOnlyBroker,
     seed_demo_journal,
@@ -273,6 +274,120 @@ def test_demo_launch_populates_the_starui_workbench_without_a_tws_refresh() -> N
     assert workbench._state.selected_con_id is not None
     assert workbench._state.quote_calculator is not None
     assert workbench._state.available_quantity == 5
+
+
+def _trailing_scenario_workbench(tmp_path: Path, scenario: str) -> StarUIWorkbench:
+    def clock() -> Decimal:
+        return Decimal("100")
+
+    from ibkr_options_manager.app.view_model import PlannerViewModel
+
+    journal = seed_demo_journal(tmp_path / "scenario.json", scenario=scenario)
+    broker = DemoReadOnlyBroker(
+        clock=clock, paper_execution_enabled=True, scenario=scenario
+    )
+    broker.use_journal(journal)
+    workbench = StarUIWorkbench(
+        PlannerViewModel(
+            SnapshotCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock),
+            portfolio=PortfolioCoordinator(
+                broker,
+                max_age_seconds=Decimal("15"),
+                clock=clock,
+                paper_execution_mode=True,
+            ),
+            clock=clock,
+        ),
+        initial_account=DEMO_ACCOUNT,
+        initial_con_id=1_004_470_201,
+        demo_mode=True,
+        paper_execution=PaperExecutionService(
+            DemoPaperExecutionTransport(journal), journal
+        ),
+    )
+    workbench.load_demo_data()
+    return workbench
+
+
+def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) -> None:
+    assert set(DEMO_SCENARIOS) == {
+        "standard",
+        "convert",
+        "working-trail",
+        "partial-fill",
+        "manual-cancel",
+        "closed-trail",
+        "no-bid",
+    }
+    convert = _trailing_scenario_workbench(tmp_path / "convert", "convert")
+    assert convert._planning_available_quantity() == 1
+    convert_page = TestClient(convert.app).get(convert.path).text
+    assert 'data-layer-state="working"' in convert_page
+    conversion_review = TestClient(convert.app).post(
+        convert.path + "action",
+        data={
+            "action": "trailing-convert-arm",
+            "trail_value": "0.25",
+            "trail_unit": "dollars",
+            "trail_limit_value": "0.10",
+            "trail_limit_unit": "dollars",
+        },
+    )
+    assert conversion_review.status_code == 200
+    assert "Cancel 1 app-owned brackets" in conversion_review.text
+    assert "1 unassigned contracts" in conversion_review.text
+
+    working = _trailing_scenario_workbench(tmp_path / "working", "working-trail")
+    working_page = TestClient(working.app).get(working.path).text
+    assert 'data-layer-state="trailing"' in working_page
+    assert "TRAIL LIMIT" in working_page
+    assert "WORKING" in working_page
+
+    partial = _trailing_scenario_workbench(tmp_path / "partial", "partial-fill")
+    assert partial._state.positions[-1].quantity == "1"
+    assert partial._state.working_orders[0].remaining == "1"
+    snapshot = partial._view_model.latest_snapshot()
+    assert snapshot is not None
+    assert snapshot.executions[0].quantity == Decimal("2")
+
+    cancelled = _trailing_scenario_workbench(tmp_path / "cancel", "manual-cancel")
+    cancelled_page = TestClient(cancelled.app).get(cancelled.path).text
+    assert 'data-layer-state="trailing"' in cancelled_page
+    assert "CHECK TWS" in cancelled_page
+
+    no_bid = _trailing_scenario_workbench(tmp_path / "no-bid", "no-bid")
+    snapshot = no_bid._view_model.latest_snapshot()
+    assert snapshot is not None
+    assert snapshot.quote.bid is None
+    blocked_review = TestClient(no_bid.app).post(
+        no_bid.path + "action",
+        data={
+            "action": "trailing-convert-arm",
+            "trail_value": "0.25",
+            "trail_unit": "dollars",
+        },
+    )
+    assert blocked_review.status_code == 200
+    assert "couldn't verify a current bid" in no_bid._message
+    assert no_bid._toast is not None
+    assert "couldn't verify a current bid" in no_bid._toast.description
+
+
+def test_closed_trailing_demo_moves_position_to_session_history_on_refresh(
+    tmp_path: Path,
+) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "closed-trail")
+    client = TestClient(workbench.app)
+    assert 'data-layer-state="trailing"' in client.get(workbench.path).text
+    refreshed = client.post(workbench.path + "action", data={"action": "refresh"})
+    assert refreshed.status_code == 200
+    assert 1_004_470_201 in workbench._session_closed_positions
+    selected = client.post(
+        workbench.path + "action",
+        data={"action": "select-session-closed", "con_id": "1004470201"},
+    )
+    assert workbench._selected_closed_con_id == 1_004_470_201
+    assert "No closed fills or unresolved layers to show." in selected.text
 
 
 def test_existing_exit_order_explanation_opens_from_available_metric() -> None:
@@ -6636,6 +6751,29 @@ def test_main_builds_the_embedded_starui_window(monkeypatch: object) -> None:
     assert created[0].launch_refresh_requested is True
 
 
+def test_named_demo_launch_uses_only_a_disposable_simulation_journal(
+    monkeypatch: object,
+) -> None:
+    QApplication.instance() or QApplication([])
+    created: list[_WindowStub] = []
+
+    def window_factory(*args: object, **kwargs: object) -> _WindowStub:
+        window = _WindowStub(*args, **kwargs)
+        created.append(window)
+        return window
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "ibkr_options_manager.app.main.StarUIPlannerWindow", window_factory
+    )
+    assert main(["--demo-data", "--demo-scenario", "working-trail"]) == 0
+    assert created[0].initial_con_id == 1_004_470_201
+    assert created[0].paper_execution is not None
+    assert created[0].demo_journal_dir is not None
+    created[0].demo_journal_dir.cleanup()
+    with pytest.raises(SystemExit):
+        main(["--demo-scenario", "working-trail"])
+
+
 def test_main_prefills_saved_account_without_cli_argument(monkeypatch: object) -> None:
     QApplication.instance() or QApplication([])
     created: list[_WindowStub] = []
@@ -6826,6 +6964,10 @@ def test_demo_entire_position_trailing_conversion_includes_unassigned_contracts(
     )
     assert review.status_code == 200
     assert f"{2 if with_bracket else 3} unassigned contracts" in review.text
+    assert "Initial stop estimate" in review.text
+    assert "Limit offset" in review.text
+    assert "Initial limit estimate" in review.text
+    assert "After the stop triggers, the limit order may remain unfilled" in review.text
     if bid_changes_before_review:
         broker.bid_adjustment = Decimal("0.05")
     if epoch_changes_before_review:
@@ -6859,6 +7001,9 @@ class _WindowStub:
         self.demo_loaded = False
         self.launch_refresh_requested = False
         self.initial_account = kwargs.get("initial_account")
+        self.initial_con_id = kwargs.get("initial_con_id")
+        self.paper_execution = kwargs.get("paper_execution")
+        self.demo_journal_dir = kwargs.get("demo_journal_dir")
 
     def show(self) -> None:
         pass

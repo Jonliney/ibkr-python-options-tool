@@ -17,6 +17,7 @@ from ..broker import (
     REQUIRED_COMPLETIONS,
     BrokerCapture,
     CapturedContract,
+    CapturedExecution,
     CapturedMarketRule,
     CapturedOrder,
     CapturedPosition,
@@ -37,6 +38,18 @@ from ..snapshot import SnapshotCoordinator, SnapshotResult
 from ..trailing import TrailingPlan
 
 DEMO_ACCOUNT = "DU0000000"
+DEMO_SCENARIOS = (
+    "standard",
+    "convert",
+    "working-trail",
+    "partial-fill",
+    "manual-cancel",
+    "closed-trail",
+    "no-bid",
+)
+DEMO_TRAILING_CON_ID = 1_004_470_201
+_TRAILING_ORDER_ID = 910_201
+_TRAILING_PERM_ID = 810_201
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,7 +57,7 @@ class _DemoPosition:
     contract: CapturedContract
     quantity: Decimal
     unit_basis: Decimal
-    bid: Decimal
+    bid: Decimal | None
     ask: Decimal
 
 
@@ -126,9 +139,18 @@ _POSITIONS = (
 DEMO_CON_IDS = frozenset(position.contract.con_id for position in _POSITIONS)
 
 
-def seed_demo_journal(path: Path) -> ExecutionJournal:
-    """Add the missing-order example once, preserving later user resolution."""
+def seed_demo_journal(
+    path: Path, *, scenario: str = "standard"
+) -> ExecutionJournal:
+    """Seed one deterministic example; named scenarios use disposable journals."""
+    if scenario not in DEMO_SCENARIOS:
+        raise ValueError("unknown demo scenario")
     journal = ExecutionJournal(path)
+    if scenario != "standard":
+        entry = _scenario_entry(scenario)
+        if entry is not None and journal.find(entry.fingerprint) is None:
+            journal._write((*journal._entries(), entry))
+        return journal
     fingerprint = sha256(b"demo-nvda-unverified-bracket-v1").hexdigest()
     if journal.find(fingerprint) is None:
         journal._write(
@@ -158,6 +180,41 @@ def seed_demo_journal(path: Path) -> ExecutionJournal:
     return journal
 
 
+def _scenario_entry(scenario: str) -> JournalEntry | None:
+    if scenario == "convert":
+        return JournalEntry(
+            fingerprint=sha256(b"demo-trailing-convert-bracket-v1").hexdigest(),
+            account=DEMO_ACCOUNT,
+            con_id=DEMO_TRAILING_CON_ID,
+            state="SUBMITTED",
+            expected_order_count=2,
+            snapshot_captured_at="0",
+            order_ids=(910_101, 910_102),
+            perm_ids=(810_101, 810_102),
+            oca_prefix="demo-trailing-convert",
+            layers=(JournalLayer(2, "12.00", "7.00", "GTC"),),
+        )
+    if scenario in {"working-trail", "partial-fill", "manual-cancel", "closed-trail"}:
+        return JournalEntry(
+            fingerprint="trailing-conversion:"
+            + sha256(f"demo-{scenario}-v1".encode()).hexdigest(),
+            account=DEMO_ACCOUNT,
+            con_id=DEMO_TRAILING_CON_ID,
+            state="SUBMITTED",
+            expected_order_count=1,
+            snapshot_captured_at="0",
+            order_ids=(_TRAILING_ORDER_ID,),
+            perm_ids=(_TRAILING_PERM_ID,),
+            trailing_quantity=3,
+            trailing_stop="8.80",
+            trailing_value="0.25",
+            trailing_unit="dollars",
+            trailing_limit_offset="0.10",
+            trailing_tif="GTC",
+        )
+    return None
+
+
 class DemoReadOnlyBroker:
     """A fresh, coherent demo capture for every read-only refresh request."""
 
@@ -166,9 +223,14 @@ class DemoReadOnlyBroker:
         *,
         clock: Callable[[], Decimal],
         paper_execution_enabled: bool = False,
+        scenario: str = "standard",
     ) -> None:
+        if scenario not in DEMO_SCENARIOS:
+            raise ValueError("unknown demo scenario")
         self._clock = clock
         self._paper_execution_enabled = paper_execution_enabled
+        self._scenario = scenario
+        self._portfolio_captures = 0
         self._journal: ExecutionJournal | None = None
 
     def use_journal(self, journal: ExecutionJournal) -> None:
@@ -231,6 +293,10 @@ class DemoReadOnlyBroker:
             for entry in self._journal.trailing_entries(
                 account=account, con_id=position.contract.con_id
             ):
+                if self._scenario == "manual-cancel" or (
+                    self._scenario == "closed-trail" and self._portfolio_captures >= 2
+                ):
+                    continue
                 if (
                     entry.state != "SUBMITTED"
                     or len(entry.order_ids) != 1
@@ -249,7 +315,11 @@ class DemoReadOnlyBroker:
                         order_type=(
                             "TRAIL LIMIT" if entry.trailing_limit_offset else "TRAIL"
                         ),
-                        remaining=Decimal(entry.trailing_quantity),
+                        remaining=(
+                            Decimal("1")
+                            if self._scenario == "partial-fill"
+                            else Decimal(entry.trailing_quantity)
+                        ),
                         status="Submitted",
                         oca_group=None,
                         parent_id=0,
@@ -263,6 +333,8 @@ class DemoReadOnlyBroker:
         self,
         request: PortfolioRequest | SnapshotRequest,
     ) -> BrokerCapture:
+        if isinstance(request, PortfolioRequest):
+            self._portfolio_captures += 1
         selected = _selected_position(request)
         now = self._clock()
         account = request.expected_account
@@ -271,11 +343,42 @@ class DemoReadOnlyBroker:
             CapturedPosition(
                 account=account,
                 contract=position.contract,
-                quantity=position.quantity,
+                quantity=(
+                    Decimal("1")
+                    if self._scenario == "partial-fill"
+                    and position.contract.con_id == DEMO_TRAILING_CON_ID
+                    else position.quantity
+                ),
                 average_cost=position.unit_basis * position.contract.multiplier,
             )
             for position in _POSITIONS
+            if not (
+                self._scenario == "closed-trail"
+                and self._portfolio_captures >= 2
+                and position.contract.con_id == DEMO_TRAILING_CON_ID
+            )
         )
+        filled = self._scenario == "partial-fill" or (
+            self._scenario == "closed-trail" and self._portfolio_captures >= 2
+        )
+        executions = (
+            CapturedExecution(
+                exec_id=f"DEMO-TRAIL-{self._scenario}",
+                account=account,
+                con_id=DEMO_TRAILING_CON_ID,
+                perm_id=_TRAILING_PERM_ID,
+                side="SLD",
+                quantity=Decimal("2")
+                if self._scenario == "partial-fill"
+                else Decimal("3"),
+                price=Decimal("9.10"),
+                time="2026-10-09T15:30:00-04:00",
+                realized_pnl=Decimal("100")
+                if self._scenario == "partial-fill"
+                else Decimal("150"),
+                currency="USD",
+            ),
+        ) if filled else ()
         return BrokerCapture(
             connection_epoch=1,
             connected=True,
@@ -288,7 +391,10 @@ class DemoReadOnlyBroker:
             orders=(*_orders(account), *self._journal_orders(account)),
             contract_details=contracts,
             quote=CapturedQuote(
-                bid=selected.bid,
+                bid=None
+                if self._scenario == "no-bid"
+                and selected.contract.con_id == DEMO_TRAILING_CON_ID
+                else selected.bid,
                 ask=selected.ask,
                 last=selected.bid,
                 close=selected.unit_basis,
@@ -307,6 +413,7 @@ class DemoReadOnlyBroker:
             ),
             errors=(),
             captured_at=now,
+            executions=executions,
             completed_orders_complete=True,
             executions_complete=True,
         )
@@ -520,6 +627,8 @@ def _orders(account: str) -> tuple[CapturedOrder, ...]:
 __all__ = [
     "DEMO_ACCOUNT",
     "DEMO_CON_IDS",
+    "DEMO_SCENARIOS",
+    "DEMO_TRAILING_CON_ID",
     "DemoPaperExecutionTransport",
     "DemoReadOnlyBroker",
     "DemoSnapshotSource",

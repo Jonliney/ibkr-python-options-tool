@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from tempfile import TemporaryDirectory
 from threading import Thread
 from time import monotonic, sleep
 
@@ -43,9 +44,11 @@ class StarUIPlannerWindow(QMainWindow):
         observe_positions: bool = False,
         observer_client_id: int = 18,
         save_account: Callable[[str], None] | None = None,
+        demo_journal_dir: TemporaryDirectory[str] | None = None,
     ) -> None:
         super().__init__()
         self._demo_mode = demo_mode
+        self._demo_journal_dir = demo_journal_dir
         self._surface = StarUIWorkbench(
             view_model,
             initial_account=initial_account,
@@ -87,6 +90,8 @@ class StarUIPlannerWindow(QMainWindow):
         self._surface.close()
         self._server.should_exit = True
         self._thread.join(timeout=2)
+        if self._demo_journal_dir is not None:
+            self._demo_journal_dir.cleanup()
         super().closeEvent(event)
 
 

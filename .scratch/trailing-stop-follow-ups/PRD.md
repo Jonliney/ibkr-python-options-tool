@@ -7,7 +7,7 @@ and trailing stop-limit workflow.
 
 ## Work to do
 
-1. [ ] Improve the action review sidebar design for trailing stop limits. Make
+1. [x] Improve the action review sidebar design for trailing stop limits. Make
    the trigger, limit offset, quantity, and risk easy to scan before confirmation.
 2. [ ] Redesign the active trailing stop-limit layer row to follow the bracket
    layer layout and visual hierarchy while showing its trailing-specific values.
@@ -26,7 +26,7 @@ and trailing stop-limit workflow.
 8. [ ] Show an estimated gain or loss at the initial stop, using the verified
    position basis, quantity, multiplier, current quote, and proposed trail.
    Label this as an estimate because the trigger and fill prices can differ.
-9. [ ] Expand demo data and dummy scenarios for trailing stops and trailing
+9. [x] Expand demo data and dummy scenarios for trailing stops and trailing
    stop limits, including conversion, fills, manual cancellation, and closed
    positions, so the UI can be iterated on without TWS.
 10. [ ] Detect when a trailing order is cancelled manually in TWS and update
