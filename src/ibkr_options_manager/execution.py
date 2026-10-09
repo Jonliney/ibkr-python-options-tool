@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from uuid import uuid4
 
 from .domain import (
@@ -23,6 +23,9 @@ from .domain import (
     stop_limit_price,
     supports_outside_rth,
 )
+
+if TYPE_CHECKING:
+    from .trailing import TrailingPlan, TrailingRequest
 
 
 class ExecutionBlocked(RuntimeError):
@@ -86,6 +89,12 @@ class JournalEntry:
     oca_prefix: str = ""
     layers: tuple[JournalLayer, ...] = ()
     fills: tuple[JournalFill, ...] = ()
+    trailing_quantity: int = 0
+    trailing_stop: str = ""
+    trailing_value: str = ""
+    trailing_unit: str = ""
+    trailing_limit_offset: str = ""
+    trailing_tif: str = ""
 
 
 def _entry_oca_prefix(entry: JournalEntry) -> str:
@@ -301,6 +310,20 @@ class PaperOcaCancellationTransport(Protocol):
 
 
 @runtime_checkable
+class PaperTrailingTransport(Protocol):
+    def submit_trailing(
+        self,
+        snapshot: BrokerSnapshot,
+        plan: TrailingPlan,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmissionResult: ...
+
+
+@runtime_checkable
 class PaperPriceUpdateTransport(Protocol):
     """Narrow transport seam for price-only amendments to app-owned pairs."""
 
@@ -375,6 +398,7 @@ class ExecutionJournal:
                         "market-exit:",
                         "market-exit-many:",
                         "cancel-bracket:",
+                        "trailing-conversion:",
                     )
                 )
             ):
@@ -1179,12 +1203,58 @@ class ExecutionJournal:
                     oca_prefix=entry.oca_prefix,
                     layers=layers,
                     fills=entry.fills,
+                    trailing_quantity=entry.trailing_quantity,
+                    trailing_stop=entry.trailing_stop,
+                    trailing_value=entry.trailing_value,
+                    trailing_unit=entry.trailing_unit,
+                    trailing_limit_offset=entry.trailing_limit_offset,
+                    trailing_tif=entry.trailing_tif,
                 )
                 entries[index] = updated
                 self._write(tuple(entries))
                 return updated
         raise ExecutionBlocked(
             "execution journal entry disappeared before acknowledgement"
+        )
+
+    def record_trailing_plan(
+        self,
+        fingerprint: str,
+        *,
+        quantity: int,
+        stop: Decimal,
+        value: Decimal,
+        unit: str,
+        limit_offset: Decimal | None,
+        tif: str,
+    ) -> None:
+        entries = list(self._entries())
+        matches = [
+            i for i, entry in enumerate(entries) if entry.fingerprint == fingerprint
+        ]
+        if len(matches) != 1 or entries[matches[0]].state != "PREPARED":
+            raise ExecutionBlocked("the trailing conversion intent is missing")
+        index = matches[0]
+        entries[index] = replace(
+            entries[index],
+            trailing_quantity=quantity,
+            trailing_stop=str(stop),
+            trailing_value=str(value),
+            trailing_unit=unit,
+            trailing_limit_offset=str(limit_offset) if limit_offset is not None else "",
+            trailing_tif=tif,
+        )
+        self._write(tuple(entries))
+
+    def trailing_entries(
+        self, *, account: str, con_id: int
+    ) -> tuple[JournalEntry, ...]:
+        return tuple(
+            entry
+            for entry in self._entries()
+            if entry.account == account
+            and entry.con_id == con_id
+            and entry.fingerprint.startswith("trailing-conversion:")
         )
 
     def record_verified_price_updates(
@@ -1637,6 +1707,12 @@ class ExecutionJournal:
                         )
                         for fill in item.get("fills", ())
                     ),
+                    trailing_quantity=int(item.get("trailing_quantity", 0)),
+                    trailing_stop=str(item.get("trailing_stop", "")),
+                    trailing_value=str(item.get("trailing_value", "")),
+                    trailing_unit=str(item.get("trailing_unit", "")),
+                    trailing_limit_offset=str(item.get("trailing_limit_offset", "")),
+                    trailing_tif=str(item.get("trailing_tif", "")),
                 )
                 for item in payload
             )
@@ -1710,7 +1786,7 @@ def require_paper_execution_snapshot(
                 or intent.con_id != snapshot.selected.con_id
                 or intent.action != "SELL"
                 or intent.oca_type != 2
-                or intent.tif not in {"DAY", "GTC"}
+                or intent.tif != "GTC"
                 for intent in (target, stop)
             )
             or target.tif != stop.tif
@@ -1900,6 +1976,131 @@ class PaperExecutionService:
         """Expose durable submission attempts to the read-only UI."""
         return self._journal.submission_entries(account=account, con_id=con_id)
 
+    def trailing_entries(
+        self, *, account: str, con_id: int
+    ) -> tuple[JournalEntry, ...]:
+        return self._journal.trailing_entries(account=account, con_id=con_id)
+
+    def prepare_entire_position_trailing(
+        self,
+        snapshot: BrokerSnapshot,
+        *,
+        target_perm_ids: tuple[int, ...],
+        expected_client_id: int,
+        request: TrailingRequest,
+    ) -> TrailingPlan:
+        from .trailing import plan_entire_position
+
+        require_paper_management_snapshot(snapshot)
+        candidates = (
+            self.prepare_market_exits(
+                snapshot,
+                target_perm_ids=target_perm_ids,
+                expected_client_id=expected_client_id,
+            )
+            if target_perm_ids
+            else ()
+        )
+        return plan_entire_position(snapshot, candidates, request)
+
+    def submit_entire_position_trailing(
+        self,
+        snapshot: BrokerSnapshot,
+        plan: TrailingPlan,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> SubmissionReceipt:
+        """Send once after every reviewed pair has been cancelled and re-observed."""
+        from .trailing import plan_entire_position
+
+        require_paper_management_snapshot(snapshot)
+        self.verify_trailing_baseline(snapshot, plan)
+        if plan.candidates and snapshot.selected.account != plan.candidates[0].account:
+            raise ExecutionBlocked("the account changed during conversion")
+        if any(order.key == snapshot.selected for order in snapshot.working_orders):
+            raise ExecutionBlocked("a closing order still works for this option")
+        for candidate in plan.candidates:
+            ids = {candidate.target_perm_id, candidate.stop_perm_id}
+            if any(order.perm_id in ids for order in snapshot.working_orders):
+                raise ExecutionBlocked("a selected bracket leg is still working")
+        fresh = plan_entire_position(snapshot, (), plan.request)
+        transport = self._transport
+        if not isinstance(transport, PaperTrailingTransport):
+            raise ExecutionBlocked("the paper transport cannot submit trailing orders")
+        entry = self._journal.begin_management(
+            snapshot,
+            operation="trailing-conversion",
+            material=(plan.fingerprint, plan.request, plan.quantity),
+            expected_order_count=1,
+        )
+        self._journal.record_trailing_plan(
+            entry.fingerprint,
+            quantity=fresh.quantity,
+            stop=fresh.initial_stop,
+            value=fresh.request.trail_value,
+            unit=fresh.request.trail_unit,
+            limit_offset=fresh.limit_offset,
+            tif=fresh.request.tif,
+        )
+        try:
+            result = transport.submit_trailing(
+                snapshot,
+                fresh,
+                host=host,
+                port=port,
+                client_id=client_id,
+                timeout_seconds=timeout_seconds,
+            )
+            order_ids = tuple(int(value) for value in result.order_ids)
+            perm_ids = tuple(int(value) for value in result.perm_ids)
+            if len(order_ids) != 1 or len(perm_ids) != 1 or perm_ids[0] <= 0:
+                raise ExecutionOutcomeUnknown(
+                    "TWS did not acknowledge the trailing order"
+                )
+        except Exception:
+            self._journal.mark_unknown(entry.fingerprint)
+            raise
+        return SubmissionReceipt(
+            self._journal.record_submission(
+                entry.fingerprint,
+                order_ids=order_ids,
+                perm_ids=perm_ids,
+            )
+        )
+
+    @staticmethod
+    def verify_trailing_baseline(snapshot: BrokerSnapshot, plan: TrailingPlan) -> None:
+        """Reject changed position, contract, or fill history on a fresh capture."""
+        require_paper_management_snapshot(snapshot)
+        if snapshot.selected != plan.selected or snapshot.position.key != plan.selected:
+            raise ExecutionBlocked("the selected account or option changed")
+        if snapshot.position.quantity != Decimal(plan.quantity):
+            raise ExecutionBlocked("the position quantity changed during conversion")
+        if (
+            snapshot.position.unit_basis != plan.position_basis
+            or snapshot.position.raw_average_cost != plan.position_raw_average_cost
+        ):
+            raise ExecutionBlocked(
+                "the position basis changed during conversion"
+            )
+        if not snapshot.executions_complete or not snapshot.completed_orders_complete:
+            raise ExecutionBlocked("complete order and execution history is required")
+        if (
+            frozenset(
+                execution.exec_id
+                for execution in snapshot.executions
+                if execution.account == snapshot.selected.account
+                and execution.con_id == snapshot.selected.con_id
+            )
+            != plan.execution_ids
+        ):
+            raise ExecutionBlocked("an execution changed during conversion")
+        if snapshot.contract != plan.contract:
+            raise ExecutionBlocked("the option contract changed during conversion")
+
     def unresolved_management_entries(
         self, *, account: str, con_id: int
     ) -> tuple[JournalEntry, ...]:
@@ -1947,7 +2148,7 @@ class PaperExecutionService:
             or target.client_id != expected_client_id
             or target.remaining <= 0
             or not target.oca_group
-            or not target.tif
+            or target.tif != "GTC"
             or target.status not in {"Submitted", "PreSubmitted"}
         ):
             raise ExecutionBlocked(
@@ -1986,6 +2187,8 @@ class PaperExecutionService:
         if snapshot.position.quantity < target.remaining:
             raise ExecutionBlocked("the position quantity no longer covers this layer")
         stop = stops[0]
+        if stop.tif != "GTC":
+            raise ExecutionBlocked("the selected OCA pair must use GTC")
         return MarketExitCandidate(
             account=snapshot.selected.account,
             con_id=snapshot.selected.con_id,

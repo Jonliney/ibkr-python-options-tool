@@ -196,6 +196,13 @@ def round_up_price(value: Decimal, bands: tuple[PriceBand, ...]) -> Decimal:
     return _round_up(value, bands)
 
 
+def round_down_price(value: Decimal, bands: tuple[PriceBand, ...]) -> Decimal:
+    """Round a verified positive price downward to its applicable increment."""
+    if not value.is_finite() or value <= 0 or not bands:
+        raise ValueError("price and market-rule bands must be positive and complete")
+    return _round_down(value, bands)
+
+
 def stop_limit_price(
     stop_price: Decimal, offset: Decimal, unit: str, bands: tuple[PriceBand, ...]
 ) -> Decimal:
@@ -671,11 +678,11 @@ def _validate_request(
                 True,
             )
         )
-    if request.tif not in {"DAY", "GTC"}:
+    if request.tif != "GTC":
         failures.append(
             Validation(
                 "TIF_UNSUPPORTED",
-                "only DAY and GTC time-in-force values are supported",
+                "new orders must use GTC time in force",
                 True,
             )
         )
@@ -727,11 +734,11 @@ def _validate_layers(
                         True,
                     )
                 )
-        if layer.tif not in {"DAY", "GTC"}:
+        if layer.tif != "GTC":
             failures.append(
                 Validation(
                     "TIF_UNSUPPORTED",
-                    f"layer {index} time-in-force must be DAY or GTC",
+                    f"layer {index} time-in-force must be GTC",
                     True,
                 )
             )

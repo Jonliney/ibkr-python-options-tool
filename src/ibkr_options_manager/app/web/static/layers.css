@@ -121,8 +121,21 @@
   border-top: 0;
 }
 
+.oca-layer-list {
+  min-width: 36rem;
+}
+
+.layer-row-grid {
+  display: grid;
+  grid-template-columns: 5rem minmax(10rem, 1fr) minmax(10rem, 1fr) minmax(5rem, 0.6fr) 2.25rem;
+}
+
 .oca-layer-list > [data-layer-state]:last-child {
   border-bottom: 0;
+}
+
+.trailing-layer-row {
+  background: rgb(14 116 144 / 9%);
 }
 
 [data-position-quantity] {

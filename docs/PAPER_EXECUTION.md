@@ -13,6 +13,12 @@ or live TWS will respond to an order or precaution.
 
 ## Execution contract
 
+New bracket, trailing, and market-exit orders use GTC time in force. Drafts
+and conversion dialogs do not offer a DAY choice; the deterministic planners
+reject non-GTC requests, and paper submission checks the planned TIF again.
+The app assumes its managed orders were created under this GTC policy. If a
+different TIF appears in a broker snapshot, order management stops for review.
+
 The persistent position subscriber supplies change hints and connection
 health. A verified empty portfolio stays idle after its initial subscription;
 manual Refresh reuses a healthy subscriber. An option-position event or a
@@ -167,6 +173,42 @@ with `transmit=True`, using the pair's unique OCA group and OCA type 2.
 TWS may still apply its own order precaution and require the user to click
 **Transmit** there. The application must not bypass that independent TWS
 safety control.
+
+## Entire-position trailing conversion
+
+The paper-only **Convert entire position** action reviews every active,
+app-owned OCA pair for the selected option and the current unassigned quantity.
+This first version requires a USD-denominated option.
+It blocks when any other working order exists for that contract, including a
+manual TWS order. The review requires a fresh bid, complete order and execution
+history, an integral long position, and the verified contract's market rule.
+If the bid moves between staging and the fresh review, the review shows a
+recalculated initial stop and limit offset before confirmation. Account,
+contract, position, execution history, and selected bracket identities must
+still match. The TWS capture counter advances on every fresh read and is not
+treated as a stable session identity. Each read must independently verify its
+connection. Confirmation takes another fresh snapshot before submission.
+The app checks the exact pairs and position again before each cancellation.
+After the last pair is acknowledged cancelled, it refreshes the position,
+orders, fills, contract, and bid before submitting one SELL `TRAIL` or `TRAIL
+LIMIT` order for the full position. A changed quantity or contract, any working
+order, or an unusable quote stops the send. Each pair cancellation and the final
+submission have separate durable journal records; an uncertain submission
+locks management of that contract until the TWS state is reviewed. The app never
+automatically retries the trailing submission.
+The final snapshot is not an atomic reservation at TWS; a manual change after
+that read can still race the send, so the acknowledged order must be checked in
+TWS.
+
+The trail may be a tick-valid dollar amount or a percentage of option premium.
+The initial stop estimate is rounded down on the verified market rule. A
+trailing-limit percentage is converted at submission to one fixed dollar
+`lmtPriceOffset`, rounded up to a valid increment, using the initial stop as
+its reference. It does not stay proportional as TWS moves the stop. TWS order
+precautions remain active. Cancellation creates a period without the original
+bracket protection; a trailing market stop can slip, and a trailing limit may
+remain unfilled. This flow has been built for paper TWS only. Paper results do
+not establish equivalent live stop or complex-order behaviour.
 
 The protective leg may be a SELL `STP LMT` for a new paper draft. The
 position-level choice defaults to STP; the connection settings can set a

@@ -11,7 +11,7 @@ from pathlib import Path
 from secrets import token_urlsafe
 from threading import Event, RLock, Thread
 from time import monotonic
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from starhtml import (
@@ -67,6 +67,7 @@ from ...execution import (
 )
 from ...observation import ObservationSettings, PositionObserver
 from ...price_update_trace import record_price_update_event
+from ...trailing import TrailingPlan, TrailingRequest
 from ..position_observation import VerifiedPositionChanges
 from ..view_model import (
     ConnectionSettings,
@@ -102,13 +103,6 @@ from .components.ui.dropdown_menu import (
 from .components.ui.input import Input
 from .components.ui.label import Label
 from .components.ui.scroll_area import ScrollArea
-from .components.ui.select import (
-    Select,
-    SelectContent,
-    SelectItem,
-    SelectTrigger,
-    SelectValue,
-)
 from .components.ui.separator import Separator
 from .components.ui.toast import Toaster
 from .components.ui.toggle_group import ToggleGroup, ToggleGroupItem
@@ -188,6 +182,7 @@ class StarUIWorkbench:
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
         self._armed_cancellation: MarketExitCandidate | None = None
         self._armed_cancellations: tuple[MarketExitCandidate, ...] = ()
+        self._armed_trailing: TrailingPlan | None = None
         self._bulk_cancel_trace_id: str | None = None
         self._bulk_cancel_started_at: float | None = None
         self._active_action_verified = False
@@ -590,6 +585,8 @@ class StarUIWorkbench:
                 "market-exit-selected",
                 "cancel-all-active",
                 "cancel-all-confirm",
+                "trailing-convert-arm",
+                "trailing-convert-confirm",
                 "active-action-execute",
                 "market-exit-confirm",
                 "cancel-pair-confirm",
@@ -701,6 +698,8 @@ class StarUIWorkbench:
                 self._arm_selected_market_exit_locked(values)
             elif action == "cancel-all-active":
                 self._arm_all_cancellations_locked()
+            elif action == "trailing-convert-arm":
+                self._arm_trailing_conversion_locked(values)
             elif action == "active-action-execute":
                 self._execute_active_action_locked()
             elif action == "market-exit-confirm":
@@ -709,6 +708,8 @@ class StarUIWorkbench:
                 self._confirm_cancellation_locked()
             elif action == "cancel-all-confirm":
                 self._confirm_all_cancellations_locked()
+            elif action == "trailing-convert-confirm":
+                self._confirm_trailing_conversion_locked()
             elif action == "resolve-cancelled-bracket":
                 self._resolve_cancelled_bracket_locked(values)
             elif action.startswith("verify-cancelled-bracket:"):
@@ -1002,6 +1003,7 @@ class StarUIWorkbench:
         self._armed_market_exits = ()
         self._armed_cancellation = None
         self._armed_cancellations = ()
+        self._armed_trailing = None
         self._bulk_cancel_trace_id = None
         self._bulk_cancel_started_at = None
         self._active_action_verified = False
@@ -1259,6 +1261,134 @@ class StarUIWorkbench:
             "The position will remain open. Review the cancellation to verify a fresh snapshot."
         )
 
+    def _arm_trailing_conversion_locked(self, values: dict[str, str]) -> None:
+        self._disarm_execution_locked()
+        if self._paper_execution is None or self._selected_con_id is None:
+            self._message = "Paper order management is disabled for this launch."
+            return
+        snapshot = self._view_model.latest_snapshot()
+        if snapshot is None:
+            self._message = "Refresh this position before reviewing a trailing exit."
+            return
+        try:
+            trail = Decimal(values.get("trail_value", ""))
+            limit_text = values.get("trail_limit_value", "").strip()
+            limit = Decimal(limit_text) if limit_text else None
+            request = TrailingRequest(
+                trail_value=trail,
+                trail_unit=values.get("trail_unit", "dollars"),
+                limit_value=limit,
+                limit_unit=values.get("trail_limit_unit", "dollars"),
+                tif="GTC",
+            )
+            self._armed_trailing = (
+                self._paper_execution.prepare_entire_position_trailing(
+                    snapshot,
+                    target_perm_ids=self._active_target_perm_ids(),
+                    expected_client_id=self._settings.client_id,
+                    request=request,
+                )
+            )
+        except (InvalidOperation, ExecutionBlocked) as error:
+            self._message = f"Trailing conversion blocked: {error}"
+            return
+        plan = self._armed_trailing
+        self._set_review_status_locked(
+            f"Review conversion of {len(plan.candidates)} brackets and "
+            f"{plan.unassigned_quantity} unassigned contracts to one trailing "
+            f"SELL for {plan.quantity} contracts."
+        )
+
+    def _confirm_trailing_conversion_locked(self) -> None:
+        if self._expire_confirmation_locked(require_deadline=True):
+            self._message = "Review expired. Review the trailing conversion again."
+            return
+        plan = self._armed_trailing
+        if (
+            plan is None
+            or self._paper_execution is None
+            or self._selected_con_id is None
+            or not self._active_action_verified
+        ):
+            self._message = "Review the trailing conversion before confirming it."
+            return
+        cancelled = 0
+        try:
+            for index, candidate in enumerate(plan.candidates):
+                state = self._view_model.select_position(
+                    self._selected_con_id,
+                    self._plan_form(self._drafts.get(self._selected_con_id, ())),
+                    include_quote=False,
+                )
+                self._apply_state_locked(state)
+                self._record_refresh_time_locked()
+                self._announce_reconciliation_locked()
+                snapshot = self._view_model.latest_snapshot()
+                if snapshot is None:
+                    raise ExecutionBlocked("the fresh bracket snapshot is unavailable")
+                self._paper_execution.verify_trailing_baseline(snapshot, plan)
+                remaining = plan.candidates[index:]
+                if set(self._active_target_perm_ids()) != {
+                    item.target_perm_id for item in remaining
+                }:
+                    raise ExecutionBlocked("the active bracket set changed")
+                refreshed = self._paper_execution.prepare_market_exits(
+                    snapshot,
+                    target_perm_ids=tuple(item.target_perm_id for item in remaining),
+                    expected_client_id=self._settings.client_id,
+                )
+                if (
+                    refreshed != remaining
+                    or snapshot.position.quantity != plan.quantity
+                ):
+                    raise ExecutionBlocked(
+                        "a bracket or position changed during conversion"
+                    )
+                self._paper_execution.cancel_pair(
+                    snapshot,
+                    candidate,
+                    host="127.0.0.1",
+                    port=self._settings.port,
+                    client_id=self._settings.client_id,
+                    timeout_seconds=self._settings.timeout_seconds,
+                )
+                cancelled += 1
+            state = self._view_model.select_position(
+                self._selected_con_id,
+                self._plan_form(self._drafts.get(self._selected_con_id, ())),
+            )
+            self._apply_state_locked(state)
+            self._record_refresh_time_locked()
+            self._announce_reconciliation_locked()
+            snapshot = self._view_model.latest_snapshot()
+            if snapshot is None:
+                raise ExecutionBlocked("the final position snapshot is unavailable")
+            self._paper_execution.submit_entire_position_trailing(
+                snapshot,
+                plan,
+                host="127.0.0.1",
+                port=self._settings.port,
+                client_id=self._settings.client_id,
+                timeout_seconds=self._settings.timeout_seconds,
+            )
+        except (ExecutionBlocked, ExecutionOutcomeUnknown) as error:
+            self._message = (
+                f"Trailing conversion stopped after cancelling {cancelled} of "
+                f"{len(plan.candidates)} brackets: {error}. Check TWS and refresh."
+            )
+        except Exception as error:
+            self._message = (
+                f"Trailing conversion outcome is unknown after {cancelled} "
+                f"cancellations: {error}. Check TWS and refresh."
+            )
+        else:
+            self._refresh_after_acknowledged_write_locked(
+                "TWS acknowledged the trailing exit. Check TWS for Transmit or fills.",
+                include_quote=False,
+            )
+        finally:
+            self._disarm_execution_locked()
+
     def _execute_active_action_locked(self) -> None:
         """Verify a reviewed cancellation or market exit before showing Confirm."""
         market_exits = self._armed_market_exits or (
@@ -1266,10 +1396,16 @@ class StarUIWorkbench:
         )
         cancellation = self._armed_cancellation
         cancellations = self._armed_cancellations
+        trailing = self._armed_trailing
         if (
             self._paper_execution is None
             or self._selected_con_id is None
-            or (not market_exits and cancellation is None and not cancellations)
+            or (
+                not market_exits
+                and cancellation is None
+                and not cancellations
+                and trailing is None
+            )
         ):
             self._message = "Review an active-layer action before executing it."
             return
@@ -1312,7 +1448,36 @@ class StarUIWorkbench:
             self._message = "Execution blocked: the fresh snapshot is unavailable."
             return
         try:
-            if cancellations:
+            if trailing is not None:
+                self._paper_execution.verify_trailing_baseline(snapshot, trailing)
+                if set(self._active_target_perm_ids()) != {
+                    item.target_perm_id for item in trailing.candidates
+                }:
+                    raise ExecutionBlocked("the active bracket set changed")
+                refreshed_trailing = (
+                    self._paper_execution.prepare_entire_position_trailing(
+                        snapshot,
+                        target_perm_ids=tuple(
+                            item.target_perm_id for item in trailing.candidates
+                        ),
+                        expected_client_id=self._settings.client_id,
+                        request=trailing.request,
+                    )
+                )
+                # The bid can move, and each fresh TWS capture has a new
+                # connection epoch. Show the new stop and limit offset for
+                # confirmation while keeping stable safety inputs identical.
+                if replace(
+                    refreshed_trailing,
+                    reference_price=trailing.reference_price,
+                    initial_stop=trailing.initial_stop,
+                    limit_offset=trailing.limit_offset,
+                    fingerprint=trailing.fingerprint,
+                    connection_epoch=trailing.connection_epoch,
+                ) != trailing:
+                    raise ExecutionBlocked("the trailing plan changed after review")
+                self._armed_trailing = refreshed_trailing
+            elif cancellations:
                 if set(self._active_target_perm_ids()) != {
                     candidate.target_perm_id for candidate in cancellations
                 }:
@@ -1355,7 +1520,8 @@ class StarUIWorkbench:
         except ExecutionBlocked as error:
             self._disarm_execution_locked()
             self._message = (
-                f"Execution blocked: {error}. Review the latest state again."
+                f"{'Trailing conversion' if trailing is not None else 'Execution'} "
+                f"blocked: {error}. Review the latest state again."
             )
             return
         self._active_action_verified = True
@@ -2487,7 +2653,6 @@ class StarUIWorkbench:
             stop = values.get(f"stop_{index}", previous.stop_percentage)
             exact_stop_text = values.get(f"draft_stop_price_{index}", "").strip()
             quantity = values.get(f"quantity_{index}", previous.quantity)
-            tif = values.get(f"tif_{index}", previous.tif)
             try:
                 target_value, stop_value = Decimal(target), Decimal(stop)
                 prices = preview_reference_prices(
@@ -2548,7 +2713,7 @@ class StarUIWorkbench:
                     ),
                     target_percentage=format(target_value, "f"),
                     stop_percentage=format(stop_value, "f"),
-                    tif=tif if tif in {"GTC", "DAY"} else previous.tif,
+                    tif="GTC",
                 )
             )
         self._drafts[self._selected_con_id] = tuple(layers)
@@ -3334,7 +3499,7 @@ class StarUIWorkbench:
             Div(
                 ScrollArea(
                     ScrollArea(
-                        Div(*rows, cls="oca-layer-list w-full min-w-[41rem]"),
+                        Div(*rows, cls="oca-layer-list w-full"),
                         aria_label="Closed OCA layer rows",
                         orientation="horizontal",
                         cls="w-full",
@@ -3774,6 +3939,7 @@ class StarUIWorkbench:
         coverage, _, _ = self._order_coverage()
         active_pairs = self._active_oca_pairs()
         outcomes = self._submission_outcomes()
+        trailing_entries = self._trailing_entries()
         active_target_ids = {target.perm_id for _group, target, _stop in active_pairs}
         pending = tuple(
             item
@@ -3911,9 +4077,15 @@ class StarUIWorkbench:
                             ),
                             TooltipContent("Sell every active layer now"),
                         ),
+                        self._trailing_conversion_dialog(),
                         cls="flex items-center gap-2",
                     )
                     if active_pairs
+                    else None,
+                    self._trailing_conversion_dialog()
+                    if not active_pairs
+                    and selected_snapshot is not None
+                    and selected_snapshot.position.quantity > 0
                     else None,
                     Separator(orientation="vertical", cls="h-5 self-center")
                     if active_pairs and draft_allowed
@@ -3998,15 +4170,18 @@ class StarUIWorkbench:
             Div(
                 ScrollArea(
                     self._existing_layers_panel(active_pairs, outcomes)
-                    if active_pairs or outcomes
+                    if active_pairs or outcomes or trailing_entries
                     else None,
                     Div(
                         self._draft_panel(
-                            show_empty_state=not (active_pairs or outcomes)
+                            show_empty_state=not (
+                                active_pairs or outcomes or trailing_entries
+                            )
                         ),
                         cls=(
                             "mt-5 border-t border-border pt-4"
-                            if (active_pairs or outcomes) and self._current_layers()
+                            if (active_pairs or outcomes or trailing_entries)
+                            and self._current_layers()
                             else "hidden"
                             if active_pairs or outcomes
                             else "h-full"
@@ -4708,11 +4883,6 @@ class StarUIWorkbench:
                 ),
                 input_id=f"verify-quantity-{number}",
             ),
-            _field(
-                "TIF",
-                Input(id=f"verify-tif-{number}", value=layer.tif, disabled=True),
-                input_id=f"verify-tif-{number}",
-            ),
             _button_tooltip(
                 Button(
                     Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
@@ -4769,7 +4939,7 @@ class StarUIWorkbench:
             ),
             data_layer_state="cancelled" if outcome.status == "CANCELLED" else "verify",
             data_result_tone="cancelled" if outcome.status == "CANCELLED" else "verify",
-            cls="sold-layer-row grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4",
+            cls="sold-layer-row layer-row-grid items-start gap-3 border-t border-border py-4",
         )
 
     def _closed_layer_row(
@@ -4847,11 +5017,6 @@ class StarUIWorkbench:
                 ),
                 input_id=f"sold-quantity-{number}",
             ),
-            _field(
-                "TIF",
-                Input(id=f"sold-tif-{number}", value=layer.tif, disabled=True),
-                input_id=f"sold-tif-{number}",
-            ),
             Div(cls="min-w-0"),
             Div(
                 Span("SOLD", cls="sold-layer-status"),
@@ -4860,7 +5025,7 @@ class StarUIWorkbench:
             ),
             data_layer_state="sold",
             data_result_tone=result_tone,
-            cls="sold-layer-row grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4",
+            cls="sold-layer-row layer-row-grid items-start gap-3 border-t border-border py-4",
         )
 
     def _verified_selected_account(self) -> str:
@@ -4882,6 +5047,119 @@ class StarUIWorkbench:
         """Act on every reconciled layer of the currently selected contract."""
         return tuple(
             target.perm_id for _group, target, _stop in self._active_oca_pairs()
+        )
+
+    def _trailing_entries(self) -> tuple[JournalEntry, ...]:
+        if self._paper_execution is None or self._selected_con_id is None:
+            return ()
+        reader = getattr(self._paper_execution, "trailing_entries", None)
+        if not callable(reader):
+            return ()
+        return cast(
+            tuple[JournalEntry, ...],
+            reader(
+                account=self._verified_selected_account(),
+                con_id=self._selected_con_id,
+            ),
+        )
+
+    def _trailing_conversion_dialog(self) -> Any:
+        return Dialog(
+            DialogTrigger(
+                Icon("lucide:route", cls="size-4", aria_hidden="true"),
+                variant="outline",
+                size="icon",
+                aria_label="Convert entire position to trailing stop",
+                disabled=self._paper_execution is None,
+            ),
+            DialogContent(
+                DialogHeader(
+                    DialogTitle("Convert entire position"),
+                    DialogDescription(
+                        "Cancel every app-owned bracket for this option and include "
+                        "unassigned contracts in one trailing SELL order."
+                    ),
+                ),
+                Form(
+                    _field(
+                        "Trail amount",
+                        Div(
+                            ToggleGroup(
+                                ("dollars", "$"),
+                                ("percent", "%"),
+                                type="single",
+                                signal="trailing_amount_unit",
+                                value="dollars",
+                                variant="outline",
+                                size="default",
+                                aria_label="Trail amount unit",
+                            ),
+                            HTMLInput(
+                                type="hidden",
+                                name="trail_unit",
+                                data_bind=Signal("trailing_amount_unit", _ref_only=True),
+                            ),
+                            Input(
+                                name="trail_value",
+                                type="number",
+                                min="0.01",
+                                step="any",
+                                value="0.25",
+                                required=True,
+                                cls="min-w-0 flex-1",
+                            ),
+                            cls="flex w-full items-center gap-2",
+                        ),
+                    ),
+                    _field(
+                        "Optional limit offset below stop",
+                        Div(
+                            ToggleGroup(
+                                ("dollars", "$"),
+                                ("percent", "%"),
+                                type="single",
+                                signal="trailing_limit_unit",
+                                value="dollars",
+                                variant="outline",
+                                size="default",
+                                aria_label="Trailing limit offset unit",
+                            ),
+                            HTMLInput(
+                                type="hidden",
+                                name="trail_limit_unit",
+                                data_bind=Signal("trailing_limit_unit", _ref_only=True),
+                            ),
+                            Input(
+                                name="trail_limit_value",
+                                type="number",
+                                min="0.01",
+                                step="any",
+                                placeholder="Blank for trailing stop",
+                                cls="min-w-0 flex-1",
+                            ),
+                            cls="flex w-full items-center gap-2",
+                        ),
+                    ),
+                    P(
+                        "A percentage limit offset becomes a fixed dollar offset "
+                        "at submission. A trailing limit may remain unfilled after "
+                        "its stop triggers.",
+                        cls="text-xs leading-5 text-muted-foreground",
+                    ),
+                    DialogFooter(
+                        Button(
+                            "Review conversion",
+                            type="submit",
+                            name="action",
+                            value="trailing-convert-arm",
+                            data_busy_text="Checking…",
+                        ),
+                    ),
+                    action=f"/{self.session_token}/action",
+                    method="post",
+                    cls="space-y-4",
+                ),
+            ),
         )
 
     def _existing_layers_panel(
@@ -4929,10 +5207,13 @@ class StarUIWorkbench:
             if pair[1].perm_id not in used_target_ids:
                 rows.append(self._active_layer_row(len(rows) + 1, *pair))
                 working_count += 1
+        for entry in self._trailing_entries():
+            if entry.state == "SUBMITTED" and entry.perm_ids:
+                rows.append(self._trailing_layer_row(len(rows) + 1, entry))
 
         return Form(
             ScrollArea(
-                Div(*rows, cls="oca-layer-list w-full min-w-[41rem]"),
+                Div(*rows, cls="oca-layer-list w-full"),
                 aria_label="Existing OCA layer rows",
                 orientation="horizontal",
                 cls="w-full",
@@ -4943,6 +5224,57 @@ class StarUIWorkbench:
             id="active-form",
             action=f"/{self.session_token}/action",
             method="post",
+        )
+
+    def _trailing_layer_row(self, index: int, entry: JournalEntry) -> Any:
+        order = next(
+            (
+                order
+                for order in self._state.working_orders
+                if order.perm_id == entry.perm_ids[0]
+                and order.order_type in {"TRAIL", "TRAIL LIMIT"}
+            ),
+            None,
+        )
+        working = order is not None
+        kind = "TRAIL LIMIT" if entry.trailing_limit_offset else "TRAIL"
+        trail = f"{entry.trailing_value}{'%' if entry.trailing_unit == 'percent' else ' USD'}"
+        return Div(
+            Div(
+                Span(str(index), cls="font-mono text-muted-foreground"),
+                Badge("WORKING" if working else "CHECK TWS", variant="outline"),
+                cls="flex flex-col items-start gap-2",
+            ),
+            Div(
+                Span(kind, cls="text-xs font-semibold"),
+                P(
+                    f"Trail {trail}",
+                    cls="mt-2 font-mono text-sm",
+                ),
+                cls="min-w-0",
+            ),
+            Div(
+                Span("Initial stop", cls="text-xs text-muted-foreground"),
+                P(f"${entry.trailing_stop}", cls="mt-2 font-mono text-sm"),
+                P(
+                    f"Limit offset ${entry.trailing_limit_offset}"
+                    if entry.trailing_limit_offset
+                    else "Market sell on trigger",
+                    cls="mt-1 text-xs text-muted-foreground",
+                ),
+                cls="min-w-0",
+            ),
+            Div(
+                Span("Quantity", cls="text-xs text-muted-foreground"),
+                P(
+                    str(order.remaining if order else entry.trailing_quantity),
+                    cls="mt-2 font-mono text-sm",
+                ),
+            ),
+            Div(),
+            data_layer_state="trailing",
+            data_trailing_perm_id=entry.perm_ids[0],
+            cls="layer-row-grid items-start gap-3 border-t border-border py-4 first:border-t-0 trailing-layer-row",
         )
 
     def _active_layer_row(self, index: int, group: str, target: Any, stop: Any) -> Any:
@@ -5094,15 +5426,6 @@ class StarUIWorkbench:
                     data_active_quantity=target.perm_id,
                 ),
                 input_id=f"active-quantity-{index}",
-            ),
-            tif_field=_field(
-                "TIF",
-                Input(
-                    id=f"active-tif-{index}",
-                    value=target.tif or "—",
-                    readonly=True,
-                ),
-                input_id=f"active-tif-{index}",
             ),
             action_field=_button_tooltip(
                 Button(
@@ -5267,7 +5590,7 @@ class StarUIWorkbench:
                             self._draft_layer_row(index, layer)
                             for index, layer in enumerate(layers, start=1)
                         ],
-                        cls="oca-layer-list w-full min-w-[41rem]",
+                        cls="oca-layer-list w-full",
                     ),
                     aria_label="Draft layer rows",
                     orientation="horizontal",
@@ -5594,7 +5917,6 @@ class StarUIWorkbench:
         }
 
     def _draft_layer_row(self, index: int, layer: DraftLayerForm) -> Any:
-        tif_signal = Signal(f"tif_{index}_value", _ref_only=True)
         gain, loss = self._layer_projection(layer)
         return _layer_row_layout(
             index=index,
@@ -5685,27 +6007,6 @@ class StarUIWorkbench:
                     cls="draft-quantity-control",
                 ),
                 input_id=f"quantity_{index}",
-            ),
-            tif_field=_field(
-                "TIF",
-                Div(
-                    Select(
-                        SelectTrigger(SelectValue(), id=f"tif_{index}_trigger"),
-                        SelectContent(
-                            SelectItem("GTC", value="GTC"),
-                            SelectItem("DAY", value="DAY"),
-                        ),
-                        value=layer.tif,
-                        label=layer.tif,
-                        signal=f"tif_{index}",
-                    ),
-                    HTMLInput(
-                        type="hidden",
-                        name=f"tif_{index}",
-                        data_bind=tif_signal,
-                    ),
-                ),
-                input_id=f"tif_{index}_trigger",
             ),
             action_field=_button_tooltip(
                 Button(
@@ -6077,10 +6378,13 @@ class StarUIWorkbench:
         )
         cancellation = self._armed_cancellation
         cancellations = self._armed_cancellations
+        trailing = self._armed_trailing
         price_updates = self._armed_price_updates
         armed_execution = self._armed_execution
         action_rows: list[Any] = []
-        if market_exits:
+        if trailing is not None:
+            action_rows = [self._review_trailing_plan(trailing)]
+        elif market_exits:
             action_rows = self._review_market_exit_plan(market_exits)
         elif cancellation is not None:
             action_rows = [self._review_cancellation_plan(cancellation)]
@@ -6113,7 +6417,9 @@ class StarUIWorkbench:
         has_active_layers = bool(self._active_oca_pairs())
         has_staged_action = bool(action_rows)
         review_badge = (
-            Badge("MKT EXIT", variant="outline", cls="text-[10px]")
+            Badge("TRAILING EXIT", variant="outline", cls="text-[10px]")
+            if trailing is not None
+            else Badge("MKT EXIT", variant="outline", cls="text-[10px]")
             if market_exits
             else Badge("CANCEL", variant="outline", cls="text-[10px]")
             if cancellation is not None or cancellations
@@ -6257,8 +6563,23 @@ class StarUIWorkbench:
             self._armed_cancellation is not None
             or self._armed_cancellations
             or market_exits
+            or self._armed_trailing is not None
         ) and not self._active_action_verified:
             return self._reviewed_active_action_controls()
+        if self._armed_trailing is not None:
+            return self._staged_action_controls(
+                confirm_action="trailing-convert-confirm",
+                busy_text="Converting…",
+                impact=(
+                    "Convert entire position",
+                    (
+                        "Confirm cancels every reviewed app-owned bracket, then "
+                        "submits one trailing SELL for all held contracts after a "
+                        "fresh position check. There is a period without bracket "
+                        "protection. A trailing limit can remain unfilled.",
+                    ),
+                ),
+            )
         if self._armed_cancellations:
             return self._staged_action_controls(
                 confirm_action="cancel-all-confirm",
@@ -6391,7 +6712,11 @@ class StarUIWorkbench:
             self._cancel_changes_control(staged=True),
             Div(
                 Button(
-                    "Review market sell" if market_exits else "Review cancellation",
+                    "Review trailing conversion"
+                    if self._armed_trailing is not None
+                    else "Review market sell"
+                    if market_exits
+                    else "Review cancellation",
                     variant="default",
                     type="submit",
                     name="action",
@@ -6780,6 +7105,38 @@ class StarUIWorkbench:
             **(row_attributes or {}),
         )
 
+    def _review_trailing_plan(self, plan: TrailingPlan) -> Any:
+        kind = "TRAIL LIMIT" if plan.limit_offset is not None else "TRAIL"
+        trail = (
+            f"{plan.request.trail_value}%"
+            if plan.request.trail_unit == "percent"
+            else f"${plan.request.trail_value}"
+        )
+        return Div(
+            H3(
+                f"SELL {kind} · {plan.quantity} contracts",
+                cls="text-base font-semibold",
+            ),
+            P(
+                f"Cancel {len(plan.candidates)} app-owned brackets; include "
+                f"{plan.unassigned_quantity} unassigned contracts.",
+                cls="mt-2 text-sm text-muted-foreground",
+            ),
+            P(
+                f"Trail {trail} from option premium · initial stop estimate "
+                f"${plan.initial_stop} from bid ${plan.reference_price} · {plan.request.tif}",
+                cls="mt-2 text-sm",
+            ),
+            P(
+                f"Limit offset ${plan.limit_offset} below the moving stop. "
+                "This is a fixed dollar offset."
+                if plan.limit_offset is not None
+                else "A trigger submits a market sell; the fill price can differ.",
+                cls="mt-2 text-sm text-amber-200",
+            ),
+            cls="rounded-md border border-border bg-card p-4",
+        )
+
     def _review_market_exit_plan(
         self, candidates: tuple[MarketExitCandidate, ...]
     ) -> list[Any]:
@@ -7042,7 +7399,7 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         assigned(`[data-live-review-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? sellPriceText(stopPrice, !exactStopInput?.value && stop === Number(stopInput?.dataset.liveInitial) ? `$${{stopInput.dataset.liveOriginal}}` : priceText(stopPrice)) : '—');
         assigned(`[data-live-outcome="target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
         assigned(`[data-live-outcome="stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} ${{stopLimit ? 'at stop trigger' : 'max loss'}}` : `— ${{stopLimit ? 'at stop trigger' : 'max loss'}}`);
-        assigned(`[data-live-review-quantity="${{index}}"]`, `${{quantityValid ? quantity : '—'}} contracts · ${{form.elements[`tif_${{index}}`]?.value || 'GTC'}}`);
+        assigned(`[data-live-review-quantity="${{index}}"]`, `${{quantityValid ? quantity : '—'}} contracts · GTC`);
         if (Number.isFinite(gain) && Number.isFinite(loss)) outcomes.push({{ quantity, gain, loss }});
         else invalid = true;
       }});
@@ -7458,7 +7815,6 @@ def _layer_row_layout(
     target_field: Any,
     stop_field: Any,
     quantity_field: Any,
-    tif_field: Any,
     action_field: Any,
     oca_group: str | None = None,
 ) -> Any:
@@ -7476,12 +7832,9 @@ def _layer_row_layout(
         target_field,
         stop_field,
         quantity_field,
-        tif_field,
         action_field,
         data_layer_state=state,
-        # This is deliberately a shared, bundled grid utility: arbitrary
-        # Tailwind values are not present in StarUI's precompiled stylesheet.
-        cls="grid grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem] items-start gap-3 border-t border-border py-4 first:border-t-0",
+        cls="layer-row-grid items-start gap-3 border-t border-border py-4 first:border-t-0",
     )
 
 
@@ -8283,6 +8636,7 @@ def _toast_notice(message: str) -> _ToastNotice | None:
     prefix, separator, detail = normalized.partition(":")
     titles = {
         "Execution blocked": "Couldn't send bracket orders",
+        "Trailing conversion blocked": "Couldn't review trailing conversion",
         "Market exit blocked": "Couldn't send the market sell",
         "Bracket cancellation blocked": "Couldn't cancel bracket orders",
         "Price update blocked": "Couldn't change prices",

@@ -123,7 +123,7 @@ def test_explicit_layer_draft_preserves_individual_prices_and_quantities() -> No
                 quantity=2,
                 target_price=Decimal("1.50"),
                 stop_price=Decimal("0.75"),
-                tif="DAY",
+                tif="GTC",
                 target_percentage=Decimal("50"),
                 runner=True,
             ),
@@ -135,8 +135,27 @@ def test_explicit_layer_draft_preserves_individual_prices_and_quantities() -> No
     assert result.status is PlanStatus.VALID
     assert [pair.quantity for pair in result.pairs] == [3, 2]
     assert result.pairs[0].target.rounded_price == Decimal("1.20")
-    assert result.pairs[1].stop.tif == "DAY"
+    assert result.pairs[1].stop.tif == "GTC"
     assert result.pairs[1].runner is True
+
+
+def test_day_time_in_force_is_blocked_for_new_brackets() -> None:
+    request = replace(canonical_request(), tif="DAY")
+    result = build_exit_plan(complete_snapshot(), request)
+    assert result.status is PlanStatus.BLOCKED
+    assert "TIF_UNSUPPORTED" in {item.code for item in result.validations}
+
+    layer = LayerRequest(
+        quantity=1,
+        target_price=Decimal("1.20"),
+        stop_price=Decimal("0.80"),
+        tif="DAY",
+    )
+    result = build_exit_plan(
+        complete_snapshot(), replace(canonical_request(), layers=(layer,))
+    )
+    assert result.status is PlanStatus.BLOCKED
+    assert "TIF_UNSUPPORTED" in {item.code for item in result.validations}
 
 
 @pytest.mark.parametrize(

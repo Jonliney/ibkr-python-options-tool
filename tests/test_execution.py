@@ -41,6 +41,7 @@ from ibkr_options_manager.execution import (
     require_paper_execution_snapshot,
 )
 from ibkr_options_manager.ibkr_probe import _IbapiImports
+from ibkr_options_manager.trailing import TrailingRequest, plan_entire_position
 
 
 def _snapshot(*, read_only_api: bool = False) -> BrokerSnapshot:
@@ -88,6 +89,358 @@ def _snapshot(*, read_only_api: bool = False) -> BrokerSnapshot:
             bands=(PriceBand(Decimal("0"), Decimal("0.05")),),
         ),
     )
+
+
+def _trailing_snapshot() -> BrokerSnapshot:
+    return replace(
+        _snapshot(), executions_complete=True, completed_orders_complete=True
+    )
+
+
+def test_trailing_plan_covers_all_unassigned_contracts_and_fixed_limit_offset() -> None:
+    snapshot = _trailing_snapshot()
+    plan = plan_entire_position(
+        snapshot,
+        (),
+        TrailingRequest(
+            trail_value=Decimal("10"),
+            trail_unit="percent",
+            limit_value=Decimal("10"),
+            limit_unit="percent",
+        ),
+    )
+
+    assert plan.quantity == 2
+    assert plan.unassigned_quantity == 2
+    assert plan.initial_stop == Decimal("0.85")
+    assert plan.limit_offset == Decimal("0.10")
+
+
+def test_trailing_plan_rejects_day_time_in_force() -> None:
+    with pytest.raises(ExecutionBlocked, match="TIF must be GTC"):
+        plan_entire_position(
+            _trailing_snapshot(),
+            (),
+            TrailingRequest(Decimal("0.10"), "dollars", tif="DAY"),
+        )
+
+
+def test_trailing_baseline_accepts_new_capture_epoch_but_rejects_basis_change() -> None:
+    snapshot = _trailing_snapshot()
+    plan = plan_entire_position(
+        snapshot, (), TrailingRequest(Decimal("0.10"), "dollars")
+    )
+
+    PaperExecutionService.verify_trailing_baseline(
+        replace(snapshot, connection_epoch=snapshot.connection_epoch + 1), plan
+    )
+    with pytest.raises(ExecutionBlocked, match="position basis changed"):
+        PaperExecutionService.verify_trailing_baseline(
+            replace(
+                snapshot,
+                position=replace(
+                    snapshot.position,
+                    raw_average_cost=snapshot.position.raw_average_cost
+                    + Decimal("1"),
+                ),
+            ),
+            plan,
+        )
+
+
+def test_trailing_plan_rejects_external_order_and_stale_bid() -> None:
+    snapshot = _trailing_snapshot()
+    external = WorkingOrder(
+        perm_id=99,
+        client_id=1,
+        order_id=9,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("1"),
+        status="Submitted",
+    )
+    with pytest.raises(ExecutionBlocked, match="another working order"):
+        plan_entire_position(
+            replace(snapshot, working_orders=(external,)),
+            (),
+            TrailingRequest(Decimal("0.10"), "dollars"),
+        )
+    with pytest.raises(ExecutionBlocked, match="fresh option bid"):
+        plan_entire_position(
+            replace(snapshot, quote=replace(snapshot.quote, fresh=False)),
+            (),
+            TrailingRequest(Decimal("0.10"), "dollars"),
+        )
+
+
+def test_trailing_plan_rejects_invalid_tick_and_insufficient_stop_room() -> None:
+    snapshot = _trailing_snapshot()
+    with pytest.raises(ExecutionBlocked, match="valid price increment"):
+        plan_entire_position(snapshot, (), TrailingRequest(Decimal("0.11"), "dollars"))
+    with pytest.raises(ExecutionBlocked, match="at or below zero"):
+        plan_entire_position(snapshot, (), TrailingRequest(Decimal("1.00"), "dollars"))
+
+
+def test_trailing_submission_is_journaled_once_and_rejects_position_change(
+    tmp_path,
+) -> None:
+    snapshot = _trailing_snapshot()
+    plan = plan_entire_position(
+        snapshot, (), TrailingRequest(Decimal("0.10"), "dollars")
+    )
+
+    class Transport:
+        calls = 0
+
+        def submit_trailing(self, *args, **kwargs):
+            self.calls += 1
+            return PaperSubmission((701,), (801,))
+
+    transport = Transport()
+    service = PaperExecutionService(
+        transport, ExecutionJournal(tmp_path / "orders.json")
+    )
+    changed = replace(
+        snapshot, position=replace(snapshot.position, quantity=Decimal("1"))
+    )
+    with pytest.raises(ExecutionBlocked, match="position quantity changed"):
+        service.submit_entire_position_trailing(
+            changed,
+            plan,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+    with pytest.raises(ExecutionBlocked, match="USD option"):
+        plan_entire_position(
+            replace(snapshot, contract=replace(snapshot.contract, currency="EUR")),
+            (),
+            TrailingRequest(Decimal("0.10"), "dollars"),
+        )
+    assert transport.calls == 0
+    receipt = service.submit_entire_position_trailing(
+        snapshot,
+        plan,
+        host="127.0.0.1",
+        port=7497,
+        client_id=17,
+        timeout_seconds=1,
+    )
+    assert receipt.entry.perm_ids == (801,)
+    assert (
+        service.trailing_entries(
+            account=snapshot.selected.account, con_id=snapshot.selected.con_id
+        )[0].trailing_quantity
+        == 2
+    )
+    with pytest.raises(ExecutionBlocked, match="already journaled"):
+        service.submit_entire_position_trailing(
+            snapshot,
+            plan,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+    assert transport.calls == 1
+
+
+def test_unknown_trailing_submission_locks_contract_after_restart(tmp_path) -> None:
+    snapshot = _trailing_snapshot()
+    plan = plan_entire_position(
+        snapshot, (), TrailingRequest(Decimal("0.10"), "dollars")
+    )
+
+    class RejectingTransport:
+        def submit_trailing(self, *args, **kwargs):
+            raise ExecutionOutcomeUnknown("no complete acknowledgement")
+
+    path = tmp_path / "orders.json"
+    service = PaperExecutionService(RejectingTransport(), ExecutionJournal(path))
+    with pytest.raises(ExecutionOutcomeUnknown):
+        service.submit_entire_position_trailing(
+            snapshot,
+            plan,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+    restarted = PaperExecutionService(RejectingTransport(), ExecutionJournal(path))
+    unresolved = restarted.unresolved_management_entries(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id
+    )
+    assert len(unresolved) == 1
+    assert unresolved[0].state == "SUBMISSION_UNKNOWN"
+    with pytest.raises(ExecutionBlocked, match="locked"):
+        restarted.submit_entire_position_trailing(
+            snapshot,
+            plan,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+
+
+def test_trailing_submission_blocks_after_disconnect(tmp_path) -> None:
+    snapshot = _trailing_snapshot()
+    plan = plan_entire_position(
+        snapshot, (), TrailingRequest(Decimal("0.10"), "dollars")
+    )
+
+    class Transport:
+        def submit_trailing(self, *args, **kwargs):
+            raise AssertionError("must not be called")
+
+    service = PaperExecutionService(
+        Transport(), ExecutionJournal(tmp_path / "orders.json")
+    )
+    with pytest.raises(ExecutionBlocked, match="complete, fresh connection"):
+        service.submit_entire_position_trailing(
+            replace(snapshot, connected=False),
+            plan,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+
+
+def test_trailing_submission_blocks_offsetting_manual_execution(tmp_path) -> None:
+    snapshot = _trailing_snapshot()
+    plan = plan_entire_position(
+        snapshot, (), TrailingRequest(Decimal("0.10"), "dollars")
+    )
+
+    class Transport:
+        def submit_trailing(self, *args, **kwargs):
+            raise AssertionError("must not be called")
+
+    manual = ObservedExecution(
+        exec_id="manual.1",
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        perm_id=999,
+        side="BOT",
+        quantity=Decimal("1"),
+        price=Decimal("0.95"),
+        time="now",
+    )
+    service = PaperExecutionService(
+        Transport(), ExecutionJournal(tmp_path / "orders.json")
+    )
+    with pytest.raises(ExecutionBlocked, match="execution changed"):
+        service.submit_entire_position_trailing(
+            replace(snapshot, executions=(manual,)),
+            plan,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+
+
+def test_unassigned_trailing_submission_rejects_account_switch(tmp_path) -> None:
+    snapshot = _trailing_snapshot()
+    plan = plan_entire_position(
+        snapshot, (), TrailingRequest(Decimal("0.10"), "dollars")
+    )
+
+    class Transport:
+        def submit_trailing(self, *args, **kwargs):
+            raise AssertionError("must not be called")
+
+    other_key = replace(snapshot.selected, account="DU7654321")
+    switched = replace(
+        snapshot,
+        selected=other_key,
+        position=replace(snapshot.position, key=other_key),
+    )
+    service = PaperExecutionService(
+        Transport(), ExecutionJournal(tmp_path / "orders.json")
+    )
+    with pytest.raises(ExecutionBlocked, match="selected account"):
+        service.submit_entire_position_trailing(
+            switched,
+            plan,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+
+
+@pytest.mark.parametrize("with_limit", [False, True])
+def test_paper_trailing_writer_sends_one_exact_order(monkeypatch, with_limit) -> None:
+    from ibkr_options_manager.broker import execution as broker_execution
+
+    snapshot = _trailing_snapshot()
+    plan = plan_entire_position(
+        snapshot,
+        (),
+        TrailingRequest(
+            Decimal("10"),
+            "percent",
+            Decimal("0.05") if with_limit else None,
+        ),
+    )
+    sent = []
+
+    class FakeWrapper:
+        def __init__(self) -> None:
+            pass
+
+    class FakeClient:
+        def __init__(self, wrapper) -> None:
+            self.wrapper = wrapper
+            self.connected = False
+
+        def connect(self, *_args) -> None:
+            self.connected = True
+            self.wrapper.nextValidId(500)
+
+        def run(self) -> None:
+            pass
+
+        def isConnected(self) -> bool:
+            return self.connected
+
+        def disconnect(self) -> None:
+            self.connected = False
+
+        def placeOrder(self, order_id, _contract, order) -> None:
+            sent.append(order)
+            order.permId = 900
+            self.wrapper.openOrder(order_id, None, order, None)
+
+    monkeypatch.setattr(
+        broker_execution,
+        "_load_ibapi",
+        lambda: _IbapiImports(
+            FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace
+        ),
+    )
+    result = IbkrPaperExecutionBroker().submit_trailing(
+        snapshot,
+        plan,
+        host="127.0.0.1",
+        port=7497,
+        client_id=17,
+        timeout_seconds=1,
+    )
+    assert result.order_ids == (500,)
+    assert result.perm_ids == (900,)
+    assert len(sent) == 1
+    assert sent[0].orderType == ("TRAIL LIMIT" if with_limit else "TRAIL")
+    assert sent[0].trailingPercent == 10
+    assert sent[0].trailStopPrice == float(plan.initial_stop)
+    assert sent[0].totalQuantity == 2
+    assert sent[0].transmit is True
+    if with_limit:
+        assert sent[0].lmtPriceOffset == float(plan.limit_offset)
 
 
 def test_cancel_order_supplies_the_required_empty_order_cancel_options() -> None:

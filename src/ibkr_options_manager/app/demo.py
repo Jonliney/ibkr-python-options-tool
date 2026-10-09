@@ -34,6 +34,7 @@ from ..execution import (
     PriceUpdateCandidate,
 )
 from ..snapshot import SnapshotCoordinator, SnapshotResult
+from ..trailing import TrailingPlan
 
 DEMO_ACCOUNT = "DU0000000"
 
@@ -227,6 +228,35 @@ class DemoReadOnlyBroker:
                                 tif=layer.tif,
                             )
                         )
+            for entry in self._journal.trailing_entries(
+                account=account, con_id=position.contract.con_id
+            ):
+                if (
+                    entry.state != "SUBMITTED"
+                    or len(entry.order_ids) != 1
+                    or len(entry.perm_ids) != 1
+                    or not entry.trailing_quantity
+                ):
+                    continue
+                orders.append(
+                    CapturedOrder(
+                        perm_id=entry.perm_ids[0],
+                        client_id=17,
+                        order_id=entry.order_ids[0],
+                        account=account,
+                        con_id=entry.con_id,
+                        action="SELL",
+                        order_type=(
+                            "TRAIL LIMIT" if entry.trailing_limit_offset else "TRAIL"
+                        ),
+                        remaining=Decimal(entry.trailing_quantity),
+                        status="Submitted",
+                        oca_group=None,
+                        parent_id=0,
+                        stop_price=Decimal(entry.trailing_stop),
+                        tif=entry.trailing_tif,
+                    )
+                )
         return tuple(orders)
 
     def capture(
@@ -373,6 +403,41 @@ class DemoPaperExecutionTransport:
         target = candidate.target_order_id
         stop = candidate.stop_order_id
         return PaperSubmission(order_ids=tuple(sorted((target, stop))), perm_ids=())
+
+    def submit_trailing(
+        self,
+        snapshot: BrokerSnapshot,
+        plan: TrailingPlan,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmission:
+        """Acknowledge one synthetic trailing order without contacting TWS."""
+        del plan, host, port, client_id, timeout_seconds
+        if self._journal is None:
+            raise ValueError("demo journal is unavailable")
+        entries = self._journal.submission_entries(
+            account=snapshot.selected.account, con_id=snapshot.selected.con_id
+        ) + self._journal.trailing_entries(
+            account=snapshot.selected.account, con_id=snapshot.selected.con_id
+        )
+        order_id = (
+            max(
+                (value for entry in entries for value in entry.order_ids),
+                default=900_000,
+            )
+            + 1
+        )
+        perm_id = (
+            max(
+                (value for entry in entries for value in entry.perm_ids),
+                default=800_000,
+            )
+            + 1
+        )
+        return PaperSubmission((order_id,), (perm_id,))
 
     def modify_prices(
         self,

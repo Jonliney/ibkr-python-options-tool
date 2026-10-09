@@ -230,7 +230,7 @@ def test_explicit_layer_form_maps_each_price_into_the_preview() -> None:
     layer_form = PlanForm(
         layers=(
             DraftLayerForm("3", "28.6", "19.1", "20", "GTC"),
-            DraftLayerForm("2", "33.4", "17.9", "40", "DAY", True),
+            DraftLayerForm("2", "33.4", "17.9", "40", "GTC", True),
         )
     )
 

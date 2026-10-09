@@ -1324,6 +1324,12 @@ def test_status_updates_render_as_short_toasts_not_workspace_copy() -> None:
     assert "document.startViewTransition" not in page.text
 
 
+def test_trailing_review_failure_uses_trailing_toast_title() -> None:
+    notice = _toast_notice("Trailing conversion blocked: the quote is unavailable")
+    assert notice is not None
+    assert notice.title == "Couldn't review trailing conversion"
+
+
 def test_selecting_fully_allocated_position_does_not_raise_error_toast() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
@@ -2155,10 +2161,7 @@ def test_reconciled_bracket_missing_after_manual_tws_cancel_offers_verification(
     assert 'value="verify-cancelled-bracket:' + fingerprint + ':0"' in page
     assert 'aria-label="Verify bracket status of layer 1"' in page
     assert "verify-layer-button" not in page
-    assert (
-        "grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem]"
-        in page
-    )
+    assert "layer-row-grid" in page
     assert "data-cancelled-bracket-recovery-dialog" not in page
     # A blocked plan refresh may clear the view model's snapshot. The explicit
     # Verify action must still open; confirmation obtains a new TWS read.
@@ -2750,8 +2753,8 @@ def test_build_draft_uses_lmt_defaults_and_available_contracts(
         in response.text
     )
     assert f"{quantities[0]} of {available} available contracts" in response.text
-    assert 'id="tif_1_trigger"' in response.text
-    assert "data-position:tif_1_trigger__" in response.text
+    assert 'aria-label="Draft order time in force"' not in response.text
+    assert 'name="tif_1"' not in response.text
 
 
 def test_build_draft_preserves_existing_rows_and_fails_closed_on_bad_defaults() -> None:
@@ -3242,7 +3245,7 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert "data-active-review-row" in page.text
     assert "data-active-execute" in page.text
     assert 'id="active-quantity-1"' in page.text
-    assert 'id="active-tif-1"' in page.text
+    assert 'id="active-tif-1"' not in page.text
     assert 'value="cancel-pair-arm:101"' in page.text
     assert "Cancel this active layer" in page.text
     assert ">State<" not in page.text
@@ -3753,7 +3756,7 @@ def test_closed_bracket_profit_is_separate_from_surviving_active_layer(
     assert re.search(r'id="sold-stop-1"[^>]*disabled', page.text)
     assert 'id="sold-quantity-1"' in page.text
     assert 'value="3"' in page.text
-    assert 'id="sold-tif-1"' in page.text
+    assert 'id="sold-tif-1"' not in page.text
     assert "aaaaaaaaaaaa/tranche-1" in page.text
     assert "aaaaaaaaaaaa/tranche-2" in page.text
     assert 'data-slot="tooltip-content"' in page.text
@@ -5329,6 +5332,11 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert ".workspace-content {" in layout_css
     assert "max-width: 80rem;" in layout_css
     assert "margin-inline: auto;" in layout_css
+    assert ".layer-row-grid {" in layout_css
+    assert (
+        "grid-template-columns: 5rem minmax(10rem, 1fr) minmax(10rem, 1fr) "
+        "minmax(5rem, 0.6fr) 2.25rem;" in layout_css
+    )
     assert 'aria-label="Draft layer rows"' in page.text
     assert 'aria-label="Draft contracts allocated"' not in page.text
     assert "data-live-allocation-text" not in page.text
@@ -5394,14 +5402,12 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert quantity_input is not None
     assert 'min="1"' in quantity_input.group()
     assert 'max="5"' in quantity_input.group()
-    assert 'for="tif_1_trigger"' in draft
-    assert 'id="tif_1_trigger"' in draft
-    assert "w-full min-w-[41rem]" in draft
+    assert 'aria-label="Draft order time in force"' not in draft
+    assert 'name="tif_1"' not in draft
+    assert 'data-slot="select"' not in draft
+    assert "oca-layer-list w-full" in draft
     assert "items-start gap-3" in draft
-    assert (
-        "grid-cols-[5rem_minmax(10rem,1fr)_minmax(10rem,1fr)_minmax(5rem,0.6fr)_5rem_2.25rem]"
-        in draft
-    )
+    assert "layer-row-grid" in draft
     assert 'aria-label="Draft layer rows"' in draft
     assert "overflow-x-auto overflow-y-hidden" in draft
 
@@ -5420,7 +5426,7 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
 
     assert response.status_code == 200
     assert [layer.quantity for layer in workbench._current_layers()] == ["3", "2"]
-    assert workbench._current_layers()[0].tif == "DAY"
+    assert workbench._current_layers()[0].tif == "GTC"
     assert "DRAFT 2" in response.text
     split_trigger = re.search(
         r'<button[^>]*aria-label="Split draft layer quantities"[^>]*>',
@@ -6667,6 +6673,185 @@ def _demo_workbench() -> StarUIWorkbench:
         initial_account=DEMO_ACCOUNT,
         demo_mode=True,
     )
+
+
+def test_submitted_trailing_exit_appears_as_central_layer_row() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    entry = JournalEntry(
+        fingerprint="trailing-conversion:" + "a" * 64,
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        state="SUBMITTED",
+        perm_ids=(90210,),
+        trailing_quantity=2,
+        trailing_stop="0.80",
+        trailing_value="0.10",
+        trailing_unit="dollars",
+        trailing_limit_offset="0.05",
+        trailing_tif="GTC",
+    )
+
+    class History:
+        def owned_perm_ids(self, **_kwargs):
+            return frozenset()
+
+        def submission_entries(self, **_kwargs):
+            return ()
+
+        def trailing_entries(self, **_kwargs):
+            return (entry,)
+
+    workbench._paper_execution = History()  # type: ignore[assignment]
+    page = to_xml(workbench._page())
+    assert 'data-layer-state="trailing"' in page
+    assert "TRAIL LIMIT" in page
+    assert "Limit offset $0.05" in page
+    assert "CHECK TWS" in page
+    trailing_row = to_xml(workbench._trailing_layer_row(1, entry))
+    assert 'class="layer-row-grid ' in trailing_row
+    assert ">TIF<" not in trailing_row
+
+
+def test_trailing_dialog_has_one_clickable_trigger_button() -> None:
+    workbench = _demo_workbench()
+    dialog_markup = to_xml(workbench._trailing_conversion_dialog())
+    trigger_markup = dialog_markup.split("<dialog", 1)[0]
+    assert trigger_markup.count("<button") == 1
+    assert 'aria-label="Convert entire position to trailing stop"' in trigger_markup
+    assert 'd="M9 19h8.5' in trigger_markup
+    assert 'aria-label="Trail amount unit"' in dialog_markup
+    assert 'aria-label="Trailing limit offset unit"' in dialog_markup
+    assert 'name="trail_unit" data-bind="trailing_amount_unit"' in dialog_markup
+    assert 'name="trail_limit_unit" data-bind="trailing_limit_unit"' in dialog_markup
+    assert 'name="trail_tif"' not in dialog_markup
+    assert '>DAY<' not in dialog_markup
+    assert dialog_markup.index('aria-label="Trail amount unit"') < dialog_markup.index(
+        'name="trail_value"'
+    )
+    assert dialog_markup.index(
+        'aria-label="Trailing limit offset unit"'
+    ) < dialog_markup.index('name="trail_limit_value"')
+
+
+@pytest.mark.parametrize("with_bracket", [False, True])
+@pytest.mark.parametrize("bid_changes_before_review", [False, True])
+@pytest.mark.parametrize("epoch_changes_before_review", [False, True])
+def test_demo_entire_position_trailing_conversion_includes_unassigned_contracts(
+    tmp_path,
+    with_bracket,
+    bid_changes_before_review,
+    epoch_changes_before_review,
+) -> None:
+    def clock() -> Decimal:
+        return Decimal("100")
+
+    from ibkr_options_manager.app.view_model import PlannerViewModel
+
+    journal = ExecutionJournal(tmp_path / "demo-trailing.json")
+    if with_bracket:
+        journal._write(
+            (
+                JournalEntry(
+                    fingerprint="b" * 64,
+                    account=DEMO_ACCOUNT,
+                    con_id=1_004_470_201,
+                    state="SUBMITTED",
+                    order_ids=(701, 702),
+                    perm_ids=(801, 802),
+                    oca_prefix="demo-trailing-test",
+                    layers=(JournalLayer(1, "12.00", "7.00", "GTC"),),
+                ),
+            )
+        )
+    class MovingBidBroker(DemoReadOnlyBroker):
+        bid_adjustment = Decimal("0")
+        epoch_adjustment = 0
+        advance_epoch_each_capture = False
+
+        def capture(self, request):
+            captured = super().capture(request)
+            if isinstance(request, SnapshotRequest):
+                if self.bid_adjustment:
+                    captured = replace(
+                        captured,
+                        quote=replace(
+                            captured.quote,
+                            bid=captured.quote.bid + self.bid_adjustment,
+                        ),
+                    )
+                if self.advance_epoch_each_capture:
+                    self.epoch_adjustment += 1
+                    captured = replace(
+                        captured,
+                        connection_epoch=captured.connection_epoch
+                        + self.epoch_adjustment,
+                    )
+            return captured
+
+    broker = MovingBidBroker(clock=clock, paper_execution_enabled=True)
+    broker.use_journal(journal)
+    workbench = StarUIWorkbench(
+        PlannerViewModel(
+            SnapshotCoordinator(broker, max_age_seconds=Decimal("15"), clock=clock),
+            portfolio=PortfolioCoordinator(
+                broker,
+                max_age_seconds=Decimal("15"),
+                clock=clock,
+                paper_execution_mode=True,
+            ),
+            clock=clock,
+        ),
+        initial_account=DEMO_ACCOUNT,
+        initial_con_id=1_004_470_201,
+        demo_mode=True,
+        paper_execution=PaperExecutionService(
+            DemoPaperExecutionTransport(journal), journal
+        ),
+    )
+    workbench.load_demo_data()
+    client = TestClient(workbench.app)
+    review = client.post(
+        workbench.path + "action",
+        data={
+            "action": "trailing-convert-arm",
+            "trail_value": "0.25",
+            "trail_unit": "dollars",
+            "trail_limit_value": "0.10",
+            "trail_limit_unit": "dollars",
+            "trail_tif": "DAY",
+        },
+    )
+    assert review.status_code == 200
+    assert f"{2 if with_bracket else 3} unassigned contracts" in review.text
+    if bid_changes_before_review:
+        broker.bid_adjustment = Decimal("0.05")
+    if epoch_changes_before_review:
+        broker.advance_epoch_each_capture = True
+    verified = client.post(
+        workbench.path + "action", data={"action": "active-action-execute"}
+    )
+    assert 'value="trailing-convert-confirm"' in verified.text
+    if bid_changes_before_review:
+        assert workbench._armed_trailing is not None
+        assert workbench._armed_trailing.reference_price == Decimal("9.10")
+        assert workbench._armed_trailing.initial_stop == Decimal("8.85")
+        assert "from bid $9.10" in verified.text
+    result = client.post(
+        workbench.path + "action", data={"action": "trailing-convert-confirm"}
+    )
+    assert result.status_code == 200
+    assert 'data-layer-state="trailing"' in result.text
+    assert "TRAIL LIMIT" in result.text
+    assert "WORKING" in result.text
+    assert journal.trailing_entries(account=DEMO_ACCOUNT, con_id=1_004_470_201)[
+        -1
+    ].trailing_tif == "GTC"
+    if with_bracket:
+        original = journal.find("b" * 64)
+        assert original is not None and original.layers[0].cancelled
 
 
 class _WindowStub:

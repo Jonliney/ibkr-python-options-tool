@@ -22,7 +22,6 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -71,7 +70,6 @@ class _LayerWidgets:
     target_outcome: QLabel
     stop_outcome: QLabel
     quantity: QLineEdit
-    tif: QComboBox
 
 
 class _PercentageSpinBox(QDoubleSpinBox):
@@ -1108,7 +1106,7 @@ class PlannerWindow(QMainWindow):
                 target_price=_raw_price_text(widgets.target_price.text()),
                 stop_price=_raw_price_text(widgets.stop_price.text()),
                 target_percentage=widgets.target_percentage.text(),
-                tif=widgets.tif.currentText(),
+                tif="GTC",
                 runner=False,
                 stop_percentage=widgets.stop_percentage.text(),
             )
@@ -1230,10 +1228,6 @@ class PlannerWindow(QMainWindow):
                 quantity = QLineEdit(layer.quantity)
                 quantity.setObjectName("layerQuantityInput")
                 quantity.setAccessibleName(f"Layer {index} quantity")
-                tif = QComboBox()
-                tif.setObjectName("layerTifInput")
-                tif.addItems(["GTC", "DAY"])
-                tif.setCurrentText(layer.tif)
                 remove = QPushButton()
                 remove.setObjectName("removeLayerButton")
                 remove.setProperty("secondary", True)
@@ -1273,7 +1267,6 @@ class PlannerWindow(QMainWindow):
                     2,
                 )
                 _add_compact_field(row_layout, 0, 5, "Qty", quantity, None, 2)
-                _add_compact_field(row_layout, 0, 7, "TIF", tif, None, 2)
                 row_layout.addWidget(remove, 1, 9, 1, 1, Qt.AlignmentFlag.AlignVCenter)
                 for widget in (quantity,):
                     widget.textChanged.connect(self._draft_changed)
@@ -1283,7 +1276,6 @@ class PlannerWindow(QMainWindow):
                 stop_percentage.valueChanged.connect(
                     lambda _value: self._reprice_draft_from_percentages()
                 )
-                tif.currentIndexChanged.connect(self._draft_changed)
                 self._layer_widgets.append(
                     _LayerWidgets(
                         target_percentage=target_percentage,
@@ -1293,7 +1285,6 @@ class PlannerWindow(QMainWindow):
                         target_outcome=target_outcome,
                         stop_outcome=stop_outcome,
                         quantity=quantity,
-                        tif=tif,
                     )
                 )
                 row.setProperty("targetPercentage", layer.target_percentage)
@@ -1313,7 +1304,7 @@ class PlannerWindow(QMainWindow):
                     target_price=_raw_price_text(widgets.target_price.text()),
                     stop_price=_raw_price_text(widgets.stop_price.text()),
                     target_percentage=widgets.target_percentage.text(),
-                    tif=widgets.tif.currentText(),
+                    tif="GTC",
                     runner=False,
                     stop_percentage=widgets.stop_percentage.text(),
                 )
@@ -1876,10 +1867,9 @@ QLabel#factNameLight { color: #627985; font: 12px "Avenir Next"; }
 QLabel#factValueLight { color: #173447; font: 12px "SF Mono"; }
 QLabel#positionTitle { color: #ffffff; font: 600 16px "SF Mono"; padding: 3px 0 7px 0; }
 QFrame#rule { color: #244355; margin: 5px 0; }
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: #102d40; color: #f1f7f8; border: 1px solid #365a6c; padding: 7px 8px; min-height: 20px; selection-background-color: #d34174; selection-color: white; font: 12px "Avenir Next"; }
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 2px solid #7fc8c8; padding: 6px 7px; }
-QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled { color: #78909b; background: #0d2637; }
-QComboBox QAbstractItemView { background: #102d40; color: white; selection-background-color: #245d70; }
+QLineEdit, QSpinBox, QDoubleSpinBox { background: #102d40; color: #f1f7f8; border: 1px solid #365a6c; padding: 7px 8px; min-height: 20px; selection-background-color: #d34174; selection-color: white; font: 12px "Avenir Next"; }
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 2px solid #7fc8c8; padding: 6px 7px; }
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled { color: #78909b; background: #0d2637; }
 QPushButton { background: #7fc8c8; color: #071a2b; border: 1px solid #9edcdc; padding: 10px 14px; min-height: 20px; font: 700 12px "Avenir Next"; }
 QPushButton:hover { background: #a0dedd; }
 QPushButton:pressed { background: #63aeb0; }
@@ -1936,10 +1926,9 @@ QPushButton#positionButton[selected="true"]:hover { background: #15301c; border-
 QPushButton#positionButton[eligible="false"] { color: #7c867c; }
 QFrame#connectionSettings { background: #101610; border-top: 1px solid #273027; padding: 0; }
 QLabel#fieldLabel, QLabel#compactFieldLabel { color: #758173; font: 700 9px "Avenir Next"; text-transform: uppercase; letter-spacing: 0.55px; }
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox { background: #080b09; color: #e6ebe4; border: 1px solid #2b362d; border-radius: 3px; padding: 6px 7px; min-height: 19px; selection-background-color: #3ec765; selection-color: #061008; font: 11px "SF Mono"; }
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border: 1px solid #59d477; padding: 6px 7px; }
+QLineEdit, QSpinBox, QDoubleSpinBox { background: #080b09; color: #e6ebe4; border: 1px solid #2b362d; border-radius: 3px; padding: 6px 7px; min-height: 19px; selection-background-color: #3ec765; selection-color: #061008; font: 11px "SF Mono"; }
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #59d477; padding: 6px 7px; }
 QLineEdit[presetInvalid="true"] { border-color: #ef6b62; }
-QComboBox QAbstractItemView { background: #101610; color: #e6ebe4; selection-background-color: #1f3d25; }
 QLabel#positionTitle { color: #f0f4ef; padding: 0; font: 700 22px "Avenir Next"; letter-spacing: -0.4px; }
 QLabel#positionOverview { color: #aeb9ad; font: 11px "SF Mono"; }
 QLabel#availableLabel { color: #54cf73; font: 700 11px "Avenir Next"; }

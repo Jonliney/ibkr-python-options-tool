@@ -13,16 +13,18 @@ from ..cancellation_trace import (
     current_cancellation_context,
     record_cancellation_event,
 )
-from ..domain import BrokerSnapshot, PlanResult
+from ..domain import BrokerSnapshot, PlanResult, supports_outside_rth
 from ..execution import (
     ExecutionBlocked,
     ExecutionOutcomeUnknown,
     MarketExitCandidate,
     PriceUpdateCandidate,
     require_paper_execution_snapshot,
+    require_paper_management_snapshot,
 )
 from ..ibkr_probe import _load_ibapi, _parse_error_arguments
 from ..price_update_trace import record_price_update_event
+from ..trailing import TrailingPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +42,116 @@ def _cancel_order(app: Any, order_id: int) -> None:
 
 class IbkrPaperExecutionBroker:
     """Bounded paper writer for creation and exact app-owned order changes."""
+
+    def submit_trailing(
+        self,
+        snapshot: BrokerSnapshot,
+        plan: TrailingPlan,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmission:
+        """Submit one standalone paper trailing exit after the service's final check."""
+        require_paper_management_snapshot(snapshot)
+        if (
+            plan.quantity != snapshot.position.quantity
+            or any(order.key == snapshot.selected for order in snapshot.working_orders)
+            or plan.outside_rth != supports_outside_rth(snapshot)
+            or plan.request.tif != "GTC"
+        ):
+            raise ExecutionBlocked("the trailing plan no longer matches TWS")
+        imports = _load_ibapi()
+        from ibapi.order import Order
+
+        class App(imports.EWrapper, imports.EClient):  # type: ignore[name-defined, misc]
+            def __init__(self) -> None:
+                imports.EWrapper.__init__(self)
+                imports.EClient.__init__(self, self)
+                self.ready = Event()
+                self.acknowledged = Event()
+                self.next_order_id = 0
+                self.order_id = 0
+                self.perm_id = 0
+                self.errors: list[str] = []
+
+            def nextValidId(self, order_id: int) -> None:
+                self.next_order_id = int(order_id)
+                self.ready.set()
+
+            def openOrder(
+                self, order_id: int, contract: Any, order: Any, state: Any
+            ) -> None:
+                del contract, state
+                if int(order_id) != self.order_id:
+                    return
+                if str(getattr(order, "orderType", "")) != (
+                    "TRAIL LIMIT" if plan.limit_offset is not None else "TRAIL"
+                ):
+                    self.errors.append("TWS returned a different trailing order type")
+                    return
+                self.perm_id = int(getattr(order, "permId", 0) or 0)
+                if self.perm_id:
+                    self.acknowledged.set()
+
+            def error(self, req_id: int, *args: Any) -> None:
+                code, message = _parse_error_arguments(args)
+                if code not in {2104, 2106, 2107, 2108, 2158}:
+                    self.errors.append(
+                        f"IBKR error reqId={req_id} code={code}: {message}"
+                    )
+
+        app = App()
+        reader: Thread | None = None
+        deadline = monotonic() + timeout_seconds
+        try:
+            app.connect(host, port, client_id)
+            reader = Thread(
+                target=app.run, name="ibkr-paper-trailing-reader", daemon=True
+            )
+            reader.start()
+            if not app.ready.wait(max(0, deadline - monotonic())):
+                raise ExecutionBlocked("TWS did not issue a next valid order ID")
+            order = Order()
+            order.action = "SELL"
+            order.orderType = (
+                "TRAIL LIMIT" if plan.limit_offset is not None else "TRAIL"
+            )
+            order.totalQuantity = plan.quantity
+            order.account = snapshot.selected.account
+            order.tif = plan.request.tif
+            order.trailStopPrice = float(plan.initial_stop)
+            order.outsideRth = plan.outside_rth
+            order.transmit = True
+            if plan.request.trail_unit == "percent":
+                order.trailingPercent = float(plan.request.trail_value)
+            else:
+                order.auxPrice = float(plan.request.trail_value)
+            if plan.limit_offset is not None:
+                order.lmtPriceOffset = float(plan.limit_offset)
+            app.order_id = app.next_order_id
+            app.placeOrder(
+                app.order_id, _build_submission_contract(imports, snapshot), order
+            )
+            while (
+                not app.acknowledged.is_set()
+                and not app.errors
+                and monotonic() < deadline
+            ):
+                sleep(0.02)
+            if app.errors:
+                raise ExecutionOutcomeUnknown("; ".join(app.errors))
+            if not app.acknowledged.is_set():
+                raise ExecutionOutcomeUnknown(
+                    "TWS did not acknowledge the trailing order"
+                )
+            return PaperSubmission((app.order_id,), (app.perm_id,))
+        finally:
+            if app.isConnected():
+                app.disconnect()
+            if reader is not None:
+                reader.join(timeout=0.5)
 
     def submit(
         self,
@@ -322,7 +434,7 @@ class IbkrPaperExecutionBroker:
             or snapshot.selected.con_id != candidate.con_id
             or candidate.client_id != client_id
             or candidate.quantity <= 0
-            or not candidate.tif
+            or candidate.tif != "GTC"
             or not candidate.oca_group
         ):
             raise ExecutionBlocked("the market-exit candidate does not match TWS")
@@ -448,7 +560,7 @@ class IbkrPaperExecutionBroker:
             order.orderType = "MKT"
             order.totalQuantity = candidate.quantity
             order.account = candidate.account
-            order.tif = candidate.tif
+            order.tif = "GTC"
             order.transmit = True
             app.market_order_id = app.next_order_id
             app.placeOrder(
@@ -501,14 +613,10 @@ class IbkrPaperExecutionBroker:
             or candidate.con_id != snapshot.selected.con_id
             or candidate.client_id != client_id
             or candidate.quantity <= 0
-            or not candidate.tif
+            or candidate.tif != "GTC"
             for candidate in candidates
         ):
             raise ExecutionBlocked("a selected market-exit layer does not match TWS")
-        if len({candidate.tif for candidate in candidates}) != 1:
-            raise ExecutionBlocked(
-                "selected layers must have the same TIF for one MKT exit"
-            )
         imports = _load_ibapi()
         from ibapi.order import Order
 
@@ -628,7 +736,7 @@ class IbkrPaperExecutionBroker:
             order.orderType = "MKT"
             order.totalQuantity = sum(candidate.quantity for candidate in candidates)
             order.account = candidates[0].account
-            order.tif = candidates[0].tif
+            order.tif = "GTC"
             order.transmit = True
             app.market_order_id = app.next_order_id
             app.placeOrder(
