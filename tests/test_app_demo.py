@@ -7021,6 +7021,7 @@ def test_trailing_dialog_has_one_clickable_trigger_button() -> None:
     trigger_markup = dialog_markup.split("<dialog", 1)[0]
     assert trigger_markup.count("<button") == 1
     assert 'aria-label="Set a trailing exit for this position"' in trigger_markup
+    assert "evt.currentTarget.blur()" in trigger_markup
     assert "Set a trailing exit for this position" in dialog_markup
     assert "Set a trailing exit" in dialog_markup
     assert "Choose a trailing stop or trailing limit" in dialog_markup

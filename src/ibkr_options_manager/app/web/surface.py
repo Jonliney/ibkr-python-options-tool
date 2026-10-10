@@ -5198,6 +5198,7 @@ class StarUIWorkbench:
                 size="icon",
                 aria_label="Set a trailing exit for this position",
                 disabled=self._paper_execution is None,
+                data_on_click=evt.currentTarget.blur(),
             ),
             DialogContent(
                 DialogHeader(
