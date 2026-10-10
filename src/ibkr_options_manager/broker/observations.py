@@ -32,6 +32,9 @@ def working_orders_from_capture(
             limit_price=order.limit_price,
             stop_price=order.stop_price,
             tif=order.tif,
+            trailing_amount=order.trailing_amount,
+            trailing_percent=order.trailing_percent,
+            limit_offset=order.limit_offset,
         )
         for order in sorted(
             orders,

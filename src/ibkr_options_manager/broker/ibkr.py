@@ -61,6 +61,9 @@ class _OrderDraft:
     limit_price: Decimal | None
     stop_price: Decimal | None
     tif: str
+    trailing_amount: Decimal | None = None
+    trailing_percent: Decimal | None = None
+    limit_offset: Decimal | None = None
 
 
 _QUOTE_STREAM_WAIT_SECONDS = 1.5
@@ -345,6 +348,19 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
                 limit_price=_positive_decimal_or_none(getattr(order, "lmtPrice", 0)),
                 stop_price=_observed_stop_price(order),
                 tif=str(getattr(order, "tif", "")),
+                trailing_amount=_trailing_field_decimal(getattr(order, "auxPrice", 0))
+                if str(getattr(order, "orderType", "")) in {"TRAIL", "TRAIL LIMIT"}
+                else None,
+                trailing_percent=_trailing_field_decimal(
+                    getattr(order, "trailingPercent", 0)
+                )
+                if str(getattr(order, "orderType", "")) in {"TRAIL", "TRAIL LIMIT"}
+                else None,
+                limit_offset=_trailing_field_decimal(
+                    getattr(order, "lmtPriceOffset", 0)
+                )
+                if str(getattr(order, "orderType", "")) == "TRAIL LIMIT"
+                else None,
             )
             if self.open_order_source == "client":
                 self.client_order_drafts[int(orderId)] = draft
@@ -625,6 +641,9 @@ def _capture(app: Any, epoch: int, *, connected: bool) -> BrokerCapture:
                 limit_price=draft.limit_price,
                 stop_price=draft.stop_price,
                 tif=draft.tif,
+                trailing_amount=draft.trailing_amount,
+                trailing_percent=draft.trailing_percent,
+                limit_offset=draft.limit_offset,
             )
             if captured.perm_id <= 0:
                 anonymous_orders.append(captured)
@@ -752,6 +771,12 @@ def _observed_stop_price(order: Any) -> Decimal | None:
 def _positive_decimal_or_none(value: Any) -> Decimal | None:
     parsed = _decimal(value)
     return parsed if parsed.is_finite() and parsed > 0 else None
+
+
+def _trailing_field_decimal(value: Any) -> Decimal | None:
+    """Treat ibapi's very large UNSET_DOUBLE as missing, not an order price."""
+    parsed = _positive_decimal_or_none(value)
+    return parsed if parsed is not None and parsed < Decimal("1e100") else None
 
 
 def _await(app: Any, name: str, deadline: float, message: str) -> bool:

@@ -19,6 +19,7 @@ from ..execution import (
     ExecutionOutcomeUnknown,
     MarketExitCandidate,
     PriceUpdateCandidate,
+    TrailingChangeCandidate,
     require_paper_execution_snapshot,
     require_paper_management_snapshot,
 )
@@ -42,6 +43,175 @@ def _cancel_order(app: Any, order_id: int) -> None:
 
 class IbkrPaperExecutionBroker:
     """Bounded paper writer for creation and exact app-owned order changes."""
+
+    def change_trailing(
+        self,
+        snapshot: BrokerSnapshot,
+        candidate: TrailingChangeCandidate,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmission:
+        """Change or cancel one same-client trail after exact prewrite verification."""
+        require_paper_management_snapshot(snapshot)
+        prior = candidate.order
+        if prior.client_id != client_id or prior.key != snapshot.selected:
+            raise ExecutionBlocked("the selected trailing order does not match TWS")
+        imports = _load_ibapi()
+
+        class App(imports.EWrapper, imports.EClient):  # type: ignore[name-defined, misc]
+            def __init__(self) -> None:
+                imports.EWrapper.__init__(self)
+                imports.EClient.__init__(self, self)
+                self.ready = Event()
+                self.orders_done = Event()
+                self.acknowledged = Event()
+                self.order: Any | None = None
+                self.status = ""
+                self.remaining: Decimal | None = None
+                self.errors: list[str] = []
+                self.sent = False
+
+            def nextValidId(self, _order_id: int) -> None:
+                self.ready.set()
+
+            def openOrder(
+                self, order_id: int, contract: Any, order: Any, state: Any
+            ) -> None:
+                if int(order_id) != prior.order_id:
+                    return
+                if int(getattr(order, "permId", 0) or 0) != prior.perm_id:
+                    self.errors.append("the trailing permanent ID changed")
+                    return
+                if int(getattr(contract, "conId", 0) or 0) != snapshot.selected.con_id:
+                    self.errors.append("the trailing contract changed")
+                    return
+                if self.sent and not candidate.cancel:
+                    try:
+                        stop = Decimal(str(order.trailStopPrice))
+                        offset = Decimal(str(order.lmtPriceOffset))
+                    except (InvalidOperation, ValueError, AttributeError):
+                        return
+                    if (
+                        stop == candidate.stop_price
+                        and offset == candidate.limit_offset
+                    ):
+                        self.acknowledged.set()
+                else:
+                    self.order = order
+                    self.status = str(getattr(state, "status", ""))
+
+            def openOrderEnd(self) -> None:
+                self.orders_done.set()
+
+            def orderStatus(self, order_id: int, status: str, *args: Any) -> None:
+                if not self.sent and int(order_id) == prior.order_id:
+                    self.status = status
+                    try:
+                        self.remaining = Decimal(str(args[1]))
+                    except (IndexError, InvalidOperation, ValueError):
+                        self.errors.append("TWS returned an invalid trailing quantity")
+                if (
+                    self.sent
+                    and candidate.cancel
+                    and int(order_id) == prior.order_id
+                    and status in {"Cancelled", "ApiCancelled"}
+                ):
+                    self.acknowledged.set()
+
+            def error(self, req_id: int, *args: Any) -> None:
+                code, message = _parse_error_arguments(args)
+                if code not in {2104, 2106, 2107, 2108, 2158}:
+                    self.errors.append(
+                        f"IBKR error reqId={req_id} code={code}: {message}"
+                    )
+
+        app = App()
+        reader: Thread | None = None
+        deadline = monotonic() + timeout_seconds
+        try:
+            app.connect(host, port, client_id)
+            reader = Thread(
+                target=app.run, name="ibkr-paper-trail-change-reader", daemon=True
+            )
+            reader.start()
+            if not app.ready.wait(max(0, deadline - monotonic())):
+                raise ExecutionBlocked("TWS did not issue a next valid order ID")
+            app.reqOpenOrders()
+            if not app.orders_done.wait(max(0, deadline - monotonic())):
+                raise ExecutionBlocked("same-client open orders were not verified")
+            order = app.order
+            if app.errors or order is None:
+                raise ExecutionBlocked("the app-owned trailing order was not available")
+            try:
+                observed_stop = Decimal(str(order.trailStopPrice))
+                observed_amount = Decimal(str(order.auxPrice))
+                observed_percent = Decimal(str(order.trailingPercent))
+                observed_offset = Decimal(str(order.lmtPriceOffset))
+                observed_quantity = Decimal(str(order.totalQuantity))
+            except (InvalidOperation, ValueError, AttributeError) as error:
+                raise ExecutionBlocked(
+                    "the trailing order fields are incomplete"
+                ) from error
+            if (
+                str(order.account) != snapshot.selected.account
+                or int(getattr(order, "clientId", -1)) != client_id
+                or str(order.action) != "SELL"
+                or str(order.orderType) != prior.order_type
+                or str(order.tif) != "GTC"
+                or str(getattr(order, "ocaGroup", "")) != ""
+                or int(getattr(order, "parentId", -1)) != 0
+                or app.status not in {"Submitted", "PreSubmitted"}
+                or app.remaining != prior.remaining
+                or observed_stop != prior.stop_price
+                or observed_quantity != prior.remaining
+                or (
+                    prior.trailing_amount is not None
+                    and observed_amount != prior.trailing_amount
+                )
+                or (
+                    prior.trailing_percent is not None
+                    and observed_percent != prior.trailing_percent
+                )
+                or (
+                    prior.limit_offset is not None
+                    and observed_offset != prior.limit_offset
+                )
+            ):
+                raise ExecutionBlocked("the trailing order changed in TWS before write")
+            app.sent = True
+            if candidate.cancel:
+                _cancel_order(app, prior.order_id)
+            else:
+                assert candidate.stop_price is not None
+                assert candidate.limit_offset is not None
+                order.trailStopPrice = float(candidate.stop_price)
+                order.lmtPriceOffset = float(candidate.limit_offset)
+                # Preserve all other broker fields, including TWS precautions.
+                app.placeOrder(
+                    prior.order_id, _build_submission_contract(imports, snapshot), order
+                )
+            while (
+                not app.acknowledged.is_set()
+                and not app.errors
+                and monotonic() < deadline
+            ):
+                sleep(0.02)
+            if app.errors or not app.acknowledged.is_set():
+                raise ExecutionOutcomeUnknown(
+                    "; ".join(app.errors)
+                    or "TWS did not acknowledge the trailing change"
+                )
+            return PaperSubmission(
+                (prior.order_id,), () if candidate.cancel else (prior.perm_id,)
+            )
+        finally:
+            if app.isConnected():
+                app.disconnect()
+            if reader is not None:
+                reader.join(timeout=0.5)
 
     def submit_trailing(
         self,

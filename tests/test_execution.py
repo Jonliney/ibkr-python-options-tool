@@ -37,6 +37,7 @@ from ibkr_options_manager.execution import (
     MarketExitCandidate,
     PaperExecutionService,
     PriceUpdateCandidate,
+    TrailingChangeCandidate,
     classify_journal_layer,
     require_paper_execution_snapshot,
 )
@@ -140,8 +141,7 @@ def test_trailing_baseline_accepts_new_capture_epoch_but_rejects_basis_change() 
                 snapshot,
                 position=replace(
                     snapshot.position,
-                    raw_average_cost=snapshot.position.raw_average_cost
-                    + Decimal("1"),
+                    raw_average_cost=snapshot.position.raw_average_cost + Decimal("1"),
                 ),
             ),
             plan,
@@ -491,6 +491,138 @@ def test_paper_trailing_writer_sends_one_exact_order(monkeypatch, with_limit) ->
     assert sent[0].transmit is True
     if with_limit:
         assert sent[0].lmtPriceOffset == float(plan.limit_offset)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("reject", [False, True])
+def test_trailing_change_writer_verifies_exact_order_before_write(
+    monkeypatch, cancel: bool, reject: bool
+) -> None:
+    import ibkr_options_manager.broker.execution as broker_execution
+
+    snapshot = _trailing_snapshot()
+    prior = WorkingOrder(
+        perm_id=900,
+        client_id=17,
+        order_id=500,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="TRAIL LIMIT",
+        remaining=Decimal("2"),
+        status="Submitted",
+        stop_price=Decimal("0.80"),
+        tif="GTC",
+        trailing_amount=Decimal("0.10"),
+        limit_offset=Decimal("0.05"),
+    )
+    snapshot = replace(snapshot, working_orders=(prior,))
+    candidate = TrailingChangeCandidate(
+        "trailing-conversion:test",
+        prior,
+        stop_price=None if cancel else Decimal("0.75"),
+        limit_offset=None if cancel else Decimal("0.10"),
+        cancel=cancel,
+    )
+    writes: list[str] = []
+    order = SimpleNamespace(
+        permId=900,
+        clientId=17,
+        account=snapshot.selected.account,
+        action="SELL",
+        orderType="TRAIL LIMIT",
+        tif="GTC",
+        ocaGroup="",
+        parentId=0,
+        totalQuantity=2,
+        trailStopPrice=0.80,
+        auxPrice=0.10,
+        trailingPercent=0,
+        lmtPriceOffset=0.05,
+    )
+
+    class FakeWrapper:
+        def __init__(self) -> None:
+            pass
+
+    class FakeClient:
+        def __init__(self, wrapper) -> None:
+            self.wrapper = wrapper
+            self.connected = False
+
+        def connect(self, *_args) -> None:
+            self.connected = True
+            self.wrapper.nextValidId(501)
+
+        def run(self) -> None:
+            pass
+
+        def isConnected(self) -> bool:
+            return self.connected
+
+        def disconnect(self) -> None:
+            self.connected = False
+
+        def reqOpenOrders(self) -> None:
+            self.wrapper.openOrder(
+                500,
+                SimpleNamespace(conId=snapshot.selected.con_id),
+                order,
+                SimpleNamespace(status="Submitted"),
+            )
+            self.wrapper.orderStatus(500, "Submitted", 0, 2)
+            self.wrapper.openOrderEnd()
+
+        def placeOrder(self, order_id, _contract, amended) -> None:
+            writes.append("amend")
+            if reject:
+                self.wrapper.error(order_id, 201, "simulated rejection")
+                return
+            self.wrapper.openOrder(
+                order_id,
+                SimpleNamespace(conId=snapshot.selected.con_id),
+                amended,
+                SimpleNamespace(status="Submitted"),
+            )
+
+    monkeypatch.setattr(
+        broker_execution,
+        "_load_ibapi",
+        lambda: _IbapiImports(
+            FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace
+        ),
+    )
+    monkeypatch.setattr(
+        broker_execution,
+        "_cancel_order",
+        lambda app, order_id: (
+            writes.append("cancel"),
+            app.error(order_id, 201, "simulated rejection")
+            if reject
+            else app.orderStatus(order_id, "Cancelled", 0, 0),
+        ),
+    )
+    if reject:
+        with pytest.raises(ExecutionOutcomeUnknown, match="simulated rejection"):
+            IbkrPaperExecutionBroker().change_trailing(
+                snapshot,
+                candidate,
+                host="127.0.0.1",
+                port=7497,
+                client_id=17,
+                timeout_seconds=1,
+            )
+    else:
+        result = IbkrPaperExecutionBroker().change_trailing(
+            snapshot,
+            candidate,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+        assert result.order_ids == (500,)
+        assert result.perm_ids == (() if cancel else (900,))
+    assert writes == ["cancel" if cancel else "amend"]
 
 
 def test_cancel_order_supplies_the_required_empty_order_cancel_options() -> None:

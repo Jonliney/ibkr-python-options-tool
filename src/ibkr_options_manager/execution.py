@@ -19,6 +19,7 @@ from .domain import (
     PlanStatus,
     WorkingOrder,
     closing_order_allocation,
+    round_down_price,
     round_up_price,
     stop_limit_price,
     supports_outside_rth,
@@ -263,6 +264,17 @@ class PriceUpdateCandidate:
     stop_limit_unit: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class TrailingChangeCandidate:
+    """One reviewed change to an exact, journal-owned paper trailing order."""
+
+    entry_fingerprint: str
+    order: WorkingOrder
+    stop_price: Decimal | None = None
+    limit_offset: Decimal | None = None
+    cancel: bool = False
+
+
 @runtime_checkable
 class PaperMarketExitTransport(Protocol):
     """The narrow transport seam for a staged paper market exit."""
@@ -317,6 +329,20 @@ class PaperTrailingTransport(Protocol):
         self,
         snapshot: BrokerSnapshot,
         plan: TrailingPlan,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmissionResult: ...
+
+
+@runtime_checkable
+class PaperTrailingChangeTransport(Protocol):
+    def change_trailing(
+        self,
+        snapshot: BrokerSnapshot,
+        candidate: TrailingChangeCandidate,
         *,
         host: str,
         port: int,
@@ -401,6 +427,8 @@ class ExecutionJournal:
                         "market-exit-many:",
                         "cancel-bracket:",
                         "trailing-conversion:",
+                        "amend-trailing:",
+                        "cancel-trailing:",
                     )
                 )
             ):
@@ -1259,6 +1287,40 @@ class ExecutionJournal:
             and entry.fingerprint.startswith("trailing-conversion:")
         )
 
+    def record_trailing_change(self, candidate: TrailingChangeCandidate) -> None:
+        entries = list(self._entries())
+        matches = [
+            index
+            for index, entry in enumerate(entries)
+            if entry.fingerprint == candidate.entry_fingerprint
+            and entry.state == "SUBMITTED"
+            and entry.perm_ids == (candidate.order.perm_id,)
+            and entry.order_ids == (candidate.order.order_id,)
+        ]
+        if len(matches) != 1:
+            raise ExecutionBlocked("the app-owned trailing journal record changed")
+        index = matches[0]
+        entry = entries[index]
+        entries[index] = replace(
+            entry,
+            state="CANCELLED_CONFIRMED" if candidate.cancel else entry.state,
+            trailing_stop=format(candidate.stop_price, "f")
+            if candidate.stop_price is not None
+            else entry.trailing_stop,
+            trailing_limit_offset=format(candidate.limit_offset, "f")
+            if candidate.limit_offset is not None
+            else entry.trailing_limit_offset,
+            trailing_last_stop=format(candidate.stop_price, "f")
+            if candidate.stop_price is not None
+            else entry.trailing_last_stop,
+            trailing_last_limit=format(
+                candidate.stop_price - candidate.limit_offset, "f"
+            )
+            if candidate.stop_price is not None and candidate.limit_offset is not None
+            else entry.trailing_last_limit,
+        )
+        self._write(tuple(entries))
+
     def record_verified_price_updates(
         self,
         snapshot: BrokerSnapshot,
@@ -2045,6 +2107,200 @@ class PaperExecutionService:
         self, *, account: str, con_id: int
     ) -> tuple[JournalEntry, ...]:
         return self._journal.trailing_entries(account=account, con_id=con_id)
+
+    def prepare_trailing_change(
+        self,
+        snapshot: BrokerSnapshot,
+        *,
+        perm_id: int,
+        expected_client_id: int,
+        stop_price: Decimal | None = None,
+        limit_offset: Decimal | None = None,
+        cancel: bool = False,
+    ) -> TrailingChangeCandidate:
+        require_paper_management_snapshot(snapshot)
+        if not snapshot.executions_complete or not snapshot.completed_orders_complete:
+            raise ExecutionBlocked("complete order and fill history is required")
+        contract = snapshot.contract
+        if (
+            contract.con_id != snapshot.selected.con_id
+            or contract.sec_type != "OPT"
+            or contract.currency != "USD"
+            or not contract.expiry
+            or not contract.right
+            or not contract.trading_class
+            or not contract.multiplier.is_finite()
+            or contract.multiplier <= 0
+            or not contract.strike.is_finite()
+            or contract.strike <= 0
+        ):
+            raise ExecutionBlocked("the selected option contract is incomplete")
+        entries = [
+            entry
+            for entry in self.trailing_entries(
+                account=snapshot.selected.account, con_id=snapshot.selected.con_id
+            )
+            if entry.state == "SUBMITTED"
+            and entry.perm_ids == (perm_id,)
+            and len(entry.order_ids) == 1
+        ]
+        orders = [
+            order
+            for order in snapshot.working_orders
+            if order.perm_id == perm_id and order.key == snapshot.selected
+        ]
+        if len(entries) != 1 or len(orders) != 1:
+            raise ExecutionBlocked(
+                "the app-owned trailing order is missing or ambiguous"
+            )
+        entry, order = entries[0], orders[0]
+        if (
+            order.order_id != entry.order_ids[0]
+            or order.client_id != expected_client_id
+            or order.action != "SELL"
+            or order.order_type
+            != ("TRAIL LIMIT" if entry.trailing_limit_offset else "TRAIL")
+            or order.status not in {"Submitted", "PreSubmitted"}
+            or order.tif != "GTC"
+            or order.oca_group
+            or order.parent_id
+            or order.remaining <= 0
+            or order.remaining > snapshot.position.quantity
+            or order.remaining != Decimal(entry.trailing_quantity)
+            or order.stop_price is None
+            or not order.stop_price.is_finite()
+            or order.stop_price <= 0
+        ):
+            raise ExecutionBlocked("the trailing order is no longer safely modifiable")
+        if any(
+            other.key == snapshot.selected and other.perm_id != perm_id
+            for other in snapshot.working_orders
+        ):
+            raise ExecutionBlocked("another closing order works for this option")
+        try:
+            expected_value = Decimal(entry.trailing_value)
+            expected_offset = (
+                Decimal(entry.trailing_limit_offset)
+                if entry.trailing_limit_offset
+                else None
+            )
+        except InvalidOperation as error:
+            raise ExecutionBlocked("the trailing journal prices are invalid") from error
+        if (
+            order.trailing_percent
+            if entry.trailing_unit == "percent"
+            else order.trailing_amount
+        ) != expected_value:
+            raise ExecutionBlocked("the trailing amount changed in TWS")
+        if entry.trailing_limit_offset and order.limit_offset != expected_offset:
+            raise ExecutionBlocked("the trailing limit gap changed in TWS")
+        if not entry.trailing_limit_offset and order.limit_offset is not None:
+            raise ExecutionBlocked("the trailing order type changed in TWS")
+        if not cancel:
+            if stop_price is None or not stop_price.is_finite() or stop_price <= 0:
+                raise ExecutionBlocked("enter a positive STP price")
+            if (
+                not snapshot.quote.fresh
+                or snapshot.quote.bid is None
+                or not snapshot.quote.bid.is_finite()
+                or stop_price >= snapshot.quote.bid
+            ):
+                raise ExecutionBlocked(
+                    "a fresh bid above the new STP price is required"
+                )
+            if (
+                not entry.trailing_limit_offset
+                or limit_offset is None
+                or not limit_offset.is_finite()
+                or limit_offset <= 0
+            ):
+                raise ExecutionBlocked("enter a positive trailing limit gap")
+            if snapshot.market_rule.exchange != snapshot.contract.exchange:
+                raise ExecutionBlocked("the option market rule changed")
+            bands = snapshot.market_rule.bands
+            try:
+                prices_valid = (
+                    round_down_price(stop_price, bands) == stop_price
+                    and round_up_price(limit_offset, bands) == limit_offset
+                    and stop_price > limit_offset
+                )
+            except (ValueError, TypeError) as error:
+                raise ExecutionBlocked("the option market rule is invalid") from error
+            if not prices_valid:
+                raise ExecutionBlocked(
+                    "STP or limit gap is outside valid price increments"
+                )
+            if stop_price == order.stop_price and limit_offset == order.limit_offset:
+                raise ExecutionBlocked("the trailing prices have not changed")
+        return TrailingChangeCandidate(
+            entry.fingerprint,
+            replace(order, observed_at=Decimal("0")),
+            stop_price,
+            limit_offset,
+            cancel,
+        )
+
+    def submit_trailing_change(
+        self,
+        snapshot: BrokerSnapshot,
+        candidate: TrailingChangeCandidate,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> SubmissionReceipt:
+        refreshed = self.prepare_trailing_change(
+            snapshot,
+            perm_id=candidate.order.perm_id,
+            expected_client_id=client_id,
+            stop_price=candidate.stop_price,
+            limit_offset=candidate.limit_offset,
+            cancel=candidate.cancel,
+        )
+        if refreshed != candidate:
+            raise ExecutionBlocked("the trailing order changed after review")
+        transport = self._transport
+        if not isinstance(transport, PaperTrailingChangeTransport):
+            raise ExecutionBlocked("the paper transport cannot change trailing orders")
+        entry = self._journal.begin_management(
+            snapshot,
+            operation="cancel-trailing" if candidate.cancel else "amend-trailing",
+            material=(
+                candidate.entry_fingerprint,
+                candidate.order.order_id,
+                candidate.order.perm_id,
+                candidate.order.stop_price,
+                candidate.order.limit_offset,
+                candidate.stop_price,
+                candidate.limit_offset,
+            ),
+            expected_order_count=1,
+        )
+        try:
+            result = transport.change_trailing(
+                snapshot,
+                candidate,
+                host=host,
+                port=port,
+                client_id=client_id,
+                timeout_seconds=timeout_seconds,
+            )
+            if tuple(result.order_ids) != (candidate.order.order_id,) or (
+                not candidate.cancel
+                and tuple(result.perm_ids) != (candidate.order.perm_id,)
+            ):
+                raise ExecutionOutcomeUnknown(
+                    "TWS did not acknowledge the exact trailing order"
+                )
+        except Exception:
+            self._journal.mark_unknown(entry.fingerprint)
+            raise
+        completed = self._journal.record_management_completion(
+            entry.fingerprint, order_ids=(candidate.order.order_id,)
+        )
+        self._journal.record_trailing_change(candidate)
+        return SubmissionReceipt(completed)
 
     def prepare_entire_position_trailing(
         self,

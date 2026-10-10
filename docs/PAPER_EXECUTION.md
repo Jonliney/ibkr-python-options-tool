@@ -510,4 +510,29 @@ permanent IDs, and reacts correctly to fills/cancellations/reconnects. Also
 test that the selected pair is cancelled without affecting other OCA groups,
 the post-cancel open-order recheck is clean, and the standalone MKT produces
 the expected order/execution callbacks.
-Trailing layer prices are read-only observations. For a working trail, the app records the latest positive `trailStopPrice` reported by TWS for the exact app-owned order; `auxPrice` is the trailing amount and must not be displayed as the stop. For a trail limit, the displayed limit is calculated from that stop and the journaled limit offset. After closure, the row keeps the last recorded values; they may precede the fill and are not a fill-price claim. If no trigger was observed, the row shows an unavailable value rather than deriving one from a later quote.
+## Working trailing stop-limit changes
+
+A working, app-owned paper `TRAIL LIMIT` shows its observed `trailStopPrice`
+as the editable STP input and its observed `lmtPriceOffset` as the editable LMT
+gap. The trail amount (`auxPrice` or `trailingPercent`) and order quantity are
+fixed. A separate Delete trail action cancels that exact order without placing
+a replacement. Both actions require review, a fresh TWS read, and a final
+confirmation. The edit also requires a fresh bid above the proposed trigger.
+
+The service requires one journal-owned permanent ID and matching order ID,
+account, contract, client ID, order type, GTC, current stop, trail amount,
+limit gap, and full unfilled quantity. It blocks partial fills, any other
+working order for the option, invalid tick increments, stale or disconnected
+state, and manual changes observed after review. The writer requests the
+same-client open order again and verifies these fields before using the
+existing order ID; it leaves TWS order precautions active. An edit is accepted
+only after TWS echoes the same permanent ID and new STP and gap. A delete
+requires a TWS cancellation status. Indeterminate outcomes are journaled and
+lock further management across restarts until verified in TWS; neither action
+is automatically retried. Successful deletion leaves the held contracts
+unprotected. Paper behaviour must be checked in TWS before any live milestone.
+
+After closure, the read-only row keeps the last recorded STP and LMT values;
+they may precede the fill and are not a fill-price claim. If no trigger was
+observed, the row shows an unavailable value rather than deriving one from a
+later quote.

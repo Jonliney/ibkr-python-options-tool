@@ -466,8 +466,8 @@ def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) ->
     working = _trailing_scenario_workbench(tmp_path / "working", "working-trail")
     working_page = TestClient(working.app).get(working.path).text
     assert 'data-layer-state="trailing"' in working_page
-    assert "TRAIL LIMIT" in working_page
-    assert "WORKING" in working_page
+    assert "TRAIL STP LMT" in working_page
+    assert "Active" in working_page
     recorded = working._paper_execution.trailing_entries(
         account=DEMO_ACCOUNT, con_id=1_004_470_201
     )
@@ -504,6 +504,191 @@ def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) ->
     assert "couldn't verify a current bid" in no_bid._message
     assert no_bid._toast is not None
     assert "couldn't verify a current bid" in no_bid._toast.description
+
+
+def test_working_trail_limit_review_update_and_delete(tmp_path: Path) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path / "change", "working-trail")
+    client = TestClient(workbench.app)
+    entry = workbench._trailing_entries()[0]
+    perm_id = entry.perm_ids[0]
+    page = client.get(workbench.path).text
+    assert f'name="trailing_stop_{perm_id}"' in page
+    assert f'name="trailing_gap_{perm_id}"' in page
+    assert f'value="trailing-delete-arm:{perm_id}"' in page
+    assert "Last recorded STP" not in page
+    assert "Last recorded LMT" not in page
+
+    reviewed = client.post(
+        workbench.path + "action",
+        data={
+            "action": f"trailing-change-arm:{perm_id}",
+            f"trailing_stop_{perm_id}": "8.80",
+            f"trailing_gap_{perm_id}": "0.15",
+        },
+    )
+    assert reviewed.status_code == 200
+    assert "Update TRAIL STP LMT sell order" in reviewed.text
+    assert "SELL STP LMT gap" in reviewed.text
+    assert workbench._armed_trailing_change is not None
+    staged_candidate = workbench._armed_trailing_change
+    stale_snapshot = workbench._view_model.latest_snapshot()
+    assert stale_snapshot is not None
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    assert workbench._active_action_verified
+    client.post(workbench.path + "action", data={"action": "trailing-change-confirm"})
+    assert workbench._trailing_entries()[0].trailing_limit_offset == "0.15", (
+        workbench._message
+    )
+    with pytest.raises(ExecutionBlocked, match="limit gap changed"):
+        workbench._paper_execution.submit_trailing_change(
+            stale_snapshot,
+            staged_candidate,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+
+    deleted = client.post(
+        workbench.path + "action",
+        data={"action": f"trailing-delete-arm:{perm_id}"},
+    )
+    assert "Cancel TRAIL STP LMT sell order" in deleted.text
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    assert workbench._active_action_verified
+    client.post(workbench.path + "action", data={"action": "trailing-change-confirm"})
+    assert workbench._trailing_entries()[0].state == "CANCELLED_CONFIRMED"
+
+
+def test_trail_change_rejects_manual_gap_change(tmp_path: Path) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path / "manual", "working-trail")
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    entry = workbench._trailing_entries()[0]
+    changed = replace(
+        snapshot,
+        working_orders=tuple(
+            replace(order, limit_offset=Decimal("0.20"))
+            if order.perm_id == entry.perm_ids[0]
+            else order
+            for order in snapshot.working_orders
+        ),
+    )
+    with pytest.raises(ExecutionBlocked, match="limit gap changed"):
+        workbench._paper_execution.prepare_trailing_change(
+            changed,
+            perm_id=entry.perm_ids[0],
+            expected_client_id=17,
+            stop_price=Decimal("8.80"),
+            limit_offset=Decimal("0.15"),
+        )
+
+
+def test_trail_change_rejects_partial_fill_disconnect_and_stale_review(
+    tmp_path: Path,
+) -> None:
+    partial = _trailing_scenario_workbench(tmp_path / "partial", "partial-fill")
+    partial_snapshot = partial._view_model.latest_snapshot()
+    assert partial_snapshot is not None
+    with pytest.raises(ExecutionBlocked, match="no longer safely modifiable"):
+        partial._paper_execution.prepare_trailing_change(
+            partial_snapshot,
+            perm_id=partial._trailing_entries()[0].perm_ids[0],
+            expected_client_id=17,
+            stop_price=Decimal("8.80"),
+            limit_offset=Decimal("0.15"),
+        )
+
+    workbench = _trailing_scenario_workbench(tmp_path / "stale", "working-trail")
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    service = workbench._paper_execution
+    perm_id = workbench._trailing_entries()[0].perm_ids[0]
+    candidate = service.prepare_trailing_change(
+        snapshot,
+        perm_id=perm_id,
+        expected_client_id=17,
+        stop_price=Decimal("8.80"),
+        limit_offset=Decimal("0.15"),
+    )
+    with pytest.raises(ExecutionBlocked, match="connection snapshot"):
+        service.submit_trailing_change(
+            replace(snapshot, connected=False),
+            candidate,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+    changed = replace(
+        snapshot,
+        working_orders=tuple(
+            replace(order, stop_price=Decimal("8.75"))
+            if order.perm_id == perm_id
+            else order
+            for order in snapshot.working_orders
+        ),
+    )
+    with pytest.raises(ExecutionBlocked, match="changed after review"):
+        service.submit_trailing_change(
+            changed,
+            candidate,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+    with pytest.raises(ExecutionBlocked, match="price increments"):
+        service.prepare_trailing_change(
+            snapshot,
+            perm_id=perm_id,
+            expected_client_id=17,
+            stop_price=Decimal("8.801"),
+            limit_offset=Decimal("0.15"),
+        )
+
+
+def test_unknown_trail_change_locks_followup_after_restart(tmp_path: Path) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path / "unknown", "working-trail")
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    service = workbench._paper_execution
+    candidate = service.prepare_trailing_change(
+        snapshot,
+        perm_id=workbench._trailing_entries()[0].perm_ids[0],
+        expected_client_id=17,
+        stop_price=Decimal("8.80"),
+        limit_offset=Decimal("0.15"),
+    )
+
+    class NoAcknowledgement:
+        def change_trailing(self, *_args, **_kwargs):
+            raise ExecutionOutcomeUnknown("simulated missing acknowledgement")
+
+    service._transport = NoAcknowledgement()
+    with pytest.raises(ExecutionOutcomeUnknown, match="missing acknowledgement"):
+        service.submit_trailing_change(
+            snapshot,
+            candidate,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+    assert service.unresolved_management_entries(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id
+    )
+    reopened = ExecutionJournal(service._journal._path)
+    restarted = PaperExecutionService(DemoPaperExecutionTransport(reopened), reopened)
+    with pytest.raises(ExecutionBlocked, match="uncertain order outcome"):
+        restarted.submit_trailing_change(
+            snapshot,
+            candidate,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
 
 
 def test_closed_trailing_demo_moves_position_to_session_history_on_refresh(
@@ -7000,8 +7185,8 @@ def test_submitted_trailing_exit_appears_as_central_layer_row() -> None:
     workbench._paper_execution = History()  # type: ignore[assignment]
     page = to_xml(workbench._page())
     assert 'data-layer-state="trailing"' in page
-    assert "TRAIL LIMIT" in page
-    assert "Last recorded LMT" in page
+    assert "TRAIL STP LMT" in page
+    assert "LMT gap" in page
     assert "CHECK TWS" in page
     trailing_row = to_xml(workbench._trailing_layer_row(1, entry))
     assert 'class="layer-row-grid ' in trailing_row
@@ -7009,7 +7194,7 @@ def test_submitted_trailing_exit_appears_as_central_layer_row() -> None:
     assert "GTC" not in trailing_row
     assert "font-mono" not in trailing_row
     assert "disabled" in trailing_row
-    assert "Last recorded STP" in trailing_row
+    assert "STP" in trailing_row
     assert "Quantity" in trailing_row
     filled = replace(
         entry,
@@ -7191,15 +7376,11 @@ def test_demo_entire_position_trailing_conversion_includes_unassigned_contracts(
         },
     )
     assert review.status_code == 200
-    assert (
-        "include 2 available contracts"
-        if with_bracket
-        else "Place one trailing SELL for all 3 held contracts"
-    ) in review.text
-    assert "Initial stop estimate" in review.text
-    assert "Limit offset" in review.text
-    assert "Initial limit estimate" in review.text
-    assert "After the stop triggers, the limit order may remain unfilled" in review.text
+    assert "Create TRAIL STP LMT sell order" in review.text
+    assert "3 contracts · GTC" in review.text
+    assert ("CANCEL BRACKET" in review.text) is with_bracket
+    assert "Trail amount" in review.text
+    assert "SELL STP LMT" in review.text
     if bid_changes_before_review:
         broker.bid_adjustment = Decimal("0.05")
     if epoch_changes_before_review:
@@ -7215,14 +7396,14 @@ def test_demo_entire_position_trailing_conversion_includes_unassigned_contracts(
         assert workbench._armed_trailing is not None
         assert workbench._armed_trailing.reference_price == Decimal("9.10")
         assert workbench._armed_trailing.initial_stop == Decimal("8.85")
-        assert "from bid $9.10" in verified.text
+        assert "$8.85" in verified.text
     result = client.post(
         workbench.path + "action", data={"action": "trailing-convert-confirm"}
     )
     assert result.status_code == 200
     assert 'data-layer-state="trailing"' in result.text
-    assert "TRAIL LIMIT" in result.text
-    assert "WORKING" in result.text
+    assert "TRAIL STP LMT" in result.text
+    assert "Active" in result.text
     assert (
         journal.trailing_entries(account=DEMO_ACCOUNT, con_id=1_004_470_201)[
             -1

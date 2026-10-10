@@ -59,6 +59,9 @@ class WorkingOrder:
     limit_price: Decimal | None = None
     stop_price: Decimal | None = None
     tif: str = ""
+    trailing_amount: Decimal | None = None
+    trailing_percent: Decimal | None = None
+    limit_offset: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)

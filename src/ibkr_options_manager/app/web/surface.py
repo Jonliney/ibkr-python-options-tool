@@ -63,6 +63,7 @@ from ...execution import (
     MarketExitCandidate,
     PaperExecutionService,
     PriceUpdateCandidate,
+    TrailingChangeCandidate,
     ambiguous_oca_prefixes,
     classify_journal_layer,
 )
@@ -196,6 +197,7 @@ class StarUIWorkbench:
         self._armed_cancellation: MarketExitCandidate | None = None
         self._armed_cancellations: tuple[MarketExitCandidate, ...] = ()
         self._armed_trailing: TrailingPlan | None = None
+        self._armed_trailing_change: TrailingChangeCandidate | None = None
         self._bulk_cancel_trace_id: str | None = None
         self._bulk_cancel_started_at: float | None = None
         self._active_action_verified = False
@@ -604,6 +606,7 @@ class StarUIWorkbench:
                 "cancel-all-confirm",
                 "trailing-convert-arm",
                 "trailing-convert-confirm",
+                "trailing-change-confirm",
                 "active-action-execute",
                 "market-exit-confirm",
                 "cancel-pair-confirm",
@@ -619,6 +622,8 @@ class StarUIWorkbench:
                     action in trading_actions
                     or action.startswith("market-exit-arm:")
                     or action.startswith("cancel-pair-arm:")
+                    or action.startswith("trailing-change-arm:")
+                    or action.startswith("trailing-delete-arm:")
                 )
             ):
                 self._disarm_execution_locked()
@@ -717,6 +722,10 @@ class StarUIWorkbench:
                 self._arm_all_cancellations_locked()
             elif action == "trailing-convert-arm":
                 self._arm_trailing_conversion_locked(values)
+            elif action.startswith("trailing-change-arm:"):
+                self._arm_trailing_change_locked(action, values, cancel=False)
+            elif action.startswith("trailing-delete-arm:"):
+                self._arm_trailing_change_locked(action, values, cancel=True)
             elif action == "active-action-execute":
                 self._execute_active_action_locked()
             elif action == "market-exit-confirm":
@@ -727,6 +736,8 @@ class StarUIWorkbench:
                 self._confirm_all_cancellations_locked()
             elif action == "trailing-convert-confirm":
                 self._confirm_trailing_conversion_locked()
+            elif action == "trailing-change-confirm":
+                self._confirm_trailing_change_locked()
             elif action == "resolve-cancelled-bracket":
                 self._resolve_cancelled_bracket_locked(values)
             elif action.startswith("verify-cancelled-bracket:"):
@@ -1021,6 +1032,7 @@ class StarUIWorkbench:
         self._armed_cancellation = None
         self._armed_cancellations = ()
         self._armed_trailing = None
+        self._armed_trailing_change = None
         self._bulk_cancel_trace_id = None
         self._bulk_cancel_started_at = None
         self._active_action_verified = False
@@ -1426,6 +1438,87 @@ class StarUIWorkbench:
         finally:
             self._disarm_execution_locked()
 
+    def _arm_trailing_change_locked(
+        self, action: str, values: dict[str, str], *, cancel: bool
+    ) -> None:
+        self._disarm_execution_locked()
+        if self._paper_execution is None:
+            self._message = "Paper order management is disabled for this launch."
+            return
+        snapshot = self._view_model.latest_snapshot()
+        if snapshot is None:
+            self._message = "Refresh the position before reviewing a trail change."
+            return
+        try:
+            perm_id = int(action.partition(":")[2])
+            stop = (
+                None if cancel else Decimal(values.get(f"trailing_stop_{perm_id}", ""))
+            )
+            gap = None if cancel else Decimal(values.get(f"trailing_gap_{perm_id}", ""))
+            self._armed_trailing_change = self._paper_execution.prepare_trailing_change(
+                snapshot,
+                perm_id=perm_id,
+                expected_client_id=self._settings.client_id,
+                stop_price=stop,
+                limit_offset=gap,
+                cancel=cancel,
+            )
+        except (ValueError, InvalidOperation, ExecutionBlocked) as error:
+            self._message = f"Trailing change blocked: {error}"
+            return
+        self._set_review_status_locked(
+            "Review cancellation of this trailing order."
+            if cancel
+            else "Review the new trailing stop and limit gap."
+        )
+
+    def _confirm_trailing_change_locked(self) -> None:
+        if self._expire_confirmation_locked(require_deadline=True):
+            self._message = "Review expired. Review the trail change again."
+            return
+        candidate = self._armed_trailing_change
+        if (
+            candidate is None
+            or self._paper_execution is None
+            or not self._active_action_verified
+            or self._selected_con_id is None
+        ):
+            self._message = "Review the trail change before confirming."
+            return
+        try:
+            state = self._view_model.select_position(
+                self._selected_con_id,
+                self._plan_form(self._drafts.get(self._selected_con_id, ())),
+                include_quote=not candidate.cancel,
+            )
+            self._apply_state_locked(state)
+            snapshot = self._view_model.latest_snapshot()
+            if snapshot is None:
+                raise ExecutionBlocked("the fresh trailing snapshot is unavailable")
+            self._paper_execution.submit_trailing_change(
+                snapshot,
+                candidate,
+                host="127.0.0.1",
+                port=self._settings.port,
+                client_id=self._settings.client_id,
+                timeout_seconds=self._settings.timeout_seconds,
+            )
+        except (ExecutionBlocked, ExecutionOutcomeUnknown) as error:
+            self._message = f"Trailing change stopped: {error}. Check TWS and refresh."
+        except Exception as error:
+            self._message = (
+                f"Trailing change outcome is unknown: {error}. Check TWS and refresh."
+            )
+        else:
+            self._refresh_after_acknowledged_write_locked(
+                "TWS acknowledged the trailing cancellation. Check TWS."
+                if candidate.cancel
+                else "TWS acknowledged the trailing amendment. Check TWS.",
+                include_quote=False,
+            )
+        finally:
+            self._disarm_execution_locked()
+
     def _execute_active_action_locked(self) -> None:
         """Verify a reviewed cancellation or market exit before showing Confirm."""
         market_exits = self._armed_market_exits or (
@@ -1442,6 +1535,7 @@ class StarUIWorkbench:
                 and cancellation is None
                 and not cancellations
                 and trailing is None
+                and self._armed_trailing_change is None
             )
         ):
             self._message = "Review an active-layer action before executing it."
@@ -1464,7 +1558,12 @@ class StarUIWorkbench:
                 self._plan_form(self._drafts.get(self._selected_con_id, ())),
                 **(
                     {"include_quote": False}
-                    if cancellation is not None or cancellations
+                    if cancellation is not None
+                    or cancellations
+                    or (
+                        self._armed_trailing_change is not None
+                        and self._armed_trailing_change.cancel
+                    )
                     else {}
                 ),
             )
@@ -1517,6 +1616,18 @@ class StarUIWorkbench:
                 ):
                     raise ExecutionBlocked("the trailing plan changed after review")
                 self._armed_trailing = refreshed_trailing
+            elif self._armed_trailing_change is not None:
+                candidate = self._armed_trailing_change
+                refreshed_change = self._paper_execution.prepare_trailing_change(
+                    snapshot,
+                    perm_id=candidate.order.perm_id,
+                    expected_client_id=self._settings.client_id,
+                    stop_price=candidate.stop_price,
+                    limit_offset=candidate.limit_offset,
+                    cancel=candidate.cancel,
+                )
+                if refreshed_change != candidate:
+                    raise ExecutionBlocked("the trailing order changed after review")
             elif cancellations:
                 if set(self._active_target_perm_ids()) != {
                     candidate.target_perm_id for candidate in cancellations
@@ -5446,13 +5557,19 @@ class StarUIWorkbench:
             None,
         )
         working = order is not None
+        modifiable = bool(
+            order is not None
+            and order.stop_price is not None
+            and order.stop_price > 0
+            and (not entry.trailing_limit_offset or order.limit_offset is not None)
+        )
         summary = _trailing_fill_summary(entry)
         sold = (
             closed_position
             and summary is not None
             and summary.quantity == entry.trailing_quantity
         )
-        kind = "TRAIL LIMIT" if entry.trailing_limit_offset else "TRAIL"
+        kind = "TRAIL STP LMT" if entry.trailing_limit_offset else "TRAIL STP"
         recorded_stop = entry.trailing_last_stop
         recorded_limit = entry.trailing_last_limit
         result = (
@@ -5475,54 +5592,44 @@ class StarUIWorkbench:
         )
         return Div(
             Div(
-                Span(f"TRAIL {index}", cls="text-xs font-semibold"),
+                Span(f"TRAIL {index} · {kind}", cls="text-xs font-semibold"),
                 P(
-                    "Closed" if sold else "WORKING" if working else "CHECK TWS",
+                    "Closed" if sold else "Active" if working else "CHECK TWS",
                     cls="mt-2 text-xs text-muted-foreground",
                 ),
                 cls="min-w-20",
             ),
             _trailing_readonly_field(
-                "STP" if sold else kind,
-                (recorded_stop or "—") if sold else entry.trailing_value,
-                input_id=(
-                    f"trailing-stop-{entry.perm_ids[0]}"
-                    if sold
-                    else f"trailing-value-{entry.perm_ids[0]}"
-                ),
-                suffix="USD"
-                if sold and recorded_stop
-                else "%"
-                if not sold and entry.trailing_unit == "percent"
-                else "USD"
-                if not sold
-                else None,
-            ),
-            _trailing_readonly_field(
-                "LMT",
-                recorded_limit or "—",
-                input_id=f"trailing-limit-{entry.perm_ids[0]}",
-                suffix="USD" if recorded_limit else None,
+                "STP",
+                recorded_stop or "—",
+                input_id=f"trailing-stop-{entry.perm_ids[0]}",
+                suffix="USD" if recorded_stop else None,
             )
-            if sold and entry.trailing_limit_offset
-            else Div(cls="min-w-0")
             if sold
-            else Div(
+            else _trailing_edit_field(
+                "STP",
+                f"trailing_stop_{entry.perm_ids[0]}",
+                _price_text(order.stop_price) if order and order.stop_price else "",
+                disabled=not modifiable or not entry.trailing_limit_offset,
+            ),
+            (
                 _trailing_readonly_field(
-                    "Last recorded STP",
-                    recorded_stop or "—",
-                    input_id=f"trailing-stop-{entry.perm_ids[0]}",
-                    suffix="USD" if recorded_stop else None,
-                ),
-                _trailing_readonly_field(
-                    "Last recorded LMT",
+                    "LMT",
                     recorded_limit or "—",
                     input_id=f"trailing-limit-{entry.perm_ids[0]}",
                     suffix="USD" if recorded_limit else None,
                 )
                 if entry.trailing_limit_offset
-                else None,
-                cls="min-w-0 space-y-2",
+                else Div(cls="min-w-0")
+            )
+            if sold
+            else _trailing_edit_field(
+                "LMT gap",
+                f"trailing_gap_{entry.perm_ids[0]}",
+                _price_text(order.limit_offset)
+                if order and order.limit_offset
+                else entry.trailing_limit_offset,
+                disabled=not modifiable or not entry.trailing_limit_offset,
             ),
             _trailing_readonly_field(
                 "Quantity",
@@ -5538,7 +5645,29 @@ class StarUIWorkbench:
                     else None
                 ),
             ),
-            Div(cls="min-w-0"),
+            Div(
+                Button(
+                    "Review changes",
+                    name="action",
+                    value=f"trailing-change-arm:{entry.perm_ids[0]}",
+                    type="submit",
+                    variant="outline",
+                    size="sm",
+                    disabled=not modifiable or not entry.trailing_limit_offset,
+                ),
+                Button(
+                    "Delete trail",
+                    name="action",
+                    value=f"trailing-delete-arm:{entry.perm_ids[0]}",
+                    type="submit",
+                    variant="ghost",
+                    size="sm",
+                    disabled=not modifiable,
+                ),
+                cls="flex flex-col gap-2",
+            )
+            if not sold
+            else Div(cls="min-w-0"),
             Div(
                 Span("SOLD" if sold else "VERIFY IN TWS", cls="sold-layer-status"),
                 Span(result, cls="sold-layer-result"),
@@ -6658,11 +6787,14 @@ class StarUIWorkbench:
         cancellation = self._armed_cancellation
         cancellations = self._armed_cancellations
         trailing = self._armed_trailing
+        trailing_change = self._armed_trailing_change
         price_updates = self._armed_price_updates
         armed_execution = self._armed_execution
         action_rows: list[Any] = []
         if trailing is not None:
             action_rows = self._review_trailing_plan(trailing)
+        elif trailing_change is not None:
+            action_rows = [self._review_trailing_change(trailing_change)]
         elif market_exits:
             action_rows = self._review_market_exit_plan(market_exits)
         elif cancellation is not None:
@@ -6698,6 +6830,8 @@ class StarUIWorkbench:
         review_badge = (
             Badge("TRAILING EXIT", variant="outline", cls="text-[10px]")
             if trailing is not None
+            else Badge("TRAIL CHANGE", variant="outline", cls="text-[10px]")
+            if trailing_change is not None
             else Badge("MKT EXIT", variant="outline", cls="text-[10px]")
             if market_exits
             else Badge("CANCEL", variant="outline", cls="text-[10px]")
@@ -6843,6 +6977,7 @@ class StarUIWorkbench:
             or self._armed_cancellations
             or market_exits
             or self._armed_trailing is not None
+            or self._armed_trailing_change is not None
         ) and not self._active_action_verified:
             return self._reviewed_active_action_controls()
         if self._armed_trailing is not None:
@@ -6861,7 +6996,27 @@ class StarUIWorkbench:
                     else (
                         "Confirm submits one trailing SELL for all held contracts "
                         "after a fresh position check. A trailing limit can remain "
-                        "unfilled."
+                        "unfilled.",
+                    ),
+                ),
+            )
+        if self._armed_trailing_change is not None:
+            return self._staged_action_controls(
+                confirm_action="trailing-change-confirm",
+                busy_text="Cancelling…"
+                if self._armed_trailing_change.cancel
+                else "Updating…",
+                impact=(
+                    "Trail protection will be removed",
+                    (
+                        "Confirm cancels this app-owned trailing order. The held contracts will remain open without this protection.",
+                    ),
+                )
+                if self._armed_trailing_change.cancel
+                else (
+                    "Trailing limit fill risk",
+                    (
+                        "After the stop triggers, a limit order may remain unfilled if the option falls below its limit.",
                     ),
                 ),
             )
@@ -6999,6 +7154,11 @@ class StarUIWorkbench:
                 Button(
                     "Review trailing exit"
                     if self._armed_trailing is not None
+                    else "Review trail cancellation"
+                    if self._armed_trailing_change is not None
+                    and self._armed_trailing_change.cancel
+                    else "Review trail changes"
+                    if self._armed_trailing_change is not None
                     else "Review market sell"
                     if market_exits
                     else "Review cancellation",
@@ -7411,7 +7571,7 @@ class StarUIWorkbench:
                 "SELL STP",
                 Span(f"${_price_text(plan.initial_stop)}", cls="text-xs font-semibold"),
                 "text-rose-400",
-            )
+            ),
         ]
         if plan.limit_offset is not None:
             price_lines.append(
@@ -7436,6 +7596,43 @@ class StarUIWorkbench:
             )
         )
         return rows
+
+    def _review_trailing_change(self, candidate: TrailingChangeCandidate) -> Any:
+        order = candidate.order
+        return Div(
+            P(
+                "Cancel TRAIL STP LMT sell order"
+                if candidate.cancel
+                else "Update TRAIL STP LMT sell order",
+                cls="text-xs font-semibold",
+            ),
+            P(
+                f"{format(order.remaining, 'f')} contracts · {order.tif}",
+                cls="mt-0.5 text-xs text-muted-foreground",
+            ),
+            Div(
+                self._review_order_line(
+                    "SELL STP",
+                    _price_transition(
+                        order.stop_price, candidate.stop_price, tone="text-rose-400"
+                    )
+                    if not candidate.cancel
+                    else Span("CANCEL", cls="text-xs font-semibold"),
+                    "text-rose-400",
+                ),
+                self._review_order_line(
+                    "SELL STP LMT gap",
+                    _price_transition(
+                        order.limit_offset, candidate.limit_offset, tone="text-rose-400"
+                    )
+                    if not candidate.cancel
+                    else Span("CANCEL", cls="text-xs font-semibold"),
+                    "text-rose-400",
+                ),
+                cls="mt-3 space-y-3 border-l-2 border-border pl-3",
+            ),
+            cls="action-review-layer py-4",
+        )
 
     def _review_market_exit_plan(
         self, candidates: tuple[MarketExitCandidate, ...]
@@ -8214,6 +8411,23 @@ def _trailing_readonly_field(
             cls="relative mt-1",
         ),
         P(detail, cls="mt-1 text-xs text-muted-foreground") if detail else None,
+        cls="min-w-0 space-y-0.5",
+    )
+
+
+def _trailing_edit_field(label: str, name: str, value: str, *, disabled: bool) -> Any:
+    return Div(
+        Label(label, fr=name, cls="text-xs font-medium text-muted-foreground"),
+        Input(
+            id=name,
+            name=name,
+            type="number",
+            value=value,
+            min="0.01",
+            step="any",
+            disabled=disabled,
+            cls="mt-1",
+        ),
         cls="min-w-0 space-y-0.5",
     )
 

@@ -8,7 +8,7 @@ order even when the paper-execution UI is being rehearsed.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
@@ -34,6 +34,7 @@ from ..execution import (
     JournalLayer,
     MarketExitCandidate,
     PriceUpdateCandidate,
+    TrailingChangeCandidate,
     classify_journal_layer,
 )
 from ..snapshot import SnapshotCoordinator, SnapshotResult
@@ -396,6 +397,15 @@ class DemoReadOnlyBroker:
                         parent_id=0,
                         stop_price=Decimal(entry.trailing_stop),
                         tif=entry.trailing_tif,
+                        trailing_amount=Decimal(entry.trailing_value)
+                        if entry.trailing_unit == "dollars"
+                        else None,
+                        trailing_percent=Decimal(entry.trailing_value)
+                        if entry.trailing_unit == "percent"
+                        else None,
+                        limit_offset=Decimal(entry.trailing_limit_offset)
+                        if entry.trailing_limit_offset
+                        else None,
                     )
                 )
         return tuple(orders)
@@ -655,6 +665,33 @@ class DemoPaperExecutionTransport:
             + 1
         )
         return PaperSubmission((order_id,), (perm_id,))
+
+    def change_trailing(
+        self,
+        snapshot: BrokerSnapshot,
+        candidate: TrailingChangeCandidate,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmission:
+        del host, port, timeout_seconds
+        matches = [
+            order
+            for order in snapshot.working_orders
+            if order.perm_id == candidate.order.perm_id
+        ]
+        if (
+            len(matches) != 1
+            or replace(matches[0], observed_at=Decimal("0")) != candidate.order
+            or matches[0].client_id != client_id
+        ):
+            raise ValueError("the simulated trailing order changed")
+        return PaperSubmission(
+            (candidate.order.order_id,),
+            () if candidate.cancel else (candidate.order.perm_id,),
+        )
 
     def modify_prices(
         self,

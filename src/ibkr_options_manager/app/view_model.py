@@ -141,6 +141,7 @@ class WorkingOrderLine:
     limit_price: Decimal | None = None
     stop_price: Decimal | None = None
     tif: str = ""
+    limit_offset: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -934,6 +935,7 @@ def _working_order_lines(snapshot: BrokerSnapshot) -> tuple[WorkingOrderLine, ..
             limit_price=order.limit_price,
             stop_price=order.stop_price,
             tif=order.tif,
+            limit_offset=order.limit_offset,
         )
         for order in snapshot.working_orders
         if order.key == snapshot.selected
