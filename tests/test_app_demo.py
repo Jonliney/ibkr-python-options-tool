@@ -67,7 +67,12 @@ from ibkr_options_manager.app.web_window import (
 )
 from ibkr_options_manager.broker import PortfolioRequest, SnapshotRequest
 from ibkr_options_manager.broker.execution import PaperSubmission
-from ibkr_options_manager.domain import ObservedExecution, PriceBand, WorkingOrder
+from ibkr_options_manager.domain import (
+    ObservedExecution,
+    PriceBand,
+    WorkingOrder,
+    round_down_price,
+)
 from ibkr_options_manager.execution import (
     ExecutionBlocked,
     ExecutionJournal,
@@ -408,15 +413,40 @@ def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) ->
         convert.path + "action",
         data={
             "action": "trailing-convert-arm",
-            "trail_value": "0.25",
+            "trail_value": "25",
             "trail_unit": "dollars",
-            "trail_limit_value": "0.10",
+            "trail_limit_value": "10",
             "trail_limit_unit": "dollars",
         },
     )
     assert conversion_review.status_code == 200
-    assert "Cancel 1 app-owned brackets" in conversion_review.text
-    assert "1 unassigned contracts" in conversion_review.text
+    assert (
+        "Replace 1 app-owned bracket and include 1 available contract"
+        in conversion_review.text
+    )
+    assert convert._armed_trailing is not None
+    assert convert._armed_trailing.request.trail_value == Decimal("0.25")
+    assert convert._armed_trailing.request.limit_value == Decimal("0.10")
+    assert convert._armed_trailing.limit_offset == Decimal("0.10")
+    assert "$25.00 per contract" in conversion_review.text
+    assert "$10.00 per contract" in conversion_review.text
+    assert "Initial limit estimate" in conversion_review.text
+    assert "$8.70" in conversion_review.text
+    percent_review = TestClient(convert.app).post(
+        convert.path + "action",
+        data={
+            "action": "trailing-convert-arm",
+            "trail_value": "25",
+            "trail_unit": "dollars",
+            "trail_limit_value": "1",
+            "trail_limit_unit": "percent",
+        },
+    )
+    assert percent_review.status_code == 200
+    assert convert._armed_trailing is not None
+    assert convert._armed_trailing.request.limit_value == Decimal("1")
+    assert convert._armed_trailing.request.limit_unit == "percent"
+    assert convert._armed_trailing.limit_offset == Decimal("0.09")
 
     working = _trailing_scenario_workbench(tmp_path / "working", "working-trail")
     working_page = TestClient(working.app).get(working.path).text
@@ -445,11 +475,13 @@ def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) ->
     snapshot = no_bid._view_model.latest_snapshot()
     assert snapshot is not None
     assert snapshot.quote.bid is None
+    no_bid_dialog = to_xml(no_bid._trailing_conversion_dialog())
+    assert "data-trail-stop-preview" in no_bid_dialog
     blocked_review = TestClient(no_bid.app).post(
         no_bid.path + "action",
         data={
             "action": "trailing-convert-arm",
-            "trail_value": "0.25",
+            "trail_value": "25",
             "trail_unit": "dollars",
         },
     )
@@ -1544,9 +1576,9 @@ def test_status_updates_render_as_short_toasts_not_workspace_copy() -> None:
 
 
 def test_trailing_review_failure_uses_trailing_toast_title() -> None:
-    notice = _toast_notice("Trailing conversion blocked: the quote is unavailable")
+    notice = _toast_notice("Trailing exit blocked: the quote is unavailable")
     assert notice is not None
-    assert notice.title == "Couldn't review trailing conversion"
+    assert notice.title == "Couldn't review trailing exit"
 
 
 def test_selecting_fully_allocated_position_does_not_raise_error_toast() -> None:
@@ -3396,7 +3428,10 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     )
     assert "data-stop-dialog-inverse" in header
     assert "Active layers" in header and "Entry cost" in header
-    assert "Latest ask" in header
+    assert "Latest bid" in header
+    assert "Latest ask" not in header
+    assert snapshot_for_cost.quote.bid is not None
+    assert f"${snapshot_for_cost.quote.bid:,.2f}" in header
     assert "data-stop-dialog-summary" in header
     assert 'data-stop-preset="-20"' in header
     assert 'data-stop-preset="-25"' in header
@@ -6985,7 +7020,11 @@ def test_trailing_dialog_has_one_clickable_trigger_button() -> None:
     dialog_markup = to_xml(workbench._trailing_conversion_dialog())
     trigger_markup = dialog_markup.split("<dialog", 1)[0]
     assert trigger_markup.count("<button") == 1
-    assert 'aria-label="Convert entire position to trailing stop"' in trigger_markup
+    assert 'aria-label="Set a trailing exit for this position"' in trigger_markup
+    assert "Set a trailing exit for this position" in dialog_markup
+    assert "Set a trailing exit" in dialog_markup
+    assert "Choose a trailing stop or trailing limit" in dialog_markup
+    assert dialog_markup.index(">Cancel<") < dialog_markup.index("Review trailing exit")
     assert 'd="M9 19h8.5' in trigger_markup
     assert 'aria-label="Trail amount unit"' in dialog_markup
     assert 'aria-label="Trailing limit offset unit"' in dialog_markup
@@ -6999,6 +7038,51 @@ def test_trailing_dialog_has_one_clickable_trigger_button() -> None:
     assert dialog_markup.index(
         'aria-label="Trailing limit offset unit"'
     ) < dialog_markup.index('name="trail_limit_value"')
+
+
+def test_trailing_conversion_dialog_shows_demo_position_prices() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    markup = to_xml(workbench._trailing_conversion_dialog())
+    assert "Average position price" in markup
+    assert "Latest bid" in markup
+    assert "Latest ask" not in markup
+    assert 'value="25"' in markup
+    assert "Trail amount per contract" in markup
+    assert "Optional limit offset per contract" in markup
+    assert snapshot.quote.bid is not None
+    expected_stop = round_down_price(
+        snapshot.quote.bid - Decimal("25") / snapshot.contract.multiplier,
+        snapshot.market_rule.bands,
+    )
+    assert f"${expected_stop:,.2f}" in markup
+    expected_change = (
+        (expected_stop - snapshot.position.unit_basis)
+        * snapshot.contract.multiplier
+        * snapshot.position.quantity
+    )
+    expected_outcome = (
+        f"+${expected_change:,.2f} gain"
+        if expected_change >= 0
+        else f"-${abs(expected_change):,.2f} estimated loss at stop"
+    )
+    assert expected_outcome in markup
+    assert "data-trail-stop-preview" in markup
+    assert "data-trail-outcome-preview" in markup
+    assert "data-trail-limit-price-preview" in markup
+    assert "data-trail-limit-outcome-preview" in markup
+    assert "Enter the dollar move for one contract" not in markup
+    assert "A percentage limit offset becomes" not in markup
+    assert "mt-4" in markup
+    assert 'class="grid gap-4"' in markup
+    assert markup.index('name="trail_limit_value"') < markup.index(
+        "Average position price"
+    )
+    assert markup.index("Latest bid") < markup.index("Review trailing exit")
+    assert f"${snapshot.position.unit_basis:,.2f}" in markup
+    assert f"${snapshot.quote.bid:,.2f}" in markup
 
 
 @pytest.mark.parametrize("with_bracket", [False, True])
@@ -7083,15 +7167,19 @@ def test_demo_entire_position_trailing_conversion_includes_unassigned_contracts(
         workbench.path + "action",
         data={
             "action": "trailing-convert-arm",
-            "trail_value": "0.25",
+            "trail_value": "25",
             "trail_unit": "dollars",
-            "trail_limit_value": "0.10",
+            "trail_limit_value": "10",
             "trail_limit_unit": "dollars",
             "trail_tif": "DAY",
         },
     )
     assert review.status_code == 200
-    assert f"{2 if with_bracket else 3} unassigned contracts" in review.text
+    assert (
+        "include 2 available contracts"
+        if with_bracket
+        else "Place one trailing SELL for all 3 held contracts"
+    ) in review.text
     assert "Initial stop estimate" in review.text
     assert "Limit offset" in review.text
     assert "Initial limit estimate" in review.text
@@ -7104,6 +7192,9 @@ def test_demo_entire_position_trailing_conversion_includes_unassigned_contracts(
         workbench.path + "action", data={"action": "active-action-execute"}
     )
     assert 'value="trailing-convert-confirm"' in verified.text
+    assert "Set trailing exit" in verified.text
+    if not with_bracket:
+        assert "Confirm cancels every reviewed app-owned bracket" not in verified.text
     if bid_changes_before_review:
         assert workbench._armed_trailing is not None
         assert workbench._armed_trailing.reference_price == Decimal("9.10")

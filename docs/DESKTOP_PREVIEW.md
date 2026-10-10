@@ -80,13 +80,13 @@ All prices, orders, fills, and P&L values below are illustrative.
 
 | Scenario | Command suffix after `--demo-data --demo-scenario` | What to inspect |
 | --- | --- | --- |
-| Convert an existing bracket | `convert` | TSLA has a 2-contract app-owned bracket and 1 unassigned contract. Open **Convert entire position**, enter a `$0.25` trail and `$0.10` limit offset, then review the 3-contract action and its risk. Confirming only changes this disposable demo. |
+| Convert an existing bracket | `convert` | TSLA has a 2-contract app-owned bracket and 1 unassigned contract. Open **Set a trailing exit**; the `$25` per-contract trail corresponds to `$0.25` in the quoted option price. Check the estimated initial stop beside the input, then enter a `$10` per-contract limit offset (`$0.10` in the quoted option price) and review the 3-contract action and its risk. Confirming only changes this disposable demo. |
 | Working trailing limit | `working-trail` | TSLA has a 3-contract `TRAIL LIMIT` order with initial stop `$8.80` and offset `$0.10`. Inspect the active trailing row. |
 | Partial trailing fill | `partial-fill` | A synthetic 2-contract sale at `$9.10` leaves 1 held contract and 1 working trailing contract. Compare the position, row quantity, and realised P&L display. |
 | Manual cancellation | `manual-cancel` | The app journal still owns a 3-contract trailing limit, but the simulated broker no longer reports its working order. Inspect the unresolved row and available-quantity treatment. |
 | Fully closed position | `closed-trail` | TSLA opens already closed, with two completed bracket layers (one target fill at $12.00 and one stop fill at $7.50) and a completed trail. Compare all three rows and their realised P&L (+$340, -$110, and +$150). The trail shows its last recorded stop ($8.80) and derived limit ($8.70), rather than a live quote. |
 
-| Missing option bid | `no-bid` | TSLA has no bid. Open **Convert entire position** and review a trail to exercise the blocked message without an order. |
+| Missing option bid | `no-bid` | TSLA has no bid. Open **Set a trailing exit** and review a trail to exercise the blocked message without an order. |
 
 For example:
 

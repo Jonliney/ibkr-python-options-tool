@@ -50,6 +50,7 @@ from ...domain import (
     BrokerSnapshot,
     VerifiedOptionContract,
     preview_reference_prices,
+    round_down_price,
     round_up_price,
     stop_limit_price,
 )
@@ -1288,13 +1289,25 @@ class StarUIWorkbench:
             return
         try:
             trail = Decimal(values.get("trail_value", ""))
+            trail_unit = values.get("trail_unit", "dollars")
+            if trail_unit == "dollars":
+                multiplier = snapshot.contract.multiplier
+                if not multiplier.is_finite() or multiplier <= 0:
+                    raise ExecutionBlocked("the option contract multiplier is invalid")
+                trail /= multiplier
             limit_text = values.get("trail_limit_value", "").strip()
             limit = Decimal(limit_text) if limit_text else None
+            limit_unit = values.get("trail_limit_unit", "dollars")
+            if limit is not None and limit_unit == "dollars":
+                multiplier = snapshot.contract.multiplier
+                if not multiplier.is_finite() or multiplier <= 0:
+                    raise ExecutionBlocked("the option contract multiplier is invalid")
+                limit /= multiplier
             request = TrailingRequest(
                 trail_value=trail,
-                trail_unit=values.get("trail_unit", "dollars"),
+                trail_unit=trail_unit,
                 limit_value=limit,
-                limit_unit=values.get("trail_limit_unit", "dollars"),
+                limit_unit=limit_unit,
                 tif="GTC",
             )
             self._armed_trailing = (
@@ -1306,18 +1319,22 @@ class StarUIWorkbench:
                 )
             )
         except (InvalidOperation, ExecutionBlocked) as error:
-            self._message = f"Trailing conversion blocked: {error}"
+            self._message = f"Trailing exit blocked: {error}"
             return
         plan = self._armed_trailing
         self._set_review_status_locked(
-            f"Review conversion of {len(plan.candidates)} brackets and "
-            f"{plan.unassigned_quantity} unassigned contracts to one trailing "
-            f"SELL for {plan.quantity} contracts."
+            f"Review a trailing SELL for all {plan.quantity} held contracts."
+            + (
+                f" It will replace {len(plan.candidates)} app-owned "
+                f"{'bracket' if len(plan.candidates) == 1 else 'brackets'}."
+                if plan.candidates
+                else ""
+            )
         )
 
     def _confirm_trailing_conversion_locked(self) -> None:
         if self._expire_confirmation_locked(require_deadline=True):
-            self._message = "Review expired. Review the trailing conversion again."
+            self._message = "Review expired. Review the trailing exit again."
             return
         plan = self._armed_trailing
         if (
@@ -1326,7 +1343,7 @@ class StarUIWorkbench:
             or self._selected_con_id is None
             or not self._active_action_verified
         ):
-            self._message = "Review the trailing conversion before confirming it."
+            self._message = "Review the trailing exit before confirming it."
             return
         cancelled = 0
         try:
@@ -1389,13 +1406,17 @@ class StarUIWorkbench:
             )
         except (ExecutionBlocked, ExecutionOutcomeUnknown) as error:
             self._message = (
-                f"Trailing conversion stopped after cancelling {cancelled} of "
+                f"Trailing exit stopped after cancelling {cancelled} of "
                 f"{len(plan.candidates)} brackets: {error}. Check TWS and refresh."
+                if plan.candidates
+                else f"Trailing exit stopped: {error}. Check TWS and refresh."
             )
         except Exception as error:
             self._message = (
-                f"Trailing conversion outcome is unknown after {cancelled} "
+                f"Trailing exit outcome is unknown after {cancelled} "
                 f"cancellations: {error}. Check TWS and refresh."
+                if plan.candidates
+                else f"Trailing exit outcome is unknown: {error}. Check TWS and refresh."
             )
         else:
             self._refresh_after_acknowledged_write_locked(
@@ -1539,7 +1560,7 @@ class StarUIWorkbench:
         except ExecutionBlocked as error:
             self._disarm_execution_locked()
             self._message = (
-                f"{'Trailing conversion' if trailing is not None else 'Execution'} "
+                f"{'Trailing exit' if trailing is not None else 'Execution'} "
                 f"blocked: {error}. Review the latest state again."
             )
             return
@@ -4489,20 +4510,19 @@ class StarUIWorkbench:
             if initial_price is not None
             else ""
         )
-        live_ask = (
-            quote.ask
+        latest_bid = (
+            quote.bid
             if snapshot_fresh
             and quote is not None
             and quote.fresh
-            and quote.market_data_type == "LIVE"
-            and quote.ask is not None
-            and quote.ask.is_finite()
-            and quote.ask > 0
+            and quote.bid is not None
+            and quote.bid.is_finite()
+            and quote.bid > 0
             else None
         )
-        ask_text = (
-            f"${live_ask:,.{max(2, -live_ask.normalize().as_tuple().exponent)}f}"
-            if live_ask is not None
+        bid_text = (
+            f"${latest_bid:,.{max(2, -latest_bid.normalize().as_tuple().exponent)}f}"
+            if latest_bid is not None
             else "Unavailable"
         )
         return Tooltip(
@@ -4633,23 +4653,15 @@ class StarUIWorkbench:
                                 Span(str(len(pairs)), cls="text-sm font-semibold"),
                                 cls="flex items-center justify-between gap-4",
                             ),
-                            Div(
-                                Span("Entry cost", cls="text-xs text-muted-foreground"),
-                                Span(
-                                    f"${basis.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}",
-                                    cls="text-sm font-semibold",
-                                ),
-                                cls="flex items-center justify-between gap-4",
+                            _dialog_context_row(
+                                "Entry cost",
+                                f"${basis.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):,.2f}",
                             ),
-                            Div(
-                                Span(
-                                    "Latest ask at refresh"
-                                    if live_ask is not None
-                                    else "Latest ask",
-                                    cls="text-xs text-muted-foreground",
-                                ),
-                                Span(ask_text, cls="text-sm font-semibold"),
-                                cls="flex items-center justify-between gap-4",
+                            _dialog_context_row(
+                                "Latest bid at refresh"
+                                if latest_bid is not None
+                                else "Latest bid",
+                                bid_text,
                             ),
                             Div(
                                 Span("Stop price", cls="text-xs text-muted-foreground"),
@@ -5108,25 +5120,110 @@ class StarUIWorkbench:
         )
 
     def _trailing_conversion_dialog(self) -> Any:
-        return Dialog(
+        snapshot = self._view_model.latest_snapshot()
+        selected = (
+            snapshot
+            if snapshot is not None
+            and snapshot.selected.con_id == self._selected_con_id
+            else None
+        )
+        currency = selected.contract.currency if selected is not None else "USD"
+        quote = selected.quote if selected is not None else None
+        display_quote = (
+            quote
+            if selected is not None
+            and selected.fresh
+            and quote is not None
+            and quote.fresh
+            else None
+        )
+        multiplier = selected.contract.multiplier if selected is not None else None
+        preview_bid = display_quote.bid if display_quote is not None else None
+        preview_stop: Decimal | None = None
+        if (
+            selected is not None
+            and preview_bid is not None
+            and preview_bid.is_finite()
+            and multiplier is not None
+            and multiplier.is_finite()
+            and multiplier > 0
+            and selected.market_rule.exchange == selected.contract.exchange
+        ):
+            raw_stop = preview_bid - Decimal("25") / multiplier
+            if raw_stop > 0:
+                try:
+                    preview_stop = round_down_price(
+                        raw_stop, selected.market_rule.bands
+                    )
+                except ValueError:
+                    preview_stop = None
+        preview_config = (
+            {
+                "bid": format(preview_bid, "f") if preview_bid is not None else None,
+                "multiplier": format(multiplier, "f")
+                if multiplier is not None
+                else None,
+                "quantity": format(selected.position.quantity, "f"),
+                "basis": format(selected.position.unit_basis, "f"),
+                "bands": [
+                    {
+                        "low": format(band.low_edge, "f"),
+                        "increment": format(band.increment, "f"),
+                    }
+                    for band in selected.market_rule.bands
+                ],
+            }
+            if selected is not None
+            else None
+        )
+        preview_change = (
+            (preview_stop - selected.position.unit_basis)
+            * multiplier
+            * selected.position.quantity
+            if preview_stop is not None
+            and preview_bid is not None
+            and multiplier is not None
+            and selected is not None
+            else None
+        )
+        outcome_text = (
+            f"{_money(preview_change)} {'gain' if preview_change >= 0 else 'estimated loss at stop'}"
+            if preview_change is not None
+            else "—"
+        )
+        dialog = Dialog(
             DialogTrigger(
                 Icon("lucide:route", cls="size-4", aria_hidden="true"),
                 variant="outline",
                 size="icon",
-                aria_label="Convert entire position to trailing stop",
+                aria_label="Set a trailing exit for this position",
                 disabled=self._paper_execution is None,
             ),
             DialogContent(
                 DialogHeader(
-                    DialogTitle("Convert entire position"),
+                    DialogTitle("Set a trailing exit"),
                     DialogDescription(
-                        "Cancel every app-owned bracket for this option and include "
-                        "unassigned contracts in one trailing SELL order."
+                        "Choose a trailing stop or trailing limit for all held "
+                        "contracts. Review the order before submitting it."
                     ),
                 ),
                 Form(
-                    _field(
-                        "Trail amount",
+                    Div(
+                        Div(
+                            Label(
+                                "Trail amount per contract",
+                                fr="trail-value",
+                                data_trail_value_label=True,
+                                cls="text-xs font-medium text-muted-foreground",
+                            ),
+                            Span(
+                                _header_price(preview_stop, currency),
+                                data_trail_stop_preview=True,
+                                aria_live="polite",
+                                cls="text-xs font-semibold text-foreground",
+                            ),
+                            cls="flex flex-wrap items-center justify-between gap-2",
+                        ),
                         Div(
                             ToggleGroup(
                                 ("dollars", "$"),
@@ -5137,6 +5234,7 @@ class StarUIWorkbench:
                                 variant="outline",
                                 size="default",
                                 aria_label="Trail amount unit",
+                                data_trail_unit_group=True,
                             ),
                             HTMLInput(
                                 type="hidden",
@@ -5146,19 +5244,46 @@ class StarUIWorkbench:
                                 ),
                             ),
                             Input(
+                                id="trail-value",
                                 name="trail_value",
                                 type="number",
                                 min="0.01",
                                 step="any",
-                                value="0.25",
+                                value="25",
                                 required=True,
                                 cls="min-w-0 flex-1",
                             ),
                             cls="flex w-full items-center gap-2",
                         ),
+                        Div(
+                            Span(
+                                outcome_text,
+                                data_trail_outcome_preview=True,
+                                aria_live="polite",
+                                cls="text-xs text-emerald-400"
+                                if preview_change is not None and preview_change >= 0
+                                else "text-xs text-rose-400",
+                            ),
+                            cls="flex justify-end",
+                        ),
+                        cls="space-y-1",
                     ),
-                    _field(
-                        "Optional limit offset below stop",
+                    Div(
+                        Div(
+                            Label(
+                                "Optional limit offset per contract",
+                                fr="trail-limit-value",
+                                data_trail_limit_value_label=True,
+                                cls="text-xs font-medium text-muted-foreground",
+                            ),
+                            Span(
+                                "—",
+                                data_trail_limit_price_preview=True,
+                                aria_live="polite",
+                                cls="text-xs font-semibold text-foreground",
+                            ),
+                            cls="flex flex-wrap items-center justify-between gap-2",
+                        ),
                         Div(
                             ToggleGroup(
                                 ("dollars", "$"),
@@ -5169,6 +5294,7 @@ class StarUIWorkbench:
                                 variant="outline",
                                 size="default",
                                 aria_label="Trailing limit offset unit",
+                                data_trail_limit_unit_group=True,
                             ),
                             HTMLInput(
                                 type="hidden",
@@ -5176,6 +5302,7 @@ class StarUIWorkbench:
                                 data_bind=Signal("trailing_limit_unit", _ref_only=True),
                             ),
                             Input(
+                                id="trail-limit-value",
                                 name="trail_limit_value",
                                 type="number",
                                 min="0.01",
@@ -5185,27 +5312,58 @@ class StarUIWorkbench:
                             ),
                             cls="flex w-full items-center gap-2",
                         ),
+                        Div(
+                            Span(
+                                "—",
+                                data_trail_limit_outcome_preview=True,
+                                aria_live="polite",
+                                cls="text-xs text-muted-foreground",
+                            ),
+                            cls="flex justify-end",
+                        ),
+                        cls="space-y-1",
                     ),
-                    P(
-                        "A percentage limit offset becomes a fixed dollar offset "
-                        "at submission. A trailing limit may remain unfilled after "
-                        "its stop triggers.",
-                        cls="text-xs leading-5 text-muted-foreground",
+                    _dialog_price_context(
+                        (
+                            "Average position price",
+                            _header_price(
+                                selected.position.unit_basis
+                                if selected is not None
+                                else None,
+                                currency,
+                            ),
+                        ),
+                        (
+                            "Latest bid",
+                            _header_price(
+                                display_quote.bid
+                                if display_quote is not None
+                                else None,
+                                currency,
+                            ),
+                        ),
                     ),
                     DialogFooter(
+                        DialogClose("Cancel", variant="outline"),
                         Button(
-                            "Review conversion",
+                            "Review trailing exit",
                             type="submit",
                             name="action",
                             value="trailing-convert-arm",
                             data_busy_text="Checking…",
                         ),
+                        cls="mt-4",
                     ),
                     action=f"/{self.session_token}/action",
                     method="post",
-                    cls="space-y-4",
+                    cls="grid gap-4",
                 ),
+                Script(_trailing_preview_script(preview_config)),
             ),
+        )
+        return Tooltip(
+            TooltipTrigger(dialog, delay_duration=250),
+            TooltipContent("Set a trailing exit for this position"),
         )
 
     def _existing_layers_panel(
@@ -6689,14 +6847,20 @@ class StarUIWorkbench:
         if self._armed_trailing is not None:
             return self._staged_action_controls(
                 confirm_action="trailing-convert-confirm",
-                busy_text="Converting…",
+                busy_text="Setting trail…",
                 impact=(
-                    "Convert entire position",
+                    "Set trailing exit",
                     (
                         "Confirm cancels every reviewed app-owned bracket, then "
                         "submits one trailing SELL for all held contracts after a "
                         "fresh position check. There is a period without bracket "
                         "protection. A trailing limit can remain unfilled.",
+                    )
+                    if self._armed_trailing.candidates
+                    else (
+                        "Confirm submits one trailing SELL for all held contracts "
+                        "after a fresh position check. A trailing limit can remain "
+                        "unfilled."
                     ),
                 ),
             )
@@ -6832,7 +6996,7 @@ class StarUIWorkbench:
             self._cancel_changes_control(staged=True),
             Div(
                 Button(
-                    "Review trailing conversion"
+                    "Review trailing exit"
                     if self._armed_trailing is not None
                     else "Review market sell"
                     if market_exits
@@ -7230,7 +7394,7 @@ class StarUIWorkbench:
         trail = (
             f"{plan.request.trail_value}%"
             if plan.request.trail_unit == "percent"
-            else f"${plan.request.trail_value}"
+            else f"${plan.request.trail_value * plan.contract.multiplier:,.2f} per contract"
         )
         stop_limit = plan.limit_offset is not None
         initial_limit = (
@@ -7257,13 +7421,17 @@ class StarUIWorkbench:
                 cls="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1",
             ),
             Div(
-                term("Trail from option premium", trail),
+                term("Trail amount", trail),
                 term(
                     "Initial stop estimate",
                     f"${plan.initial_stop}",
                     f"from bid ${plan.reference_price}",
                 ),
-                term("Limit offset", f"${plan.limit_offset}", "below moving stop")
+                term(
+                    "Limit offset",
+                    f"${plan.limit_offset * plan.contract.multiplier:,.2f} per contract",
+                    f"${plan.limit_offset} below moving stop",
+                )
                 if stop_limit
                 else None,
                 term("Initial limit estimate", f"${initial_limit}")
@@ -7272,12 +7440,17 @@ class StarUIWorkbench:
                 cls="mt-4 grid grid-cols-2 gap-x-4 gap-y-4 border-y border-border py-4",
             ),
             P(
-                f"Cancel {len(plan.candidates)} app-owned brackets, then place one "
-                f"trailing sell for all {plan.quantity} held contracts. "
-                f"Includes {plan.unassigned_quantity} unassigned contracts."
+                f"Replace {len(plan.candidates)} app-owned "
+                f"{'bracket' if len(plan.candidates) == 1 else 'brackets'} and "
+                f"include {plan.unassigned_quantity} available "
+                f"{'contract' if plan.unassigned_quantity == 1 else 'contracts'} "
+                f"in one trailing SELL for all {plan.quantity} held contracts."
+                if plan.candidates and plan.unassigned_quantity
+                else f"Replace {len(plan.candidates)} app-owned "
+                f"{'bracket' if len(plan.candidates) == 1 else 'brackets'} "
+                f"with one trailing SELL for all {plan.quantity} held contracts."
                 if plan.candidates
-                else f"Place one trailing sell for all {plan.quantity} held contracts. "
-                f"Includes {plan.unassigned_quantity} unassigned contracts.",
+                else f"Place one trailing SELL for all {plan.quantity} held contracts.",
                 cls="mt-4 text-xs leading-5 text-muted-foreground",
             ),
             Div(
@@ -7377,6 +7550,114 @@ class StarUIWorkbench:
                 ),
             ),
         )
+
+
+def _trailing_preview_script(configuration: dict[str, Any] | None) -> str:
+    """Show an illustrative trigger from the displayed bid and verified tick bands."""
+    payload = json.dumps(configuration, separators=(",", ":"))
+    return f"""
+(() => {{
+  const config = {payload};
+  const form = document.querySelector('input[name="trail_value"]')?.closest('form');
+  if (!form) return;
+  const input = form.elements['trail_value'];
+  const label = form.querySelector('[data-trail-value-label]');
+  const preview = form.querySelector('[data-trail-stop-preview]');
+  const outcome = form.querySelector('[data-trail-outcome-preview]');
+  const group = form.querySelector('[data-trail-unit-group]');
+  const limitInput = form.elements['trail_limit_value'];
+  const limitLabel = form.querySelector('[data-trail-limit-value-label]');
+  const limitPrice = form.querySelector('[data-trail-limit-price-preview]');
+  const limitOutcome = form.querySelector('[data-trail-limit-outcome-preview]');
+  const limitGroup = form.querySelector('[data-trail-limit-unit-group]');
+  if (!input || !label || !preview || !outcome || !group || !limitInput || !limitLabel ||
+      !limitPrice || !limitOutcome || !limitGroup) return;
+  const bands = (config?.bands || []).map(band => ({{
+    low: Number(band.low), increment: Number(band.increment)
+  }}));
+  const bid = Number(config?.bid);
+  const multiplier = Number(config?.multiplier);
+  const quantity = Number(config?.quantity);
+  const basis = Number(config?.basis);
+  const roundDown = (value) => {{
+    let candidate = value;
+    for (let attempt = 0; attempt <= bands.length; attempt += 1) {{
+      const applicable = bands.filter(band => band.low <= candidate + 1e-9);
+      const band = applicable[applicable.length - 1];
+      if (!band || !(band.increment > 0)) return NaN;
+      const rounded = Math.floor(value / band.increment + 1e-9) * band.increment;
+      const atRounded = bands.filter(item => item.low <= rounded + 1e-9);
+      if (atRounded[atRounded.length - 1] === band) return rounded;
+      candidate = rounded;
+    }}
+    return NaN;
+  }};
+  const roundUp = (value) => {{
+    let candidate = value;
+    for (let attempt = 0; attempt <= bands.length; attempt += 1) {{
+      const applicable = bands.filter(band => band.low <= candidate + 1e-9);
+      const band = applicable[applicable.length - 1];
+      if (!band || !(band.increment > 0)) return NaN;
+      const rounded = Math.ceil(value / band.increment - 1e-9) * band.increment;
+      const atRounded = bands.filter(item => item.low <= rounded + 1e-9);
+      if (atRounded[atRounded.length - 1] === band) return rounded;
+      candidate = rounded;
+    }}
+    return NaN;
+  }};
+  const displayOutcome = (node, change, negativeLabel) => {{
+    const gain = Number.isFinite(change) && change >= 0;
+    node.textContent = Number.isFinite(change)
+      ? `${{change >= 0 ? '+' : '-'}}$${{Math.abs(change).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}})}} ${{gain ? 'gain' : negativeLabel}}`
+      : '—';
+    node.classList.toggle('text-emerald-400', Number.isFinite(change) && gain);
+    node.classList.toggle('text-rose-400', Number.isFinite(change) && !gain);
+    node.classList.toggle('text-muted-foreground', !Number.isFinite(change));
+  }};
+  const refresh = () => {{
+    const unit = form.elements['trail_unit']?.value || 'dollars';
+    label.textContent = unit === 'percent' ? 'Trail amount (%)' : 'Trail amount per contract';
+    const amount = Number(input.value);
+    let stop = NaN;
+    if (input.value.trim() && amount > 0 && Number.isFinite(bid) && bid > 0) {{
+      const trail = unit === 'percent' ? bid * amount / 100 : amount / multiplier;
+      if (Number.isFinite(trail) && trail > 0 && bid - trail > 0) {{
+        stop = roundDown(bid - trail);
+      }}
+    }}
+    const valid = Number.isFinite(stop) && stop > 0 && stop < bid;
+    preview.textContent = valid ? '$' + Number(stop.toFixed(6)).toString() : '—';
+    const change = valid && Number.isFinite(multiplier) && multiplier > 0 &&
+      Number.isFinite(quantity) && quantity > 0 && Number.isFinite(basis) && basis > 0
+      ? (stop - basis) * multiplier * quantity : NaN;
+    displayOutcome(outcome, change, 'estimated loss at stop');
+    const offsetValue = Number(limitInput.value);
+    const limitUnit = form.elements['trail_limit_unit']?.value || 'dollars';
+    limitLabel.textContent = limitUnit === 'percent'
+      ? 'Optional limit offset below stop (%)' : 'Optional limit offset per contract';
+    const rawOffset = limitUnit === 'percent' ? stop * offsetValue / 100 : offsetValue / multiplier;
+    const offset = valid && limitInput.value.trim() && offsetValue > 0 &&
+      Number.isFinite(rawOffset) ? roundUp(rawOffset) : NaN;
+    const initialLimit = Number.isFinite(offset) && stop - offset > 0 ? stop - offset : NaN;
+    limitPrice.textContent = Number.isFinite(initialLimit)
+      ? '$' + Number(initialLimit.toFixed(6)).toString() : '—';
+    const limitChange = Number.isFinite(initialLimit) && Number.isFinite(change)
+      ? (initialLimit - basis) * multiplier * quantity : NaN;
+    displayOutcome(limitOutcome, limitChange, 'estimated loss at limit');
+  }};
+  input.addEventListener('input', refresh);
+  limitInput.addEventListener('input', refresh);
+  group.querySelectorAll('[data-value]').forEach(button => button.addEventListener('click', () => {{
+    form.elements['trail_unit'].value = button.dataset.value;
+    refresh();
+  }}));
+  limitGroup.querySelectorAll('[data-value]').forEach(button => button.addEventListener('click', () => {{
+    form.elements['trail_limit_unit'].value = button.dataset.value;
+    refresh();
+  }}));
+  refresh();
+}})();
+"""
 
 
 def _global_stop_type_visual_script() -> str:
@@ -8535,6 +8816,21 @@ def _header_price(price: Decimal | None, currency: str) -> str:
     return f"${amount}" if currency == "USD" else f"{currency} {amount}"
 
 
+def _dialog_context_row(label: str, value: str) -> Any:
+    return Div(
+        Span(label, cls="text-xs text-muted-foreground"),
+        Span(value, cls="text-sm font-semibold"),
+        cls="flex items-center justify-between gap-4",
+    )
+
+
+def _dialog_price_context(*rows: tuple[str, str]) -> Any:
+    return Div(
+        *(_dialog_context_row(label, value) for label, value in rows),
+        cls="space-y-2 rounded-md border border-border bg-muted/20 px-4 py-3",
+    )
+
+
 def _header_pnl(value: Decimal | None, currency: str) -> str:
     if value is None or not value.is_finite():
         return "—"
@@ -8885,7 +9181,7 @@ def _toast_notice(message: str) -> _ToastNotice | None:
     prefix, separator, detail = normalized.partition(":")
     titles = {
         "Execution blocked": "Couldn't send bracket orders",
-        "Trailing conversion blocked": "Couldn't review trailing conversion",
+        "Trailing exit blocked": "Couldn't review trailing exit",
         "Market exit blocked": "Couldn't send the market sell",
         "Bracket cancellation blocked": "Couldn't cancel bracket orders",
         "Price update blocked": "Couldn't change prices",

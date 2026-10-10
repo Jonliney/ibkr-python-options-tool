@@ -176,7 +176,7 @@ safety control.
 
 ## Entire-position trailing conversion
 
-The paper-only **Convert entire position** action reviews every active,
+The paper-only **Set a trailing exit** action reviews every active,
 app-owned OCA pair for the selected option and the current unassigned quantity.
 This first version requires a USD-denominated option.
 It blocks when any other working order exists for that contract, including a
@@ -200,6 +200,11 @@ The final snapshot is not an atomic reservation at TWS; a manual change after
 that read can still race the send, so the acknowledged order must be checked in
 TWS.
 
+The dialog's dollar trail and dollar limit offset are entered per contract;
+both are divided by the verified multiplier before the pure plan and TWS order
+use quoted option-price units. The review shows the effective per-contract
+offset after market-rule rounding. Percentage entries retain their quoted-price
+references: the trail uses the bid and the limit offset uses the initial stop.
 The trail may be a tick-valid dollar amount or a percentage of option premium.
 The initial stop estimate is rounded down on the verified market rule. A
 trailing-limit percentage is converted at submission to one fixed dollar

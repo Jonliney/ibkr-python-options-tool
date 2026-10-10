@@ -22,9 +22,9 @@ and trailing stop-limit workflow.
    the original session has no saved callback trace.
 5. [x] Show the trailing layer row after it closes, within the closed-position
    state, using its completed outcome rather than dropping the row.
-6. [ ] Add the current bid, ask, and average position price to the **Convert
+6. [x] Add the current bid, ask, and average position price to the **Convert
    entire position** dialog, using the contextual pattern from other dialogs.
-7. [ ] Improve that dialog's wording and spacing. Distinguish converting active
+7. [x] Improve that dialog's wording and spacing. Distinguish converting active
    brackets from placing a trail for wholly unassigned contracts, and simplify
    the copy accordingly.
 8. [ ] Show an estimated gain or loss at the initial stop, using the verified
