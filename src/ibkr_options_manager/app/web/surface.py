@@ -6662,7 +6662,7 @@ class StarUIWorkbench:
         armed_execution = self._armed_execution
         action_rows: list[Any] = []
         if trailing is not None:
-            action_rows = [self._review_trailing_plan(trailing)]
+            action_rows = self._review_trailing_plan(trailing)
         elif market_exits:
             action_rows = self._review_market_exit_plan(market_exits)
         elif cancellation is not None:
@@ -7390,91 +7390,52 @@ class StarUIWorkbench:
             **(row_attributes or {}),
         )
 
-    def _review_trailing_plan(self, plan: TrailingPlan) -> Any:
-        kind = "TRAIL LIMIT" if plan.limit_offset is not None else "TRAIL"
-        trail = (
-            f"{plan.request.trail_value}%"
-            if plan.request.trail_unit == "percent"
-            else f"${plan.request.trail_value * plan.contract.multiplier:,.2f} per contract"
-        )
-        stop_limit = plan.limit_offset is not None
-        initial_limit = (
-            plan.initial_stop - plan.limit_offset
-            if plan.limit_offset is not None
-            else None
-        )
-
-        def term(label: str, value: str, detail: str | None = None) -> Any:
-            return Div(
-                Span(label, cls="text-xs text-muted-foreground"),
-                Span(value, cls="font-mono text-sm font-semibold tabular-nums"),
-                Span(detail, cls="text-xs text-muted-foreground") if detail else None,
-                cls="flex min-w-0 flex-col gap-0.5",
-            )
-
-        return Div(
-            Div(
-                H3(f"SELL {kind}", cls="text-base font-semibold"),
+    def _review_trailing_plan(self, plan: TrailingPlan) -> list[Any]:
+        rows = [
+            self._review_cancellation_plan(candidate, index=index)
+            for index, candidate in enumerate(plan.candidates, start=1)
+        ]
+        kind = "TRAIL STP LMT" if plan.limit_offset is not None else "TRAIL STP"
+        price_lines = [
+            self._review_order_line(
+                "Trail amount",
                 Span(
+                    f"{plan.request.trail_value}%"
+                    if plan.request.trail_unit == "percent"
+                    else f"${_price_text(plan.request.trail_value * plan.contract.multiplier)}",
+                    cls="text-xs font-semibold",
+                ),
+                "text-rose-400",
+            ),
+            self._review_order_line(
+                "SELL STP",
+                Span(f"${_price_text(plan.initial_stop)}", cls="text-xs font-semibold"),
+                "text-rose-400",
+            )
+        ]
+        if plan.limit_offset is not None:
+            price_lines.append(
+                self._review_order_line(
+                    "SELL STP LMT",
+                    Span(
+                        f"${_price_text(plan.initial_stop - plan.limit_offset)}",
+                        cls="text-xs font-semibold",
+                    ),
+                    "text-rose-400",
+                )
+            )
+        rows.append(
+            Div(
+                P(f"Create {kind} sell order", cls="text-xs font-semibold"),
+                P(
                     f"{plan.quantity} contracts · {plan.request.tif}",
-                    cls="font-mono text-xs font-semibold tabular-nums",
+                    cls="mt-0.5 text-xs text-muted-foreground",
                 ),
-                cls="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1",
-            ),
-            Div(
-                term("Trail amount", trail),
-                term(
-                    "Initial stop estimate",
-                    f"${plan.initial_stop}",
-                    f"from bid ${plan.reference_price}",
-                ),
-                term(
-                    "Limit offset",
-                    f"${plan.limit_offset * plan.contract.multiplier:,.2f} per contract",
-                    f"${plan.limit_offset} below moving stop",
-                )
-                if stop_limit
-                else None,
-                term("Initial limit estimate", f"${initial_limit}")
-                if stop_limit
-                else None,
-                cls="mt-4 grid grid-cols-2 gap-x-4 gap-y-4 border-y border-border py-4",
-            ),
-            P(
-                f"Replace {len(plan.candidates)} app-owned "
-                f"{'bracket' if len(plan.candidates) == 1 else 'brackets'} and "
-                f"include {plan.unassigned_quantity} available "
-                f"{'contract' if plan.unassigned_quantity == 1 else 'contracts'} "
-                f"in one trailing SELL for all {plan.quantity} held contracts."
-                if plan.candidates and plan.unassigned_quantity
-                else f"Replace {len(plan.candidates)} app-owned "
-                f"{'bracket' if len(plan.candidates) == 1 else 'brackets'} "
-                f"with one trailing SELL for all {plan.quantity} held contracts."
-                if plan.candidates
-                else f"Place one trailing SELL for all {plan.quantity} held contracts.",
-                cls="mt-4 text-xs leading-5 text-muted-foreground",
-            ),
-            Div(
-                P("Fill risk", cls="text-xs font-semibold text-amber-200"),
-                P(
-                    "After the stop triggers, the limit order may remain unfilled "
-                    "if the option falls below its limit. You may still own the "
-                    "contracts and lose more than the initial stop suggests."
-                    if stop_limit
-                    else "The stop submits a market sell. The fill price can "
-                    "differ from the initial stop estimate.",
-                    cls="mt-1 text-xs leading-5 text-amber-100",
-                ),
-                P(
-                    "Cancelling the brackets creates a period without their protection.",
-                    cls="mt-2 text-xs leading-5 text-amber-100",
-                )
-                if plan.candidates
-                else None,
-                cls="mt-4 border border-amber-500/40 bg-amber-500/10 p-3",
-            ),
-            cls="action-review-layer py-4",
+                Div(*price_lines, cls="mt-3 space-y-3 border-l-2 border-border pl-3"),
+                cls="action-review-layer py-4",
+            )
         )
+        return rows
 
     def _review_market_exit_plan(
         self, candidates: tuple[MarketExitCandidate, ...]

@@ -420,17 +420,22 @@ def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) ->
         },
     )
     assert conversion_review.status_code == 200
-    assert (
-        "Replace 1 app-owned bracket and include 1 available contract"
-        in conversion_review.text
+    sidebar = conversion_review.text.split("ACTION REVIEW", maxsplit=1)[1]
+    assert sidebar.index("CANCEL BRACKET") < sidebar.index(
+        "Create TRAIL STP LMT sell order"
     )
+    assert "OCA-1" in sidebar
+    assert "2 contracts · GTC" in sidebar
+    assert sidebar.index("Trail amount") < sidebar.index("SELL STP")
+    assert "$25" in sidebar
+    assert "SELL STP LMT" in sidebar
     assert convert._armed_trailing is not None
     assert convert._armed_trailing.request.trail_value == Decimal("0.25")
     assert convert._armed_trailing.request.limit_value == Decimal("0.10")
     assert convert._armed_trailing.limit_offset == Decimal("0.10")
-    assert "$25.00 per contract" in conversion_review.text
-    assert "$10.00 per contract" in conversion_review.text
-    assert "Initial limit estimate" in conversion_review.text
+    assert "Limit offset" not in sidebar
+    assert "Initial limit estimate" not in sidebar
+    assert "Fill risk" not in sidebar
     assert "$8.70" in conversion_review.text
     percent_review = TestClient(convert.app).post(
         convert.path + "action",
@@ -447,6 +452,16 @@ def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) ->
     assert convert._armed_trailing.request.limit_value == Decimal("1")
     assert convert._armed_trailing.request.limit_unit == "percent"
     assert convert._armed_trailing.limit_offset == Decimal("0.09")
+    stop_only = replace(convert._armed_trailing, limit_offset=None)
+    stop_only_review = "".join(map(str, convert._review_trailing_plan(stop_only)))
+    assert "Create TRAIL STP sell order" in stop_only_review
+    assert "2 contracts · GTC" in stop_only_review
+    assert "Trail amount" in stop_only_review
+    assert "SELL STP" in stop_only_review
+    assert "SELL STP LMT</span>" not in stop_only_review
+    assert stop_only_review.index("CANCEL BRACKET") < stop_only_review.index(
+        "Create TRAIL STP sell order"
+    )
 
     working = _trailing_scenario_workbench(tmp_path / "working", "working-trail")
     working_page = TestClient(working.app).get(working.path).text
