@@ -209,6 +209,7 @@ class IbkrSnapshotBroker:
                         duration_ms=round((monotonic() - wait_started) * 1000, 1),
                         complete=complete,
                     )
+                _await_matching_pnl_reports(app, deadline)
             build_started = monotonic()
             result = _capture(app, self._connection_epoch, connected=app.connected)
             _trace_snapshot(
@@ -289,6 +290,7 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
             self.completed_history_errors: list[str] = []
             self.execution_drafts: dict[str, CapturedExecution] = {}
             self.commission_reports: dict[str, tuple[Decimal | None, str]] = {}
+            self.commission_report_signal = Event()
             self.completed_order_drafts: dict[int, CapturedCompletedOrder] = {}
 
         def _complete(self, name: str) -> None:
@@ -427,6 +429,7 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
                 pnl,
                 str(getattr(report, "currency", "")),
             )
+            self.commission_report_signal.set()
 
         def contractDetails(self, reqId: int, contractDetails: Any) -> None:
             if reqId != self.contract_request_id:
@@ -577,6 +580,19 @@ def _market_rule_exchange(details: Any, rule_id: int) -> str:
         if value.strip().isdigit() and int(value.strip()) == rule_id:
             return exchange.strip()
     return ""
+
+
+def _await_matching_pnl_reports(app: Any, deadline: float) -> None:
+    """Allow P&L callbacks to follow the execution-history end marker."""
+    if not app.events["executions"].is_set() or not app.execution_drafts:
+        return
+    grace_deadline = min(deadline, monotonic() + 0.75)
+    while not set(app.execution_drafts).issubset(app.commission_reports):
+        remaining = grace_deadline - monotonic()
+        if remaining <= 0:
+            break
+        app.commission_report_signal.wait(min(remaining, 0.1))
+        app.commission_report_signal.clear()
 
 
 def _capture(app: Any, epoch: int, *, connected: bool) -> BrokerCapture:

@@ -14,8 +14,12 @@ and trailing stop-limit workflow.
 3. [ ] Allow an app-owned trailing stop-limit order to be modified through a
    reviewed, verified paper-order workflow.
 4. [ ] Capture and display realized P&L when a trailing exit fills. Investigate
-   why the completed sale still showed `$0`, and reconcile fills and fees before
-   treating the result as realized.
+   why the completed sale still showed `$0`. Use TWS-reported realized P&L for
+   the exact trailing SELL executions; do not calculate it from fills or track
+   fees separately. A missing report stays pending, while a reported zero is
+   displayed as zero. The app briefly waits for P&L callbacks after execution
+   history completes. Verify the original `$0` symptom with a paper TWS fill;
+   the original session has no saved callback trace.
 5. [x] Show the trailing layer row after it closes, within the closed-position
    state, using its completed outcome rather than dropping the row.
 6. [ ] Add the current bid, ask, and average position price to the **Convert

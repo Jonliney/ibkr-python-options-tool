@@ -214,9 +214,12 @@ The layer display records trailing fills only from complete execution history
 whose account, contract ID, permanent order ID, and SELL side match the
 app-owned trailing order. It marks the trail sold in the closed-position view
 only when those fills account for its full quantity. A missing or conflicting
-fill remains unresolved. The displayed realised P&L requires a USD
-commission/fees report for every matching execution; until then it remains
-unavailable rather than displaying zero. A broker callback or a disappeared
+fill remains unresolved. The displayed realised P&L sums TWS-reported
+`realizedPNL` from a matching USD `commissionAndFeesReport` (or legacy
+`commissionReport`) for each execution. Fees are not tracked or reconstructed
+separately. The app waits briefly for those callbacks after `execDetailsEnd`;
+if any P&L report is missing, the result stays pending until a later refresh.
+A reported zero is displayed as zero. A broker callback or a disappeared
 position alone is not evidence of the final outcome.
 
 The protective leg may be a SELL `STP LMT` for a new paper draft. The

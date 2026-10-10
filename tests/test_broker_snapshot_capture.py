@@ -1,11 +1,13 @@
 import json
 from decimal import Decimal
-from threading import Event
-from time import monotonic
+from threading import Event, Thread
+from time import monotonic, sleep
 from types import SimpleNamespace
 
 from ibkr_options_manager.broker.ibkr import (
     _await,
+    _await_matching_pnl_reports,
+    _build_capture_app,
     _capture,
     _observed_stop_price,
     _OrderDraft,
@@ -16,6 +18,7 @@ from ibkr_options_manager.broker.read_only import (
     CapturedExecution,
 )
 from ibkr_options_manager.cancellation_trace import current_snapshot_context
+from ibkr_options_manager.ibkr_probe import _IbapiImports
 
 
 def _order(*, order_id: int) -> _OrderDraft:
@@ -44,6 +47,47 @@ def test_trailing_stop_uses_reported_trigger_not_trailing_amount() -> None:
     assert _observed_stop_price(
         SimpleNamespace(orderType="STP", auxPrice=0.75)
     ) == Decimal("0.75")
+
+
+def test_execution_capture_waits_for_matching_pnl_report() -> None:
+    executions_done = Event()
+    executions_done.set()
+    app = SimpleNamespace(
+        events={"executions": executions_done},
+        execution_drafts={"fill.01": object()},
+        commission_reports={},
+        commission_report_signal=Event(),
+    )
+
+    def deliver() -> None:
+        sleep(0.03)
+        app.commission_reports["fill.01"] = (Decimal("147.75"), "USD")
+        app.commission_report_signal.set()
+
+    worker = Thread(target=deliver)
+    worker.start()
+    _await_matching_pnl_reports(app, monotonic() + 0.5)
+    worker.join(timeout=0.5)
+    assert app.commission_reports["fill.01"] == (Decimal("147.75"), "USD")
+
+
+def test_tws_report_captures_raw_pnl_including_zero() -> None:
+    class Wrapper:
+        pass
+
+    class Client:
+        def __init__(self, wrapper):
+            self.wrapper = wrapper
+
+    app = _build_capture_app(_IbapiImports(Client, Wrapper, object, object))
+    app.commissionAndFeesReport(
+        SimpleNamespace(execId="fill.01", realizedPNL=147.75, currency="USD")
+    )
+    app.commissionReport(
+        SimpleNamespace(execId="fill.02", realizedPNL=0, currency="USD")
+    )
+    assert app.commission_reports["fill.01"] == (Decimal("147.75"), "USD")
+    assert app.commission_reports["fill.02"] == (Decimal("0"), "USD")
 
 
 def test_capture_prefers_client_bound_order_over_nonbinding_all_order_view() -> None:

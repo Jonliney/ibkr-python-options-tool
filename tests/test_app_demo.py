@@ -58,6 +58,7 @@ from ibkr_options_manager.app.web.surface import (
     _projection_gain_value,
     _projection_loss_value,
     _toast_notice,
+    _trailing_fill_summary,
 )
 from ibkr_options_manager.app.web_window import (
     StarUIPlannerWindow,
@@ -231,6 +232,46 @@ def test_closed_trail_keeps_row_but_withholds_pnl_without_report() -> None:
     assert "P&amp;L pending" in page or "P&L pending" in page
     assert "Realised P&amp;L" in page or "Realised P&L" in page
     assert "+$0.00" not in page
+
+
+@pytest.mark.parametrize("reported_pnl", ["147.75", "0"])
+def test_closed_trail_uses_raw_tws_reported_pnl(reported_pnl: str) -> None:
+    entry = JournalEntry(
+        fingerprint="trailing-conversion:" + "d" * 64,
+        account=DEMO_ACCOUNT,
+        con_id=1_004_470_201,
+        state="SUBMITTED",
+        perm_ids=(90210,),
+        trailing_quantity=3,
+        fills=(
+            JournalFill(
+                "trail.01", 90210, "SLD", "3", "9.10", "now", reported_pnl, "USD"
+            ),
+        ),
+    )
+    summary = _trailing_fill_summary(entry)
+    assert summary is not None
+    assert summary.quantity == Decimal("3")
+    assert summary.realized_pnl == Decimal(reported_pnl)
+
+
+def test_trailing_pnl_sums_matching_partial_fill_reports() -> None:
+    entry = JournalEntry(
+        fingerprint="trailing-conversion:" + "e" * 64,
+        account=DEMO_ACCOUNT,
+        con_id=1_004_470_201,
+        state="SUBMITTED",
+        perm_ids=(90210,),
+        trailing_quantity=3,
+        fills=(
+            JournalFill("trail.01", 90210, "SLD", "1", "9.00", "first", "39", "USD"),
+            JournalFill("trail.02", 90210, "SLD", "2", "9.20", "second", "118", "USD"),
+        ),
+    )
+    summary = _trailing_fill_summary(entry)
+    assert summary is not None
+    assert summary.quantity == Decimal("3")
+    assert summary.realized_pnl == Decimal("157")
 
 
 def test_closed_history_refresh_records_exact_broker_evidence(monkeypatch) -> None:
