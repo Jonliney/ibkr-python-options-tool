@@ -62,6 +62,7 @@ from ...execution import (
     LayerOutcome,
     MarketExitCandidate,
     PaperExecutionService,
+    PositionMarketExitPlan,
     PriceUpdateCandidate,
     TrailingChangeCandidate,
     ambiguous_oca_prefixes,
@@ -193,6 +194,7 @@ class StarUIWorkbench:
         self._recovery_requested_fingerprint: str | None = None
         self._recovery_requested_layer_index: int | None = None
         self._armed_market_exit: MarketExitCandidate | None = None
+        self._armed_position_exit: PositionMarketExitPlan | None = None
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
         self._armed_cancellation: MarketExitCandidate | None = None
         self._armed_cancellations: tuple[MarketExitCandidate, ...] = ()
@@ -729,6 +731,8 @@ class StarUIWorkbench:
                 self._arm_trailing_change_locked(action, values, cancel=True)
             elif action == "active-action-execute":
                 self._execute_active_action_locked()
+            elif action == "position-exit-confirm":
+                self._confirm_position_exit_locked()
             elif action == "market-exit-confirm":
                 self._confirm_market_exit_locked()
             elif action == "cancel-pair-confirm":
@@ -1049,6 +1053,7 @@ class StarUIWorkbench:
         self._armed_execution = None
         self._armed_execution_deadline = None
         self._armed_market_exit = None
+        self._armed_position_exit = None
         self._armed_market_exits = ()
         self._armed_cancellation = None
         self._armed_cancellations = ()
@@ -1287,6 +1292,19 @@ class StarUIWorkbench:
             self._message = "Paper order management is disabled for this launch."
             self._trace_bulk_cancel("stage_blocked", reason="unavailable")
             return
+        trails = [
+            entry for entry in self._trailing_entries() if entry.state == "SUBMITTED"
+        ]
+        if trails:
+            if len(trails) != 1 or self._active_target_perm_ids():
+                self._message = (
+                    "Exit cancellation blocked: the active exit set is ambiguous."
+                )
+                return
+            self._arm_trailing_change_locked(
+                f"trailing-delete-arm:{trails[0].perm_ids[0]}", {}, cancel=True
+            )
+            return
         target_ids = self._active_target_perm_ids()
         snapshot = self._view_model.latest_snapshot()
         if not target_ids or snapshot is None:
@@ -1511,9 +1529,36 @@ class StarUIWorkbench:
                     raise ExecutionBlocked(
                         "The trailing order is missing or ambiguous."
                     )
+                if (
+                    values.get("raise_stops_only") == "yes"
+                    and orders[0].stop_price is not None
+                    and orders[0].stop_price
+                    >= round_up_price(
+                        snapshot.position.unit_basis, snapshot.market_rule.bands
+                    )
+                ):
+                    raise ExecutionBlocked(
+                        "The stop is already at or above B/E. Refresh to review its current price."
+                    )
                 stop, trail_value, gap = trailing_edit_prices(
-                    snapshot, orders[0], value, trail_unit, offset, offset_unit
+                    snapshot,
+                    orders[0],
+                    value,
+                    trail_unit,
+                    offset,
+                    offset_unit,
+                    stop_price=_decimal_value(
+                        values.get(f"trailing_exact_stop_{perm_id}", "")
+                    ),
                 )
+                if values.get(f"trailing_exact_stop_{perm_id}", "").strip():
+                    if _decimal_value(values[f"trailing_exact_stop_{perm_id}"]) is None:
+                        raise ExecutionBlocked("Enter a valid STP price.")
+                    trail_unit = "dollars"
+                    values[f"trailing_value_{perm_id}"] = _price_text(
+                        trail_value * snapshot.contract.multiplier
+                    )
+                    values[f"trailing_value_unit_{perm_id}"] = "dollars"
             elif not cancel:
                 if f"trailing_limit_{perm_id}" not in values:
                     raise ExecutionBlocked(
@@ -1618,7 +1663,8 @@ class StarUIWorkbench:
             self._paper_execution is None
             or self._selected_con_id is None
             or (
-                not market_exits
+                self._armed_position_exit is None
+                and not market_exits
                 and cancellation is None
                 and not cancellations
                 and trailing is None
@@ -1671,7 +1717,23 @@ class StarUIWorkbench:
             self._message = "Execution blocked: the fresh snapshot is unavailable."
             return
         try:
-            if trailing is not None:
+            if self._armed_position_exit is not None:
+                plan = self._armed_position_exit
+                if set(self._active_target_perm_ids()) != {
+                    pair.target_perm_id for pair in plan.pairs
+                }:
+                    raise ExecutionBlocked(
+                        "the set of active exits changed after review"
+                    )
+                self._paper_execution.verify_position_exit_baseline(snapshot, plan)
+                refreshed = self._paper_execution.prepare_position_market_exit(
+                    snapshot,
+                    target_perm_ids=self._active_target_perm_ids(),
+                    expected_client_id=self._settings.client_id,
+                )
+                if refreshed != plan:
+                    raise ExecutionBlocked("the position exits changed after review")
+            elif trailing is not None:
                 self._paper_execution.verify_trailing_baseline(snapshot, trailing)
                 if set(self._active_target_perm_ids()) != {
                     item.target_perm_id for item in trailing.candidates
@@ -2142,41 +2204,117 @@ class StarUIWorkbench:
             self._message = f"Cancelled row could not be removed: {error}"
             return
 
-    def _arm_selected_market_exit_locked(self, values: dict[str, str]) -> None:
-        """Review an all-active-layer exit from the displayed snapshot."""
-        del values
-        selected = self._active_target_perm_ids()
-        if not selected:
-            self._message = (
-                "Select at least one active layer for the staged paper MKT exit."
-            )
-            return
-        if self._paper_execution is None or self._selected_con_id is None:
-            self._message = "Paper order management is disabled for this launch."
-            return
-        self._disarm_execution_locked()
+    def _position_exit_snapshot_locked(self) -> BrokerSnapshot:
+        if self._selected_con_id is None:
+            raise ExecutionBlocked("select a position before reviewing an exit")
+        state = self._view_model.select_position(
+            self._selected_con_id,
+            self._plan_form(self._drafts.get(self._selected_con_id, ())),
+            include_quote=False,
+        )
+        self._apply_state_locked(state)
+        self._record_refresh_time_locked()
+        self._announce_reconciliation_locked()
         snapshot = self._view_model.latest_snapshot()
         if snapshot is None:
-            self._message = (
-                "Market exit blocked: a fresh selected-position snapshot is required."
-            )
+            raise ExecutionBlocked("the fresh position snapshot is unavailable")
+        return snapshot
+
+    def _arm_selected_market_exit_locked(self, values: dict[str, str]) -> None:
+        del values
+        self._disarm_execution_locked()
+        if self._paper_execution is None:
+            self._message = "Paper order management is disabled for this launch."
             return
         try:
-            candidates = self._paper_execution.prepare_market_exits(
-                snapshot,
-                target_perm_ids=selected,
-                expected_client_id=self._settings.client_id,
+            snapshot = self._view_model.latest_snapshot()
+            if snapshot is None:
+                raise ExecutionBlocked("the selected-position snapshot is unavailable")
+            self._armed_position_exit = (
+                self._paper_execution.prepare_position_market_exit(
+                    snapshot,
+                    target_perm_ids=self._active_target_perm_ids(),
+                    expected_client_id=self._settings.client_id,
+                )
             )
         except ExecutionBlocked as error:
-            self._message = f"Market exit blocked: {error}"
+            self._message = f"Position exit blocked: {error}"
             return
-        self._armed_market_exits = candidates
-        self._review_all_active_exits = True
-        total = sum((candidate.quantity for candidate in candidates), Decimal("0"))
         self._set_review_status_locked(
-            f"Review cancellation of {len(candidates)} OCA layers and one MKT sell "
-            f"for {total} contracts, then review the market sell."
+            "Review cancellation of all app-owned exits and one market sell for the entire held position."
         )
+
+    def _confirm_position_exit_locked(self) -> None:
+        if self._expire_confirmation_locked(require_deadline=True):
+            self._message = "Review expired. Review the position exit again."
+            return
+        plan = self._armed_position_exit
+        service = self._paper_execution
+        if plan is None or service is None or not self._active_action_verified:
+            self._message = "Review the position exit before confirming."
+            return
+        cancelled = 0
+        try:
+            for index, pair in enumerate(plan.pairs):
+                snapshot = self._position_exit_snapshot_locked()
+                service.verify_position_exit_baseline(snapshot, plan)
+                fresh = service.prepare_position_market_exit(
+                    snapshot,
+                    target_perm_ids=self._active_target_perm_ids(),
+                    expected_client_id=self._settings.client_id,
+                )
+                if fresh.pairs != plan.pairs[index:] or fresh.trail != plan.trail:
+                    raise ExecutionBlocked(
+                        "the working exits changed during cancellation"
+                    )
+                service.cancel_pair(
+                    snapshot,
+                    pair,
+                    host="127.0.0.1",
+                    port=self._settings.port,
+                    client_id=self._settings.client_id,
+                    timeout_seconds=self._settings.timeout_seconds,
+                )
+                cancelled += 1
+            if plan.trail is not None:
+                snapshot = self._position_exit_snapshot_locked()
+                service.verify_position_exit_baseline(snapshot, plan)
+                fresh = service.prepare_position_market_exit(
+                    snapshot,
+                    target_perm_ids=self._active_target_perm_ids(),
+                    expected_client_id=self._settings.client_id,
+                )
+                if fresh.pairs or fresh.trail != plan.trail:
+                    raise ExecutionBlocked(
+                        "the trailing exit changed during cancellation"
+                    )
+                service.submit_trailing_change(
+                    snapshot,
+                    plan.trail,
+                    host="127.0.0.1",
+                    port=self._settings.port,
+                    client_id=self._settings.client_id,
+                    timeout_seconds=self._settings.timeout_seconds,
+                )
+                cancelled += 1
+            snapshot = self._position_exit_snapshot_locked()
+            service.submit_position_market_exit(
+                snapshot,
+                plan,
+                host="127.0.0.1",
+                port=self._settings.port,
+                client_id=self._settings.client_id,
+                timeout_seconds=self._settings.timeout_seconds,
+            )
+        except Exception as error:
+            self._message = f"Position exit stopped after {cancelled} cancellations: {error}. Check TWS and refresh."
+        else:
+            self._refresh_after_acknowledged_write_locked(
+                "TWS acknowledged the position market exit. Check TWS for fills.",
+                include_quote=False,
+            )
+        finally:
+            self._disarm_execution_locked()
 
     def _confirm_market_exit_locked(self) -> None:
         if self._expire_confirmation_locked(require_deadline=True):
@@ -2369,6 +2507,14 @@ class StarUIWorkbench:
                         or (),
                     )
                 )
+                if (
+                    values.get("raise_stops_only") == "yes"
+                    and stop.stop_price is not None
+                    and desired_stop < stop.stop_price
+                ):
+                    raise ExecutionBlocked(
+                        "A stop is already above B/E. Refresh before reviewing changes."
+                    )
                 next_stop = (
                     desired_stop
                     if exact_stop_text and desired_stop != stop.stop_price
@@ -4260,6 +4406,7 @@ class StarUIWorkbench:
             # Partial trailing fills are not included in the held/total and
             # outcome projection yet; avoid presenting zero as a verified result.
             realized = None
+        working_trails = any(entry.state == "SUBMITTED" for entry in trailing_entries)
         return self._workspace_content(
             self._selected_quantity_notice(),
             Div(
@@ -4286,17 +4433,22 @@ class StarUIWorkbench:
                                     size="icon",
                                     type="button",
                                     data_move_stops_to_be=True,
-                                    aria_label="Move all active stops to B/E",
+                                    aria_label="Raise stops to B/E",
                                     disabled=self._paper_execution is None
                                     or bool(self._armed_price_updates)
+                                    or self._armed_position_exit is not None
+                                    or self._armed_trailing_change is not None
                                     or not self._active_stop_limits_editable(
                                         active_pairs
                                     ),
                                 ),
                                 delay_duration=250,
                             ),
-                            TooltipContent("Move every active stop to break even"),
+                            TooltipContent(
+                                "Raise stops below entry to B/E; keep higher stops unchanged"
+                            ),
                         ),
+                        Separator(orientation="vertical", cls="h-5 self-center"),
                         Tooltip(
                             TooltipTrigger(
                                 Button(
@@ -4311,13 +4463,15 @@ class StarUIWorkbench:
                                     form="active-form",
                                     name="action",
                                     value="cancel-all-active",
-                                    aria_label="Delete all active layers",
+                                    aria_label="Cancel all exits",
                                     disabled=self._paper_execution is None
-                                    or bool(self._armed_price_updates),
+                                    or bool(self._armed_price_updates)
+                                    or self._armed_position_exit is not None
+                                    or self._armed_trailing_change is not None,
                                 ),
                                 delay_duration=250,
                             ),
-                            TooltipContent("Cancel every active layer"),
+                            TooltipContent("Cancel all exits and keep the contracts"),
                         ),
                         Tooltip(
                             TooltipTrigger(
@@ -4333,26 +4487,31 @@ class StarUIWorkbench:
                                     form="active-form",
                                     name="action",
                                     value="market-exit-selected",
-                                    aria_label="Sell all active layers",
+                                    aria_label="Exit position now",
                                     disabled=self._paper_execution is None
-                                    or bool(self._armed_price_updates),
+                                    or bool(self._armed_price_updates)
+                                    or self._armed_position_exit is not None
+                                    or self._armed_trailing_change is not None,
                                 ),
                                 delay_duration=250,
                             ),
-                            TooltipContent("Sell every active layer now"),
+                            TooltipContent(
+                                "Cancel app-owned exits, then market-sell the entire position"
+                            ),
                         ),
-                        self._trailing_conversion_dialog(),
+                        self._trailing_conversion_dialog() if active_pairs else None,
                         cls="flex items-center gap-2",
                     )
-                    if active_pairs
+                    if active_pairs or working_trails
                     else None,
                     self._trailing_conversion_dialog()
                     if not active_pairs
+                    and not working_trails
                     and selected_snapshot is not None
                     and selected_snapshot.position.quantity > 0
                     else None,
                     Separator(orientation="vertical", cls="h-5 self-center")
-                    if active_pairs and draft_allowed
+                    if (active_pairs or working_trails) and draft_allowed
                     else None,
                     Div(
                         Tooltip(
@@ -4703,7 +4862,15 @@ class StarUIWorkbench:
         has_stop_limit = any(
             stop.order_type == "STP LMT" for _group, _target, stop in pairs
         )
+        has_stop_limit |= any(
+            order.order_type == "TRAIL LIMIT" for order in self._state.working_orders
+        )
         current_prices = {stop.stop_price for _group, _target, stop in pairs}
+        current_prices.update(
+            order.stop_price
+            for order in self._state.working_orders
+            if order.order_type in {"TRAIL", "TRAIL LIMIT"}
+        )
         initial_price = next(iter(current_prices)) if len(current_prices) == 1 else None
         initial_return = (
             _price_percentage(initial_price, basis, target=True)
@@ -4732,17 +4899,19 @@ class StarUIWorkbench:
                         Icon("lucide:arrow-up", cls="size-4", aria_hidden="true"),
                         variant="outline",
                         size="icon",
-                        aria_label="Set all active stops",
+                        aria_label="Set all stops…",
                         disabled=self._paper_execution is None
                         or bool(self._armed_price_updates)
+                        or self._armed_position_exit is not None
+                        or self._armed_trailing_change is not None
                         or not self._active_stop_limits_editable(pairs),
                         data_on_click=evt.currentTarget.blur(),
                     ),
                     DialogContent(
                         DialogHeader(
-                            DialogTitle("Set all active stops"),
+                            DialogTitle("Set all stops…"),
                             DialogDescription(
-                                "Enter a stop price or return percentage to be applied to all active layers."
+                                "Enter a common stop price. For trails, review also shows the resulting trail distance and limit price."
                             ),
                         ),
                         Div(
@@ -5629,6 +5798,12 @@ class StarUIWorkbench:
             if working_count
             or any(entry.state == "SUBMITTED" for entry in self._trailing_entries())
             else None,
+            HTMLInput(
+                type="hidden",
+                name="raise_stops_only",
+                value="",
+                data_raise_stops_only=True,
+            ),
             id="active-form",
             action=f"/{self.session_token}/action",
             method="post",
@@ -5750,7 +5925,7 @@ class StarUIWorkbench:
                 initial_stop=order.stop_price if order else None,
                 description="Distance below the market reference used to calculate the trailing stop. $ is per contract; % is based on the bid.",
                 disabled=not modifiable,
-                readonly=staged,
+                readonly=staged or self._armed_position_exit is not None,
             ),
             (
                 _trailing_readonly_field(
@@ -5774,7 +5949,7 @@ class StarUIWorkbench:
                 initial_stop=order.stop_price if order else None,
                 description="Gap below the STP used to calculate the trailing limit. $ is per contract; % is based on STP and becomes a fixed dollar gap when reviewed.",
                 disabled=not modifiable,
-                readonly=staged,
+                readonly=staged or self._armed_position_exit is not None,
             ),
             _field(
                 "Quantity",
@@ -5799,7 +5974,7 @@ class StarUIWorkbench:
                     variant="outline",
                     size="icon",
                     aria_label=f"Delete trail {index}",
-                    disabled=not modifiable,
+                    disabled=not modifiable or self._armed_position_exit is not None,
                     cls="mt-5",
                 ),
                 "Cancel this active trail",
@@ -5886,6 +6061,7 @@ class StarUIWorkbench:
                     min="0.1",
                     step="0.1",
                     disabled=bool(self._armed_price_updates)
+                    or self._armed_position_exit is not None
                     or (stop.order_type == "STP LMT" and saved_rule is None),
                     data_active_input="target",
                     data_active_perm_id=target.perm_id,
@@ -5913,6 +6089,7 @@ class StarUIWorkbench:
                         min="-99.9",
                         step="any",
                         disabled=bool(self._armed_price_updates)
+                        or self._armed_position_exit is not None
                         or (stop.order_type == "STP LMT" and saved_rule is None),
                         data_active_input="stop",
                         data_active_perm_id=target.perm_id,
@@ -5981,7 +6158,8 @@ class StarUIWorkbench:
                     type="submit",
                     name="action",
                     value=f"cancel-pair-arm:{target.perm_id}",
-                    disabled=self._paper_execution is None,
+                    disabled=self._paper_execution is None
+                    or self._armed_position_exit is not None,
                     aria_label=f"Delete OCA layer {index}",
                     cls="mt-5",
                 ),
@@ -6873,7 +7051,11 @@ class StarUIWorkbench:
             exits=tuple(observed),
             unresolved=unresolved,
         )
-        market_exit = bool(self._armed_market_exits or self._armed_market_exit)
+        market_exit = bool(
+            self._armed_market_exits
+            or self._armed_market_exit
+            or self._armed_position_exit is not None
+        )
         proposed_outcome = project_position_outcome(
             held_quantity=held,
             realized_pnl=realized,
@@ -7029,7 +7211,30 @@ class StarUIWorkbench:
         price_updates = self._armed_price_updates
         armed_execution = self._armed_execution
         action_rows: list[Any] = []
-        if trailing is not None:
+        if self._armed_position_exit is not None:
+            plan = self._armed_position_exit
+            action_rows = [
+                self._review_cancellation_plan(pair, index=index)
+                for index, pair in enumerate(plan.pairs, start=1)
+            ]
+            if plan.trail is not None:
+                action_rows.append(self._review_trailing_change(plan.trail))
+            action_rows.append(
+                self._review_oca_pair(
+                    index=1,
+                    name="EXIT POSITION",
+                    quantity=format(plan.quantity, "f"),
+                    tif="GTC",
+                    lines=(
+                        self._review_order_line(
+                            "SELL MKT",
+                            Span("Entire held position", cls="text-xs font-semibold"),
+                            "text-rose-400",
+                        ),
+                    ),
+                )
+            )
+        elif trailing is not None:
             action_rows = self._review_trailing_plan(trailing)
         elif trailing_change is not None:
             action_rows = [self._review_trailing_change(trailing_change)]
@@ -7073,7 +7278,7 @@ class StarUIWorkbench:
             else Badge("TRAIL CHANGE", variant="outline", cls="text-[10px]")
             if trailing_change is not None
             else Badge("MKT EXIT", variant="outline", cls="text-[10px]")
-            if market_exits
+            if market_exits or self._armed_position_exit is not None
             else Badge("CANCEL", variant="outline", cls="text-[10px]")
             if cancellation is not None or cancellations
             else Badge("PRICE UPDATE", variant="outline", cls="text-[10px]")
@@ -7213,13 +7418,25 @@ class StarUIWorkbench:
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
         if (
-            self._armed_cancellation is not None
+            self._armed_position_exit is not None
+            or self._armed_cancellation is not None
             or self._armed_cancellations
             or market_exits
             or self._armed_trailing is not None
             or self._armed_trailing_change is not None
         ) and not self._active_action_verified:
             return self._reviewed_active_action_controls()
+        if self._armed_position_exit is not None:
+            return self._staged_action_controls(
+                confirm_action="position-exit-confirm",
+                busy_text="Exiting…",
+                impact=(
+                    "Exit entire position",
+                    (
+                        "Confirm cancels all reviewed app-owned exits, verifies the position and fills again, then submits one market sell for all held contracts. The fill price is not guaranteed.",
+                    ),
+                ),
+            )
         if self._armed_trailing is not None:
             return self._staged_action_controls(
                 confirm_action="trailing-convert-confirm",
@@ -7402,7 +7619,7 @@ class StarUIWorkbench:
                     else "Review trail changes"
                     if self._armed_trailing_change is not None
                     else "Review market sell"
-                    if market_exits
+                    if market_exits or self._armed_position_exit is not None
                     else "Review cancellation",
                     variant="default",
                     type="submit",
@@ -8594,14 +8811,15 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         const limitInput = form.querySelector(`[name="trailing_offset_${{permId}}"]`);
         const stopUnit = form.querySelector(`[data-trailing-unit="${{stopInput.name}}"]`);
         const limitUnit = form.querySelector(`[data-trailing-unit="${{limitInput.name}}"]`);
-        const stopEdited = Number(stopInput.value) !== Number(stopInput.dataset.trailingInitial) || stopUnit.value !== stopUnit.dataset.trailingInitial;
+        const exactStop = form.querySelector(`[data-trailing-exact-stop="${{stopInput.name}}"]`);
+        const stopEdited = Boolean(exactStop?.value) || Number(stopInput.value) !== Number(stopInput.dataset.trailingInitial) || stopUnit.value !== stopUnit.dataset.trailingInitial;
         const limitEdited = limitInput.value.trim() !== limitInput.dataset.trailingInitial || limitUnit.value !== limitUnit.dataset.trailingInitial;
         const trailEdited = stopEdited || limitEdited;
         edited ||= trailEdited;
         const value = Number(stopInput.value), gapValue = Number(limitInput.value), bid = Number(config.bid);
         const noStop = !stopInput.value.trim(), noLimit = !limitInput.value.trim();
         const distance = stopUnit.value === 'percent' ? bid * value / 100 : value / multiplier;
-        const stop = stopEdited ? roundDown(bid - distance) : Number(stopInput.dataset.trailingStop);
+        const stop = exactStop?.value ? Number(exactStop.value) : stopEdited ? roundDown(bid - distance) : Number(stopInput.dataset.trailingStop);
         const gap = limitUnit.value === 'percent' ? stop * gapValue / 100 : gapValue / multiplier;
         const limit = stop - roundUp(gap);
         let stopError = '', limitError = '';
@@ -8675,6 +8893,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
     }};
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('input', () => {{
       if (input.dataset.activeInput === 'stop') {{
+        form.querySelector('[data-raise-stops-only]').value = '';
         const exact = form.querySelector(`[data-active-exact-stop="${{input.dataset.activePermId}}"]`);
         if (exact) exact.value = '';
       }}
@@ -8689,9 +8908,30 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
     }});
     form.querySelectorAll('[data-trailing-unit-button]').forEach((button) => button.addEventListener('click', () => {{
       form.querySelector(`[data-trailing-unit="${{button.dataset.trailingUnitButton}}"]`).value = button.dataset.unit;
+      const exact = form.querySelector(`[data-trailing-exact-stop="${{button.dataset.trailingUnitButton}}"]`);
+      if (exact) exact.value = '';
+      form.querySelector('[data-raise-stops-only]').value = '';
+      form.querySelector('[data-raise-stops-only]').value = '';
       showTrailUnits(); update();
     }}));
-    form.querySelectorAll('[data-trailing-edit]').forEach((input) => input.addEventListener('input', update));
+    form.querySelectorAll('[data-trailing-edit]').forEach((input) => input.addEventListener('input', () => {{
+      if (input.dataset.trailingEdit === 'STP') {{
+        form.querySelector('[data-raise-stops-only]').value = '';
+        const exact = form.querySelector(`[data-trailing-exact-stop="${{input.name}}"]`);
+        if (exact) exact.value = '';
+      }}
+      update();
+    }}));
+    const setTrailStops = (stop, raiseOnly = false) => {{
+      form.querySelectorAll('[data-trailing-edit="STP"]:not(:disabled):not([readonly])').forEach((input) => {{
+        if (raiseOnly && Number(input.dataset.trailingStop) >= stop) return;
+        const distance = roundUp(Number(config.bid) - stop);
+        input.value = Number.isFinite(distance) && distance > 0 ? String(Number((distance * multiplier).toFixed(6))) : '';
+        form.querySelector(`[data-trailing-unit="${{input.name}}"]`).value = 'dollars';
+        form.querySelector(`[data-trailing-exact-stop="${{input.name}}"]`).value = String(stop);
+      }});
+      showTrailUnits();
+    }};
     document.querySelectorAll('[data-edit-active-prices]').forEach((button) => button.addEventListener('click', () => {{
       const firstPrice = form.querySelector('[data-active-input]:not(:disabled), [data-trailing-edit]:not(:disabled)');
       if (!firstPrice) return;
@@ -8700,12 +8940,16 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
     }}));
     form.querySelectorAll('[data-active-input]').forEach((input) => input.addEventListener('change', update));
     document.querySelectorAll('[data-move-stops-to-be]').forEach((button) => button.addEventListener('click', () => {{
-      form.querySelectorAll('[data-active-exact-stop]').forEach((input) => {{ input.value = ''; }});
+      form.querySelectorAll('[data-active-exact-stop], [data-trailing-exact-stop]').forEach((input) => {{ input.value = ''; }});
       form.querySelectorAll('input[type="hidden"][data-active-stop-limit-offset], input[type="hidden"][data-active-stop-limit-unit]').forEach((input) => {{ input.value = ''; }});
       form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{
+        if (Number(input.dataset.activeOriginal) >= basis || Number(input.value) >= 0) return;
         input.value = '0';
         input.dispatchEvent(new Event('input', {{ bubbles: true }}));
       }});
+      setTrailStops(roundUp(basis), true);
+      form.querySelector('[data-raise-stops-only]').value = 'yes';
+      update();
     }}));
     const stopDialog = document.querySelector('[data-stop-dialog]');
     if (stopDialog) {{
@@ -8791,6 +9035,15 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
           if (offsetField) offsetField.value = offsetOverride?.checked && input.dataset.activeStopLimitPrice ? offsetValue.value : '';
           if (unitField) unitField.value = offsetOverride?.checked && input.dataset.activeStopLimitPrice ? offsetUnit : '';
         }});
+        form.querySelector('[data-raise-stops-only]').value = '';
+        setTrailStops(value.rounded);
+        if (offsetOverride?.checked) {{
+          form.querySelectorAll('[data-trailing-edit="LMT"]').forEach((input) => {{
+            input.value = offsetValue.value;
+            form.querySelector(`[data-trailing-unit="${{input.name}}"]`).value = offsetUnit;
+          }});
+          showTrailUnits();
+        }}
         update();
         stopDialog.closest('dialog')?.close();
       }});
@@ -8805,7 +9058,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         input.value = input.dataset.trailingInitial || '';
       }});
       showTrailUnits();
-      form.querySelectorAll('[data-active-exact-stop]').forEach((input) => {{ input.value = ''; }});
+      form.querySelectorAll('[data-active-exact-stop], [data-trailing-exact-stop]').forEach((input) => {{ input.value = ''; }});
       form.querySelectorAll('input[type="hidden"][data-active-stop-limit-offset], input[type="hidden"][data-active-stop-limit-unit]').forEach((input) => {{ input.value = ''; }});
       update();
     }}));
@@ -8914,6 +9167,14 @@ def _trailing_edit_field(
                 else "",
                 aria_describedby=f"{name}-error",
             ),
+            HTMLInput(
+                type="hidden",
+                name=name.replace("trailing_value_", "trailing_exact_stop_"),
+                value="",
+                data_trailing_exact_stop=name,
+            )
+            if kind == "STP"
+            else None,
             HTMLInput(
                 type="hidden",
                 name=name.replace("trailing_value_", "trailing_value_unit_").replace(

@@ -83,6 +83,7 @@ from ibkr_options_manager.execution import (
     LayerOutcome,
     MarketExitCandidate,
     PaperExecutionService,
+    PositionMarketExitPlan,
     PriceUpdateCandidate,
 )
 from ibkr_options_manager.portfolio import PortfolioCoordinator, PortfolioStatus
@@ -3848,15 +3849,15 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert "$27.6128028335" not in cost_page
     workbench._view_model.latest_snapshot = original_latest_snapshot  # type: ignore[method-assign]
     header = page.text.split('id="active-form"', maxsplit=1)[0]
-    assert 'aria-label="Set all active stops"' in header
+    assert 'aria-label="Set all stops…"' in header
     assert "evt.stopPropagation()" in header
     assert 'aria-label="Enter return percentage from entry"' in header
     assert "data-stop-mode-group" in header
     assert "Choose a percentage or price" not in header
     assert 'aria-label="Stop value unit"' in header
     assert (
-        "Enter a stop price or return percentage to be applied to all active layers."
-        in header
+        "Enter a common stop price. For trails, review also shows the resulting "
+        "trail distance and limit price." in header
     )
     assert "data-stop-dialog-inverse" in header
     assert "Active layers" in header and "Entry cost" in header
@@ -3873,21 +3874,21 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert header.index('data-stop-preset="0"') < header.index('data-stop-preset="-20"')
     assert header.index('data-stop-preset="-35"') < header.rindex("Active layers")
     assert "Apply to active layers" in header
-    assert 'aria-label="Move all active stops to B/E"' in header
+    assert 'aria-label="Raise stops to B/E"' in header
     assert re.search(r'<button[^>]*type="button"[^>]*data-move-stops-to-be', header)
-    assert 'aria-label="Delete all active layers"' in header
-    assert 'aria-label="Sell all active layers"' in header
+    assert 'aria-label="Cancel all exits"' in header
+    assert 'aria-label="Exit position now"' in header
     assert 'data-orientation="vertical"' in header
     assert 'form="active-form" name="action" value="market-exit-selected"' in header
     assert 'form="active-form" name="action" value="cancel-all-active"' in header
     assert (
-        header.index('aria-label="Move all active stops to B/E"')
-        < header.index('aria-label="Delete all active layers"')
-        < header.index('aria-label="Sell all active layers"')
+        header.index('aria-label="Raise stops to B/E"')
+        < header.index('aria-label="Cancel all exits"')
+        < header.index('aria-label="Exit position now"')
         < header.index('aria-label="Split draft layer quantities"')
     )
-    assert header.index('aria-label="Set all active stops"') < header.index(
-        'aria-label="Move all active stops to B/E"'
+    assert header.index('aria-label="Set all stops…"') < header.index(
+        'aria-label="Raise stops to B/E"'
     )
     assert "data-reset-active-prices" in page.text
     assert "Cancel changes" in page.text
@@ -4757,7 +4758,7 @@ def test_reset_active_prices_restores_target_and_stop_after_move_to_be() -> None
     view.close()
 
     assert results == [
-        '{"afterMove":["60","0",1,false,"true","$10","$9.5"],"afterReset":["50","25","25",true,"false"]}'
+        '{"afterMove":["60","25",0,false,"true","",""],"afterReset":["50","25","25",true,"false"]}'
     ]
 
 
@@ -5739,7 +5740,7 @@ def test_delete_all_active_layers_traces_final_refresh_after_disarm(
     [
         ("cancel-pair-arm:101", "cancel-pair-confirm", 1),
         ("market-exit-arm:101", "market-exit-confirm", 1),
-        ("market-exit-selected", "market-exit-confirm", 2),
+        ("market-exit-selected", "position-exit-confirm", 2),
     ],
 )
 def test_active_action_reviews_before_refresh_and_requires_execute(
@@ -5768,6 +5769,17 @@ def test_active_action_reviews_before_refresh_and_requires_execute(
         owned_perm_ids=lambda **_kwargs: frozenset(),
         prepare_market_exit=lambda *_args, **_kwargs: candidates[0],
         prepare_market_exits=lambda *_args, **_kwargs: candidates,
+        prepare_position_market_exit=lambda *_args, **_kwargs: PositionMarketExitPlan(
+            snapshot.selected,
+            snapshot.contract,
+            snapshot.position.quantity,
+            snapshot.position.unit_basis,
+            snapshot.position.raw_average_cost,
+            frozenset(),
+            snapshot.connection_epoch,
+            candidates,
+        ),
+        verify_position_exit_baseline=lambda *_args: None,
     )
     monkeypatch.setattr(workbench, "_active_target_perm_ids", lambda: (101, 103))
     monkeypatch.setattr(workbench, "_announce_reconciliation_locked", lambda: None)
@@ -8136,3 +8148,136 @@ def test_offset_edit_preserves_ratcheted_stop_and_rejects_invalid_rule(
             None,
             "dollars",
         )
+
+
+@pytest.mark.parametrize("action", ["cancel-all-active", "market-exit-selected"])
+def test_trail_toolbar_cancel_and_position_exit_require_review(
+    tmp_path, monkeypatch, action
+):
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    client = TestClient(workbench.app)
+    service = workbench._paper_execution
+    assert service is not None
+    writes = []
+    original = service._transport.change_trailing
+
+    def cancel(*args, **kwargs):
+        writes.append("cancel-trail")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service._transport, "change_trailing", cancel)
+    original_market = service._transport.submit_market
+
+    def market(*args, **kwargs):
+        writes.append(("market", args[1].quantity))
+        return original_market(*args, **kwargs)
+
+    monkeypatch.setattr(service._transport, "submit_market", market)
+    page = client.get(workbench.path).text
+    for label in (
+        "Set all stops…",
+        "Raise stops to B/E",
+        "Cancel all exits",
+        "Exit position now",
+    ):
+        assert f'aria-label="{label}"' in page
+    reviewed = client.post(workbench.path + "action", data={"action": action})
+    assert writes == []
+    assert 'value="active-action-execute"' in reviewed.text
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    confirm = (
+        "trailing-change-confirm"
+        if action == "cancel-all-active"
+        else "position-exit-confirm"
+    )
+    assert workbench._active_action_verified, workbench._message
+    assert writes == []
+    client.post(workbench.path + "action", data={"action": confirm})
+    assert writes == (
+        ["cancel-trail"]
+        if action == "cancel-all-active"
+        else ["cancel-trail", ("market", Decimal("3"))]
+    )
+    assert workbench._trailing_entries()[0].state == "CANCELLED_CONFIRMED"
+
+
+def test_set_trail_trigger_uses_fresh_bid_and_preserves_limit_gap(tmp_path):
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    perm_id = workbench._trailing_entries()[0].perm_ids[0]
+    client = TestClient(workbench.app)
+    client.post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"trailing_value_{perm_id}": "55",
+            f"trailing_value_unit_{perm_id}": "dollars",
+            f"trailing_offset_{perm_id}": "10",
+            f"trailing_offset_unit_{perm_id}": "dollars",
+            f"trailing_exact_stop_{perm_id}": "8.50",
+        },
+    )
+    candidate = workbench._armed_trailing_change
+    assert candidate is not None, workbench._message
+    assert candidate.stop_price == Decimal("8.50")
+    assert candidate.trail_value == Decimal("0.55")
+    assert candidate.limit_offset == Decimal("0.10")
+    assert candidate.stop_price - candidate.limit_offset == Decimal("8.40")
+
+
+def test_raise_trail_stop_to_be_does_not_lower_a_higher_fresh_stop(tmp_path):
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    perm_id = workbench._trailing_entries()[0].perm_ids[0]
+    client = TestClient(workbench.app)
+    client.post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            "raise_stops_only": "yes",
+            f"trailing_value_{perm_id}": "45",
+            f"trailing_value_unit_{perm_id}": "dollars",
+            f"trailing_offset_{perm_id}": "10",
+            f"trailing_offset_unit_{perm_id}": "dollars",
+            f"trailing_exact_stop_{perm_id}": "8.60",
+        },
+    )
+    assert workbench._armed_trailing_change is None
+    assert "already at or above B/E" in workbench._message
+    assert workbench._trailing_entries()[0].trailing_stop == "8.80"
+
+
+def test_position_exit_stops_if_position_changes_after_trail_cancellation(
+    tmp_path, monkeypatch
+):
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    service = workbench._paper_execution
+    assert service is not None
+    client = TestClient(workbench.app)
+    client.post(workbench.path + "action", data={"action": "market-exit-selected"})
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    assert workbench._active_action_verified
+    original = workbench._position_exit_snapshot_locked
+    reads = 0
+
+    def capture():
+        nonlocal reads
+        snapshot = original()
+        reads += 1
+        return (
+            replace(
+                snapshot, position=replace(snapshot.position, quantity=Decimal("2"))
+            )
+            if reads == 2
+            else snapshot
+        )
+
+    monkeypatch.setattr(workbench, "_position_exit_snapshot_locked", capture)
+    markets = []
+    monkeypatch.setattr(
+        service._transport,
+        "submit_market",
+        lambda *args, **kwargs: markets.append(args),
+    )
+    client.post(workbench.path + "action", data={"action": "position-exit-confirm"})
+    assert markets == []
+    assert workbench._trailing_entries()[0].state == "CANCELLED_CONFIRMED"
+    assert "stopped after 1 cancellations" in workbench._message

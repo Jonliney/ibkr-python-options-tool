@@ -3697,3 +3697,240 @@ def test_cancelled_bracket_with_a_fill_cannot_be_rebuilt(tmp_path) -> None:
     assert journal.reconcile_snapshot(refreshed) == ()
     with pytest.raises(ExecutionBlocked, match="already journaled"):
         journal.begin(refreshed, plan)
+
+
+def test_position_market_exit_covers_unassigned_and_suppresses_restart_duplicate(
+    tmp_path,
+):
+    calls = []
+    transport = SimpleNamespace(
+        submit_market=lambda snapshot, plan, **kwargs: (
+            calls.append(plan.quantity) or PaperSubmission((501,), (901,))
+        )
+    )
+    journal_path = tmp_path / "exit.json"
+    service = PaperExecutionService(transport, ExecutionJournal(journal_path))
+    snapshot = _trailing_snapshot()
+    plan = service.prepare_position_market_exit(
+        snapshot, target_perm_ids=(), expected_client_id=17
+    )
+    assert plan.quantity == Decimal("2")
+    assert plan.pairs == () and plan.trail is None
+    settings = dict(host="127.0.0.1", port=7497, client_id=17, timeout_seconds=1)
+    service.submit_position_market_exit(snapshot, plan, **settings)
+    restarted = PaperExecutionService(transport, ExecutionJournal(journal_path))
+    with pytest.raises(ExecutionBlocked, match="already journaled"):
+        restarted.submit_position_market_exit(snapshot, plan, **settings)
+    assert calls == [Decimal("2")]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "quantity",
+        "fills",
+        "epoch",
+        "external",
+        "incomplete",
+        "disconnect",
+        "partial",
+        "rejection",
+        "ack",
+    ],
+)
+def test_position_exit_fails_closed_and_persists_unknown(tmp_path, failure):
+    calls = []
+
+    def submit(snapshot, plan, **kwargs):
+        calls.append(plan.quantity)
+        if failure == "rejection":
+            raise ExecutionOutcomeUnknown("rejected")
+        return PaperSubmission((501,), () if failure == "ack" else (901,))
+
+    path = tmp_path / "exit.json"
+    service = PaperExecutionService(
+        SimpleNamespace(submit_market=submit), ExecutionJournal(path)
+    )
+    snapshot = _trailing_snapshot()
+    plan = service.prepare_position_market_exit(
+        snapshot, target_perm_ids=(), expected_client_id=17
+    )
+    fresh = snapshot
+    if failure in {"quantity", "partial"}:
+        fresh = replace(
+            snapshot, position=replace(snapshot.position, quantity=Decimal("1"))
+        )
+    elif failure == "fills":
+        fresh = replace(
+            snapshot,
+            executions=(
+                ObservedExecution(
+                    exec_id="manual",
+                    account=snapshot.selected.account,
+                    con_id=snapshot.selected.con_id,
+                    perm_id=800,
+                    side="SLD",
+                    quantity=Decimal("1"),
+                    price=Decimal("1"),
+                    time="now",
+                ),
+            ),
+        )
+    elif failure == "epoch":
+        fresh = replace(snapshot, connection_epoch=snapshot.connection_epoch + 1)
+    elif failure == "external":
+        fresh = replace(
+            snapshot,
+            working_orders=(
+                WorkingOrder(
+                    perm_id=800,
+                    client_id=17,
+                    order_id=10,
+                    key=snapshot.selected,
+                    action="SELL",
+                    order_type="MKT",
+                    remaining=Decimal("2"),
+                    status="Submitted",
+                ),
+            ),
+        )
+    elif failure == "incomplete":
+        fresh = replace(snapshot, executions_complete=False)
+    elif failure == "disconnect":
+        fresh = replace(snapshot, connected=False)
+    with pytest.raises(ExecutionBlocked):
+        service.submit_position_market_exit(
+            fresh, plan, host="127.0.0.1", port=7497, client_id=17, timeout_seconds=1
+        )
+    if failure in {"rejection", "ack"}:
+        assert calls == [Decimal("2")]
+        restarted = PaperExecutionService(
+            SimpleNamespace(submit_market=submit), ExecutionJournal(path)
+        )
+        assert restarted.unresolved_management_entries(
+            account=snapshot.selected.account, con_id=snapshot.selected.con_id
+        )
+        with pytest.raises(ExecutionBlocked, match="locked"):
+            restarted.submit_position_market_exit(
+                snapshot,
+                plan,
+                host="127.0.0.1",
+                port=7497,
+                client_id=17,
+                timeout_seconds=1,
+            )
+    else:
+        assert calls == []
+
+
+@pytest.mark.parametrize(
+    "failure", [None, "quantity", "fills", "order", "cost", "ack", "reject"]
+)
+def test_position_market_writer_rechecks_before_write(monkeypatch, tmp_path, failure):
+    import ibkr_options_manager.broker.execution as broker_execution
+
+    snapshot = _trailing_snapshot()
+    service = PaperExecutionService(
+        SimpleNamespace(), ExecutionJournal(tmp_path / "orders.json")
+    )
+    plan = service.prepare_position_market_exit(
+        snapshot, target_perm_ids=(), expected_client_id=17
+    )
+    writes = []
+
+    class Wrapper:
+        def __init__(self):
+            pass
+
+    class Client:
+        def __init__(self, wrapper):
+            self.wrapper = wrapper
+            self.connected = False
+
+        def connect(self, *args):
+            self.connected = True
+            self.wrapper.nextValidId(501)
+
+        def run(self):
+            pass
+
+        def disconnect(self):
+            self.connected = False
+
+        def isConnected(self):
+            return self.connected
+
+        def reqAllOpenOrders(self):
+            if failure == "order":
+                self.wrapper.openOrder(
+                    400,
+                    SimpleNamespace(conId=plan.selected.con_id),
+                    SimpleNamespace(account=plan.selected.account),
+                    SimpleNamespace(status="Submitted"),
+                )
+            self.wrapper.openOrderEnd()
+
+        def reqPositions(self):
+            self.wrapper.position(
+                plan.selected.account,
+                SimpleNamespace(conId=plan.selected.con_id),
+                1 if failure == "quantity" else 2,
+                101 if failure == "cost" else 100,
+            )
+            self.wrapper.positionEnd()
+
+        def reqExecutions(self, req_id, filter):
+            if failure == "fills":
+                self.wrapper.execDetails(
+                    req_id,
+                    SimpleNamespace(conId=plan.selected.con_id),
+                    SimpleNamespace(acctNumber=plan.selected.account, execId="manual"),
+                )
+            self.wrapper.execDetailsEnd(req_id)
+
+        def placeOrder(self, order_id, contract, order):
+            writes.append(order)
+            if failure == "reject":
+                self.wrapper.error(order_id, 201, "rejected")
+                return
+            order.permId, order.clientId = 901, 17
+            if failure == "ack":
+                order.totalQuantity = 1
+            self.wrapper.openOrder(
+                order_id,
+                SimpleNamespace(conId=plan.selected.con_id),
+                order,
+                SimpleNamespace(status="Submitted"),
+            )
+
+    monkeypatch.setattr(
+        broker_execution,
+        "_load_ibapi",
+        lambda: _IbapiImports(Client, Wrapper, SimpleNamespace, SimpleNamespace),
+    )
+    writer = IbkrPaperExecutionBroker()
+    if failure:
+        with pytest.raises(ExecutionBlocked):
+            writer.submit_market(
+                snapshot,
+                plan,
+                host="127.0.0.1",
+                port=7497,
+                client_id=17,
+                timeout_seconds=0.1,
+            )
+        assert len(writes) == (1 if failure in {"ack", "reject"} else 0)
+    else:
+        result = writer.submit_market(
+            snapshot,
+            plan,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=0.1,
+        )
+        assert result.perm_ids == (901,)
+        assert writes[0].totalQuantity == 2
+        assert writes[0].orderType == "MKT" and writes[0].tif == "GTC"
+        assert writes[0].transmit
+        assert not writes[0].overridePercentageConstraints

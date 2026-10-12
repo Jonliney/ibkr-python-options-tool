@@ -582,3 +582,47 @@ a maximum loss or guaranteed fill price. Tooltips state the price assumptions
 and explain slippage and non-execution of stop-limit orders. Positive P&L and
 return percentages are green, negative values are red, and zero or unavailable
 values are neutral in both server reviews and local edit previews.
+
+## Position toolbar for brackets and trails
+
+The selected-position toolbar exposes **Set all stops…**, **Raise stops to
+B/E**, **Cancel all exits**, and **Exit position now** for both working
+brackets and a working trail. There is still at most one working trail for
+an option, covering the full position; split trailing quantities are not
+supported. All management remains paper-only and restricted to journal-owned
+orders. An external order or ambiguous exit set blocks the position exit.
+
+Set all stops applies a common premium trigger. For a trail, review derives a
+fixed dollar trail distance from the fresh bid minus that trigger, rounding
+the distance up to a valid increment. The explicit trigger is retained, and
+the existing limit gap is preserved unless the user overrides it. Review
+shows the changed trail rule, STP, LMT, and projected P&L. Raise stops to B/E
+only raises triggers below the entry basis and never lowers higher triggers;
+a fresh read that would turn it into a lowering operation blocks review.
+A trail's limit may still be below basis, so B/E is a trigger description,
+not a guaranteed break-even fill.
+
+Cancel all exits keeps the contracts. For the supported single trail it uses
+the same exact-order cancellation and acknowledgement checks as row deletion.
+Exit position now replaces the former toolbar action that sold only assigned
+bracket quantities: it reviews all app-owned exit cancellations and one market
+sell for the **entire held position**, including unassigned contracts. Row-level
+market exits keep their existing per-layer scope.
+
+Position exit requires review, a fresh verification, and final confirmation
+within ten seconds. It checks the reviewed position quantity, basis, full
+contract, connection epoch, and execution IDs before each cancellation and
+again before market submission. After cancellation, no working order for the
+option may remain. The market writer reads all open orders, positions, and
+executions on its own connection before writing; a changed quantity, cost,
+fill set, or new order prevents the sell. It requires an exact SELL MKT/GTC
+quantity acknowledgement with a positive permanent ID. Submission is durably
+reserved before the writer; rejection or incomplete acknowledgement locks
+management across restarts, and duplicate attempts are not automatically
+retried. If cancellation succeeds but the position subsequently changes, the
+sell stops and the UI reports how many cancellations completed; the contracts
+can remain without exit protection.
+
+Verify with `.venv/bin/python -m pytest -q`. These demo and automated checks do
+not establish paper-TWS or live execution success. Paper-TWS verification is
+still required before a separately authorized live milestone.

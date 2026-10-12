@@ -44,6 +44,7 @@ class ProductionSourceSafetyTests(unittest.TestCase):
             public_methods,
             {
                 "submit",
+                "submit_market",
                 "submit_trailing",
                 "change_trailing",
                 "cancel_pair",

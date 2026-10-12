@@ -18,6 +18,7 @@ from ..execution import (
     ExecutionBlocked,
     ExecutionOutcomeUnknown,
     MarketExitCandidate,
+    PositionMarketExitPlan,
     PriceUpdateCandidate,
     TrailingChangeCandidate,
     require_paper_execution_snapshot,
@@ -257,6 +258,169 @@ class IbkrPaperExecutionBroker:
             return PaperSubmission(
                 (prior.order_id,), () if candidate.cancel else (prior.perm_id,)
             )
+        finally:
+            if app.isConnected():
+                app.disconnect()
+            if reader is not None:
+                reader.join(timeout=0.5)
+
+    def submit_market(
+        self,
+        snapshot: BrokerSnapshot,
+        plan: PositionMarketExitPlan,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmission:
+        require_paper_management_snapshot(snapshot)
+        if (
+            snapshot.selected != plan.selected
+            or snapshot.contract != plan.contract
+            or snapshot.position.quantity != plan.quantity
+        ):
+            raise ExecutionBlocked("the market exit no longer matches the position")
+        imports = _load_ibapi()
+        from ibapi.execution import ExecutionFilter
+        from ibapi.order import Order
+
+        class App(imports.EWrapper, imports.EClient):  # type: ignore[name-defined, misc]
+            def __init__(self) -> None:
+                imports.EWrapper.__init__(self)
+                imports.EClient.__init__(self, self)
+                (
+                    self.ready,
+                    self.orders_done,
+                    self.positions_done,
+                    self.fills_done,
+                    self.ack,
+                ) = (Event() for _ in range(5))
+                self.next_id = self.order_id = self.perm_id = 0
+                self.quantity = Decimal("0")
+                self.positions = 0
+                self.execution_ids: set[str] = set()
+                self.errors: list[str] = []
+
+            def nextValidId(self, order_id: int) -> None:
+                self.next_id = int(order_id)
+                self.ready.set()
+
+            def position(
+                self, account: str, contract: Any, position: Any, average_cost: Any
+            ) -> None:
+                if (
+                    account == plan.selected.account
+                    and int(contract.conId) == plan.selected.con_id
+                ):
+                    self.positions += 1
+                    self.quantity = Decimal(str(position))
+                    if Decimal(str(average_cost)) != plan.raw_average_cost:
+                        self.errors.append(
+                            "the position cost changed before market submission"
+                        )
+
+            def positionEnd(self) -> None:
+                self.positions_done.set()
+
+            def execDetails(self, req_id: int, contract: Any, execution: Any) -> None:
+                if (
+                    str(execution.acctNumber) == plan.selected.account
+                    and int(contract.conId) == plan.selected.con_id
+                ):
+                    self.execution_ids.add(str(execution.execId))
+
+            def execDetailsEnd(self, req_id: int) -> None:
+                self.fills_done.set()
+
+            def openOrder(
+                self, order_id: int, contract: Any, order: Any, state: Any
+            ) -> None:
+                if (
+                    int(contract.conId) != plan.selected.con_id
+                    or str(order.account) != plan.selected.account
+                ):
+                    return
+                if int(order_id) != self.order_id or self.order_id == 0:
+                    self.errors.append(
+                        "a closing order appeared before market submission"
+                    )
+                    return
+                if (
+                    str(order.orderType) == "MKT"
+                    and str(order.action) == "SELL"
+                    and Decimal(str(order.totalQuantity)) == plan.quantity
+                    and str(order.tif) == "GTC"
+                    and int(getattr(order, "clientId", -1)) == client_id
+                    and str(getattr(state, "status", ""))
+                    in {"Submitted", "PreSubmitted", "Filled"}
+                    and int(order.permId) > 0
+                ):
+                    self.perm_id = int(order.permId)
+                    self.ack.set()
+
+            def openOrderEnd(self) -> None:
+                self.orders_done.set()
+
+            def error(self, req_id: int, *args: Any) -> None:
+                code, message = _parse_error_arguments(args)
+                if code not in {2104, 2106, 2107, 2108, 2158}:
+                    self.errors.append(f"IBKR error {code}: {message}")
+
+        app = App()
+        reader: Thread | None = None
+        deadline = monotonic() + timeout_seconds
+        sent = False
+        try:
+            app.connect(host, port, client_id)
+            reader = Thread(
+                target=app.run, name="ibkr-paper-position-market-reader", daemon=True
+            )
+            reader.start()
+            if not app.ready.wait(max(0, deadline - monotonic())):
+                raise ExecutionBlocked("TWS did not issue an order ID")
+            app.reqAllOpenOrders()
+            app.reqPositions()
+            app.reqExecutions(71, ExecutionFilter())
+            for event in (app.orders_done, app.positions_done, app.fills_done):
+                if not event.wait(max(0, deadline - monotonic())):
+                    raise ExecutionBlocked(
+                        "the final market-exit verification is incomplete"
+                    )
+            if (
+                app.errors
+                or app.positions != 1
+                or app.quantity != plan.quantity
+                or frozenset(app.execution_ids) != plan.execution_ids
+            ):
+                raise ExecutionBlocked(
+                    "; ".join(app.errors)
+                    or "the position or fills changed before market submission"
+                )
+            order = Order()
+            order.account, order.action, order.orderType, order.tif = (
+                plan.selected.account,
+                "SELL",
+                "MKT",
+                "GTC",
+            )
+            order.totalQuantity, order.transmit = plan.quantity, True
+            app.order_id = app.next_id
+            sent = True
+            app.placeOrder(
+                app.order_id, _build_submission_contract(imports, snapshot), order
+            )
+            while not app.ack.is_set() and not app.errors and monotonic() < deadline:
+                sleep(0.02)
+            if app.errors or not app.ack.is_set():
+                raise ExecutionOutcomeUnknown(
+                    "; ".join(app.errors) or "TWS did not acknowledge the market exit"
+                )
+            return PaperSubmission((app.order_id,), (app.perm_id,))
+        except Exception as error:
+            if sent and not isinstance(error, ExecutionOutcomeUnknown):
+                raise ExecutionOutcomeUnknown(str(error)) from error
+            raise
         finally:
             if app.isConnected():
                 app.disconnect()

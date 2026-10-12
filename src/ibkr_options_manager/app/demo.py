@@ -33,6 +33,7 @@ from ..execution import (
     JournalFill,
     JournalLayer,
     MarketExitCandidate,
+    PositionMarketExitPlan,
     PriceUpdateCandidate,
     TrailingChangeCandidate,
     classify_journal_layer,
@@ -630,6 +631,44 @@ class DemoPaperExecutionTransport:
         target = candidate.target_order_id
         stop = candidate.stop_order_id
         return PaperSubmission(order_ids=tuple(sorted((target, stop))), perm_ids=())
+
+    def submit_market(
+        self,
+        snapshot: BrokerSnapshot,
+        plan: PositionMarketExitPlan,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmission:
+        if snapshot.position.quantity != plan.quantity or any(
+            order.key == snapshot.selected for order in snapshot.working_orders
+        ):
+            raise ValueError("the simulated position market exit changed")
+        del host, port, client_id, timeout_seconds
+        if self._journal is None:
+            raise ValueError("demo journal is unavailable")
+        entries = self._journal.submission_entries(
+            account=snapshot.selected.account, con_id=snapshot.selected.con_id
+        ) + self._journal.trailing_entries(
+            account=snapshot.selected.account, con_id=snapshot.selected.con_id
+        )
+        return PaperSubmission(
+            (
+                max(
+                    (id_ for entry in entries for id_ in entry.order_ids),
+                    default=900000,
+                )
+                + 1,
+            ),
+            (
+                max(
+                    (id_ for entry in entries for id_ in entry.perm_ids), default=800000
+                )
+                + 1,
+            ),
+        )
 
     def submit_trailing(
         self,

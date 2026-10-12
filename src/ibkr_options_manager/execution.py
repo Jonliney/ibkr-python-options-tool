@@ -14,9 +14,11 @@ from uuid import uuid4
 
 from .domain import (
     BrokerSnapshot,
+    ContractKey,
     ObservedExecution,
     PlanResult,
     PlanStatus,
+    VerifiedOptionContract,
     WorkingOrder,
     closing_order_allocation,
     round_down_price,
@@ -277,6 +279,33 @@ class TrailingChangeCandidate:
     trail_unit: str = "dollars"
 
 
+@dataclass(frozen=True, slots=True)
+class PositionMarketExitPlan:
+    selected: ContractKey
+    contract: VerifiedOptionContract
+    quantity: Decimal
+    basis: Decimal
+    raw_average_cost: Decimal
+    execution_ids: frozenset[str]
+    connection_epoch: int
+    pairs: tuple[MarketExitCandidate, ...]
+    trail: TrailingChangeCandidate | None = None
+
+
+@runtime_checkable
+class PaperPositionMarketTransport(Protocol):
+    def submit_market(
+        self,
+        snapshot: BrokerSnapshot,
+        plan: PositionMarketExitPlan,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmissionResult: ...
+
+
 @runtime_checkable
 class PaperMarketExitTransport(Protocol):
     """The narrow transport seam for a staged paper market exit."""
@@ -427,6 +456,7 @@ class ExecutionJournal:
                         "price-update:",
                         "market-exit:",
                         "market-exit-many:",
+                        "market-exit-position:",
                         "cancel-bracket:",
                         "trailing-conversion:",
                         "amend-trailing:",
@@ -2354,6 +2384,179 @@ class PaperExecutionService:
         )
         self._journal.record_trailing_change(candidate)
         return SubmissionReceipt(completed)
+
+    def prepare_position_market_exit(
+        self,
+        snapshot: BrokerSnapshot,
+        *,
+        target_perm_ids: tuple[int, ...],
+        expected_client_id: int,
+    ) -> PositionMarketExitPlan:
+        require_paper_management_snapshot(snapshot)
+        contract = snapshot.contract
+        quantity = snapshot.position.quantity
+        if (
+            contract.con_id != snapshot.selected.con_id
+            or contract.sec_type != "OPT"
+            or contract.currency != "USD"
+            or not contract.expiry
+            or not contract.right
+            or not contract.trading_class
+            or not contract.multiplier.is_finite()
+            or contract.multiplier <= 0
+            or not contract.strike.is_finite()
+            or contract.strike <= 0
+            or snapshot.position.key != snapshot.selected
+            or not quantity.is_finite()
+            or quantity <= 0
+            or quantity != quantity.to_integral_value()
+            or not snapshot.executions_complete
+            or not snapshot.completed_orders_complete
+        ):
+            raise ExecutionBlocked(
+                "a complete long option position and fill history is required"
+            )
+        pairs = (
+            self.prepare_market_exits(
+                snapshot,
+                target_perm_ids=target_perm_ids,
+                expected_client_id=expected_client_id,
+            )
+            if target_perm_ids
+            else ()
+        )
+        trails = [
+            order
+            for order in snapshot.working_orders
+            if order.key == snapshot.selected
+            and order.order_type in {"TRAIL", "TRAIL LIMIT"}
+        ]
+        if len(trails) > 1:
+            raise ExecutionBlocked("multiple working trails are not supported")
+        trail = (
+            self.prepare_trailing_change(
+                snapshot,
+                perm_id=trails[0].perm_id,
+                expected_client_id=expected_client_id,
+                cancel=True,
+            )
+            if trails
+            else None
+        )
+        owned = {
+            id_ for pair in pairs for id_ in (pair.target_perm_id, pair.stop_perm_id)
+        }
+        if trail is not None:
+            owned.add(trail.order.perm_id)
+        if {
+            order.perm_id
+            for order in snapshot.working_orders
+            if order.key == snapshot.selected
+        } != owned:
+            raise ExecutionBlocked("another working order exists for this option")
+        return PositionMarketExitPlan(
+            snapshot.selected,
+            contract,
+            quantity,
+            snapshot.position.unit_basis,
+            snapshot.position.raw_average_cost,
+            frozenset(
+                item.exec_id
+                for item in snapshot.executions
+                if item.account == snapshot.selected.account
+                and item.con_id == snapshot.selected.con_id
+            ),
+            snapshot.connection_epoch,
+            pairs,
+            trail,
+        )
+
+    @staticmethod
+    def verify_position_exit_baseline(
+        snapshot: BrokerSnapshot, plan: PositionMarketExitPlan
+    ) -> None:
+        require_paper_management_snapshot(snapshot)
+        if (
+            snapshot.selected != plan.selected
+            or snapshot.contract != plan.contract
+            or snapshot.position.key != plan.selected
+            or snapshot.position.quantity != plan.quantity
+            or snapshot.position.unit_basis != plan.basis
+            or snapshot.position.raw_average_cost != plan.raw_average_cost
+            or snapshot.connection_epoch != plan.connection_epoch
+            or not snapshot.executions_complete
+            or not snapshot.completed_orders_complete
+            or frozenset(
+                item.exec_id
+                for item in snapshot.executions
+                if item.account == plan.selected.account
+                and item.con_id == plan.selected.con_id
+            )
+            != plan.execution_ids
+        ):
+            raise ExecutionBlocked(
+                "the position, contract, connection, or fills changed after review"
+            )
+
+    def submit_position_market_exit(
+        self,
+        snapshot: BrokerSnapshot,
+        plan: PositionMarketExitPlan,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> SubmissionReceipt:
+        self.verify_position_exit_baseline(snapshot, plan)
+        if any(order.key == snapshot.selected for order in snapshot.working_orders):
+            raise ExecutionBlocked("a closing order still works for this option")
+        transport = self._transport
+        if not isinstance(transport, PaperPositionMarketTransport):
+            raise ExecutionBlocked(
+                "the paper transport cannot submit a position market exit"
+            )
+        entry = self._journal.begin_management(
+            snapshot,
+            operation="market-exit-position",
+            material=(
+                plan.selected,
+                plan.contract,
+                plan.quantity,
+                plan.basis,
+                tuple(sorted(plan.execution_ids)),
+                tuple((p.target_perm_id, p.stop_perm_id) for p in plan.pairs),
+                plan.trail.order.perm_id if plan.trail else None,
+            ),
+            expected_order_count=1,
+        )
+        try:
+            result = transport.submit_market(
+                snapshot,
+                plan,
+                host=host,
+                port=port,
+                client_id=client_id,
+                timeout_seconds=timeout_seconds,
+            )
+            order_ids, perm_ids = tuple(result.order_ids), tuple(result.perm_ids)
+            if (
+                len(order_ids) != 1
+                or len(perm_ids) != 1
+                or order_ids[0] <= 0
+                or perm_ids[0] <= 0
+            ):
+                raise ExecutionOutcomeUnknown(
+                    "TWS did not acknowledge the position market exit"
+                )
+        except Exception:
+            self._journal.mark_unknown(entry.fingerprint)
+            raise
+        return SubmissionReceipt(
+            self._journal.record_submission(
+                entry.fingerprint, order_ids=order_ids, perm_ids=perm_ids
+            )
+        )
 
     def prepare_entire_position_trailing(
         self,

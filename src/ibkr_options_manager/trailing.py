@@ -181,6 +181,8 @@ def trailing_edit_prices(
     unit: str,
     offset: Decimal | None,
     offset_unit: str,
+    *,
+    stop_price: Decimal | None = None,
 ) -> tuple[Decimal, Decimal, Decimal | None]:
     """Convert per-contract money/percent inputs to verified premium prices.
 
@@ -214,6 +216,13 @@ def trailing_edit_prices(
         if unchanged
         else round_down_price(reference - distance, snapshot.market_rule.bands)
     )
+    if stop_price is not None:
+        if not stop_price.is_finite() or stop_price <= 0 or stop_price >= reference:
+            raise ExecutionBlocked("Set STP below the fresh bid and above zero.")
+        if round_up_price(stop_price, snapshot.market_rule.bands) != stop_price:
+            raise ExecutionBlocked("STP must use a valid price increment.")
+        stop = stop_price
+        normalized = round_up_price(reference - stop, snapshot.market_rule.bands)
     if stop is None or stop <= 0 or stop >= reference:
         raise ExecutionBlocked("STP trail must leave a positive stop below the bid.")
     gap = None
