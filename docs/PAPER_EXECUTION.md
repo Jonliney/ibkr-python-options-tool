@@ -512,25 +512,31 @@ the post-cancel open-order recheck is clean, and the standalone MKT produces
 the expected order/execution callbacks.
 ## Working trailing order changes
 
-A working, app-owned paper `TRAIL` or `TRAIL LIMIT` shows its observed
-`trailStopPrice` as the editable STP input. The editable LMT price is blank for
-`TRAIL`; entering a positive LMT below STP requests `TRAIL LIMIT`, and clearing
-LMT requests `TRAIL`. The UI converts the entered prices to a fixed broker gap
-(STP minus LMT) using Decimal arithmetic. The LMT is an estimate at the shown
-STP, and moves with the trailing stop after submission. A blank STP is invalid.
-Inline field feedback and Action Review explain missing STP, nonpositive
-prices, and LMT at or above STP; review submission stays disabled until fixed.
-The server repeats these checks and rejects outdated gap-based forms. The trail amount (`auxPrice` or
-`trailingPercent`) and order quantity are fixed. Editing either field updates
-Action Review; Review price changes takes fresh TWS reads and checks the
-candidate against the current order before opening Cancel / Confirm directly.
-The STP and LMT inputs retain the staged prices and become read-only until
-Cancel or Confirm. Cancel restores the observed prices. The existing ten-second
-confirmation expiry and final fresh-snapshot checks remain in effect; review
-itself sends no order writes. A separate
-Delete trail action cancels the exact order without placing a replacement.
-Both actions require review and final confirmation. The edit also requires a
-fresh bid above the proposed trigger.
+A working, app-owned paper `TRAIL` or `TRAIL LIMIT` exposes **STP trail**
+followed by **LMT offset**. Both accept dollars per contract or percentages;
+the calculated premium price appears above each input. Dollar amounts are
+divided by the verified contract multiplier. STP percentages use the fresh
+bid; LMT percentages use STP and become a fixed dollar gap at review. The
+stop rounds down and the limit gap rounds up using the verified market rule.
+A dollar trail must already be on a valid increment. Editing only the offset
+preserves the observed, potentially ratcheted stop; changing the trail rule
+calculates a new initial stop from the fresh bid. The reviewed stop stays fixed
+through confirmation, which requires a fresh bid above it.
+
+An empty offset requests `TRAIL`; a positive offset requests `TRAIL LIMIT`.
+The resulting limit must remain positive and below STP. Inline field feedback
+and Action Review explain missing trails, invalid amounts, unavailable bids,
+and excessive offsets. Review remains disabled until valid; the server repeats
+the checks. Older absolute-price forms keep their explicitly named semantics;
+the new distance fields cannot be interpreted as absolute prices.
+
+Order quantity remains fixed. Review price changes takes fresh TWS reads and
+checks the candidate against the current order before opening Cancel / Confirm
+directly. The values and units remain visible and read-only until Cancel or
+Confirm. Cancel restores the observed broker rule. The ten-second confirmation
+expiry and final fresh-snapshot checks remain in effect; review sends no writes.
+A separate Delete trail action cancels the exact order without replacement.
+Both actions require review and final confirmation.
 
 The service requires one journal-owned permanent ID and matching order ID,
 account, contract, client ID, order type, GTC, current stop, trail amount,
@@ -540,7 +546,10 @@ state, and manual changes observed after review. The writer requests the
 same-client open order again and verifies these fields before using the
 existing order ID; it leaves TWS order precautions active. For a gap change that
 switches `TRAIL` and `TRAIL LIMIT`, the writer sends the new type with the same
-order ID and requires an echo of the same permanent ID, new type, STP, and gap.
+order ID and requires an echo of the same permanent ID, new type, STP, gap, trail value, and the active trail unit. The unused
+`auxPrice` or `trailingPercent` field is cleared when changing units; an
+incomplete or mismatched rule echo is never accepted. A successful change
+records the acknowledged rule in the durable journal for later management.
 IBKR [cautions that order-type modifications may be rejected](https://interactivebrokers.github.io/tws-api/modifying_orders.html),
 so a rejection or incomplete acknowledgement is treated as an unknown outcome
 and locks further management until checked in TWS. This type switch requires

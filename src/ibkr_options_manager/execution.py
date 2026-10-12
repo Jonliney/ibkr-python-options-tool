@@ -273,6 +273,8 @@ class TrailingChangeCandidate:
     stop_price: Decimal | None = None
     limit_offset: Decimal | None = None
     cancel: bool = False
+    trail_value: Decimal | None = None
+    trail_unit: str = "dollars"
 
 
 @runtime_checkable
@@ -1304,6 +1306,12 @@ class ExecutionJournal:
         entries[index] = replace(
             entry,
             state="CANCELLED_CONFIRMED" if candidate.cancel else entry.state,
+            trailing_value=format(candidate.trail_value, "f")
+            if candidate.trail_value is not None and not candidate.cancel
+            else entry.trailing_value,
+            trailing_unit=candidate.trail_unit
+            if candidate.trail_value is not None and not candidate.cancel
+            else entry.trailing_unit,
             trailing_stop=format(candidate.stop_price, "f")
             if candidate.stop_price is not None
             else entry.trailing_stop,
@@ -2124,6 +2132,8 @@ class PaperExecutionService:
         stop_price: Decimal | None = None,
         limit_offset: Decimal | None = None,
         cancel: bool = False,
+        trail_value: Decimal | None = None,
+        trail_unit: str = "dollars",
     ) -> TrailingChangeCandidate:
         require_paper_management_snapshot(snapshot)
         if not snapshot.executions_complete or not snapshot.completed_orders_complete:
@@ -2204,6 +2214,27 @@ class PaperExecutionService:
         if not entry.trailing_limit_offset and order.limit_offset is not None:
             raise ExecutionBlocked("the trailing order type changed in TWS")
         if not cancel:
+            if trail_value is not None:
+                if (
+                    trail_unit not in {"dollars", "percent"}
+                    or not trail_value.is_finite()
+                    or trail_value <= 0
+                    or (trail_unit == "percent" and trail_value >= 100)
+                ):
+                    raise ExecutionBlocked("enter a positive STP trail below 100%")
+                if trail_unit == "dollars":
+                    try:
+                        if (
+                            round_up_price(trail_value, snapshot.market_rule.bands)
+                            != trail_value
+                        ):
+                            raise ExecutionBlocked(
+                                "the dollar trail is not on a valid price increment"
+                            )
+                    except (ValueError, TypeError) as error:
+                        raise ExecutionBlocked(
+                            "the option market rule is invalid"
+                        ) from error
             if stop_price is None or not stop_price.is_finite() or stop_price <= 0:
                 raise ExecutionBlocked("enter a positive STP price")
             if (
@@ -2236,7 +2267,17 @@ class PaperExecutionService:
                 raise ExecutionBlocked(
                     "STP or limit gap is outside valid price increments"
                 )
-            if stop_price == order.stop_price and limit_offset == order.limit_offset:
+            if (
+                stop_price == order.stop_price
+                and limit_offset == order.limit_offset
+                and (
+                    trail_value is None
+                    or (
+                        trail_value == expected_value
+                        and trail_unit == entry.trailing_unit
+                    )
+                )
+            ):
                 raise ExecutionBlocked("the trailing prices have not changed")
         return TrailingChangeCandidate(
             entry.fingerprint,
@@ -2244,6 +2285,8 @@ class PaperExecutionService:
             stop_price,
             limit_offset,
             cancel,
+            trail_value,
+            trail_unit,
         )
 
     def submit_trailing_change(
@@ -2263,6 +2306,8 @@ class PaperExecutionService:
             stop_price=candidate.stop_price,
             limit_offset=candidate.limit_offset,
             cancel=candidate.cancel,
+            trail_value=candidate.trail_value,
+            trail_unit=candidate.trail_unit,
         )
         if refreshed != candidate:
             raise ExecutionBlocked("the trailing order changed after review")
@@ -2280,6 +2325,8 @@ class PaperExecutionService:
                 candidate.order.limit_offset,
                 candidate.stop_price,
                 candidate.limit_offset,
+                candidate.trail_value,
+                candidate.trail_unit,
             ),
             expected_order_count=1,
         )

@@ -103,11 +103,27 @@ class IbkrPaperExecutionBroker:
                     try:
                         stop = Decimal(str(order.trailStopPrice))
                         offset = _observed_trailing_offset(order.lmtPriceOffset)
+                        value = _observed_trailing_offset(
+                            order.trailingPercent
+                            if candidate.trail_unit == "percent"
+                            else order.auxPrice
+                        )
+                        unused_value = _observed_trailing_offset(
+                            order.auxPrice
+                            if candidate.trail_unit == "percent"
+                            else order.trailingPercent
+                        )
                     except (InvalidOperation, ValueError, AttributeError):
                         return
                     if (
-                        stop == candidate.stop_price
+                        (
+                            candidate.trail_value is None
+                            or (value == candidate.trail_value and unused_value is None)
+                        )
+                        and stop == candidate.stop_price
                         and offset == candidate.limit_offset
+                        and str(getattr(state, "status", ""))
+                        in {"Submitted", "PreSubmitted"}
                         and str(order.orderType)
                         == (
                             "TRAIL LIMIT"
@@ -200,6 +216,19 @@ class IbkrPaperExecutionBroker:
                 _cancel_order(app, prior.order_id)
             else:
                 assert candidate.stop_price is not None
+                from ibapi.const import UNSET_DOUBLE
+
+                if candidate.trail_value is not None:
+                    order.auxPrice = (
+                        float(candidate.trail_value)
+                        if candidate.trail_unit == "dollars"
+                        else UNSET_DOUBLE
+                    )
+                    order.trailingPercent = (
+                        float(candidate.trail_value)
+                        if candidate.trail_unit == "percent"
+                        else UNSET_DOUBLE
+                    )
                 order.trailStopPrice = float(candidate.stop_price)
                 order.orderType = (
                     "TRAIL LIMIT" if candidate.limit_offset is not None else "TRAIL"

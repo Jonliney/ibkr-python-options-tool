@@ -69,7 +69,7 @@ from ...execution import (
 )
 from ...observation import ObservationSettings, PositionObserver
 from ...price_update_trace import record_price_update_event
-from ...trailing import TrailingPlan, TrailingRequest
+from ...trailing import TrailingPlan, TrailingRequest, trailing_edit_prices
 from ..position_observation import VerifiedPositionChanges
 from ..view_model import (
     ConnectionSettings,
@@ -198,6 +198,7 @@ class StarUIWorkbench:
         self._armed_cancellations: tuple[MarketExitCandidate, ...] = ()
         self._armed_trailing: TrailingPlan | None = None
         self._armed_trailing_change: TrailingChangeCandidate | None = None
+        self._armed_trailing_form: dict[str, str] = {}
         self._bulk_cancel_trace_id: str | None = None
         self._bulk_cancel_started_at: float | None = None
         self._active_action_verified = False
@@ -770,9 +771,10 @@ class StarUIWorkbench:
                 )
             elif action == "active-update-arm":
                 trail_ids = {
-                    name.removeprefix("trailing_stop_")
+                    name.removeprefix("trailing_stop_").removeprefix("trailing_value_")
                     for name in values
-                    if name.startswith("trailing_stop_")
+                    if name.startswith(("trailing_stop_", "trailing_value_"))
+                    and not name.startswith("trailing_value_unit_")
                 }
                 if trail_ids:
                     if len(trail_ids) != 1 or self._active_target_perm_ids():
@@ -1052,6 +1054,7 @@ class StarUIWorkbench:
         self._armed_cancellations = ()
         self._armed_trailing = None
         self._armed_trailing_change = None
+        self._armed_trailing_form = {}
         self._bulk_cancel_trace_id = None
         self._bulk_cancel_started_at = None
         self._active_action_verified = False
@@ -1480,8 +1483,38 @@ class StarUIWorkbench:
             if snapshot is None:
                 raise ExecutionBlocked("the fresh trailing snapshot is unavailable")
             perm_id = int(action.partition(":")[2])
-            stop = gap = None
-            if not cancel:
+            stop = gap = trail_value = None
+            trail_unit = "dollars"
+            if not cancel and f"trailing_value_{perm_id}" in values:
+                value_text = values[f"trailing_value_{perm_id}"].strip()
+                gap_text = values.get(f"trailing_offset_{perm_id}", "").strip()
+                if not value_text:
+                    raise ExecutionBlocked(
+                        "A STP trail is required before entering a LMT offset."
+                        if gap_text
+                        else "A STP trail is required."
+                    )
+                value = _decimal_value(value_text)
+                offset = _decimal_value(gap_text)
+                if value is None or (gap_text and offset is None):
+                    raise ExecutionBlocked(
+                        "Enter valid STP trail and LMT offset values."
+                    )
+                trail_unit = values.get(f"trailing_value_unit_{perm_id}", "")
+                offset_unit = values.get(f"trailing_offset_unit_{perm_id}", "")
+                orders = [
+                    order
+                    for order in snapshot.working_orders
+                    if order.perm_id == perm_id
+                ]
+                if len(orders) != 1:
+                    raise ExecutionBlocked(
+                        "The trailing order is missing or ambiguous."
+                    )
+                stop, trail_value, gap = trailing_edit_prices(
+                    snapshot, orders[0], value, trail_unit, offset, offset_unit
+                )
+            elif not cancel:
                 if f"trailing_limit_{perm_id}" not in values:
                     raise ExecutionBlocked(
                         "Refresh and enter the STP and LMT prices again."
@@ -1513,10 +1546,13 @@ class StarUIWorkbench:
                 stop_price=stop,
                 limit_offset=gap,
                 cancel=cancel,
+                trail_value=trail_value,
+                trail_unit=trail_unit,
             )
         except (ValueError, InvalidOperation, ExecutionBlocked) as error:
             self._message = f"Trailing change blocked: {error}"
             return
+        self._armed_trailing_form = dict(values) if not cancel else {}
         self._set_review_status_locked(
             "Review cancellation of this trailing order."
             if cancel
@@ -1676,6 +1712,8 @@ class StarUIWorkbench:
                     stop_price=candidate.stop_price,
                     limit_offset=candidate.limit_offset,
                     cancel=candidate.cancel,
+                    trail_value=candidate.trail_value,
+                    trail_unit=candidate.trail_unit,
                 )
                 if refreshed_change != candidate:
                     raise ExecutionBlocked("the trailing order changed after review")
@@ -5374,7 +5412,7 @@ class StarUIWorkbench:
                     Div(
                         Div(
                             Label(
-                                "Trail amount per contract",
+                                "STP trail",
                                 fr="trail-value",
                                 data_trail_value_label=True,
                                 cls="text-xs font-medium text-muted-foreground",
@@ -5434,7 +5472,7 @@ class StarUIWorkbench:
                     Div(
                         Div(
                             Label(
-                                "Optional limit offset per contract",
+                                "LMT offset (optional)",
                                 fr="trail-limit-value",
                                 data_trail_limit_value_label=True,
                                 cls="text-xs font-medium text-muted-foreground",
@@ -5626,6 +5664,34 @@ class StarUIWorkbench:
             if order
             else None
         )
+        multiplier = self._state.multiplier or Decimal("0")
+        trail_unit = (
+            candidate.trail_unit
+            if staged and candidate is not None and candidate.trail_value is not None
+            else entry.trailing_unit
+        )
+        trail_value = (
+            candidate.trail_value
+            if staged and candidate is not None and candidate.trail_value is not None
+            else _decimal_value(entry.trailing_value)
+        )
+        display_value = (
+            trail_value * multiplier
+            if trail_value is not None and trail_unit == "dollars"
+            else trail_value
+        )
+        form = self._armed_trailing_form if staged else {}
+        display_value_text = form.get(
+            f"trailing_value_{entry.perm_ids[0]}",
+            _price_text(display_value) if display_value is not None else "",
+        )
+        display_offset_text = form.get(
+            f"trailing_offset_{entry.perm_ids[0]}",
+            _price_text(display_offset * multiplier)
+            if display_offset is not None
+            else "",
+        )
+        offset_unit = form.get(f"trailing_offset_unit_{entry.perm_ids[0]}", "dollars")
         working = order is not None
         modifiable = bool(
             order is not None
@@ -5676,9 +5742,13 @@ class StarUIWorkbench:
             )
             if sold
             else _trailing_edit_field(
-                "STP",
-                f"trailing_stop_{entry.perm_ids[0]}",
-                _price_text(display_stop) if display_stop is not None else "",
+                "STP trail",
+                f"trailing_value_{entry.perm_ids[0]}",
+                display_value_text,
+                unit=trail_unit,
+                price=display_stop,
+                initial_stop=order.stop_price if order else None,
+                description="Distance below the market reference used to calculate the trailing stop. $ is per contract; % is based on the bid.",
                 disabled=not modifiable,
                 readonly=staged,
             ),
@@ -5694,11 +5764,15 @@ class StarUIWorkbench:
             )
             if sold
             else _trailing_edit_field(
-                "LMT",
-                f"trailing_limit_{entry.perm_ids[0]}",
-                _price_text(display_stop - display_offset)
+                "LMT offset",
+                f"trailing_offset_{entry.perm_ids[0]}",
+                display_offset_text,
+                unit=offset_unit,
+                price=display_stop - display_offset
                 if display_stop is not None and display_offset is not None
-                else "",
+                else None,
+                initial_stop=order.stop_price if order else None,
+                description="Gap below the STP used to calculate the trailing limit. $ is per contract; % is based on STP and becomes a fixed dollar gap when reviewed.",
                 disabled=not modifiable,
                 readonly=staged,
             ),
@@ -5716,21 +5790,19 @@ class StarUIWorkbench:
                 ),
                 input_id=f"trailing-quantity-{entry.perm_ids[0]}",
             ),
-            Div(
-                _button_tooltip(
-                    Button(
-                        Icon("lucide:trash-2"),
-                        name="action",
-                        value=f"trailing-delete-arm:{entry.perm_ids[0]}",
-                        type="submit",
-                        variant="outline",
-                        size="icon",
-                        aria_label=f"Delete trail {index}",
-                        disabled=not modifiable,
-                    ),
-                    "Cancel this active trail",
+            _button_tooltip(
+                Button(
+                    Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
+                    name="action",
+                    value=f"trailing-delete-arm:{entry.perm_ids[0]}",
+                    type="submit",
+                    variant="outline",
+                    size="icon",
+                    aria_label=f"Delete trail {index}",
+                    disabled=not modifiable,
+                    cls="mt-5",
                 ),
-                cls="mt-5",
+                "Cancel this active trail",
             )
             if not sold
             else Div(cls="min-w-0"),
@@ -5903,7 +5975,7 @@ class StarUIWorkbench:
             ),
             action_field=_button_tooltip(
                 Button(
-                    Icon("lucide:trash-2"),
+                    Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
                     variant="outline",
                     size="icon",
                     type="submit",
@@ -6381,6 +6453,11 @@ class StarUIWorkbench:
         return {
             "basis": format(basis, "f"),
             "multiplier": format(self._state.multiplier or Decimal("0"), "f"),
+            "bid": format(snapshot.quote.bid, "f")
+            if (snapshot := self._view_model.latest_snapshot()) is not None
+            and snapshot.quote.fresh
+            and snapshot.quote.bid is not None
+            else None,
             "bands": [
                 {
                     "low": format(band.low_edge, "f"),
@@ -6482,7 +6559,7 @@ class StarUIWorkbench:
             ),
             action_field=_button_tooltip(
                 Button(
-                    Icon("lucide:trash-2"),
+                    Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
                     variant="outline",
                     size="icon",
                     type="submit",
@@ -7510,6 +7587,16 @@ class StarUIWorkbench:
                             cls="hidden text-xs leading-5 text-rose-400",
                         ),
                         self._review_order_line(
+                            "STP trail",
+                            Span(
+                                data_trailing_review_rule=perm_id,
+                                cls="text-xs font-semibold",
+                            ),
+                            "text-muted-foreground",
+                            row_attributes={"data_trailing_review_rule_row": perm_id},
+                            hidden=True,
+                        ),
+                        self._review_order_line(
                             "SELL STP",
                             _price_transition(
                                 order.stop_price if order else None,
@@ -7556,7 +7643,7 @@ class StarUIWorkbench:
                     cls="text-base font-semibold tracking-tight text-foreground",
                 ),
                 P(
-                    "Change the STP or LMT price to preview the trail update here."
+                    "Change the STP trail or LMT offset to preview the update here."
                     if any(
                         entry.state == "SUBMITTED" for entry in self._trailing_entries()
                     )
@@ -7839,6 +7926,35 @@ class StarUIWorkbench:
             tif=order.tif,
             lines=(
                 self._review_order_line(
+                    "STP trail",
+                    Span(
+                        (
+                            f"${_price_text(order.trailing_amount * (self._state.multiplier or Decimal('0')))}"
+                            if order.trailing_amount is not None
+                            else f"{_price_text(order.trailing_percent)}%"
+                        )
+                        + " → "
+                        + (
+                            f"${_price_text(candidate.trail_value * (self._state.multiplier or Decimal('0')))}"
+                            if candidate.trail_unit == "dollars"
+                            else f"{_price_text(candidate.trail_value)}%"
+                        ),
+                        cls="text-xs font-semibold",
+                    ),
+                    "text-muted-foreground",
+                )
+                if not candidate.cancel
+                and candidate.trail_value is not None
+                and (
+                    candidate.trail_value
+                    != (
+                        order.trailing_percent
+                        if candidate.trail_unit == "percent"
+                        else order.trailing_amount
+                    )
+                )
+                else None,
+                self._review_order_line(
                     "SELL STP",
                     Span("CANCEL", cls="text-xs font-semibold")
                     if candidate.cancel
@@ -8014,7 +8130,7 @@ def _trailing_preview_script(configuration: dict[str, Any] | None) -> str:
   }};
   const refresh = () => {{
     const unit = form.elements['trail_unit']?.value || 'dollars';
-    label.textContent = unit === 'percent' ? 'Trail amount (%)' : 'Trail amount per contract';
+    label.textContent = 'STP trail';
     const amount = Number(input.value);
     let stop = NaN;
     if (input.value.trim() && amount > 0 && Number.isFinite(bid) && bid > 0) {{
@@ -8031,8 +8147,7 @@ def _trailing_preview_script(configuration: dict[str, Any] | None) -> str:
     displayOutcome(outcome, change, 'estimated loss at stop');
     const offsetValue = Number(limitInput.value);
     const limitUnit = form.elements['trail_limit_unit']?.value || 'dollars';
-    limitLabel.textContent = limitUnit === 'percent'
-      ? 'Optional limit offset below stop (%)' : 'Optional limit offset per contract';
+    limitLabel.textContent = 'LMT offset (optional)';
     const rawOffset = limitUnit === 'percent' ? stop * offsetValue / 100 : offsetValue / multiplier;
     const offset = valid && limitInput.value.trim() && offsetValue > 0 &&
       Number.isFinite(rawOffset) ? roundUp(rawOffset) : NaN;
@@ -8475,26 +8590,39 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         changed ||= targetChanged || stopChanged || limitChanged;
       }});
       form.querySelectorAll('[data-trailing-edit="STP"]').forEach((stopInput) => {{
-        const permId = stopInput.name.slice('trailing_stop_'.length);
-        const limitInput = form.querySelector(`[name="trailing_limit_${{permId}}"]`);
-        const stopEdited = stopInput.value.trim() !== stopInput.dataset.trailingInitial;
-        const limitEdited = limitInput && limitInput.value.trim() !== limitInput.dataset.trailingInitial;
+        const permId = stopInput.name.slice('trailing_value_'.length);
+        const limitInput = form.querySelector(`[name="trailing_offset_${{permId}}"]`);
+        const stopUnit = form.querySelector(`[data-trailing-unit="${{stopInput.name}}"]`);
+        const limitUnit = form.querySelector(`[data-trailing-unit="${{limitInput.name}}"]`);
+        const stopEdited = Number(stopInput.value) !== Number(stopInput.dataset.trailingInitial) || stopUnit.value !== stopUnit.dataset.trailingInitial;
+        const limitEdited = limitInput.value.trim() !== limitInput.dataset.trailingInitial || limitUnit.value !== limitUnit.dataset.trailingInitial;
         const trailEdited = stopEdited || limitEdited;
         edited ||= trailEdited;
-        const stop = Number(stopInput.value), limit = Number(limitInput?.value);
-        const noStop = !stopInput.value.trim(), noLimit = !limitInput?.value.trim();
+        const value = Number(stopInput.value), gapValue = Number(limitInput.value), bid = Number(config.bid);
+        const noStop = !stopInput.value.trim(), noLimit = !limitInput.value.trim();
+        const distance = stopUnit.value === 'percent' ? bid * value / 100 : value / multiplier;
+        const stop = stopEdited ? roundDown(bid - distance) : Number(stopInput.dataset.trailingStop);
+        const gap = limitUnit.value === 'percent' ? stop * gapValue / 100 : gapValue / multiplier;
+        const limit = stop - roundUp(gap);
         let stopError = '', limitError = '';
-        if (noStop) stopError = noLimit ? 'A STP is required.' : 'A STP is required before entering a LMT.';
-        else if (!Number.isFinite(stop) || stop <= 0) stopError = 'Enter a positive STP price.';
-        if (!noLimit && (!Number.isFinite(limit) || limit <= 0)) limitError = 'Enter a positive LMT price, or leave it blank.';
-        else if (!stopError && !noLimit && limit >= stop) limitError = 'LMT must be lower than STP.';
-        const enabled = !stopInput.disabled && !limitInput?.disabled;
+        if (noStop) stopError = noLimit ? 'A STP trail is required.' : 'A STP trail is required before entering a LMT offset.';
+        else if (!Number.isFinite(value) || value <= 0 || (stopUnit.value === 'percent' && value >= 100)) stopError = 'Enter a positive STP trail below 100%.';
+        else if (stopUnit.value === 'dollars' && Math.abs(roundUp(distance) - distance) > 1e-8) stopError = 'STP trail must use a valid price increment.';
+        else if (stopEdited && !config.bid) stopError = 'A fresh bid is required to review the STP trail.';
+        else if (!Number.isFinite(stop) || stop <= 0 || (config.bid && stop >= bid)) stopError = 'STP trail must leave a positive stop below the bid.';
+        if (!noLimit && (!Number.isFinite(gapValue) || gapValue <= 0 || (limitUnit.value === 'percent' && gapValue >= 100))) limitError = 'Enter a positive LMT offset below 100%, or leave it blank.';
+        else if (!stopError && !noLimit && (!Number.isFinite(limit) || limit <= 0)) limitError = 'LMT offset must leave a positive limit price below STP.';
+        const enabled = !stopInput.disabled && !limitInput.disabled;
         const error = enabled && trailEdited ? stopError || limitError : '';
         const valid = enabled && !stopError && !limitError;
-        const stopChanged = Math.abs(stop - Number(stopInput.dataset.trailingInitial)) > 1e-8;
-        const limitChanged = noLimit !== !limitInput?.dataset.trailingInitial.trim() ||
-          Math.abs(limit - Number(limitInput?.dataset.trailingInitial)) > 1e-8;
-        const changedTrail = valid && (stopChanged || limitChanged);
+        const stopChanged = Math.abs(stop - Number(stopInput.dataset.trailingStop)) > 1e-8;
+        const initialGap = Number(limitInput.dataset.trailingInitial) / multiplier;
+        const limitChanged = noLimit !== !limitInput.dataset.trailingInitial.trim() || Math.abs((noLimit ? 0 : stop - limit) - initialGap) > 1e-8;
+        const changedTrail = valid && (stopEdited || stopChanged || limitChanged);
+        [stopInput, limitInput].forEach((input) => {{
+          const display = form.querySelector(`[data-trailing-price="${{input.name}}"]`);
+          if (display) display.textContent = (input === stopInput ? stopError : stopError || limitError || noLimit) ? '—' : `$${{(input === stopInput ? stop : limit).toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 6}})}}`;
+        }});
         [[stopInput, stopError], [limitInput, limitError]].forEach(([input, message]) => {{
           if (!input) return;
           const showError = enabled && trailEdited && Boolean(message);
@@ -8506,6 +8634,11 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         const feedback = row?.querySelector('[data-trailing-review-error]');
         if (feedback) {{ feedback.textContent = error; feedback.classList.toggle('hidden', !error); }}
         row?.querySelectorAll('.justify-between').forEach((line) => line.classList.toggle('hidden', Boolean(error)));
+        const ruleRow = row?.querySelector('[data-trailing-review-rule-row]');
+        const ruleText = row?.querySelector('[data-trailing-review-rule]');
+        const ruleLabel = (number, unit) => unit === 'percent' ? `${{number}}%` : `$${{number}}`;
+        if (ruleText) ruleText.textContent = `${{ruleLabel(stopInput.dataset.trailingInitial, stopUnit.dataset.trailingInitial)}} → ${{ruleLabel(stopInput.value, stopUnit.value)}}`;
+        if (ruleRow) ruleRow.classList.toggle('hidden', !stopEdited || Boolean(error));
         const stopText = document.querySelector(`[data-trailing-review-stop="${{permId}}"]`);
         const limitText = document.querySelector(`[data-trailing-review-limit="${{permId}}"]`);
         const limitRow = document.querySelector(`[data-trailing-review-limit-row="${{permId}}"]`);
@@ -8546,6 +8679,17 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         if (exact) exact.value = '';
       }}
       update();
+    }}));
+    const showTrailUnits = () => form.querySelectorAll('[data-trailing-unit-button]').forEach((button) => {{
+      const unit = form.querySelector(`[data-trailing-unit="${{button.dataset.trailingUnitButton}}"]`);
+      const selected = unit.value === button.dataset.unit;
+      button.setAttribute('aria-pressed', String(selected));
+      button.classList.toggle('bg-muted', selected);
+      button.classList.toggle('text-muted-foreground', !selected);
+    }});
+    form.querySelectorAll('[data-trailing-unit-button]').forEach((button) => button.addEventListener('click', () => {{
+      form.querySelector(`[data-trailing-unit="${{button.dataset.trailingUnitButton}}"]`).value = button.dataset.unit;
+      showTrailUnits(); update();
     }}));
     form.querySelectorAll('[data-trailing-edit]').forEach((input) => input.addEventListener('input', update));
     document.querySelectorAll('[data-edit-active-prices]').forEach((button) => button.addEventListener('click', () => {{
@@ -8657,9 +8801,10 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       form.querySelectorAll('[data-active-input]').forEach((input) => {{
         input.value = input.dataset.activeInitial || '';
       }});
-      form.querySelectorAll('[data-trailing-edit]').forEach((input) => {{
+      form.querySelectorAll('[data-trailing-edit], [data-trailing-unit]').forEach((input) => {{
         input.value = input.dataset.trailingInitial || '';
       }});
+      showTrailUnits();
       form.querySelectorAll('[data-active-exact-stop]').forEach((input) => {{ input.value = ''; }});
       form.querySelectorAll('input[type="hidden"][data-active-stop-limit-offset], input[type="hidden"][data-active-stop-limit-unit]').forEach((input) => {{ input.value = ''; }});
       update();
@@ -8727,23 +8872,80 @@ def _trailing_readonly_field(
 
 
 def _trailing_edit_field(
-    label: str, name: str, value: str, *, disabled: bool, readonly: bool = False
+    label: str,
+    name: str,
+    value: str,
+    *,
+    unit: str,
+    price: Decimal | None,
+    initial_stop: Decimal | None,
+    description: str,
+    disabled: bool,
+    readonly: bool = False,
 ) -> Any:
+    kind = "STP" if label == "STP trail" else "LMT"
     return Div(
-        Label(label, fr=name, cls="text-xs font-medium text-muted-foreground"),
-        Input(
-            id=name,
-            name=name,
-            type="number",
-            value=value,
-            min="0.01",
-            step="any",
-            disabled=disabled,
-            readonly=readonly,
-            data_trailing_edit=label,
-            data_trailing_initial=value,
-            aria_describedby=f"{name}-error",
-            cls="mt-1",
+        Div(
+            _button_tooltip(
+                Label(label, fr=name, cls="text-xs font-medium text-muted-foreground"),
+                description,
+            ),
+            Span(
+                f"${_price_text(price)}" if price is not None else "—",
+                data_trailing_price=name,
+                cls="text-xs font-semibold tabular-nums",
+            ),
+            cls="trail-field-header flex items-center justify-between gap-2",
+        ),
+        Div(
+            Input(
+                id=name,
+                name=name,
+                type="number",
+                value=value,
+                min="0.01",
+                step="any",
+                disabled=disabled,
+                readonly=readonly,
+                data_trailing_edit=kind,
+                data_trailing_initial=value,
+                data_trailing_stop=_price_text(initial_stop)
+                if initial_stop is not None
+                else "",
+                aria_describedby=f"{name}-error",
+            ),
+            HTMLInput(
+                type="hidden",
+                name=name.replace("trailing_value_", "trailing_value_unit_").replace(
+                    "trailing_offset_", "trailing_offset_unit_"
+                ),
+                value=unit,
+                data_trailing_unit=name,
+                data_trailing_initial=unit,
+            ),
+            Div(
+                *(
+                    Button(
+                        symbol,
+                        type="button",
+                        variant="ghost",
+                        size="sm",
+                        disabled=disabled or readonly,
+                        aria_label=f"{label} in {description_unit}",
+                        aria_pressed=unit == choice,
+                        data_trailing_unit_button=name,
+                        data_unit=choice,
+                        cls="trail-unit-button "
+                        + ("bg-muted" if unit == choice else "text-muted-foreground"),
+                    )
+                    for symbol, choice, description_unit in (
+                        ("$", "dollars", "dollars per contract"),
+                        ("%", "percent", "percent"),
+                    )
+                ),
+                cls="trail-unit-controls",
+            ),
+            cls="trail-input-control",
         ),
         P(
             id=f"{name}-error",

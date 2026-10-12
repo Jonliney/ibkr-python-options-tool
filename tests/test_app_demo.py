@@ -509,8 +509,8 @@ def test_working_trail_limit_review_update_and_delete(tmp_path: Path) -> None:
     entry = workbench._trailing_entries()[0]
     perm_id = entry.perm_ids[0]
     page = client.get(workbench.path).text
-    assert f'name="trailing_stop_{perm_id}"' in page
-    assert f'name="trailing_limit_{perm_id}"' in page
+    assert f'name="trailing_value_{perm_id}"' in page
+    assert f'name="trailing_offset_{perm_id}"' in page
     assert f'value="trailing-delete-arm:{perm_id}"' in page
     assert 'aria-label="Delete trail 1"' in page
     assert 'aria-label="Review trail 1 changes"' not in page
@@ -520,10 +520,10 @@ def test_working_trail_limit_review_update_and_delete(tmp_path: Path) -> None:
         "data-layer-state=", 1
     )[0]
     stop_input = re.search(
-        rf'<input[^>]+name="trailing_stop_{perm_id}"[^>]*>', trailing_row
+        rf'<input[^>]+name="trailing_value_{perm_id}"[^>]*>', trailing_row
     )
     gap_input = re.search(
-        rf'<input[^>]+name="trailing_limit_{perm_id}"[^>]*>', trailing_row
+        rf'<input[^>]+name="trailing_offset_{perm_id}"[^>]*>', trailing_row
     )
     quantity_input = re.search(
         rf'<input[^>]+id="trailing-quantity-{perm_id}"[^>]*>', trailing_row
@@ -599,7 +599,7 @@ def test_trail_gap_can_be_added_and_removed_but_stop_is_required(
     perm_id = entry.perm_ids[0]
     assert workbench._state.working_orders[0].order_type == "TRAIL"
     page = client.get(workbench.path).text
-    for field in ("stop", "limit"):
+    for field in ("value", "offset"):
         input_markup = re.search(
             rf'<input[^>]+name="trailing_{field}_{perm_id}"[^>]*>', page
         )
@@ -660,6 +660,9 @@ def test_working_trail_input_opens_active_review(
         client.post(
             workbench.path + "action", data={"action": "trailing-convert-confirm"}
         )
+    TestClient(workbench.app).post(
+        workbench.path + "action", data={"action": "refresh"}
+    )
     server, server_thread, port = _start_local_server(workbench.app)
     QApplication.instance() or QApplication([])
     loop = QEventLoop()
@@ -676,7 +679,7 @@ def test_working_trail_input_opens_active_review(
             """(() => {
               const stop = document.querySelector('[data-trailing-edit="STP"]');
               const gap = document.querySelector('[data-trailing-edit="LMT"]');
-              gap.value = '8.65';
+              gap.value = '15';
               gap.dispatchEvent(new Event('input', { bubbles: true }));
               const review = document.querySelector('[data-trailing-review-row]');
               const button = document.querySelector('[data-active-execute]');
@@ -705,13 +708,13 @@ def test_working_trail_input_opens_active_review(
               gap.dispatchEvent(new Event('input', { bubbles: true }));
               const blankGapReview = !review.classList.contains('hidden')
                 && !button.disabled;
-              gap.value = '8.10'; stop.value = '';
+              gap.value = '20'; stop.value = '';
               stop.dispatchEvent(new Event('input', { bubbles: true }));
               const missingStop = review.querySelector(
                 '[data-trailing-review-error]').textContent;
               const blankStopRejected = button.disabled;
               const invalidReviewVisible = !review.classList.contains('hidden');
-              stop.value = '8.30'; gap.value = '8.40';
+              stop.value = '75'; gap.value = '900';
               gap.dispatchEvent(new Event('input', { bubbles: true }));
               const highLimit = review.querySelector(
                 '[data-trailing-review-error]').textContent;
@@ -720,14 +723,14 @@ def test_working_trail_input_opens_active_review(
               const invalidGain = document.querySelector(
                 '[data-gain-value]').textContent;
               const unknownTones = tones();
-              gap.value = '8.10';
+              gap.value = '20';
               gap.dispatchEvent(new Event('input', { bubbles: true }));
               const recoveredGain = document.querySelector(
                 '[data-gain-value]').textContent;
               const recovered = !button.disabled &&
                 gap.getAttribute('aria-invalid') === 'false';
               const negativeTones = tones();
-              stop.value = '8.60'; gap.value = '';
+              stop.value = '45'; gap.value = '';
               gap.dispatchEvent(new Event('input', { bubbles: true }));
               const zeroTones = tones();
               return JSON.stringify({
@@ -769,14 +772,14 @@ def test_working_trail_input_opens_active_review(
         "firstReview": True,
         "blankGapReview": with_limit,
         "title": "TRAIL-1",
-        "linkedRows": 2,
+        "linkedRows": 3,
         "stopReview": "$8.80",
         "gapReview": "$8.65",
         "gain": _money(gain),
         "blankStopRejected": True,
-        "missingStop": "A STP is required before entering a LMT.",
+        "missingStop": "A STP trail is required before entering a LMT offset.",
         "invalidReviewVisible": True,
-        "highLimit": "LMT must be lower than STP.",
+        "highLimit": "LMT offset must leave a positive limit price below STP.",
         "highLimitRejected": True,
         "fieldInvalid": "true",
         "invalidGain": "— Unknown",
@@ -7415,7 +7418,7 @@ def test_submitted_trailing_exit_appears_as_central_layer_row() -> None:
     page = to_xml(workbench._page())
     assert 'data-layer-state="trailing"' in page
     assert "TRAIL 1</span>" in page
-    assert "LMT</label>" in page
+    assert "LMT offset</label>" in page
     assert "CHECK TWS" in page
     trailing_row = to_xml(workbench._trailing_layer_row(1, entry))
     assert 'class="layer-row-grid ' in trailing_row
@@ -7535,8 +7538,8 @@ def test_trailing_conversion_dialog_shows_demo_position_prices() -> None:
     assert "Latest bid" in markup
     assert "Latest ask" not in markup
     assert 'value="25"' in markup
-    assert "Trail amount per contract" in markup
-    assert "Optional limit offset per contract" in markup
+    assert "STP trail</label>" in markup
+    assert "LMT offset (optional)</label>" in markup
     assert snapshot.quote.bid is not None
     expected_stop = round_down_price(
         snapshot.quote.bid - Decimal("25") / snapshot.contract.multiplier,
@@ -7688,7 +7691,7 @@ def test_demo_entire_position_trailing_conversion_includes_unassigned_contracts(
     assert 'data-layer-state="trailing"' in result.text
     assert re.search(r"TRAIL [12]</span>", result.text)
     assert "Active" in result.text
-    for field in ("stop", "limit"):
+    for field in ("value", "offset"):
         input_markup = re.search(
             rf'<input[^>]+name="trailing_{field}_[0-9]+"[^>]*>', result.text
         )
@@ -7783,7 +7786,7 @@ def test_trail_absolute_limit_matches_expected_gain(tmp_path: Path) -> None:
     perm_id = workbench._trailing_entries()[0].perm_ids[0]
     client = TestClient(workbench.app)
     page = client.get(workbench.path).text
-    assert f'name="trailing_limit_{perm_id}"' in page
+    assert f'name="trailing_offset_{perm_id}"' in page
     response = client.post(
         workbench.path + "action",
         data={
@@ -7886,8 +7889,10 @@ def test_review_trail_prices_goes_directly_to_confirm_and_retains_inputs(
         workbench.path + "action",
         data={
             "action": "active-update-arm",
-            f"trailing_stop_{perm_id}": "8.30",
-            f"trailing_limit_{perm_id}": limit,
+            f"trailing_value_{perm_id}": "75",
+            f"trailing_value_unit_{perm_id}": "dollars",
+            f"trailing_offset_unit_{perm_id}": "dollars",
+            f"trailing_offset_{perm_id}": "20" if limit else "",
         },
     )
     assert workbench._armed_trailing_change is not None, workbench._message
@@ -7895,7 +7900,7 @@ def test_review_trail_prices_goes_directly_to_confirm_and_retains_inputs(
     assert workbench._armed_execution_deadline is not None
     assert 'value="trailing-change-confirm"' in reviewed.text
     assert 'value="active-action-execute"' not in reviewed.text
-    for field, value in (("stop", "8.30"), ("limit", limit)):
+    for field, value in (("value", "75"), ("offset", "20" if limit else "")):
         node = re.search(
             rf'<input[^>]*name="trailing_{field}_{perm_id}"[^>]*>', reviewed.text
         )
@@ -7909,9 +7914,9 @@ def test_review_trail_prices_goes_directly_to_confirm_and_retains_inputs(
     assert not workbench._active_action_verified
     assert 'value="trailing-change-confirm"' not in cancelled.text
     node = re.search(
-        rf'<input[^>]*name="trailing_stop_{perm_id}"[^>]*>', cancelled.text
+        rf'<input[^>]*name="trailing_value_{perm_id}"[^>]*>', cancelled.text
     )
-    assert node is not None and 'value="8.80"' in node.group()
+    assert node is not None and 'value="25.00"' in node.group()
 
 
 @pytest.mark.parametrize("failure", ["disconnect", "manual-change"])
@@ -7986,7 +7991,7 @@ def test_trail_review_click_preserves_prices_and_shows_confirm_in_browser(
             view.page().runJavaScript("""(() => {
                 const stop = document.querySelector('[data-trailing-edit="STP"]');
                 const limit = document.querySelector('[data-trailing-edit="LMT"]');
-                stop.value = '8.30'; limit.value = '8.10';
+                stop.value = '75'; limit.value = '20';
                 limit.dispatchEvent(new Event('input', {bubbles: true}));
                 document.querySelector('[data-active-execute]').click();
             })()""")
@@ -8016,10 +8021,118 @@ def test_trail_review_click_preserves_prices_and_shows_confirm_in_browser(
         thread.join(timeout=2)
     assert len(observations) == 1
     assert json.loads(observations[0]) == {
-        "stop": "8.30",
-        "limit": "8.10",
+        "stop": "75",
+        "limit": "20",
         "readonly": True,
         "confirm": True,
         "extraReview": False,
     }
     assert workbench._trailing_entries()[0].trailing_limit_offset == "0.10"
+
+
+@pytest.mark.parametrize(
+    ("value", "unit", "offset", "offset_unit", "stop", "gap"),
+    [
+        ("75", "dollars", "20", "dollars", "8.30", "0.20"),
+        ("10", "percent", "10", "percent", "8.14", "0.82"),
+        ("25", "dollars", "25", "dollars", "8.80", "0.25"),
+    ],
+)
+def test_trail_distance_review_and_confirmation_record_exact_rule(
+    tmp_path: Path,
+    value: str,
+    unit: str,
+    offset: str,
+    offset_unit: str,
+    stop: str,
+    gap: str,
+) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    client = TestClient(workbench.app)
+    perm_id = workbench._trailing_entries()[0].perm_ids[0]
+    reviewed = client.post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"trailing_value_{perm_id}": value,
+            f"trailing_value_unit_{perm_id}": unit,
+            f"trailing_offset_{perm_id}": offset,
+            f"trailing_offset_unit_{perm_id}": offset_unit,
+        },
+    )
+    candidate = workbench._armed_trailing_change
+    assert candidate is not None, workbench._message
+    assert candidate.stop_price == Decimal(stop)
+    assert candidate.limit_offset == Decimal(gap)
+    assert candidate.trail_unit == unit
+    assert candidate.trail_value == (
+        Decimal(value) / 100 if unit == "dollars" else Decimal(value)
+    )
+    assert 'value="trailing-change-confirm"' in reviewed.text
+    assert workbench._trailing_entries()[0].trailing_value == "0.25"
+    for name, expected in (
+        (f"trailing_value_{perm_id}", value),
+        (f"trailing_offset_{perm_id}", offset),
+        (f"trailing_offset_unit_{perm_id}", offset_unit),
+    ):
+        node = re.search(rf'<input[^>]*name="{name}"[^>]*>', reviewed.text)
+        assert node is not None and f'value="{expected}"' in node.group()
+    client.post(workbench.path + "action", data={"action": "trailing-change-confirm"})
+    entry = workbench._trailing_entries()[0]
+    assert entry.trailing_value == format(candidate.trail_value, "f")
+    assert entry.trailing_unit == unit
+    assert Decimal(entry.trailing_limit_offset) == Decimal(gap)
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    order = next(order for order in snapshot.working_orders if order.perm_id == perm_id)
+    assert (
+        order.trailing_amount if unit == "dollars" else order.trailing_percent
+    ) == candidate.trail_value
+    # The updated durable rule is accepted by the next management review.
+    assert workbench._paper_execution is not None
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    workbench._paper_execution.prepare_trailing_change(
+        snapshot,
+        perm_id=perm_id,
+        expected_client_id=workbench._settings.client_id,
+        cancel=True,
+    )
+
+
+def test_offset_edit_preserves_ratcheted_stop_and_rejects_invalid_rule(
+    tmp_path: Path,
+) -> None:
+    from ibkr_options_manager.trailing import trailing_edit_prices
+
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    order = replace(
+        next(order for order in snapshot.working_orders if order.perm_id == 810201),
+        stop_price=Decimal("8.90"),
+    )
+    assert trailing_edit_prices(
+        snapshot, order, Decimal("25"), "dollars", Decimal("25"), "dollars"
+    ) == (Decimal("8.90"), Decimal("0.25"), Decimal("0.25"))
+    for value, unit, offset, offset_unit in (
+        ("0", "dollars", "25", "dollars"),
+        ("100", "percent", "25", "dollars"),
+        ("25", "dollars", "900", "dollars"),
+        ("25", "dollars", "100", "percent"),
+        ("25", "unknown", "25", "dollars"),
+        ("NaN", "dollars", "25", "dollars"),
+    ):
+        with pytest.raises(ExecutionBlocked):
+            trailing_edit_prices(
+                snapshot, order, Decimal(value), unit, Decimal(offset), offset_unit
+            )
+    with pytest.raises(ExecutionBlocked, match="fresh bid"):
+        trailing_edit_prices(
+            replace(snapshot, quote=replace(snapshot.quote, fresh=False)),
+            order,
+            Decimal("25"),
+            "dollars",
+            None,
+            "dollars",
+        )

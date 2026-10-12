@@ -122,7 +122,8 @@
 }
 
 .oca-layer-list {
-  min-width: 36rem;
+  min-width: 0;
+  container-type: inline-size;
 }
 
 .layer-row-grid {
@@ -364,4 +365,45 @@
 
 [data-cancelled-bracket-recovery-dialog] dialog[data-dialog] {
   max-width: min(38rem, calc(100vw - 2rem));
+}
+
+/* Trail distances share bracket input geometry; units stay inside the field. */
+.trail-input-control { position: relative; margin-top: 0.25rem; }
+.trail-input-control > input[type="number"] { padding-right: 4.5rem; }
+.trail-unit-controls {
+  position: absolute;
+  inset: 0 0.375rem 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.125rem;
+}
+.trail-unit-button {
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  border-radius: 0.25rem;
+  font-size: 0.75rem;
+}
+.trail-unit-button[aria-pressed="true"] {
+  background: var(--muted);
+  color: var(--foreground);
+}
+.trail-unit-button:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }
+
+
+@container (max-width: 36rem) {
+  .layer-row-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .layer-row-grid > :first-child { grid-column: 1 / -1; }
+  .layer-row-grid > :nth-child(5) { justify-self: end; }
+}
+@container (max-width: 20rem) {
+  .layer-row-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+
+/* Tooltip wrappers must retain the same 16px label line as bracket fields. */
+.trail-field-header > [data-slot="tooltip"],
+.trail-field-header [data-slot="tooltip-trigger"] {
+  display: flex;
+  align-items: center;
 }

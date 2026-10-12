@@ -493,6 +493,7 @@ def test_paper_trailing_writer_sends_one_exact_order(monkeypatch, with_limit) ->
         assert sent[0].lmtPriceOffset == float(plan.limit_offset)
 
 
+@pytest.mark.parametrize("trail_unit", [None, "dollars", "percent", "wrong-ack"])
 @pytest.mark.parametrize("cancel", [False, True])
 @pytest.mark.parametrize("reject", [False, True])
 @pytest.mark.parametrize("manual_gap_change", [False, True])
@@ -507,6 +508,7 @@ def test_paper_trailing_writer_sends_one_exact_order(monkeypatch, with_limit) ->
 )
 def test_trailing_change_writer_verifies_exact_order_before_write(
     monkeypatch,
+    trail_unit: str | None,
     cancel: bool,
     reject: bool,
     manual_gap_change: bool,
@@ -539,6 +541,12 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
         stop_price=None if cancel else Decimal("0.75"),
         limit_offset=None if cancel else next_gap,
         cancel=cancel,
+        trail_value=Decimal("5")
+        if trail_unit == "percent"
+        else Decimal("0.15")
+        if trail_unit is not None and not cancel
+        else None,
+        trail_unit="percent" if trail_unit == "percent" else "dollars",
     )
     writes: list[str] = []
     order = SimpleNamespace(
@@ -600,6 +608,8 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
             if reject:
                 self.wrapper.error(order_id, 201, "simulated rejection")
                 return
+            if trail_unit == "wrong-ack":
+                amended.auxPrice = 0.10
             self.wrapper.openOrder(
                 order_id,
                 SimpleNamespace(conId=snapshot.selected.con_id),
@@ -632,19 +642,22 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
                 host="127.0.0.1",
                 port=7497,
                 client_id=17,
-                timeout_seconds=1,
+                timeout_seconds=0.1,
             )
         assert writes == []
         return
-    if reject:
-        with pytest.raises(ExecutionOutcomeUnknown, match="simulated rejection"):
+    if reject or (trail_unit == "wrong-ack" and not cancel):
+        with pytest.raises(
+            ExecutionOutcomeUnknown,
+            match="simulated rejection" if reject else "did not acknowledge",
+        ):
             IbkrPaperExecutionBroker().change_trailing(
                 snapshot,
                 candidate,
                 host="127.0.0.1",
                 port=7497,
                 client_id=17,
-                timeout_seconds=1,
+                timeout_seconds=0.1,
             )
     else:
         result = IbkrPaperExecutionBroker().change_trailing(
@@ -653,7 +666,7 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
             host="127.0.0.1",
             port=7497,
             client_id=17,
-            timeout_seconds=1,
+            timeout_seconds=0.1,
         )
         assert result.order_ids == (500,)
         assert result.perm_ids == (() if cancel else (900,))
@@ -662,6 +675,14 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
         assert order.orderType == ("TRAIL LIMIT" if next_gap is not None else "TRAIL")
         assert (
             broker_execution._observed_trailing_offset(order.lmtPriceOffset) == next_gap
+        )
+
+    if not cancel and trail_unit in {"dollars", "percent"}:
+        assert broker_execution._observed_trailing_offset(order.auxPrice) == (
+            Decimal("0.15") if trail_unit == "dollars" else None
+        )
+        assert broker_execution._observed_trailing_offset(order.trailingPercent) == (
+            Decimal("5") if trail_unit == "percent" else None
         )
 
 

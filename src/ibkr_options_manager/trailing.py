@@ -10,6 +10,7 @@ from .domain import (
     BrokerSnapshot,
     ContractKey,
     VerifiedOptionContract,
+    WorkingOrder,
     round_down_price,
     round_up_price,
     supports_outside_rth,
@@ -171,3 +172,69 @@ def plan_entire_position(
             and execution.con_id == snapshot.selected.con_id
         ),
     )
+
+
+def trailing_edit_prices(
+    snapshot: BrokerSnapshot,
+    order: WorkingOrder,
+    value: Decimal,
+    unit: str,
+    offset: Decimal | None,
+    offset_unit: str,
+) -> tuple[Decimal, Decimal, Decimal | None]:
+    """Convert per-contract money/percent inputs to verified premium prices.
+
+    Preserve a ratcheted stop when its trail rule is unchanged. Percent limit
+    offsets become a fixed premium gap at review, as required by IBKR.
+    """
+    multiplier = snapshot.contract.multiplier
+    if not multiplier.is_finite() or multiplier <= 0:
+        raise ExecutionBlocked("the option multiplier is invalid")
+    if (
+        unit not in {"dollars", "percent"}
+        or not value.is_finite()
+        or value <= 0
+        or (unit == "percent" and value >= 100)
+    ):
+        raise ExecutionBlocked("Enter a positive STP trail below 100%.")
+    normalized = value / multiplier if unit == "dollars" else value
+    unchanged = (
+        order.trailing_amount == normalized
+        if unit == "dollars"
+        else order.trailing_percent == normalized
+    )
+    if not snapshot.quote.fresh or snapshot.quote.bid is None:
+        raise ExecutionBlocked("A fresh bid is required to review the STP trail.")
+    reference = snapshot.quote.bid
+    if not reference.is_finite() or reference <= 0:
+        raise ExecutionBlocked("The option bid is invalid.")
+    distance = normalized if unit == "dollars" else reference * value / Decimal("100")
+    stop = (
+        order.stop_price
+        if unchanged
+        else round_down_price(reference - distance, snapshot.market_rule.bands)
+    )
+    if stop is None or stop <= 0 or stop >= reference:
+        raise ExecutionBlocked("STP trail must leave a positive stop below the bid.")
+    gap = None
+    if offset is not None:
+        if (
+            offset_unit not in {"dollars", "percent"}
+            or not offset.is_finite()
+            or offset <= 0
+            or (offset_unit == "percent" and offset >= 100)
+        ):
+            raise ExecutionBlocked(
+                "Enter a positive LMT offset below 100%, or leave it blank."
+            )
+        raw_gap = (
+            offset / multiplier
+            if offset_unit == "dollars"
+            else stop * offset / Decimal("100")
+        )
+        gap = round_up_price(raw_gap, snapshot.market_rule.bands)
+        if gap >= stop:
+            raise ExecutionBlocked(
+                "LMT offset must leave a positive limit price below STP."
+            )
+    return stop, normalized, gap
