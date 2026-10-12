@@ -512,7 +512,7 @@ the post-cancel open-order recheck is clean, and the standalone MKT produces
 the expected order/execution callbacks.
 ## Working trailing order changes
 
-A working, app-owned paper `TRAIL` or `TRAIL LIMIT` exposes **STP trail**
+A working, app-owned paper `TRAIL` or `TRAIL LIMIT` exposes **TRAIL AMT**
 followed by **LMT offset**. Both accept dollars per contract or percentages;
 the calculated premium price appears above each input. Dollar amounts are
 divided by the verified contract multiplier. STP percentages use the fresh
@@ -596,7 +596,11 @@ Set all stops applies a common premium trigger. For a trail, review derives a
 fixed dollar trail distance from the fresh bid minus that trigger, rounding
 the distance up to a valid increment. The explicit trigger is retained, and
 the existing limit gap is preserved unless the user overrides it. Review
-shows the changed trail rule, STP, LMT, and projected P&L. Raise stops to B/E
+shows the changed trail rule, STP, LMT, and projected P&L. The dialog blocks
+Apply if the bid is missing or stale, or the requested trail trigger is at
+or above the bid; it explains the problem without changing either input.
+Return percentages use entry basis: -20% of $8.60 is a $6.88 trigger.
+Raise stops to B/E
 only raises triggers below the entry basis and never lowers higher triggers;
 a fresh read that would turn it into a lowering operation blocks review.
 A trail's limit may still be below basis, so B/E is a trigger description,

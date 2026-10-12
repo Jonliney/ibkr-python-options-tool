@@ -1508,15 +1508,15 @@ class StarUIWorkbench:
                 gap_text = values.get(f"trailing_offset_{perm_id}", "").strip()
                 if not value_text:
                     raise ExecutionBlocked(
-                        "A STP trail is required before entering a LMT offset."
+                        "A trail amount is required before entering a LMT offset."
                         if gap_text
-                        else "A STP trail is required."
+                        else "A trail amount is required."
                     )
                 value = _decimal_value(value_text)
                 offset = _decimal_value(gap_text)
                 if value is None or (gap_text and offset is None):
                     raise ExecutionBlocked(
-                        "Enter valid STP trail and LMT offset values."
+                        "Enter valid trail amount and LMT offset values."
                     )
                 trail_unit = values.get(f"trailing_value_unit_{perm_id}", "")
                 offset_unit = values.get(f"trailing_offset_unit_{perm_id}", "")
@@ -4911,7 +4911,7 @@ class StarUIWorkbench:
                         DialogHeader(
                             DialogTitle("Set all stops…"),
                             DialogDescription(
-                                "Enter a common stop price. For trails, review also shows the resulting trail distance and limit price."
+                                "Choose a stop price or return from entry. For trails, the distance is calculated from the latest bid; the limit offset is kept unless you override it."
                             ),
                         ),
                         Div(
@@ -5019,7 +5019,16 @@ class StarUIWorkbench:
                                 Span(
                                     "Active layers", cls="text-xs text-muted-foreground"
                                 ),
-                                Span(str(len(pairs)), cls="text-sm font-semibold"),
+                                Span(
+                                    str(
+                                        len(pairs)
+                                        + sum(
+                                            order.order_type in {"TRAIL", "TRAIL LIMIT"}
+                                            for order in self._state.working_orders
+                                        )
+                                    ),
+                                    cls="text-sm font-semibold",
+                                ),
                                 cls="flex items-center justify-between gap-4",
                             ),
                             _dialog_context_row(
@@ -5043,6 +5052,12 @@ class StarUIWorkbench:
                                 cls="flex items-center justify-between gap-4",
                             ),
                             cls="space-y-2 rounded-md border border-border bg-muted/20 px-4 py-3",
+                        ),
+                        Span(
+                            "",
+                            data_stop_dialog_error=True,
+                            role="alert",
+                            cls="hidden text-sm text-rose-400",
                         ),
                         DialogFooter(
                             DialogClose("Cancel", variant="outline"),
@@ -5581,7 +5596,7 @@ class StarUIWorkbench:
                     Div(
                         Div(
                             Label(
-                                "STP trail",
+                                "TRAIL AMT",
                                 fr="trail-value",
                                 data_trail_value_label=True,
                                 cls="text-xs font-medium text-muted-foreground",
@@ -5603,7 +5618,7 @@ class StarUIWorkbench:
                                 value="dollars",
                                 variant="outline",
                                 size="default",
-                                aria_label="Trail amount unit",
+                                aria_label="TRAIL AMT unit",
                                 data_trail_unit_group=True,
                             ),
                             HTMLInput(
@@ -5917,7 +5932,7 @@ class StarUIWorkbench:
             )
             if sold
             else _trailing_edit_field(
-                "STP trail",
+                "TRAIL AMT",
                 f"trailing_value_{entry.perm_ids[0]}",
                 display_value_text,
                 unit=trail_unit,
@@ -6633,8 +6648,11 @@ class StarUIWorkbench:
             "multiplier": format(self._state.multiplier or Decimal("0"), "f"),
             "bid": format(snapshot.quote.bid, "f")
             if (snapshot := self._view_model.latest_snapshot()) is not None
+            and snapshot.fresh
             and snapshot.quote.fresh
             and snapshot.quote.bid is not None
+            and snapshot.quote.bid.is_finite()
+            and snapshot.quote.bid > 0
             else None,
             "bands": [
                 {
@@ -7804,10 +7822,14 @@ class StarUIWorkbench:
                             cls="hidden text-xs leading-5 text-rose-400",
                         ),
                         self._review_order_line(
-                            "STP trail",
-                            Span(
-                                data_trailing_review_rule=perm_id,
-                                cls="text-xs font-semibold",
+                            "TRAIL AMT",
+                            _value_transition(
+                                "",
+                                "",
+                                tone="text-muted-foreground",
+                                current_attributes={
+                                    "data_trailing_review_rule": perm_id
+                                },
                             ),
                             "text-muted-foreground",
                             row_attributes={"data_trailing_review_rule_row": perm_id},
@@ -7860,7 +7882,7 @@ class StarUIWorkbench:
                     cls="text-base font-semibold tracking-tight text-foreground",
                 ),
                 P(
-                    "Change the STP trail or LMT offset to preview the update here."
+                    "Change the trail amount or LMT offset to preview the update here."
                     if any(
                         entry.state == "SUBMITTED" for entry in self._trailing_entries()
                     )
@@ -8089,18 +8111,21 @@ class StarUIWorkbench:
         ]
         price_lines = [
             self._review_order_line(
-                "Trail amount",
+                "TRAIL AMT",
                 Span(
-                    f"{plan.request.trail_value}%"
+                    f"{_review_number(plan.request.trail_value)}%"
                     if plan.request.trail_unit == "percent"
-                    else f"${_price_text(plan.request.trail_value * plan.contract.multiplier)}",
-                    cls="text-xs font-semibold",
+                    else f"${_review_number(plan.request.trail_value * plan.contract.multiplier)}",
+                    cls="font-mono text-xs font-semibold tabular-nums",
                 ),
-                "text-rose-400",
+                "text-muted-foreground",
             ),
             self._review_order_line(
                 "SELL STP",
-                Span(f"${_price_text(plan.initial_stop)}", cls="text-xs font-semibold"),
+                Span(
+                    f"${_review_number(plan.initial_stop)}",
+                    cls="font-mono text-xs font-semibold tabular-nums",
+                ),
                 "text-rose-400",
             ),
         ]
@@ -8109,8 +8134,8 @@ class StarUIWorkbench:
                 self._review_order_line(
                     "SELL STP LMT",
                     Span(
-                        f"${_price_text(plan.initial_stop - plan.limit_offset)}",
-                        cls="text-xs font-semibold",
+                        f"${_review_number(plan.initial_stop - plan.limit_offset)}",
+                        cls="font-mono text-xs font-semibold tabular-nums",
                     ),
                     "text-rose-400",
                 )
@@ -8143,20 +8168,19 @@ class StarUIWorkbench:
             tif=order.tif,
             lines=(
                 self._review_order_line(
-                    "STP trail",
-                    Span(
+                    "TRAIL AMT",
+                    _value_transition(
                         (
-                            f"${_price_text(order.trailing_amount * (self._state.multiplier or Decimal('0')))}"
+                            f"${_review_number(order.trailing_amount * (self._state.multiplier or Decimal('0')))}"
                             if order.trailing_amount is not None
-                            else f"{_price_text(order.trailing_percent)}%"
-                        )
-                        + " → "
-                        + (
-                            f"${_price_text(candidate.trail_value * (self._state.multiplier or Decimal('0')))}"
-                            if candidate.trail_unit == "dollars"
-                            else f"{_price_text(candidate.trail_value)}%"
+                            else f"{_review_number(order.trailing_percent)}%"
                         ),
-                        cls="text-xs font-semibold",
+                        (
+                            f"${_review_number(candidate.trail_value * (self._state.multiplier or Decimal('0')))}"
+                            if candidate.trail_unit == "dollars"
+                            else f"{_review_number(candidate.trail_value)}%"
+                        ),
+                        tone="text-muted-foreground",
                     ),
                     "text-muted-foreground",
                 )
@@ -8176,7 +8200,8 @@ class StarUIWorkbench:
                     Span("CANCEL", cls="text-xs font-semibold")
                     if candidate.cancel
                     else Span(
-                        f"${_price_text(order.stop_price)}", cls="text-xs font-semibold"
+                        f"${_review_number(order.stop_price)}",
+                        cls="font-mono text-xs font-semibold tabular-nums",
                     )
                     if order.stop_price == candidate.stop_price
                     else _price_transition(
@@ -8347,7 +8372,7 @@ def _trailing_preview_script(configuration: dict[str, Any] | None) -> str:
   }};
   const refresh = () => {{
     const unit = form.elements['trail_unit']?.value || 'dollars';
-    label.textContent = 'STP trail';
+    label.textContent = 'TRAIL AMT';
     const amount = Number(input.value);
     let stop = NaN;
     if (input.value.trim() && amount > 0 && Number.isFinite(bid) && bid > 0) {{
@@ -8503,7 +8528,8 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         node.classList.toggle('text-muted-foreground', !Number.isFinite(value) || value === 0);
       }}
     }});
-    const priceText = (number) => `$${{Number(number.toFixed(6)).toString()}}`;
+    const reviewNumber = (number) => Number(number).toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 6, useGrouping: false}});
+    const priceText = (number) => `$${{reviewNumber(number)}}`;
     const sellPriceText = (number, display = priceText(number)) => `${{display}} (${{((number / basis - 1) * 100) >= 0 ? '+' : ''}}${{((number / basis - 1) * 100).toFixed(1)}}%)`;
     const money = (number) => `${{number >= 0 ? '+' : '-'}}$${{Math.abs(number).toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})}}`;
     const roundUp = (number) => {{
@@ -8697,7 +8723,8 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         node.classList.toggle('text-muted-foreground', !Number.isFinite(value) || value === 0);
       }}
     }});
-    const priceText = (number) => `$${{Number(number.toFixed(6)).toString()}}`;
+    const reviewNumber = (number) => Number(number).toLocaleString('en-US', {{minimumFractionDigits: 2, maximumFractionDigits: 6, useGrouping: false}});
+    const priceText = (number) => `$${{reviewNumber(number)}}`;
     const money = (number) => `${{number >= 0 ? '+' : '-'}}$${{Math.abs(number).toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})}}`;
     const roundUp = (number) => {{
       let candidate = number;
@@ -8823,11 +8850,11 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         const gap = limitUnit.value === 'percent' ? stop * gapValue / 100 : gapValue / multiplier;
         const limit = stop - roundUp(gap);
         let stopError = '', limitError = '';
-        if (noStop) stopError = noLimit ? 'A STP trail is required.' : 'A STP trail is required before entering a LMT offset.';
-        else if (!Number.isFinite(value) || value <= 0 || (stopUnit.value === 'percent' && value >= 100)) stopError = 'Enter a positive STP trail below 100%.';
-        else if (stopUnit.value === 'dollars' && Math.abs(roundUp(distance) - distance) > 1e-8) stopError = 'STP trail must use a valid price increment.';
-        else if (stopEdited && !config.bid) stopError = 'A fresh bid is required to review the STP trail.';
-        else if (!Number.isFinite(stop) || stop <= 0 || (config.bid && stop >= bid)) stopError = 'STP trail must leave a positive stop below the bid.';
+        if (noStop) stopError = noLimit ? 'A trail amount is required.' : 'A trail amount is required before entering a LMT offset.';
+        else if (!Number.isFinite(value) || value <= 0 || (stopUnit.value === 'percent' && value >= 100)) stopError = 'Enter a positive trail amount below 100%.';
+        else if (stopUnit.value === 'dollars' && Math.abs(roundUp(distance) - distance) > 1e-8) stopError = 'TRAIL AMT must use a valid price increment.';
+        else if (stopEdited && !config.bid) stopError = 'A fresh bid is required to review the trail amount.';
+        else if (!Number.isFinite(stop) || stop <= 0 || (config.bid && stop >= bid)) stopError = 'The trail amount must leave a positive stop below the bid.';
         if (!noLimit && (!Number.isFinite(gapValue) || gapValue <= 0 || (limitUnit.value === 'percent' && gapValue >= 100))) limitError = 'Enter a positive LMT offset below 100%, or leave it blank.';
         else if (!stopError && !noLimit && (!Number.isFinite(limit) || limit <= 0)) limitError = 'LMT offset must leave a positive limit price below STP.';
         const enabled = !stopInput.disabled && !limitInput.disabled;
@@ -8854,8 +8881,11 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         row?.querySelectorAll('.justify-between').forEach((line) => line.classList.toggle('hidden', Boolean(error)));
         const ruleRow = row?.querySelector('[data-trailing-review-rule-row]');
         const ruleText = row?.querySelector('[data-trailing-review-rule]');
-        const ruleLabel = (number, unit) => unit === 'percent' ? `${{number}}%` : `$${{number}}`;
-        if (ruleText) ruleText.textContent = `${{ruleLabel(stopInput.dataset.trailingInitial, stopUnit.dataset.trailingInitial)}} → ${{ruleLabel(stopInput.value, stopUnit.value)}}`;
+        const ruleLabel = (number, unit) => unit === 'percent' ? `${{reviewNumber(number)}}%` : `$${{reviewNumber(number)}}`;
+        if (ruleText) {{
+          ruleText.parentElement.firstElementChild.textContent = ruleLabel(stopInput.dataset.trailingInitial, stopUnit.dataset.trailingInitial);
+          ruleText.textContent = ruleLabel(stopInput.value, stopUnit.value);
+        }};
         if (ruleRow) ruleRow.classList.toggle('hidden', !stopEdited || Boolean(error));
         const stopText = document.querySelector(`[data-trailing-review-stop="${{permId}}"]`);
         const limitText = document.querySelector(`[data-trailing-review-limit="${{permId}}"]`);
@@ -8923,14 +8953,19 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       update();
     }}));
     const setTrailStops = (stop, raiseOnly = false) => {{
-      form.querySelectorAll('[data-trailing-edit="STP"]:not(:disabled):not([readonly])').forEach((input) => {{
-        if (raiseOnly && Number(input.dataset.trailingStop) >= stop) return;
-        const distance = roundUp(Number(config.bid) - stop);
-        input.value = Number.isFinite(distance) && distance > 0 ? String(Number((distance * multiplier).toFixed(6))) : '';
+      const inputs = [...form.querySelectorAll('[data-trailing-edit="STP"]:not(:disabled):not([readonly])')]
+        .filter((input) => !raiseOnly || Number(input.dataset.trailingStop) < stop);
+      const bid = Number(config.bid);
+      const distance = roundUp(bid - stop);
+      if (inputs.length && (!config.bid || !Number.isFinite(bid) || bid <= stop ||
+          !Number.isFinite(distance) || distance <= 0)) return false;
+      inputs.forEach((input) => {{
+        input.value = String(Number((distance * multiplier).toFixed(6)));
         form.querySelector(`[data-trailing-unit="${{input.name}}"]`).value = 'dollars';
         form.querySelector(`[data-trailing-exact-stop="${{input.name}}"]`).value = String(stop);
       }});
       showTrailUnits();
+      return true;
     }};
     document.querySelectorAll('[data-edit-active-prices]').forEach((button) => button.addEventListener('click', () => {{
       const firstPrice = form.querySelector('[data-active-input]:not(:disabled), [data-trailing-edit]:not(:disabled)');
@@ -8958,6 +8993,7 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       const inverse = stopDialog.querySelector('[data-stop-dialog-inverse]');
       const summary = stopDialog.querySelector('[data-stop-dialog-summary]');
       const apply = stopDialog.querySelector('[data-apply-all-stops]');
+      const error = stopDialog.querySelector('[data-stop-dialog-error]');
       const modeGroup = stopDialog.querySelector('[data-stop-mode-group]');
       const offsetOverride = stopDialog.querySelector('[data-stop-limit-override]');
       const offsetValue = stopDialog.querySelector('[data-stop-limit-override-value]');
@@ -8984,7 +9020,15 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
           ? `${{dialogPriceText(rounded)}} (${{rate >= 0 ? '+' : ''}}${{Number(rate.toFixed(2))}}%)`
           : '—';
         const offset = Number(offsetValue?.value);
-        apply.disabled = !Number.isFinite(rounded) || (offsetOverride?.checked &&
+        const hasTrails = Boolean(form.querySelector('[data-trailing-edit="STP"]:not(:disabled):not([readonly])'));
+        const bid = Number(config.bid);
+        const message = hasTrails && (!config.bid || !Number.isFinite(bid) || bid <= 0)
+          ? 'A fresh bid is required to calculate the trail amount. Refresh prices before applying.'
+          : hasTrails && Number.isFinite(rounded) && rounded >= bid
+            ? 'The trail stop must be below the latest bid. Choose a lower stop price.' : '';
+        error.textContent = message;
+        error.classList.toggle('hidden', !message);
+        apply.disabled = Boolean(message) || !Number.isFinite(rounded) || (offsetOverride?.checked &&
           (!offsetValue.value.trim() || !Number.isFinite(offset) || offset <= 0 ||
            (offsetUnit === 'percent' && offset >= 100)));
         return {{ rounded, rate }};
@@ -9024,7 +9068,8 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       }}));
       apply.addEventListener('click', () => {{
         const value = previewStop();
-        if (!Number.isFinite(value.rounded)) return;
+        if (apply.disabled || !Number.isFinite(value.rounded)) return;
+        if (!setTrailStops(value.rounded)) return;
         const rate = (value.rounded / basis - 1) * 100;
         form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{
           input.value = rate.toFixed(2);
@@ -9036,7 +9081,6 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
           if (unitField) unitField.value = offsetOverride?.checked && input.dataset.activeStopLimitPrice ? offsetUnit : '';
         }});
         form.querySelector('[data-raise-stops-only]').value = '';
-        setTrailStops(value.rounded);
         if (offsetOverride?.checked) {{
           form.querySelectorAll('[data-trailing-edit="LMT"]').forEach((input) => {{
             input.value = offsetValue.value;
@@ -9136,7 +9180,7 @@ def _trailing_edit_field(
     disabled: bool,
     readonly: bool = False,
 ) -> Any:
-    kind = "STP" if label == "STP trail" else "LMT"
+    kind = "STP" if label == "TRAIL AMT" else "LMT"
     return Div(
         Div(
             _button_tooltip(
@@ -9459,11 +9503,24 @@ def _price_transition(
     current_attributes: dict[str, Any] | None = None,
 ) -> Any:
     """Render an inspectable old-to-new price transition with a Lucide arrow."""
+    return _value_transition(
+        "—" if previous is None else f"${_review_number(previous)}",
+        "" if current is None else f"${_review_number(current)}",
+        tone=tone,
+        current_attributes=current_attributes,
+    )
+
+
+def _value_transition(
+    previous: str,
+    current: str,
+    *,
+    tone: str,
+    current_attributes: dict[str, Any] | None = None,
+) -> Any:
+    """Share typography, arrow, and accessible copy across review transitions."""
     return Span(
-        Span(
-            "—" if previous is None else f"${format(previous, 'f')}",
-            cls="text-muted-foreground",
-        ),
+        Span(previous, cls="text-muted-foreground"),
         Span("to", cls="sr-only"),
         Icon(
             "lucide:arrow-right",
@@ -9471,7 +9528,7 @@ def _price_transition(
             cls="size-3.5 shrink-0 text-muted-foreground",
         ),
         Span(
-            "" if current is None else f"${format(current, 'f')}",
+            current,
             cls=tone,
             **(current_attributes or {}),
         ),
@@ -9588,6 +9645,14 @@ def _active_percentage_for_price(
         if candidate == price:
             return format(percentage, "f")
     return _price_percentage(price, basis, target=target)
+
+
+def _review_number(value: Decimal | None) -> str:
+    """Pad review values to cents without hiding finer valid increments."""
+    if value is None or not value.is_finite():
+        return "—"
+    digits = max(2, -int(value.normalize().as_tuple().exponent))
+    return f"{value:.{digits}f}"
 
 
 def _price_text(price: Decimal | None) -> str:

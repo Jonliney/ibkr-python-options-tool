@@ -425,7 +425,7 @@ def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) ->
     assert sidebar.index("CANCEL BRACKET") < sidebar.index("TRAIL-1")
     assert "OCA-1" in sidebar
     assert "2 contracts · GTC" in sidebar
-    assert sidebar.index("Trail amount") < sidebar.index("SELL STP")
+    assert sidebar.index("TRAIL AMT") < sidebar.index("SELL STP")
     assert "$25" in sidebar
     assert "SELL STP LMT" in sidebar
     assert convert._armed_trailing is not None
@@ -455,7 +455,7 @@ def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) ->
     stop_only_review = "".join(map(str, convert._review_trailing_plan(stop_only)))
     assert "TRAIL-1" in stop_only_review
     assert "2 contracts · GTC" in stop_only_review
-    assert "Trail amount" in stop_only_review
+    assert "TRAIL AMT" in stop_only_review
     assert "SELL STP" in stop_only_review
     assert "SELL STP LMT</span>" not in stop_only_review
     assert stop_only_review.index("CANCEL BRACKET") < stop_only_review.index("TRAIL-1")
@@ -778,7 +778,7 @@ def test_working_trail_input_opens_active_review(
         "gapReview": "$8.65",
         "gain": _money(gain),
         "blankStopRejected": True,
-        "missingStop": "A STP trail is required before entering a LMT offset.",
+        "missingStop": "A trail amount is required before entering a LMT offset.",
         "invalidReviewVisible": True,
         "highLimit": "LMT offset must leave a positive limit price below STP.",
         "highLimitRejected": True,
@@ -3856,8 +3856,9 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert "Choose a percentage or price" not in header
     assert 'aria-label="Stop value unit"' in header
     assert (
-        "Enter a common stop price. For trails, review also shows the resulting "
-        "trail distance and limit price." in header
+        "Choose a stop price or return from entry. For trails, the distance is "
+        "calculated from the latest bid; the limit offset is kept unless you "
+        "override it." in header
     )
     assert "data-stop-dialog-inverse" in header
     assert "Active layers" in header and "Entry cost" in header
@@ -7471,13 +7472,13 @@ def test_trailing_dialog_has_one_clickable_trigger_button() -> None:
     assert "Choose a trailing stop or trailing limit" in dialog_markup
     assert dialog_markup.index(">Cancel<") < dialog_markup.index("Review trailing exit")
     assert 'd="M9 19h8.5' in trigger_markup
-    assert 'aria-label="Trail amount unit"' in dialog_markup
+    assert 'aria-label="TRAIL AMT unit"' in dialog_markup
     assert 'aria-label="Trailing limit offset unit"' in dialog_markup
     assert 'name="trail_unit" data-bind="trailing_amount_unit"' in dialog_markup
     assert 'name="trail_limit_unit" data-bind="trailing_limit_unit"' in dialog_markup
     assert 'name="trail_tif"' not in dialog_markup
     assert ">DAY<" not in dialog_markup
-    assert dialog_markup.index('aria-label="Trail amount unit"') < dialog_markup.index(
+    assert dialog_markup.index('aria-label="TRAIL AMT unit"') < dialog_markup.index(
         'name="trail_value"'
     )
     assert dialog_markup.index(
@@ -7550,7 +7551,7 @@ def test_trailing_conversion_dialog_shows_demo_position_prices() -> None:
     assert "Latest bid" in markup
     assert "Latest ask" not in markup
     assert 'value="25"' in markup
-    assert "STP trail</label>" in markup
+    assert "TRAIL AMT</label>" in markup
     assert "LMT offset (optional)</label>" in markup
     assert snapshot.quote.bid is not None
     expected_stop = round_down_price(
@@ -7678,7 +7679,7 @@ def test_demo_entire_position_trailing_conversion_includes_unassigned_contracts(
     assert "TRAIL-1" in review.text
     assert "3 contracts · GTC" in review.text
     assert ("CANCEL BRACKET" in review.text) is with_bracket
-    assert "Trail amount" in review.text
+    assert "TRAIL AMT" in review.text
     assert "SELL STP LMT" in review.text
     if bid_changes_before_review:
         broker.bid_adjustment = Decimal("0.05")
@@ -8281,3 +8282,95 @@ def test_position_exit_stops_if_position_changes_after_trail_cancellation(
     assert markets == []
     assert workbench._trailing_entries()[0].state == "CANCELLED_CONFIRMED"
     assert "stopped after 1 cancellations" in workbench._message
+
+
+@pytest.mark.parametrize("bid_state", ["fresh", "missing", "stale", "below-stop"])
+@pytest.mark.parametrize(
+    ("preset", "stop_price", "distance"),
+    [("-20", "6.88", "217"), ("-25", "6.45", "260")],
+)
+def test_set_all_stops_trail_dialog_preserves_fields_when_conversion_unavailable(
+    tmp_path: Path, bid_state: str, preset: str, stop_price: str, distance: str
+) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    if bid_state != "fresh":
+        quote = replace(
+            snapshot.quote,
+            bid=None
+            if bid_state == "missing"
+            else Decimal("6")
+            if bid_state == "below-stop"
+            else snapshot.quote.bid,
+            fresh=bid_state != "stale",
+        )
+        workbench._view_model._latest_snapshot = replace(snapshot, quote=quote)
+    server, thread, port = _start_local_server(workbench.app)
+    QApplication.instance() or QApplication([])
+    view = QWebEngineView()
+    view.resize(1500, 920)
+    loop = QEventLoop()
+    observations: list[str] = []
+
+    def loaded(ok: bool) -> None:
+        if not ok:
+            loop.quit()
+            return
+        view.page().runJavaScript(
+            """(() => {
+            document.querySelector('[aria-label="Set all stops…"]').click();
+            const dialog = document.querySelector('[data-stop-dialog]');
+            const stop = document.querySelector('[data-trailing-edit="STP"]');
+            const limit = document.querySelector('[data-trailing-edit="LMT"]');
+            const before = [stop.value, limit.value];
+            dialog.querySelector('[data-stop-preset="PRESET"]').click();
+            const apply = dialog.querySelector('[data-apply-all-stops]');
+            const disabled = apply.disabled;
+            apply.click();
+            return JSON.stringify({before, after: [stop.value, limit.value], disabled,
+                summary: dialog.querySelector('[data-stop-dialog-summary]').textContent,
+                error: dialog.querySelector('[data-stop-dialog-error]')
+                    ?.textContent || '',
+                exact: document.querySelector('[data-trailing-exact-stop]').value});
+        })()""".replace("PRESET", preset),
+            lambda result: (observations.append(result), loop.quit()),
+        )
+
+    try:
+        view.loadFinished.connect(loaded)
+        view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
+        QTimer.singleShot(5000, loop.quit)
+        loop.exec()
+    finally:
+        view.close()
+        server.should_exit = True
+        thread.join(timeout=2)
+    assert len(observations) == 1
+    result = json.loads(observations[0])
+    assert result["summary"] == f"${stop_price} ({preset}%)"
+    if bid_state == "fresh":
+        assert not result["disabled"]
+        assert result["after"] == [distance, result["before"][1]]
+        assert Decimal(result["exact"]) == Decimal(stop_price)
+        perm_id = workbench._trailing_entries()[0].perm_ids[0]
+        TestClient(workbench.app).post(
+            workbench.path + "action",
+            data={
+                "action": "active-update-arm",
+                f"trailing_value_{perm_id}": distance,
+                f"trailing_value_unit_{perm_id}": "dollars",
+                f"trailing_offset_{perm_id}": result["after"][1],
+                f"trailing_offset_unit_{perm_id}": "dollars",
+                f"trailing_exact_stop_{perm_id}": stop_price,
+            },
+        )
+        candidate = workbench._armed_trailing_change
+        assert candidate is not None, workbench._message
+        assert candidate.stop_price == Decimal(stop_price)
+        assert candidate.trail_value == Decimal(distance) / 100
+        assert candidate.limit_offset == Decimal("0.10")
+    else:
+        assert result["disabled"], result
+        assert result["after"] == result["before"]
+        assert "bid" in result["error"].lower()
