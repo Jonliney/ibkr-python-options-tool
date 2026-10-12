@@ -495,9 +495,26 @@ def test_paper_trailing_writer_sends_one_exact_order(monkeypatch, with_limit) ->
 
 @pytest.mark.parametrize("cancel", [False, True])
 @pytest.mark.parametrize("reject", [False, True])
+@pytest.mark.parametrize("manual_gap_change", [False, True])
+@pytest.mark.parametrize(
+    ("prior_gap", "next_gap"),
+    [
+        (None, None),
+        (None, Decimal("0.10")),
+        (Decimal("0.05"), None),
+        (Decimal("0.05"), Decimal("0.10")),
+    ],
+)
 def test_trailing_change_writer_verifies_exact_order_before_write(
-    monkeypatch, cancel: bool, reject: bool
+    monkeypatch,
+    cancel: bool,
+    reject: bool,
+    manual_gap_change: bool,
+    prior_gap: Decimal | None,
+    next_gap: Decimal | None,
 ) -> None:
+    from ibapi.const import UNSET_DOUBLE
+
     import ibkr_options_manager.broker.execution as broker_execution
 
     snapshot = _trailing_snapshot()
@@ -507,20 +524,20 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
         order_id=500,
         key=snapshot.selected,
         action="SELL",
-        order_type="TRAIL LIMIT",
+        order_type="TRAIL LIMIT" if prior_gap is not None else "TRAIL",
         remaining=Decimal("2"),
         status="Submitted",
         stop_price=Decimal("0.80"),
         tif="GTC",
         trailing_amount=Decimal("0.10"),
-        limit_offset=Decimal("0.05"),
+        limit_offset=prior_gap,
     )
     snapshot = replace(snapshot, working_orders=(prior,))
     candidate = TrailingChangeCandidate(
         "trailing-conversion:test",
         prior,
         stop_price=None if cancel else Decimal("0.75"),
-        limit_offset=None if cancel else Decimal("0.10"),
+        limit_offset=None if cancel else next_gap,
         cancel=cancel,
     )
     writes: list[str] = []
@@ -529,7 +546,7 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
         clientId=17,
         account=snapshot.selected.account,
         action="SELL",
-        orderType="TRAIL LIMIT",
+        orderType="TRAIL LIMIT" if prior_gap is not None else "TRAIL",
         tif="GTC",
         ocaGroup="",
         parentId=0,
@@ -537,7 +554,13 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
         trailStopPrice=0.80,
         auxPrice=0.10,
         trailingPercent=0,
-        lmtPriceOffset=0.05,
+        lmtPriceOffset=(
+            0.07
+            if manual_gap_change
+            else float(prior_gap)
+            if prior_gap is not None
+            else UNSET_DOUBLE
+        ),
     )
 
     class FakeWrapper:
@@ -601,6 +624,18 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
             else app.orderStatus(order_id, "Cancelled", 0, 0),
         ),
     )
+    if manual_gap_change:
+        with pytest.raises(ExecutionBlocked, match="changed in TWS before write"):
+            IbkrPaperExecutionBroker().change_trailing(
+                snapshot,
+                candidate,
+                host="127.0.0.1",
+                port=7497,
+                client_id=17,
+                timeout_seconds=1,
+            )
+        assert writes == []
+        return
     if reject:
         with pytest.raises(ExecutionOutcomeUnknown, match="simulated rejection"):
             IbkrPaperExecutionBroker().change_trailing(
@@ -623,6 +658,11 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
         assert result.order_ids == (500,)
         assert result.perm_ids == (() if cancel else (900,))
     assert writes == ["cancel" if cancel else "amend"]
+    if not cancel:
+        assert order.orderType == ("TRAIL LIMIT" if next_gap is not None else "TRAIL")
+        assert (
+            broker_execution._observed_trailing_offset(order.lmtPriceOffset) == next_gap
+        )
 
 
 def test_cancel_order_supplies_the_required_empty_order_cancel_options() -> None:

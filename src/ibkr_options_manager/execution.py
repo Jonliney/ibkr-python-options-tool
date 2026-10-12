@@ -1307,16 +1307,23 @@ class ExecutionJournal:
             trailing_stop=format(candidate.stop_price, "f")
             if candidate.stop_price is not None
             else entry.trailing_stop,
-            trailing_limit_offset=format(candidate.limit_offset, "f")
-            if candidate.limit_offset is not None
+            trailing_limit_offset=(
+                format(candidate.limit_offset, "f")
+                if candidate.limit_offset is not None
+                else ""
+            )
+            if not candidate.cancel
             else entry.trailing_limit_offset,
             trailing_last_stop=format(candidate.stop_price, "f")
             if candidate.stop_price is not None
             else entry.trailing_last_stop,
-            trailing_last_limit=format(
-                candidate.stop_price - candidate.limit_offset, "f"
+            trailing_last_limit=(
+                format(candidate.stop_price - candidate.limit_offset, "f")
+                if candidate.stop_price is not None
+                and candidate.limit_offset is not None
+                else ""
             )
-            if candidate.stop_price is not None and candidate.limit_offset is not None
+            if not candidate.cancel
             else entry.trailing_last_limit,
         )
         self._write(tuple(entries))
@@ -2208,21 +2215,20 @@ class PaperExecutionService:
                 raise ExecutionBlocked(
                     "a fresh bid above the new STP price is required"
                 )
-            if (
-                not entry.trailing_limit_offset
-                or limit_offset is None
-                or not limit_offset.is_finite()
-                or limit_offset <= 0
+            if limit_offset is not None and (
+                not limit_offset.is_finite() or limit_offset <= 0
             ):
                 raise ExecutionBlocked("enter a positive trailing limit gap")
             if snapshot.market_rule.exchange != snapshot.contract.exchange:
                 raise ExecutionBlocked("the option market rule changed")
             bands = snapshot.market_rule.bands
             try:
-                prices_valid = (
-                    round_down_price(stop_price, bands) == stop_price
-                    and round_up_price(limit_offset, bands) == limit_offset
-                    and stop_price > limit_offset
+                prices_valid = round_down_price(stop_price, bands) == stop_price and (
+                    limit_offset is None
+                    or (
+                        round_up_price(limit_offset, bands) == limit_offset
+                        and stop_price > limit_offset
+                    )
                 )
             except (ValueError, TypeError) as error:
                 raise ExecutionBlocked("the option market rule is invalid") from error

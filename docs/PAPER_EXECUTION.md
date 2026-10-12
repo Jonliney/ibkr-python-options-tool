@@ -510,14 +510,22 @@ permanent IDs, and reacts correctly to fills/cancellations/reconnects. Also
 test that the selected pair is cancelled without affecting other OCA groups,
 the post-cancel open-order recheck is clean, and the standalone MKT produces
 the expected order/execution callbacks.
-## Working trailing stop-limit changes
+## Working trailing order changes
 
-A working, app-owned paper `TRAIL LIMIT` shows its observed `trailStopPrice`
-as the editable STP input and its observed `lmtPriceOffset` as the editable LMT
-gap. The trail amount (`auxPrice` or `trailingPercent`) and order quantity are
-fixed. A separate Delete trail action cancels that exact order without placing
-a replacement. Both actions require review, a fresh TWS read, and a final
-confirmation. The edit also requires a fresh bid above the proposed trigger.
+A working, app-owned paper `TRAIL` or `TRAIL LIMIT` shows its observed
+`trailStopPrice` as the editable STP input. The editable LMT price is blank for
+`TRAIL`; entering a positive LMT below STP requests `TRAIL LIMIT`, and clearing
+LMT requests `TRAIL`. The UI converts the entered prices to a fixed broker gap
+(STP minus LMT) using Decimal arithmetic. The LMT is an estimate at the shown
+STP, and moves with the trailing stop after submission. A blank STP is invalid.
+Inline field feedback and Action Review explain missing STP, nonpositive
+prices, and LMT at or above STP; review submission stays disabled until fixed.
+The server repeats these checks and rejects outdated gap-based forms. The trail amount (`auxPrice` or
+`trailingPercent`) and order quantity are fixed. Editing either field updates
+Action Review; the bottom review control takes a fresh TWS read. A separate
+Delete trail action cancels the exact order without placing a replacement.
+Both actions require review and final confirmation. The edit also requires a
+fresh bid above the proposed trigger.
 
 The service requires one journal-owned permanent ID and matching order ID,
 account, contract, client ID, order type, GTC, current stop, trail amount,
@@ -525,8 +533,13 @@ limit gap, and full unfilled quantity. It blocks partial fills, any other
 working order for the option, invalid tick increments, stale or disconnected
 state, and manual changes observed after review. The writer requests the
 same-client open order again and verifies these fields before using the
-existing order ID; it leaves TWS order precautions active. An edit is accepted
-only after TWS echoes the same permanent ID and new STP and gap. A delete
+existing order ID; it leaves TWS order precautions active. For a gap change that
+switches `TRAIL` and `TRAIL LIMIT`, the writer sends the new type with the same
+order ID and requires an echo of the same permanent ID, new type, STP, and gap.
+IBKR [cautions that order-type modifications may be rejected](https://interactivebrokers.github.io/tws-api/modifying_orders.html),
+so a rejection or incomplete acknowledgement is treated as an unknown outcome
+and locks further management until checked in TWS. This type switch requires
+paper-TWS verification before any live milestone. A delete
 requires a TWS cancellation status. Indeterminate outcomes are journaled and
 lock further management across restarts until verified in TWS; neither action
 is automatically retried. Successful deletion leaves the held contracts
@@ -536,3 +549,15 @@ After closure, the read-only row keeps the last recorded STP and LMT values;
 they may precede the fill and are not a fill-price claim. If no trigger was
 observed, the row shows an unavailable value rather than deriving one from a
 later quote.
+
+Trail action reviews share the bracket review component: `TRAIL-n`, remaining
+quantity/TIF, linked SELL STP and SELL STP LMT rows, and old-to-new price arrows.
+The LMT review row shows the actual limit price; adding or removing it
+transitions from or to zero. An unchanged stop is shown once. Expected gain
+uses the shown LMT price, less unit basis, multiplied by contract multiplier
+and remaining quantity; without LMT it uses the stop. For a $8.60 unit basis,
+$8.10 LMT, multiplier 100, and three contracts, this is a $150 estimated loss. This is an estimate at the
+shown prices, not a guaranteed fill or forecast of the trail's future movement.
+The projection uses verified observed remaining quantities and the staged
+candidate after review, without changing execution validation or order writes.
+Verify with `.venv/bin/python -m pytest -q tests/test_app_demo.py`.

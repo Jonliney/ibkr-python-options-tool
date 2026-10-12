@@ -41,6 +41,17 @@ def _cancel_order(app: Any, order_id: int) -> None:
     app.cancelOrder(order_id, OrderCancel())
 
 
+def _observed_trailing_offset(value: Any) -> Decimal | None:
+    """Normalize the TWS unset sentinel while rejecting malformed gap values."""
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError) as error:
+        raise ValueError("the trailing limit offset is invalid") from error
+    if not parsed.is_finite() or parsed < 0:
+        raise ValueError("the trailing limit offset is invalid")
+    return None if parsed == 0 or parsed >= Decimal("1e100") else parsed
+
+
 class IbkrPaperExecutionBroker:
     """Bounded paper writer for creation and exact app-owned order changes."""
 
@@ -91,12 +102,18 @@ class IbkrPaperExecutionBroker:
                 if self.sent and not candidate.cancel:
                     try:
                         stop = Decimal(str(order.trailStopPrice))
-                        offset = Decimal(str(order.lmtPriceOffset))
+                        offset = _observed_trailing_offset(order.lmtPriceOffset)
                     except (InvalidOperation, ValueError, AttributeError):
                         return
                     if (
                         stop == candidate.stop_price
                         and offset == candidate.limit_offset
+                        and str(order.orderType)
+                        == (
+                            "TRAIL LIMIT"
+                            if candidate.limit_offset is not None
+                            else "TRAIL"
+                        )
                     ):
                         self.acknowledged.set()
                 else:
@@ -149,7 +166,7 @@ class IbkrPaperExecutionBroker:
                 observed_stop = Decimal(str(order.trailStopPrice))
                 observed_amount = Decimal(str(order.auxPrice))
                 observed_percent = Decimal(str(order.trailingPercent))
-                observed_offset = Decimal(str(order.lmtPriceOffset))
+                observed_offset = _observed_trailing_offset(order.lmtPriceOffset)
                 observed_quantity = Decimal(str(order.totalQuantity))
             except (InvalidOperation, ValueError, AttributeError) as error:
                 raise ExecutionBlocked(
@@ -175,10 +192,7 @@ class IbkrPaperExecutionBroker:
                     prior.trailing_percent is not None
                     and observed_percent != prior.trailing_percent
                 )
-                or (
-                    prior.limit_offset is not None
-                    and observed_offset != prior.limit_offset
-                )
+                or observed_offset != prior.limit_offset
             ):
                 raise ExecutionBlocked("the trailing order changed in TWS before write")
             app.sent = True
@@ -186,9 +200,16 @@ class IbkrPaperExecutionBroker:
                 _cancel_order(app, prior.order_id)
             else:
                 assert candidate.stop_price is not None
-                assert candidate.limit_offset is not None
                 order.trailStopPrice = float(candidate.stop_price)
-                order.lmtPriceOffset = float(candidate.limit_offset)
+                order.orderType = (
+                    "TRAIL LIMIT" if candidate.limit_offset is not None else "TRAIL"
+                )
+                if candidate.limit_offset is None:
+                    from ibapi.const import UNSET_DOUBLE
+
+                    order.lmtPriceOffset = UNSET_DOUBLE
+                else:
+                    order.lmtPriceOffset = float(candidate.limit_offset)
                 # Preserve all other broker fields, including TWS precautions.
                 app.placeOrder(
                     prior.order_id, _build_submission_contract(imports, snapshot), order

@@ -421,9 +421,7 @@ def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) ->
     )
     assert conversion_review.status_code == 200
     sidebar = conversion_review.text.split("ACTION REVIEW", maxsplit=1)[1]
-    assert sidebar.index("CANCEL BRACKET") < sidebar.index(
-        "Create TRAIL STP LMT sell order"
-    )
+    assert sidebar.index("CANCEL BRACKET") < sidebar.index("TRAIL-1")
     assert "OCA-1" in sidebar
     assert "2 contracts · GTC" in sidebar
     assert sidebar.index("Trail amount") < sidebar.index("SELL STP")
@@ -454,19 +452,18 @@ def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) ->
     assert convert._armed_trailing.limit_offset == Decimal("0.09")
     stop_only = replace(convert._armed_trailing, limit_offset=None)
     stop_only_review = "".join(map(str, convert._review_trailing_plan(stop_only)))
-    assert "Create TRAIL STP sell order" in stop_only_review
+    assert "TRAIL-1" in stop_only_review
     assert "2 contracts · GTC" in stop_only_review
     assert "Trail amount" in stop_only_review
     assert "SELL STP" in stop_only_review
     assert "SELL STP LMT</span>" not in stop_only_review
-    assert stop_only_review.index("CANCEL BRACKET") < stop_only_review.index(
-        "Create TRAIL STP sell order"
-    )
+    assert stop_only_review.index("CANCEL BRACKET") < stop_only_review.index("TRAIL-1")
 
     working = _trailing_scenario_workbench(tmp_path / "working", "working-trail")
     working_page = TestClient(working.app).get(working.path).text
     assert 'data-layer-state="trailing"' in working_page
-    assert "TRAIL STP LMT" in working_page
+    assert "TRAIL 1</span>" in working_page
+    assert "TRAIL 1 · TRAIL STP LMT" not in working_page
     assert "Active" in working_page
     recorded = working._paper_execution.trailing_entries(
         account=DEMO_ACCOUNT, con_id=1_004_470_201
@@ -513,22 +510,44 @@ def test_working_trail_limit_review_update_and_delete(tmp_path: Path) -> None:
     perm_id = entry.perm_ids[0]
     page = client.get(workbench.path).text
     assert f'name="trailing_stop_{perm_id}"' in page
-    assert f'name="trailing_gap_{perm_id}"' in page
+    assert f'name="trailing_limit_{perm_id}"' in page
     assert f'value="trailing-delete-arm:{perm_id}"' in page
+    assert 'aria-label="Delete trail 1"' in page
+    assert 'aria-label="Review trail 1 changes"' not in page
+    assert 'value="active-update-arm"' in page
+    assert "data-trailing-review-row" in page
+    trailing_row = page.split(f'data-trailing-perm-id="{perm_id}"', 1)[1].split(
+        "data-layer-state=", 1
+    )[0]
+    stop_input = re.search(
+        rf'<input[^>]+name="trailing_stop_{perm_id}"[^>]*>', trailing_row
+    )
+    gap_input = re.search(
+        rf'<input[^>]+name="trailing_limit_{perm_id}"[^>]*>', trailing_row
+    )
+    quantity_input = re.search(
+        rf'<input[^>]+id="trailing-quantity-{perm_id}"[^>]*>', trailing_row
+    )
+    assert stop_input is not None
+    assert re.search(r"\sdisabled(?:\s|>)", stop_input.group()) is None
+    assert gap_input is not None
+    assert re.search(r"\sdisabled(?:\s|>)", gap_input.group()) is None
+    assert quantity_input is not None
+    assert re.search(r"\sreadonly(?:\s|>)", quantity_input.group())
     assert "Last recorded STP" not in page
     assert "Last recorded LMT" not in page
 
     reviewed = client.post(
         workbench.path + "action",
         data={
-            "action": f"trailing-change-arm:{perm_id}",
+            "action": "active-update-arm",
             f"trailing_stop_{perm_id}": "8.80",
-            f"trailing_gap_{perm_id}": "0.15",
+            f"trailing_limit_{perm_id}": "8.65",
         },
     )
     assert reviewed.status_code == 200
-    assert "Update TRAIL STP LMT sell order" in reviewed.text
-    assert "SELL STP LMT gap" in reviewed.text
+    assert "TRAIL-1" in reviewed.text
+    assert "SELL STP LMT</span>" in reviewed.text
     assert workbench._armed_trailing_change is not None
     staged_candidate = workbench._armed_trailing_change
     stale_snapshot = workbench._view_model.latest_snapshot()
@@ -553,11 +572,200 @@ def test_working_trail_limit_review_update_and_delete(tmp_path: Path) -> None:
         workbench.path + "action",
         data={"action": f"trailing-delete-arm:{perm_id}"},
     )
-    assert "Cancel TRAIL STP LMT sell order" in deleted.text
+    assert "TRAIL-1" in deleted.text
     client.post(workbench.path + "action", data={"action": "active-action-execute"})
     assert workbench._active_action_verified
     client.post(workbench.path + "action", data={"action": "trailing-change-confirm"})
     assert workbench._trailing_entries()[0].state == "CANCELLED_CONFIRMED"
+
+
+def test_trail_gap_can_be_added_and_removed_but_stop_is_required(
+    tmp_path: Path,
+) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "convert")
+    client = TestClient(workbench.app)
+    client.post(
+        workbench.path + "action",
+        data={
+            "action": "trailing-convert-arm",
+            "trail_value": "25",
+            "trail_unit": "dollars",
+        },
+    )
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    assert workbench._active_action_verified, workbench._message
+    client.post(workbench.path + "action", data={"action": "trailing-convert-confirm"})
+    entry = workbench._trailing_entries()[0]
+    perm_id = entry.perm_ids[0]
+    assert workbench._state.working_orders[0].order_type == "TRAIL"
+    page = client.get(workbench.path).text
+    for field in ("stop", "limit"):
+        input_markup = re.search(
+            rf'<input[^>]+name="trailing_{field}_{perm_id}"[^>]*>', page
+        )
+        assert input_markup is not None
+        assert re.search(r"\sdisabled(?:\s|>)", input_markup.group()) is None
+
+    blank_stop = client.post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"trailing_stop_{perm_id}": "",
+            f"trailing_limit_{perm_id}": "8.70",
+        },
+    )
+    assert "A STP is required before entering a LMT." in blank_stop.text
+    assert workbench._armed_trailing_change is None
+
+    for limit, expected_type in (("8.70", "TRAIL LIMIT"), ("", "TRAIL")):
+        reviewed = client.post(
+            workbench.path + "action",
+            data={
+                "action": "active-update-arm",
+                f"trailing_stop_{perm_id}": "8.80",
+                f"trailing_limit_{perm_id}": limit,
+            },
+        )
+        assert "TRAIL-1" in reviewed.text
+        assert workbench._armed_trailing_change is not None, workbench._message
+        client.post(workbench.path + "action", data={"action": "active-action-execute"})
+        assert workbench._active_action_verified, workbench._message
+        client.post(
+            workbench.path + "action", data={"action": "trailing-change-confirm"}
+        )
+        assert workbench._state.working_orders[0].order_type == expected_type
+        assert workbench._trailing_entries()[0].trailing_limit_offset == (
+            "0.10" if limit else ""
+        )
+
+
+@pytest.mark.parametrize("with_limit", [False, True])
+def test_working_trail_input_opens_active_review(
+    tmp_path: Path, with_limit: bool
+) -> None:
+    workbench = _trailing_scenario_workbench(
+        tmp_path, "working-trail" if with_limit else "convert"
+    )
+    if not with_limit:
+        client = TestClient(workbench.app)
+        client.post(
+            workbench.path + "action",
+            data={
+                "action": "trailing-convert-arm",
+                "trail_value": "25",
+                "trail_unit": "dollars",
+            },
+        )
+        client.post(workbench.path + "action", data={"action": "active-action-execute"})
+        client.post(
+            workbench.path + "action", data={"action": "trailing-convert-confirm"}
+        )
+    server, server_thread, port = _start_local_server(workbench.app)
+    QApplication.instance() or QApplication([])
+    loop = QEventLoop()
+    view = QWebEngineView()
+    view.resize(1500, 920)
+    view.show()
+    observations: list[str] = []
+
+    def loaded(ok: bool) -> None:
+        if not ok:
+            loop.quit()
+            return
+        view.page().runJavaScript(
+            """(() => {
+              const stop = document.querySelector('[data-trailing-edit="STP"]');
+              const gap = document.querySelector('[data-trailing-edit="LMT"]');
+              gap.value = '8.65';
+              gap.dispatchEvent(new Event('input', { bubbles: true }));
+              const review = document.querySelector('[data-trailing-review-row]');
+              const button = document.querySelector('[data-active-execute]');
+              const firstReview = !review.classList.contains('hidden')
+                && !button.disabled;
+              const title = review.querySelector('p').textContent;
+              const linkedRows = review.querySelectorAll(
+                '.border-l-2 .justify-between').length;
+              const stopReview = review.querySelector(
+                '[data-trailing-review-stop]').textContent;
+              const gapReview = review.querySelector(
+                '[data-trailing-review-limit]').textContent;
+              const gain = document.querySelector('[data-gain-value]').textContent;
+              gap.value = '';
+              gap.dispatchEvent(new Event('input', { bubbles: true }));
+              const blankGapReview = !review.classList.contains('hidden')
+                && !button.disabled;
+              gap.value = '8.10'; stop.value = '';
+              stop.dispatchEvent(new Event('input', { bubbles: true }));
+              const missingStop = review.querySelector(
+                '[data-trailing-review-error]').textContent;
+              const blankStopRejected = button.disabled;
+              const invalidReviewVisible = !review.classList.contains('hidden');
+              stop.value = '8.30'; gap.value = '8.40';
+              gap.dispatchEvent(new Event('input', { bubbles: true }));
+              const highLimit = review.querySelector(
+                '[data-trailing-review-error]').textContent;
+              const highLimitRejected = button.disabled;
+              const fieldInvalid = gap.getAttribute('aria-invalid');
+              const invalidGain = document.querySelector(
+                '[data-gain-value]').textContent;
+              gap.value = '8.10';
+              gap.dispatchEvent(new Event('input', { bubbles: true }));
+              const recoveredGain = document.querySelector(
+                '[data-gain-value]').textContent;
+              const recovered = !button.disabled &&
+                gap.getAttribute('aria-invalid') === 'false';
+              return JSON.stringify({
+                stopDisabled: stop?.matches(':disabled'),
+                gapDisabled: gap?.matches(':disabled'),
+                firstReview, blankGapReview, title, linkedRows,
+                stopReview, gapReview, gain,
+                blankStopRejected, missingStop, invalidReviewVisible,
+                highLimit, highLimitRejected, fieldInvalid, invalidGain,
+                recovered, recoveredGain
+              });
+            })()""",
+            lambda result: (observations.append(result), loop.quit()),
+        )
+
+    try:
+        view.loadFinished.connect(loaded)
+        view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
+        QTimer.singleShot(5_000, loop.quit)
+        loop.exec()
+    finally:
+        view.close()
+        server.should_exit = True
+        server_thread.join(timeout=2)
+
+    assert len(observations) == 1
+    assert workbench._state.unit_basis is not None
+    assert workbench._state.multiplier is not None
+    gain = (Decimal("8.65") - workbench._state.unit_basis) * workbench._state.multiplier
+    gain *= Decimal(workbench._state.working_orders[0].remaining)
+    assert json.loads(observations[0]) == {
+        "stopDisabled": False,
+        "gapDisabled": False,
+        "firstReview": True,
+        "blankGapReview": with_limit,
+        "title": "TRAIL-1",
+        "linkedRows": 2,
+        "stopReview": "$8.80",
+        "gapReview": "$8.65",
+        "gain": _money(gain),
+        "blankStopRejected": True,
+        "missingStop": "A STP is required before entering a LMT.",
+        "invalidReviewVisible": True,
+        "highLimit": "LMT must be lower than STP.",
+        "highLimitRejected": True,
+        "fieldInvalid": "true",
+        "invalidGain": "— Unknown",
+        "recovered": True,
+        "recoveredGain": _money(
+            (Decimal("8.10") - workbench._state.unit_basis)
+            * workbench._state.multiplier
+            * Decimal(workbench._state.working_orders[0].remaining)
+        ),
+    }
 
 
 def test_trail_change_rejects_manual_gap_change(tmp_path: Path) -> None:
@@ -3716,7 +3924,7 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
         "setHidden(row, !(targetChanged || stopChanged || limitChanged), 'block')"
         in active_script
     )
-    assert "setReviewMode(changed)" in active_script
+    assert "setReviewMode(changed || invalid)" in active_script
     assert "input.value = input.dataset.activeInitial || ''" in active_script
     assert "UPDATE SELL LMT" in page.text
 
@@ -7185,8 +7393,8 @@ def test_submitted_trailing_exit_appears_as_central_layer_row() -> None:
     workbench._paper_execution = History()  # type: ignore[assignment]
     page = to_xml(workbench._page())
     assert 'data-layer-state="trailing"' in page
-    assert "TRAIL STP LMT" in page
-    assert "LMT gap" in page
+    assert "TRAIL 1</span>" in page
+    assert "LMT</label>" in page
     assert "CHECK TWS" in page
     trailing_row = to_xml(workbench._trailing_layer_row(1, entry))
     assert 'class="layer-row-grid ' in trailing_row
@@ -7239,6 +7447,61 @@ def test_trailing_dialog_has_one_clickable_trigger_button() -> None:
     assert dialog_markup.index(
         'aria-label="Trailing limit offset unit"'
     ) < dialog_markup.index('name="trail_limit_value"')
+
+
+def test_trailing_dialog_open_closes_its_tooltip(tmp_path: Path) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "convert")
+    assert 'aria-label="Set a trailing exit for this position"' in (
+        TestClient(workbench.app).get(workbench.path).text
+    )
+    server, server_thread, port = _start_local_server(workbench.app)
+    QApplication.instance() or QApplication([])
+    loop = QEventLoop()
+    view = QWebEngineView()
+    view.resize(1500, 920)
+    view.show()
+    observations: list[str] = []
+
+    def inspect() -> None:
+        view.page().runJavaScript(
+            """(() => {
+              const button = document.querySelector(
+                'button[aria-label="Set a trailing exit for this position"]');
+              const tooltip = button?.closest('[data-slot="tooltip"]')
+                ?.querySelector('[data-slot="tooltip-content"]');
+              const dialog = button?.closest('[data-slot="tooltip"]')
+                ?.querySelector('dialog');
+              return JSON.stringify({
+                open: !!dialog?.open,
+                tooltip: tooltip?.dataset.state ?? null,
+                focusInsideDialog: !!dialog?.contains(document.activeElement)
+              });
+            })()""",
+            lambda result: (observations.append(result), loop.quit()),
+        )
+
+    def loaded(ok: bool) -> None:
+        if not ok:
+            loop.quit()
+            return
+        view.page().runJavaScript(
+            """document.querySelector(
+              'button[aria-label="Set a trailing exit for this position"]')
+              ?.click()""",
+            lambda _result: QTimer.singleShot(350, inspect),
+        )
+
+    try:
+        view.loadFinished.connect(loaded)
+        view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
+        QTimer.singleShot(5_000, loop.quit)
+        loop.exec()
+    finally:
+        view.close()
+        server.should_exit = True
+        server_thread.join(timeout=2)
+
+    assert observations == ['{"open":true,"tooltip":"closed","focusInsideDialog":true}']
 
 
 def test_trailing_conversion_dialog_shows_demo_position_prices() -> None:
@@ -7376,7 +7639,7 @@ def test_demo_entire_position_trailing_conversion_includes_unassigned_contracts(
         },
     )
     assert review.status_code == 200
-    assert "Create TRAIL STP LMT sell order" in review.text
+    assert "TRAIL-1" in review.text
     assert "3 contracts · GTC" in review.text
     assert ("CANCEL BRACKET" in review.text) is with_bracket
     assert "Trail amount" in review.text
@@ -7402,8 +7665,14 @@ def test_demo_entire_position_trailing_conversion_includes_unassigned_contracts(
     )
     assert result.status_code == 200
     assert 'data-layer-state="trailing"' in result.text
-    assert "TRAIL STP LMT" in result.text
+    assert re.search(r"TRAIL [12]</span>", result.text)
     assert "Active" in result.text
+    for field in ("stop", "limit"):
+        input_markup = re.search(
+            rf'<input[^>]+name="trailing_{field}_[0-9]+"[^>]*>', result.text
+        )
+        assert input_markup is not None
+        assert re.search(r"\sdisabled(?:\s|>)", input_markup.group()) is None
     assert (
         journal.trailing_entries(account=DEMO_ACCOUNT, con_id=1_004_470_201)[
             -1
@@ -7442,3 +7711,115 @@ class _OwnedOrderService:
     def owned_perm_ids(self, *, account: str, con_id: int) -> frozenset[int]:
         del account, con_id
         return frozenset(self._perm_ids)
+
+
+@pytest.mark.parametrize("limit", ["8.65", "8.10", ""])
+def test_trail_projection_uses_limit_estimate_in_staged_review(
+    tmp_path: Path, limit: str
+) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    entry = workbench._trailing_entries()[0]
+    perm_id = entry.perm_ids[0]
+    client = TestClient(workbench.app)
+    baseline, observed, _ = workbench._projection_state()
+    assert baseline == observed
+    assert baseline.covered_quantity == Decimal("3")
+    assert baseline.expected_gain is not None
+    reviewed = client.post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"trailing_stop_{perm_id}": "8.80",
+            f"trailing_limit_{perm_id}": limit,
+        },
+    )
+    candidate = workbench._armed_trailing_change
+    assert candidate is not None, workbench._message
+    before, after, config = workbench._projection_state()
+    basis, multiplier = workbench._state.unit_basis, workbench._state.multiplier
+    assert basis is not None and multiplier is not None
+    expected = (Decimal(limit or "8.80") - basis) * multiplier * 3
+    assert before.expected_gain == baseline.expected_gain
+    assert after.expected_gain == expected
+    assert after.max_loss == (Decimal("8.80") - basis) * multiplier * 3
+    assert config["staged"]
+    review = to_xml(workbench._review_trailing_change(candidate))
+    assert "TRAIL-1" in review
+    assert "3 contracts · GTC" in review
+    assert "SELL STP LMT</span>" in review
+    assert "border-l-2 border-border pl-3" in review
+    assert "Remove limit gap" not in review
+    assert "shown LMT price" in reviewed.text
+    assert _money(expected) in reviewed.text
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    workbench._view_model._latest_snapshot = replace(snapshot, fresh=False)
+    assert workbench._projection_state()[1].expected_gain is None
+
+
+def test_trail_absolute_limit_matches_expected_gain(tmp_path: Path) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    perm_id = workbench._trailing_entries()[0].perm_ids[0]
+    client = TestClient(workbench.app)
+    page = client.get(workbench.path).text
+    assert f'name="trailing_limit_{perm_id}"' in page
+    response = client.post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"trailing_stop_{perm_id}": "8.30",
+            f"trailing_limit_{perm_id}": "8.10",
+        },
+    )
+    candidate = workbench._armed_trailing_change
+    assert candidate is not None, workbench._message
+    assert candidate.limit_offset == Decimal("0.20")
+    assert workbench._projection_state()[1].expected_gain == Decimal("-150.00")
+    assert "-$150.00" in response.text
+    review = to_xml(workbench._review_trailing_change(candidate))
+    assert "$8.10" in review
+    assert "$0.20" not in review
+
+
+@pytest.mark.parametrize(
+    "stop, limit, message",
+    [
+        ("8.30", "8.40", "LMT must be lower than STP."),
+        ("8.30", "8.30", "LMT must be lower than STP."),
+        ("", "8.10", "A STP is required before entering a LMT."),
+        ("", "", "A STP is required."),
+        ("0", "8.10", "Enter a positive STP price."),
+        ("8.30", "-1", "Enter a positive LMT price, or leave it blank."),
+    ],
+)
+def test_invalid_trail_prices_cannot_stage(
+    tmp_path: Path, stop: str, limit: str, message: str
+) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    perm_id = workbench._trailing_entries()[0].perm_ids[0]
+    response = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"trailing_stop_{perm_id}": stop,
+            f"trailing_limit_{perm_id}": limit,
+        },
+    )
+    assert workbench._armed_trailing_change is None
+    assert message in response.text
+
+
+def test_outdated_trail_gap_form_does_not_remove_limit(tmp_path: Path) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    perm_id = workbench._trailing_entries()[0].perm_ids[0]
+    response = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"trailing_stop_{perm_id}": "8.30",
+            f"trailing_gap_{perm_id}": "0.20",
+        },
+    )
+    assert workbench._armed_trailing_change is None
+    assert "Refresh and enter the STP and LMT prices again." in response.text
+    assert workbench._trailing_entries()[0].trailing_limit_offset == "0.10"
