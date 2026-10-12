@@ -690,6 +690,17 @@ def test_working_trail_input_opens_active_review(
               const gapReview = review.querySelector(
                 '[data-trailing-review-limit]').textContent;
               const gain = document.querySelector('[data-gain-value]').textContent;
+              const tones = () => ['gain', 'loss'].map((kind) => {
+                const node = document.querySelector(`[data-live-metric="${kind}"]`);
+                const percent = node.querySelector(`[data-${kind}-percent]`);
+                const amount = node.querySelector(`[data-${kind}-value]`);
+                return { tone: ['text-emerald-400', 'text-rose-400',
+                    'text-muted-foreground'].filter(
+                      (cls) => node.classList.contains(cls)),
+                  sameColour: getComputedStyle(percent).color ===
+                    getComputedStyle(amount).color };
+              });
+              const positiveTones = tones();
               gap.value = '';
               gap.dispatchEvent(new Event('input', { bubbles: true }));
               const blankGapReview = !review.classList.contains('hidden')
@@ -708,13 +719,19 @@ def test_working_trail_input_opens_active_review(
               const fieldInvalid = gap.getAttribute('aria-invalid');
               const invalidGain = document.querySelector(
                 '[data-gain-value]').textContent;
+              const unknownTones = tones();
               gap.value = '8.10';
               gap.dispatchEvent(new Event('input', { bubbles: true }));
               const recoveredGain = document.querySelector(
                 '[data-gain-value]').textContent;
               const recovered = !button.disabled &&
                 gap.getAttribute('aria-invalid') === 'false';
+              const negativeTones = tones();
+              stop.value = '8.60'; gap.value = '';
+              gap.dispatchEvent(new Event('input', { bubbles: true }));
+              const zeroTones = tones();
               return JSON.stringify({
+                positiveTones, negativeTones, unknownTones, zeroTones,
                 stopDisabled: stop?.matches(':disabled'),
                 gapDisabled: gap?.matches(':disabled'),
                 firstReview, blankGapReview, title, linkedRows,
@@ -743,6 +760,10 @@ def test_working_trail_input_opens_active_review(
     gain = (Decimal("8.65") - workbench._state.unit_basis) * workbench._state.multiplier
     gain *= Decimal(workbench._state.working_orders[0].remaining)
     assert json.loads(observations[0]) == {
+        "positiveTones": [{"tone": ["text-emerald-400"], "sameColour": True}] * 2,
+        "negativeTones": [{"tone": ["text-rose-400"], "sameColour": True}] * 2,
+        "unknownTones": [{"tone": ["text-muted-foreground"], "sameColour": True}] * 2,
+        "zeroTones": [{"tone": ["text-muted-foreground"], "sameColour": True}] * 2,
         "stopDisabled": False,
         "gapDisabled": False,
         "firstReview": True,
@@ -1446,8 +1467,8 @@ def test_unverified_projection_shows_layer_estimate_without_enabling_review() ->
     assert (
         "Estimate from shown layers. Refresh TWS before reviewing an order." not in page
     )
-    assert "Expected gain" in page
-    assert "Max loss" in page
+    assert "Projected P&amp;L" in page
+    assert "P&amp;L at STP" in page
     assert "Estimated gain" not in page
     assert "Estimated stop result" not in page
     assert _money(outcome.covered_gain) in page
@@ -1617,8 +1638,8 @@ def test_selected_contract_header_uses_verified_position_and_quote_values() -> N
     assert 'id="existing_exit_orders"' in page
     assert page.index("Available") < page.index("Existing TWS exit orders")
     assert page.index("Existing TWS exit orders") < page.index("Average price")
-    assert "Expected gain" in page
-    assert "Max loss" in page
+    assert "Projected P&amp;L" in page
+    assert "P&amp;L at STP" in page
     assert "+$659.00" in page
     assert "-$340.00" in page
     assert "Projection covers 5 held contracts" not in page
@@ -3986,7 +4007,7 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     delta = after_add.expected_gain - before_add.expected_gain
     direction = "increased" if delta > 0 else "decreased"
     assert (
-        f'aria-label="Expected gain {direction} by ${abs(delta):,.2f}"'
+        f'aria-label="Projected P&amp;L {direction} by ${abs(delta):,.2f}"'
         in added_page.text
     )
 
@@ -4102,14 +4123,14 @@ def test_expected_gain_change_uses_opposite_arrow_mapping_to_loss() -> None:
     increased = str(_projection_gain_value(Decimal("3882.08"), Decimal("640")))
     decreased = str(_projection_gain_value(Decimal("3242.08"), Decimal("-640")))
 
-    assert 'aria-label="Expected gain increased by $640.00"' in increased
+    assert 'aria-label="Projected P&amp;L increased by $640.00"' in increased
     assert re.search(
         r'data-gain-arrow="down" class="hidden"><span data-icon-sh', increased
     )
     assert "data-gain-change" in increased
     assert "text-muted-foreground" in increased
     assert "<span data-gain-amount>$640.00</span>" in increased
-    assert 'aria-label="Expected gain decreased by $640.00"' in decreased
+    assert 'aria-label="Projected P&amp;L decreased by $640.00"' in decreased
     assert re.search(
         r'data-gain-arrow="up" class="hidden"><span data-icon-sh', decreased
     )
@@ -4199,15 +4220,15 @@ def test_fully_allocated_position_keeps_active_outcome_visible() -> None:
     assert "All 10 held contract(s) covered." not in page.text
     assert ">Realized P&amp;L<" not in page.text
     assert ">Cost basis<" not in page.text
-    assert "How expected gain is calculated" in page.text
-    assert "How max loss is calculated" in page.text
+    assert "How projected p&amp;l is calculated" in page.text
+    assert "How p&amp;l at stp is calculated" in page.text
     assert (
-        "Realised P&amp;L plus projected gains from the current layer plan."
-        in page.text
+        "Brackets use the profit-taking LMT; trails use the shown LMT, "
+        "or STP without a LMT." in page.text
     )
     assert (
-        "Projected losses at the current layer stops; excludes realised P&amp;L."
-        in page.text
+        "A trigger is not a fill price or a maximum loss: "
+        "stops can slip and stop-limit orders can remain unfilled." in page.text
     )
     assert "An up arrow" not in page.text
 
@@ -6025,8 +6046,8 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     action_panel = page.text.split('aria-label="Planned order actions"', maxsplit=1)[1]
     assert action_panel.index("Outcome projection") < action_panel.index("Review order")
     assert "data-outcome-projection" in action_panel
-    assert "Expected gain" in action_panel
-    assert "Max loss" in action_panel
+    assert "Projected P&amp;L" in action_panel
+    assert "P&amp;L at STP" in action_panel
     assert "Covered subtotal:" not in action_panel
     assert 'data-layer-state="draft"' in draft
     assert 'data-slot="card"' not in draft
@@ -6050,8 +6071,8 @@ def test_starui_workbench_renders_and_adds_a_layer_from_a_server_owned_form() ->
     assert 'name="action" value="save-draft"' not in draft
     assert "font-mono" not in draft
     assert "text-xs font-semibold text-foreground" in draft
-    assert "+$275.00 gain" in draft
-    assert "-$340.00 max loss" in draft
+    assert "+$275.00 Projected P&amp;L" in draft
+    assert "-$340.00 P&amp;L at STP" in draft
     assert ">%</span>" in draft
     assert 'for="target_1"' in draft
     assert re.search(r'<label[^>]*for="target_1"[^>]*>\s*LMT\s*</label>', draft)
@@ -7749,7 +7770,7 @@ def test_trail_projection_uses_limit_estimate_in_staged_review(
     assert "SELL STP LMT</span>" in review
     assert "border-l-2 border-border pl-3" in review
     assert "Remove limit gap" not in review
-    assert "shown LMT price" in reviewed.text
+    assert "trails use the shown LMT" in reviewed.text
     assert _money(expected) in reviewed.text
     snapshot = workbench._view_model.latest_snapshot()
     assert snapshot is not None
@@ -7822,4 +7843,183 @@ def test_outdated_trail_gap_form_does_not_remove_limit(tmp_path: Path) -> None:
     )
     assert workbench._armed_trailing_change is None
     assert "Refresh and enter the STP and LMT prices again." in response.text
+    assert workbench._trailing_entries()[0].trailing_limit_offset == "0.10"
+
+
+@pytest.mark.parametrize(
+    "value, tone",
+    [
+        (Decimal("15"), "text-emerald-400"),
+        (Decimal("-60"), "text-rose-400"),
+        (Decimal("0"), "text-muted-foreground"),
+        (None, "text-muted-foreground"),
+    ],
+)
+def test_projection_metrics_use_sign_colour_in_server_review(
+    tmp_path: Path, value: Decimal | None, tone: str
+) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    baseline, outcome, config = workbench._projection_state()
+    outcome = replace(outcome, expected_gain=value, max_loss=value)
+    page = to_xml(workbench._outcome_projection((baseline, outcome, config)))
+    for metric in ("gain", "loss"):
+        metric_node = re.search(rf'<p[^>]*data-live-metric="{metric}"[^>]*>', page)
+        assert metric_node is not None
+        for candidate in ("text-emerald-400", "text-rose-400", "text-muted-foreground"):
+            assert (candidate in metric_node.group()) == (candidate == tone)
+    assert "Projected P&amp;L" in page
+    assert "P&amp;L at STP" in page
+    assert "Brackets use the profit-taking LMT" in page
+    assert "trails use the shown LMT, or STP without a LMT" in page
+    assert "stop-limit orders can remain unfilled" in page
+
+
+@pytest.mark.parametrize("limit", ["8.10", ""])
+def test_review_trail_prices_goes_directly_to_confirm_and_retains_inputs(
+    tmp_path: Path, limit: str
+) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    client = TestClient(workbench.app)
+    entry = workbench._trailing_entries()[0]
+    perm_id = entry.perm_ids[0]
+    reviewed = client.post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"trailing_stop_{perm_id}": "8.30",
+            f"trailing_limit_{perm_id}": limit,
+        },
+    )
+    assert workbench._armed_trailing_change is not None, workbench._message
+    assert workbench._active_action_verified
+    assert workbench._armed_execution_deadline is not None
+    assert 'value="trailing-change-confirm"' in reviewed.text
+    assert 'value="active-action-execute"' not in reviewed.text
+    for field, value in (("stop", "8.30"), ("limit", limit)):
+        node = re.search(
+            rf'<input[^>]*name="trailing_{field}_{perm_id}"[^>]*>', reviewed.text
+        )
+        assert node is not None
+        assert f'value="{value}"' in node.group()
+        assert re.search(r"\sreadonly(?:\s|>)", node.group())
+    # Review has no broker write. Cancel restores the observed order values.
+    assert workbench._trailing_entries()[0].trailing_limit_offset == "0.10"
+    cancelled = client.post(workbench.path + "action", data={"action": "cancel-staged"})
+    assert workbench._armed_trailing_change is None
+    assert not workbench._active_action_verified
+    assert 'value="trailing-change-confirm"' not in cancelled.text
+    node = re.search(
+        rf'<input[^>]*name="trailing_stop_{perm_id}"[^>]*>', cancelled.text
+    )
+    assert node is not None and 'value="8.80"' in node.group()
+
+
+@pytest.mark.parametrize("failure", ["disconnect", "manual-change"])
+def test_direct_trail_review_fails_closed_when_verification_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    perm_id = workbench._trailing_entries()[0].perm_ids[0]
+    original = workbench._view_model.select_position
+    captures = 0
+
+    def capture(*args, **kwargs):
+        nonlocal captures
+        state = original(*args, **kwargs)
+        captures += 1
+        if captures == 2:
+            snapshot = workbench._view_model.latest_snapshot()
+            assert snapshot is not None
+            workbench._view_model._latest_snapshot = (
+                replace(snapshot, connected=False)
+                if failure == "disconnect"
+                else replace(
+                    snapshot,
+                    working_orders=tuple(
+                        replace(order, stop_price=Decimal("8.75"))
+                        if order.perm_id == perm_id
+                        else order
+                        for order in snapshot.working_orders
+                    ),
+                )
+            )
+        return state
+
+    monkeypatch.setattr(workbench._view_model, "select_position", capture)
+    reviewed = TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"trailing_stop_{perm_id}": "8.30",
+            f"trailing_limit_{perm_id}": "8.10",
+        },
+    )
+    assert captures == 2
+    assert workbench._armed_trailing_change is None
+    assert not workbench._active_action_verified
+    assert workbench._armed_execution_deadline is None
+    assert 'value="trailing-change-confirm"' not in reviewed.text
+    assert "blocked" in workbench._message
+    assert workbench._trailing_entries()[0].trailing_limit_offset == "0.10"
+
+
+def test_trail_review_click_preserves_prices_and_shows_confirm_in_browser(
+    tmp_path: Path,
+) -> None:
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    server, thread, port = _start_local_server(workbench.app)
+    QApplication.instance() or QApplication([])
+    view = QWebEngineView()
+    view.resize(1500, 920)
+    view.show()
+    loop = QEventLoop()
+    observations: list[str] = []
+    submitted = False
+
+    def loaded(ok: bool) -> None:
+        nonlocal submitted
+        if not ok:
+            loop.quit()
+            return
+        if not submitted:
+            submitted = True
+            view.page().runJavaScript("""(() => {
+                const stop = document.querySelector('[data-trailing-edit="STP"]');
+                const limit = document.querySelector('[data-trailing-edit="LMT"]');
+                stop.value = '8.30'; limit.value = '8.10';
+                limit.dispatchEvent(new Event('input', {bubbles: true}));
+                document.querySelector('[data-active-execute]').click();
+            })()""")
+            return
+        view.page().runJavaScript(
+            """(() => {
+            const stop = document.querySelector('[data-trailing-edit="STP"]');
+            const limit = document.querySelector('[data-trailing-edit="LMT"]');
+            return JSON.stringify({stop: stop.value, limit: limit.value,
+                readonly: stop.readOnly && limit.readOnly,
+                confirm: Boolean(document.querySelector(
+                  '[value="trailing-change-confirm"]')),
+                extraReview: Boolean(document.querySelector(
+                  '[value="active-action-execute"]'))});
+        })()""",
+            lambda result: (observations.append(result), loop.quit()),
+        )
+
+    try:
+        view.loadFinished.connect(loaded)
+        view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
+        QTimer.singleShot(5000, loop.quit)
+        loop.exec()
+    finally:
+        view.close()
+        server.should_exit = True
+        thread.join(timeout=2)
+    assert len(observations) == 1
+    assert json.loads(observations[0]) == {
+        "stop": "8.30",
+        "limit": "8.10",
+        "readonly": True,
+        "confirm": True,
+        "extraReview": False,
+    }
     assert workbench._trailing_entries()[0].trailing_limit_offset == "0.10"

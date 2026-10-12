@@ -785,6 +785,8 @@ class StarUIWorkbench:
                             values,
                             cancel=False,
                         )
+                        if self._armed_trailing_change is not None:
+                            self._execute_active_action_locked()
                 else:
                     self._arm_price_updates_locked(values)
             elif action == "price-update-confirm":
@@ -5077,17 +5079,17 @@ class StarUIWorkbench:
                 cls="min-w-20",
             ),
             _sold_percentage_price_field(
-                _LAYER_TARGET_LABEL,
-                value=layer.target_percentage,
-                price=layer.target_price,
-                input_id=f"verify-target-{number}",
-            ),
-            _sold_percentage_price_field(
                 _LAYER_STOP_LABEL,
                 value=layer.stop_percentage,
                 price=layer.stop_price,
                 input_id=f"verify-stop-{number}",
                 limit_price=layer.stop_limit_price or None,
+            ),
+            _sold_percentage_price_field(
+                _LAYER_TARGET_LABEL,
+                value=layer.target_percentage,
+                price=layer.target_price,
+                input_id=f"verify-target-{number}",
             ),
             _field(
                 "Quantity",
@@ -5209,19 +5211,19 @@ class StarUIWorkbench:
                 cls="min-w-20",
             ),
             _sold_percentage_price_field(
-                _LAYER_TARGET_LABEL,
-                value=target_percentage,
-                price=layer.target_price,
-                input_id=f"sold-target-{number}",
-                inferred=not layer.target_percentage and bool(recovered),
-            ),
-            _sold_percentage_price_field(
                 _LAYER_STOP_LABEL,
                 value=stop_percentage,
                 price=layer.stop_price,
                 input_id=f"sold-stop-{number}",
                 inferred=not layer.stop_percentage and bool(recovered),
                 limit_price=layer.stop_limit_price or None,
+            ),
+            _sold_percentage_price_field(
+                _LAYER_TARGET_LABEL,
+                value=target_percentage,
+                price=layer.target_price,
+                input_id=f"sold-target-{number}",
+                inferred=not layer.target_percentage and bool(recovered),
             ),
             _field(
                 "Quantity",
@@ -5608,6 +5610,22 @@ class StarUIWorkbench:
             ),
             None,
         )
+        candidate = self._armed_trailing_change
+        staged = candidate is not None and candidate.order.perm_id == entry.perm_ids[0]
+        display_stop = (
+            candidate.stop_price
+            if staged and candidate is not None and not candidate.cancel
+            else order.stop_price
+            if order
+            else None
+        )
+        display_offset = (
+            candidate.limit_offset
+            if staged and candidate is not None and not candidate.cancel
+            else order.limit_offset
+            if order
+            else None
+        )
         working = order is not None
         modifiable = bool(
             order is not None
@@ -5660,8 +5678,9 @@ class StarUIWorkbench:
             else _trailing_edit_field(
                 "STP",
                 f"trailing_stop_{entry.perm_ids[0]}",
-                _price_text(order.stop_price) if order and order.stop_price else "",
+                _price_text(display_stop) if display_stop is not None else "",
                 disabled=not modifiable,
+                readonly=staged,
             ),
             (
                 _trailing_readonly_field(
@@ -5677,12 +5696,11 @@ class StarUIWorkbench:
             else _trailing_edit_field(
                 "LMT",
                 f"trailing_limit_{entry.perm_ids[0]}",
-                _price_text(order.stop_price - order.limit_offset)
-                if order
-                and order.stop_price is not None
-                and order.limit_offset is not None
+                _price_text(display_stop - display_offset)
+                if display_stop is not None and display_offset is not None
                 else "",
                 disabled=not modifiable,
+                readonly=staged,
             ),
             _field(
                 "Quantity",
@@ -5807,7 +5825,7 @@ class StarUIWorkbench:
                 input_id=f"active-target-{index}",
                 price=_price_text(display_target_price),
                 outcome=gain,
-                outcome_label="gain",
+                outcome_label="Projected P&L",
                 tone="text-emerald-400",
                 layer_index=index,
                 kind="active-target",
@@ -5867,7 +5885,7 @@ class StarUIWorkbench:
                     else _price_text(display_stop_price)
                 ),
                 outcome=loss,
-                outcome_label="at stop",
+                outcome_label="P&L at STP",
                 tone="text-rose-400",
                 layer_index=index,
                 kind="active-stop",
@@ -6395,7 +6413,7 @@ class StarUIWorkbench:
                 input_id=f"target_{index}",
                 price=layer.target_price,
                 outcome=gain,
-                outcome_label="gain",
+                outcome_label="Projected P&L",
                 tone="text-emerald-400",
                 layer_index=index,
                 kind="target",
@@ -6419,9 +6437,7 @@ class StarUIWorkbench:
                     input_id=f"stop_{index}",
                     price=layer.stop_price,
                     outcome=loss,
-                    outcome_label="at stop trigger"
-                    if self._stop_configuration()[0] == "STP LMT"
-                    else "max loss",
+                    outcome_label="P&L at STP",
                     tone="text-rose-400",
                     layer_index=index,
                     kind="stop",
@@ -6880,45 +6896,41 @@ class StarUIWorkbench:
             H3("Outcome projection", cls="mb-3 text-sm font-semibold"),
             Div(
                 _metric(
-                    "Expected gain",
+                    "Projected P&L",
                     _projection_gain_value(gain_value, gain_delta, gain_cost),
-                    "text-emerald-400",
+                    _pnl_tone(gain_value),
                     live_key="gain",
                     help_text=(
-                        "Return percentage uses the cost of shown contracts and verified sold contracts. "
-                        "Realised P&L plus projected target results from shown "
-                        "layers. Pending bracket prices assume TWS accepts "
-                        "the submitted exits; other contracts are excluded."
-                        if Decimal(config["pendingQuantity"])
-                        else "Return percentage uses the cost of shown contracts and verified sold contracts. "
-                        "Realised P&L plus projected gains from the shown layers. "
-                        "Excludes contracts without a verified target and stop."
-                        if partial
-                        else "Return percentage uses the cost of held and verified sold contracts. "
-                        "Realised P&L plus projected gains from the current layer plan."
+                        "Realised P&L plus (exit price minus average price) times multiplier times remaining contracts. "
+                        "Brackets use the profit-taking LMT; trails use the shown LMT, or STP without a LMT. "
+                        "Return percentage uses the cost of shown and verified sold contracts. "
+                        "Trailing prices move; fills are not guaranteed."
                     )
                     + (
-                        " Trail gains use the shown LMT price (or STP without a LMT), "
-                        "less unit basis, times multiplier and remaining quantity. "
-                        "Trailing prices move and fills are not guaranteed."
+                        " Pending bracket prices assume TWS accepts the submitted exits; other contracts are excluded."
+                        if Decimal(config["pendingQuantity"])
+                        else " Contracts without verified exits are excluded."
+                        if partial or estimate
+                        else ""
                     ),
                 ),
                 _metric(
-                    "Max loss",
+                    "P&L at STP",
                     _projection_loss_value(loss_value, loss_delta, covered_cost),
-                    "text-rose-400",
+                    _pnl_tone(loss_value),
                     live_key="loss",
                     help_text=(
-                        "Return percentage uses the cost of shown held contracts. "
-                        "Projected stop results from shown layers; excludes "
-                        "realised P&L. Pending stops may not be working in TWS."
+                        "Hypothetical P&L at the shown STP triggers: "
+                        "(STP minus average price) times multiplier times remaining contracts. "
+                        "Excludes realised P&L. Return percentage uses the cost of shown held contracts. "
+                        "A trigger is not a fill price or a maximum loss: stops can slip and stop-limit orders can remain unfilled."
+                    )
+                    + (
+                        " Pending stops may not be working in TWS."
                         if Decimal(config["pendingQuantity"])
-                        else "Return percentage uses the cost of shown held contracts. "
-                        "Projected result at the shown layer stops; excludes "
-                        "realised P&L and contracts without a verified target and stop."
-                        if partial
-                        else "Return percentage uses the cost of held contracts. "
-                        "Projected losses at the current layer stops; excludes realised P&L."
+                        else " Contracts without verified exits are excluded."
+                        if partial or estimate
+                        else ""
                     ),
                 ),
                 cls="outcome-projection-pair grid grid-cols-2",
@@ -8150,7 +8162,15 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
     const basis = Number(config.basis), multiplier = Number(config.multiplier);
     const bands = config.bands.map((band) => ({{ low: Number(band.low), increment: Number(band.increment) }}));
     const value = (name, index) => Number(form.elements[`${{name}}_${{index}}`]?.value);
-    const assigned = (selector, text) => document.querySelectorAll(selector).forEach((node) => {{ node.textContent = text; }});
+    const assigned = (selector, text) => document.querySelectorAll(selector).forEach((node) => {{
+      node.textContent = text;
+      if (selector.includes('data-live-outcome')) {{
+        const value = parseFloat(text.replace(/[$,]/g, ''));
+        node.classList.toggle('text-emerald-400', value > 0);
+        node.classList.toggle('text-rose-400', value < 0);
+        node.classList.toggle('text-muted-foreground', !Number.isFinite(value) || value === 0);
+      }}
+    }});
     const priceText = (number) => `$${{Number(number.toFixed(6)).toString()}}`;
     const sellPriceText = (number, display = priceText(number)) => `${{display}} (${{((number / basis - 1) * 100) >= 0 ? '+' : ''}}${{((number / basis - 1) * 100).toFixed(1)}}%)`;
     const money = (number) => `${{number >= 0 ? '+' : '-'}}$${{Math.abs(number).toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})}}`;
@@ -8229,8 +8249,8 @@ def _live_draft_script(configuration: dict[str, Any] | None) -> str:
         assigned(`[data-live-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? (exactStopInput?.value ? priceText(stopPrice) : stop === Number(stopInput?.dataset.liveInitial) ? `$${{stopInput.dataset.liveOriginal}}` : priceText(stopPrice)) : '—');
         assigned(`[data-live-review-price="target-${{index}}"]`, Number.isFinite(targetPrice) ? sellPriceText(targetPrice, target === Number(input.dataset.liveInitial) ? `$${{input.dataset.liveOriginal}}` : priceText(targetPrice)) : '—');
         assigned(`[data-live-review-price="stop-${{index}}"]`, Number.isFinite(stopPrice) ? sellPriceText(stopPrice, !exactStopInput?.value && stop === Number(stopInput?.dataset.liveInitial) ? `$${{stopInput.dataset.liveOriginal}}` : priceText(stopPrice)) : '—');
-        assigned(`[data-live-outcome="target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
-        assigned(`[data-live-outcome="stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} ${{stopLimit ? 'at stop trigger' : 'max loss'}}` : `— ${{stopLimit ? 'at stop trigger' : 'max loss'}}`);
+        assigned(`[data-live-outcome="target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} Projected P&L` : '— Projected P&L');
+        assigned(`[data-live-outcome="stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} P&L at STP` : '— P&L at STP');
         assigned(`[data-live-review-quantity="${{index}}"]`, `${{quantityValid ? quantity : '—'}} contracts · GTC`);
         if (Number.isFinite(gain) && Number.isFinite(loss)) outcomes.push({{ quantity, gain, loss }});
         else invalid = true;
@@ -8336,7 +8356,15 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
     if (!form) return;
     const basis = Number(config.basis), multiplier = Number(config.multiplier);
     const bands = config.bands.map((band) => ({{ low: Number(band.low), increment: Number(band.increment) }}));
-    const assigned = (selector, text) => document.querySelectorAll(selector).forEach((node) => {{ node.textContent = text; }});
+    const assigned = (selector, text) => document.querySelectorAll(selector).forEach((node) => {{
+      node.textContent = text;
+      if (selector.includes('data-live-outcome')) {{
+        const value = parseFloat(text.replace(/[$,]/g, ''));
+        node.classList.toggle('text-emerald-400', value > 0);
+        node.classList.toggle('text-rose-400', value < 0);
+        node.classList.toggle('text-muted-foreground', !Number.isFinite(value) || value === 0);
+      }}
+    }});
     const priceText = (number) => `$${{Number(number.toFixed(6)).toString()}}`;
     const money = (number) => `${{number >= 0 ? '+' : '-'}}$${{Math.abs(number).toLocaleString(undefined, {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }})}}`;
     const roundUp = (number) => {{
@@ -8415,8 +8443,8 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
             ? priceText(computedLimit) : `$${{stopInput.dataset.activeStopLimitPrice}}`)
           : '';
         assigned(`[data-live-price="active-stop-${{index}}"]`, Number.isFinite(stopPrice) ? `${{exactStop?.value || stop !== Number(stopInput?.dataset.activeInitial) ? priceText(stopPrice) : `$${{stopInput.dataset.activeOriginal}}`}}${{stopLimitPrice ? ` (LMT ${{stopLimitPrice}})` : ''}}` : '—');
-        assigned(`[data-live-outcome="active-target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} gain` : '— gain');
-        assigned(`[data-live-outcome="active-stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} at stop` : '— at stop');
+        assigned(`[data-live-outcome="active-target-${{index}}"]`, Number.isFinite(gain) ? `${{money(gain)}} Projected P&L` : '— Projected P&L');
+        assigned(`[data-live-outcome="active-stop-${{index}}"]`, Number.isFinite(loss) ? `${{money(loss)}} P&L at STP` : '— P&L at STP');
         const originalTarget = Number(targetInput.dataset.activeOriginal);
         const originalStop = Number(stopInput?.dataset.activeOriginal);
         const targetEdited = targetInput.value.trim() !== (targetInput.dataset.activeInitial || '').trim();
@@ -8698,7 +8726,9 @@ def _trailing_readonly_field(
     )
 
 
-def _trailing_edit_field(label: str, name: str, value: str, *, disabled: bool) -> Any:
+def _trailing_edit_field(
+    label: str, name: str, value: str, *, disabled: bool, readonly: bool = False
+) -> Any:
     return Div(
         Label(label, fr=name, cls="text-xs font-medium text-muted-foreground"),
         Input(
@@ -8709,6 +8739,7 @@ def _trailing_edit_field(label: str, name: str, value: str, *, disabled: bool) -
             min="0.01",
             step="any",
             disabled=disabled,
+            readonly=readonly,
             data_trailing_edit=label,
             data_trailing_initial=value,
             aria_describedby=f"{name}-error",
@@ -8826,8 +8857,8 @@ def _layer_row_layout(
             else None,
             cls="min-w-20",
         ),
-        target_field,
         stop_field,
+        target_field,
         quantity_field,
         action_field,
         data_layer_state=state,
@@ -8855,6 +8886,7 @@ def _percentage_price_field(
     kind: str,
 ) -> Any:
     """Render a percentage input with its calculated price and layer outcome."""
+    outcome_tone = _pnl_tone(_decimal_value(outcome.replace("$", "").replace(",", "")))
     return Div(
         Div(
             Label(
@@ -8894,7 +8926,7 @@ def _percentage_price_field(
                 f"{outcome} {outcome_label}",
                 data_live_outcome=f"{kind}-{layer_index}",
                 aria_live="polite",
-                cls=f"text-xs {tone}",
+                cls=f"text-xs {outcome_tone}",
             ),
             cls="mt-1 flex justify-end",
         ),
@@ -9402,6 +9434,12 @@ def _money(value: Decimal) -> str:
     return f"{'+' if value >= 0 else '-'}${abs(value):,.2f}"
 
 
+def _pnl_tone(value: Decimal | None) -> str:
+    if value is None or not value:
+        return "text-muted-foreground"
+    return "text-emerald-400" if value > 0 else "text-rose-400"
+
+
 def _projection_gain_value(
     value: Decimal | None, delta: Decimal | None, cost: Decimal | None = None
 ) -> Any:
@@ -9426,7 +9464,7 @@ def _projection_change_value(
     amount = f"${abs(delta):,.2f}" if changed and delta is not None else "—"
     baseline = value - delta if value is not None and delta is not None else None
     if metric == "gain":
-        direction = "Expected gain increased" if up else "Expected gain decreased"
+        direction = "Projected P&L increased" if up else "Projected P&L decreased"
     elif (
         changed
         and value is not None
@@ -9452,7 +9490,7 @@ def _projection_change_value(
         ),
         Span(
             percent or "",
-            cls="text-muted-foreground text-[11px] font-normal leading-4 whitespace-nowrap",
+            cls="text-[11px] font-normal leading-4 whitespace-nowrap",
             **{f"data_{metric}_percent": True},
         ),
         Span(
@@ -9501,6 +9539,9 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       if (!node) return;
       const select = (part) => node.querySelector('[data-' + kind + '-' + part + ']');
       const change = select('change');
+      node.classList.toggle('text-emerald-400', value !== null && value > 0);
+      node.classList.toggle('text-rose-400', value !== null && value < 0);
+      node.classList.toggle('text-muted-foreground', value === null || value === 0);
       select('value').textContent = value === null ? '— Unknown' : money(value);
       select('percent').textContent = value !== null && Number.isFinite(cost) && cost > 0
         ? `${{new Intl.NumberFormat(undefined, {{minimumFractionDigits: 1, maximumFractionDigits: 1, signDisplay: 'always'}}).format(value / cost * 100)}}%` : '';
@@ -9518,7 +9559,7 @@ def _projection_script(configuration: dict[str, Any]) -> str:
       node.querySelector('[data-' + kind + '-arrow="up"]').classList.toggle('hidden', !up);
       node.querySelector('[data-' + kind + '-arrow="down"]').classList.toggle('hidden', up);
       const direction = kind === 'gain'
-        ? (up ? 'Expected gain increased' : 'Expected gain decreased')
+        ? (up ? 'Projected P&L increased' : 'Projected P&L decreased')
         : (value < 0 || baseline < 0)
           ? (up ? 'More loss' : 'Less loss')
           : (up ? 'Lower stop outcome' : 'Higher stop outcome');

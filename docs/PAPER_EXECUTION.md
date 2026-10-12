@@ -522,7 +522,12 @@ Inline field feedback and Action Review explain missing STP, nonpositive
 prices, and LMT at or above STP; review submission stays disabled until fixed.
 The server repeats these checks and rejects outdated gap-based forms. The trail amount (`auxPrice` or
 `trailingPercent`) and order quantity are fixed. Editing either field updates
-Action Review; the bottom review control takes a fresh TWS read. A separate
+Action Review; Review price changes takes fresh TWS reads and checks the
+candidate against the current order before opening Cancel / Confirm directly.
+The STP and LMT inputs retain the staged prices and become read-only until
+Cancel or Confirm. Cancel restores the observed prices. The existing ten-second
+confirmation expiry and final fresh-snapshot checks remain in effect; review
+itself sends no order writes. A separate
 Delete trail action cancels the exact order without placing a replacement.
 Both actions require review and final confirmation. The edit also requires a
 fresh bid above the proposed trigger.
@@ -553,7 +558,7 @@ later quote.
 Trail action reviews share the bracket review component: `TRAIL-n`, remaining
 quantity/TIF, linked SELL STP and SELL STP LMT rows, and old-to-new price arrows.
 The LMT review row shows the actual limit price; adding or removing it
-transitions from or to zero. An unchanged stop is shown once. Expected gain
+transitions from or to zero. An unchanged stop is shown once. Projected P&L
 uses the shown LMT price, less unit basis, multiplied by contract multiplier
 and remaining quantity; without LMT it uses the stop. For a $8.60 unit basis,
 $8.10 LMT, multiplier 100, and three contracts, this is a $150 estimated loss. This is an estimate at the
@@ -561,3 +566,10 @@ shown prices, not a guaranteed fill or forecast of the trail's future movement.
 The projection uses verified observed remaining quantities and the staged
 candidate after review, without changing execution validation or order writes.
 Verify with `.venv/bin/python -m pytest -q tests/test_app_demo.py`.
+
+Outcome projection uses the same labels for brackets and trails: `Projected
+P&L` and `P&L at STP`. The latter is a hypothetical result at the trigger, not
+a maximum loss or guaranteed fill price. Tooltips state the price assumptions
+and explain slippage and non-execution of stop-limit orders. Positive P&L and
+return percentages are green, negative values are red, and zero or unavailable
+values are neutral in both server reviews and local edit previews.

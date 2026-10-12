@@ -681,7 +681,11 @@ class PlannerWindow(QMainWindow):
         metrics.setSpacing(28)
         gain = QVBoxLayout()
         gain.setSpacing(2)
-        gain_label = QLabel("Expected gain")
+        gain_label = QLabel("Projected P&L")
+        gain_label.setToolTip(
+            "Projected P&L at the bracket profit-taking LMT: "
+            "(LMT minus average price) times multiplier times quantity. Fills are not guaranteed."
+        )
         gain_label.setObjectName("outcomeMetricLabel")
         gain.addWidget(gain_label)
         self.outcome_gain_label = QLabel("—")
@@ -690,7 +694,13 @@ class PlannerWindow(QMainWindow):
         metrics.addLayout(gain)
         loss = QVBoxLayout()
         loss.setSpacing(2)
-        loss_label = QLabel("Max loss")
+        loss_label = QLabel("P&L at STP")
+        loss_label.setToolTip(
+            "Hypothetical P&L at the STP trigger: "
+            "(STP minus average price) times multiplier times quantity. "
+            "The trigger is not a guaranteed fill price or maximum loss; "
+            "stops can slip and stop-limit orders can remain unfilled."
+        )
         loss_label.setObjectName("outcomeMetricLabel")
         loss.addWidget(loss_label)
         self.outcome_loss_label = QLabel("—")
@@ -711,6 +721,8 @@ class PlannerWindow(QMainWindow):
         return panel
 
     def _update_outcome_projection(self) -> None:
+        for label in (self.outcome_gain_label, self.outcome_loss_label):
+            label.setStyleSheet("color: #8fa8b4;")
         basis = self._state.unit_basis
         basis_text = _basis_text(basis) if self._selected_con_id is not None else "—"
         multiplier = self._state.multiplier
@@ -759,6 +771,12 @@ class PlannerWindow(QMainWindow):
         self.outcome_loss_label.setText(
             f"{_signed_money_text(stop_pnl)} ({_return_percentage_text(stop_pnl, cost)})"
         )
+        for label, value in (
+            (self.outcome_gain_label, target_pnl),
+            (self.outcome_loss_label, stop_pnl),
+        ):
+            colour = "#5bd578" if value > 0 else "#ef6b62" if value < 0 else "#8fa8b4"
+            label.setStyleSheet(f"color: {colour};")
         self.outcome_breakeven_label.setText(_basis_text(basis))
 
     def _build_action_extended_view(self) -> QWidget:
@@ -1163,12 +1181,22 @@ class PlannerWindow(QMainWindow):
             for widgets in self._layer_widgets:
                 widgets.target_outcome.setText("—")
                 widgets.stop_outcome.setText("—")
+                for label in (widgets.target_outcome, widgets.stop_outcome):
+                    label.setStyleSheet("color: #8fa8b4;")
             return
         for widgets, (_, target_pnl, stop_pnl) in zip(
             self._layer_widgets, outcomes, strict=True
         ):
             widgets.target_outcome.setText(_signed_money_text(target_pnl))
             widgets.stop_outcome.setText(_signed_money_text(stop_pnl))
+            for label, value in (
+                (widgets.target_outcome, target_pnl),
+                (widgets.stop_outcome, stop_pnl),
+            ):
+                colour = (
+                    "#5bd578" if value > 0 else "#ef6b62" if value < 0 else "#8fa8b4"
+                )
+                label.setStyleSheet(f"color: {colour};")
 
     def _render_draft_layers(self) -> None:
         forms = (
@@ -1223,7 +1251,7 @@ class PlannerWindow(QMainWindow):
                 stop_outcome = QLabel("—")
                 stop_outcome.setObjectName("layerStopOutcome")
                 stop_outcome.setAccessibleName(
-                    f"Layer {index} dollar outcome if its stop loss fills"
+                    f"Layer {index} hypothetical P&L at its STP trigger"
                 )
                 quantity = QLineEdit(layer.quantity)
                 quantity.setObjectName("layerQuantityInput")
@@ -1247,7 +1275,7 @@ class PlannerWindow(QMainWindow):
                 _add_percentage_field(
                     row_layout,
                     0,
-                    1,
+                    3,
                     "LMT target",
                     target_percentage,
                     target_price,
@@ -1258,7 +1286,7 @@ class PlannerWindow(QMainWindow):
                 _add_percentage_field(
                     row_layout,
                     0,
-                    3,
+                    1,
                     "STP loss",
                     stop_percentage,
                     stop_price,
@@ -1267,6 +1295,8 @@ class PlannerWindow(QMainWindow):
                     2,
                 )
                 _add_compact_field(row_layout, 0, 5, "Qty", quantity, None, 2)
+                QWidget.setTabOrder(stop_percentage, target_percentage)
+                QWidget.setTabOrder(target_percentage, quantity)
                 row_layout.addWidget(remove, 1, 9, 1, 1, Qt.AlignmentFlag.AlignVCenter)
                 for widget in (quantity,):
                     widget.textChanged.connect(self._draft_changed)

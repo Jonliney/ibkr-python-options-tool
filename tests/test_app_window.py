@@ -274,6 +274,13 @@ def test_outcome_projection_uses_the_draft_layers_and_cost_basis() -> None:
     assert window.outcome_summary_label.text().startswith("5 assigned contract(s)")
     assert window.outcome_gain_label.text() == "+$2391.85 (+20.1%)"
     assert window.outcome_loss_label.text() == "-$2958.15 (-24.8%)"
+    assert window.outcome_gain_label.styleSheet() == "color: #5bd578;"
+    assert window.outcome_loss_label.styleSheet() == "color: #ef6b62;"
+    labels = {label.text(): label for label in window.findChildren(QLabel)}
+    assert "profit-taking LMT" in labels["Projected P&L"].toolTip()
+    assert (
+        "not a guaranteed fill price or maximum loss" in labels["P&L at STP"].toolTip()
+    )
 
     target = window.findChildren(QDoubleSpinBox, "layerTargetPercentageInput")[0]
     target.setValue(40)
