@@ -583,6 +583,9 @@ class StarUIWorkbench:
                 order_hint = self._pending_order_observation
                 self._pending_order_observation = False
                 before_orders = self._state.working_orders
+                trailing_review = self._armed_trailing
+                trailing_verified = self._active_action_verified
+                trailing_deadline = self._armed_execution_deadline
                 if order_hint:
                     self._disarm_execution_locked()
                 previous_selected = self._selected_con_id
@@ -591,6 +594,23 @@ class StarUIWorkbench:
                     self._refresh_locked(
                         auto_select=False, preserve_invalid_drafts=True
                     )
+                    if trailing_review is not None:
+                        try:
+                            snapshot = self._view_model.latest_snapshot()
+                            if snapshot is None:
+                                raise ExecutionBlocked(
+                                    "the fresh snapshot is unavailable"
+                                )
+                            self._verify_trailing_review_locked(
+                                snapshot, trailing_review
+                            )
+                        except ExecutionBlocked as error:
+                            self._message = f"Trailing exit review invalidated: {error}. Review the latest state again."
+                            self._protection_change_message = self._message
+                        else:
+                            self._armed_trailing = trailing_review
+                            self._active_action_verified = trailing_verified
+                            self._armed_execution_deadline = trailing_deadline
                     if (
                         order_hint
                         and before_orders != self._state.working_orders
@@ -666,7 +686,10 @@ class StarUIWorkbench:
                 return self._page()
 
         with self._lock:
-            if self._pending_order_observation:
+            if self._pending_order_observation and not (
+                self._armed_trailing is not None
+                and action in {"active-action-execute", "trailing-convert-confirm"}
+            ):
                 self._disarm_execution_locked()
             # Each response carries only feedback produced by this action.
             self._toast = None
@@ -1739,6 +1762,39 @@ class StarUIWorkbench:
         finally:
             self._disarm_execution_locked()
 
+    def _verify_trailing_review_locked(
+        self, snapshot: BrokerSnapshot, plan: TrailingPlan
+    ) -> TrailingPlan:
+        """Recheck safety inputs without treating quote/connection churn as an edit."""
+        if self._paper_execution is None:
+            raise ExecutionBlocked("paper order management is unavailable")
+        self._paper_execution.verify_trailing_baseline(snapshot, plan)
+        if set(self._active_target_perm_ids()) != {
+            item.target_perm_id for item in plan.candidates
+        }:
+            raise ExecutionBlocked("the active bracket set changed")
+        refreshed = self._paper_execution.prepare_entire_position_trailing(
+            snapshot,
+            target_perm_ids=tuple(item.target_perm_id for item in plan.candidates),
+            expected_client_id=self._settings.client_id,
+            request=plan.request,
+        )
+        # Captures have new connection epochs and the bid may move. All other
+        # inputs, including external reservations, must still match exactly.
+        if (
+            replace(
+                refreshed,
+                reference_price=plan.reference_price,
+                initial_stop=plan.initial_stop,
+                limit_offset=plan.limit_offset,
+                fingerprint=plan.fingerprint,
+                connection_epoch=plan.connection_epoch,
+            )
+            != plan
+        ):
+            raise ExecutionBlocked("the trailing plan changed after review")
+        return refreshed
+
     def _execute_active_action_locked(self) -> None:
         """Verify a reviewed cancellation or market exit before showing Confirm."""
         market_exits = self._armed_market_exits or (
@@ -1822,37 +1878,9 @@ class StarUIWorkbench:
                 if refreshed != plan:
                     raise ExecutionBlocked("the position exits changed after review")
             elif trailing is not None:
-                self._paper_execution.verify_trailing_baseline(snapshot, trailing)
-                if set(self._active_target_perm_ids()) != {
-                    item.target_perm_id for item in trailing.candidates
-                }:
-                    raise ExecutionBlocked("the active bracket set changed")
-                refreshed_trailing = (
-                    self._paper_execution.prepare_entire_position_trailing(
-                        snapshot,
-                        target_perm_ids=tuple(
-                            item.target_perm_id for item in trailing.candidates
-                        ),
-                        expected_client_id=self._settings.client_id,
-                        request=trailing.request,
-                    )
+                self._armed_trailing = self._verify_trailing_review_locked(
+                    snapshot, trailing
                 )
-                # The bid can move, and each fresh TWS capture has a new
-                # connection epoch. Show the new stop and limit offset for
-                # confirmation while keeping stable safety inputs identical.
-                if (
-                    replace(
-                        refreshed_trailing,
-                        reference_price=trailing.reference_price,
-                        initial_stop=trailing.initial_stop,
-                        limit_offset=trailing.limit_offset,
-                        fingerprint=trailing.fingerprint,
-                        connection_epoch=trailing.connection_epoch,
-                    )
-                    != trailing
-                ):
-                    raise ExecutionBlocked("the trailing plan changed after review")
-                self._armed_trailing = refreshed_trailing
             elif self._armed_trailing_change is not None:
                 candidate = self._armed_trailing_change
                 refreshed_change = self._paper_execution.prepare_trailing_change(

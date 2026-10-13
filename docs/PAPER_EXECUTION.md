@@ -680,6 +680,13 @@ The cancellation label does not claim who initiated it.
 The browser receives a protection-change notice through its existing two-second
 revision stream. Draft and active inputs remain mounted until the operator uses
 **Update view**; affected server-side confirmations are invalidated immediately.
+A trailing conversion review survives a background hint only when a fresh
+snapshot verifies the same position, fills, app-owned brackets, and external
+reservations. Quote movement and a new capture connection epoch alone do not
+invalidate it. Its original confirmation deadline is preserved. A queued hint
+before Review or Confirm does not erase the conversion: those actions perform
+their existing fresh safety checks, and writes still require explicit Confirm.
+A changed safety input invalidates the review with a protection-change notice.
 The updated view shows the cancelled trail and any partial-fill quantity, or
 `CHECK TWS` when terminal evidence is missing. A confirmed trail cancellation is
 recorded once and survives restart. This is observation and display behavior;

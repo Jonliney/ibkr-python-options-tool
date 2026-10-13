@@ -8549,3 +8549,100 @@ def test_order_hint_reconciles_manual_trail_cancellation_without_position_change
     finally:
         workbench.close()
         worker.join(timeout=2)
+
+
+def test_trailing_review_survives_pending_order_hint(tmp_path):
+    workbench = _trailing_scenario_workbench(tmp_path, "convert")
+    client = TestClient(workbench.app)
+    client.post(
+        workbench.path + "action",
+        data={
+            "action": "trailing-convert-arm",
+            "trail_value": "25",
+            "trail_unit": "dollars",
+            "trail_limit_value": "10",
+            "trail_limit_unit": "dollars",
+        },
+    )
+    assert workbench._armed_trailing is not None
+    workbench._pending_order_observation = True
+    reviewed = client.post(
+        workbench.path + "action", data={"action": "active-action-execute"}
+    )
+    assert workbench._armed_trailing is not None, workbench._message
+    assert workbench._active_action_verified, workbench._message
+    assert 'value="trailing-convert-confirm"' in reviewed.text
+    assert not workbench._paper_execution.trailing_entries(
+        account=DEMO_ACCOUNT, con_id=workbench._selected_con_id
+    )
+    # A further callback between review and confirmation is still subject to
+    # the confirmation's fresh bracket/position/fill checks.
+    workbench._pending_order_observation = True
+    client.post(workbench.path + "action", data={"action": "trailing-convert-confirm"})
+    entries = workbench._paper_execution.trailing_entries(
+        account=DEMO_ACCOUNT, con_id=workbench._selected_con_id
+    )
+    assert len(entries) == 1, workbench._message
+    assert entries[0].state == "SUBMITTED"
+
+
+@pytest.mark.parametrize("verified", [False, True])
+@pytest.mark.parametrize("changed", [False, True])
+def test_background_order_hint_preserves_trailing_review_only_when_verified(
+    tmp_path, monkeypatch, changed, verified
+):
+    workbench = _trailing_scenario_workbench(tmp_path, "convert")
+    client = TestClient(workbench.app)
+    client.post(
+        workbench.path + "action",
+        data={
+            "action": "trailing-convert-arm",
+            "trail_value": "25",
+            "trail_unit": "dollars",
+        },
+    )
+    if verified:
+        client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    plan = workbench._armed_trailing
+    deadline = workbench._armed_execution_deadline
+    assert plan is not None
+    assert workbench._active_action_verified is verified
+    if changed:
+        broker = workbench._view_model._snapshots._broker
+        capture = broker.capture
+
+        def changed_capture(request):
+            result = capture(request)
+            return replace(
+                result,
+                orders=tuple(
+                    replace(order, limit_price=order.limit_price + Decimal("0.01"))
+                    if order.limit_price is not None
+                    else order
+                    for order in result.orders
+                ),
+            )
+
+        monkeypatch.setattr(broker, "capture", changed_capture)
+    workbench._pending_order_observation = True
+    workbench._pending_observation = True
+    revision = workbench._inventory_revision
+    worker = Thread(target=workbench._observation_loop, daemon=True)
+    worker.start()
+    workbench._observer_signal.set()
+    try:
+        for _ in range(100):
+            if workbench._inventory_revision > revision:
+                break
+            Event().wait(0.01)
+        assert workbench._inventory_revision > revision
+        if changed:
+            assert workbench._armed_trailing is None
+            assert "Trailing exit review invalidated" in workbench._message
+        else:
+            assert workbench._armed_trailing == plan
+            assert workbench._active_action_verified is verified
+            assert workbench._armed_execution_deadline == deadline
+    finally:
+        workbench.close()
+        worker.join(timeout=2)
