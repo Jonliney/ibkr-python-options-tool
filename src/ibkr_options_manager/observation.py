@@ -8,9 +8,8 @@ from threading import Event, Lock, Thread, current_thread
 from time import monotonic
 from typing import Any
 
-from .broker.ibkr import _INFORMATIONAL_ERROR_CODES
 from .connection import validate_paper_connection
-from .ibkr_probe import _load_ibapi, _parse_error_arguments
+from .ibkr_probe import _INFORMATIONAL_ERROR_CODES, _load_ibapi, _parse_error_arguments
 
 
 @dataclass(frozen=True, slots=True)

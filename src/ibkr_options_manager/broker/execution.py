@@ -25,9 +25,14 @@ from ..execution import (
     require_paper_execution_snapshot,
     require_paper_management_snapshot,
 )
-from ..ibkr_probe import _load_ibapi, _parse_error_arguments
+from ..ibkr_probe import (
+    _INFORMATIONAL_ERROR_CODES,
+    _load_ibapi,
+    _parse_error_arguments,
+)
 from ..order_observation import leased_client
 from ..price_update_trace import record_price_update_event
+from ..redaction import redact_account
 from ..trailing import TrailingPlan, plan_entire_position
 
 
@@ -160,7 +165,7 @@ class IbkrPaperExecutionBroker:
 
             def error(self, req_id: int, *args: Any) -> None:
                 code, message = _parse_error_arguments(args)
-                if code not in {2104, 2106, 2107, 2108, 2158}:
+                if code not in _INFORMATIONAL_ERROR_CODES:
                     self.errors.append(
                         f"IBKR error reqId={req_id} code={code}: {message}"
                     )
@@ -368,7 +373,7 @@ class IbkrPaperExecutionBroker:
 
             def error(self, req_id: int, *args: Any) -> None:
                 code, message = _parse_error_arguments(args)
-                if code not in {2104, 2106, 2107, 2108, 2158}:
+                if code not in _INFORMATIONAL_ERROR_CODES:
                     self.errors.append(f"IBKR error {code}: {message}")
 
         app = App()
@@ -489,7 +494,7 @@ class IbkrPaperExecutionBroker:
 
             def error(self, req_id: int, *args: Any) -> None:
                 code, message = _parse_error_arguments(args)
-                if code not in {2104, 2106, 2107, 2108, 2158}:
+                if code not in _INFORMATIONAL_ERROR_CODES:
                     self.errors.append(
                         f"IBKR error reqId={req_id} code={code}: {message}"
                     )
@@ -576,6 +581,7 @@ class IbkrPaperExecutionBroker:
                 self.acks: dict[int, int] = {}
                 self.errors: list[str] = []
                 self.next_order_id = 0
+                self.outside_rth_ignored: set[int] = set()
                 self.orders: dict[int, tuple[Any, Any, str]] = {}
                 self.scan: dict[int, tuple[Any, Any, str]] | None = None
                 self.orders_done, self.positions_done, self.fills_done = (
@@ -598,15 +604,30 @@ class IbkrPaperExecutionBroker:
                 state: Any,
             ) -> None:
                 self.next_order_id = max(self.next_order_id, int(order_id) + 1)
-                if int(order_id) in submitted and (
-                    not _same_option_identity(contract, snapshot)
-                    or _bracket_order_fields(order)
-                    != _bracket_order_fields(submitted[int(order_id)])
-                    or int(getattr(order, "clientId", -1)) != client_id
-                ):
-                    self.errors.append(
-                        "The acknowledged bracket does not match the submitted order"
+                if int(order_id) in submitted:
+                    differences = list(
+                        _bracket_order_mismatches(
+                            order,
+                            submitted[int(order_id)],
+                            outside_rth_ignored=int(order_id)
+                            in self.outside_rth_ignored,
+                        )
                     )
+                    if not _same_option_identity(contract, snapshot):
+                        differences.append(
+                            "contract identity differs from verified option"
+                        )
+                    if int(getattr(order, "clientId", -1)) != client_id:
+                        differences.append(
+                            f"clientId expected={client_id!r} "
+                            f"observed={getattr(order, 'clientId', None)!r}"
+                        )
+                    if differences:
+                        self.errors.append(
+                            "The acknowledged bracket does not match "
+                            "the submitted order: "
+                            + "; ".join(differences)
+                        )
                 perm_id = int(getattr(order, "permId", 0) or 0)
                 if (
                     self.acks.get(int(order_id), 0) > 0
@@ -678,7 +699,9 @@ class IbkrPaperExecutionBroker:
 
             def error(self, req_id: int, *args: Any) -> None:
                 code, message = _parse_error_arguments(args)
-                if code not in {2104, 2106, 2107, 2108, 2158}:
+                if code == 2109 and int(req_id) in submitted:
+                    self.outside_rth_ignored.add(int(req_id))
+                if code not in _INFORMATIONAL_ERROR_CODES:
                     self.errors.append(
                         f"IBKR error reqId={req_id} code={code}: {message}"
                     )
@@ -842,7 +865,7 @@ class IbkrPaperExecutionBroker:
                 if code == 202 and req_id in selected_ids:
                     self.cancelled.add(int(req_id))
                     return
-                if code not in {2104, 2106, 2107, 2108, 2158}:
+                if code not in _INFORMATIONAL_ERROR_CODES:
                     self.errors.append(
                         f"IBKR error reqId={req_id} code={code}: {message}"
                     )
@@ -1018,7 +1041,7 @@ class IbkrPaperExecutionBroker:
                 }:
                     self.cancelled.add(int(req_id))
                     return
-                if code not in {2104, 2106, 2107, 2108, 2158}:
+                if code not in _INFORMATIONAL_ERROR_CODES:
                     self.errors.append(
                         f"IBKR error reqId={req_id} code={code}: {message}"
                     )
@@ -1198,7 +1221,7 @@ class IbkrPaperExecutionBroker:
                 if code == 202 and req_id in selected_ids:
                     self.cancelled.add(int(req_id))
                     return
-                if code not in {2104, 2106, 2107, 2108, 2158}:
+                if code not in _INFORMATIONAL_ERROR_CODES:
                     self.errors.append(
                         f"IBKR error reqId={req_id} code={code}: {message}"
                     )
@@ -1475,7 +1498,7 @@ class IbkrPaperExecutionBroker:
                     message=message,
                     advanced_rejection=str(args[2]) if len(args) > 2 else "",
                 )
-                if code not in {2104, 2106, 2107, 2108, 2158}:
+                if code not in _INFORMATIONAL_ERROR_CODES:
                     self.errors.append(
                         f"IBKR error reqId={req_id} code={code}: {message}"
                     )
@@ -1701,9 +1724,9 @@ def _same_option_identity(contract: Any, snapshot: BrokerSnapshot) -> bool:
     )
 
 
-def _bracket_order_fields(order: Any) -> tuple[Any, ...]:
-    return tuple(
-        getattr(order, field, None)
+def _bracket_order_fields(order: Any) -> dict[str, Any]:
+    fields = dict(
+        (field, getattr(order, field, None))
         for field in (
             "account",
             "action",
@@ -1718,6 +1741,43 @@ def _bracket_order_fields(order: Any) -> tuple[Any, ...]:
             "outsideRth",
         )
     )
+    # TWS represents an unused price as zero instead of the API unset sentinel.
+    # Only inactive price fields are normalized; stop/limit prices remain exact.
+    from ibapi.const import UNSET_DOUBLE
+
+    unused = (
+        "lmtPrice"
+        if fields["orderType"] == "STP"
+        else "auxPrice"
+        if fields["orderType"] == "LMT"
+        else None
+    )
+    if unused and fields[unused] in {None, 0, UNSET_DOUBLE}:
+        fields[unused] = None
+    return fields
+
+
+def _bracket_order_mismatches(
+    order: Any, expected: Any, *, outside_rth_ignored: bool = False
+) -> tuple[str, ...]:
+    observed_fields = _bracket_order_fields(order)
+    expected_fields = _bracket_order_fields(expected)
+    differences = []
+    for field, value in expected_fields.items():
+        observed = observed_fields[field]
+        if value == observed:
+            continue
+        if (
+            field == "outsideRth"
+            and outside_rth_ignored
+            and value is True
+            and observed is False
+        ):
+            continue
+        if field == "account":
+            value, observed = redact_account(str(value)), redact_account(str(observed))
+        differences.append(f"{field} expected={value!r} observed={observed!r}")
+    return tuple(differences)
 
 
 def _verify_bracket_snapshot(
@@ -1808,7 +1868,11 @@ def _verify_bracket_snapshot(
             contract, order, status = selected_orders[oid]
             if (
                 not _same_option_identity(contract, snapshot)
-                or _bracket_order_fields(order) != _bracket_order_fields(submitted[oid])
+                or _bracket_order_mismatches(
+                    order,
+                    submitted[oid],
+                    outside_rth_ignored=oid in app.outside_rth_ignored,
+                )
                 or int(getattr(order, "clientId", -1)) != client_id
                 or int(order.permId) != app.acks[oid]
                 or int(order.permId) <= 0

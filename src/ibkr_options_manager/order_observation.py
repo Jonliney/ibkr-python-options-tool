@@ -15,7 +15,11 @@ from time import monotonic
 from typing import Any, cast
 
 from .connection import validate_paper_connection
-from .ibkr_probe import _load_ibapi, _parse_error_arguments
+from .ibkr_probe import (
+    _INFORMATIONAL_ERROR_CODES,
+    _load_ibapi,
+    _parse_error_arguments,
+)
 
 
 class _ClientSlot:
@@ -248,7 +252,7 @@ class OrderObserver:
                         owner._on_change()
                         return
                     del reqId
-                    if code not in {2104, 2106, 2107, 2108, 2158} and current():
+                    if code not in _INFORMATIONAL_ERROR_CODES and current():
                         owner._on_health("error")
                         stop.set()
 

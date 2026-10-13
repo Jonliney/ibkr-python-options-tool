@@ -8,6 +8,7 @@ from typing import Any
 
 from ..cancellation_trace import current_snapshot_context, record_cancellation_event
 from ..ibkr_probe import (
+    _INFORMATIONAL_ERROR_CODES,
     IbapiUnavailableError,
     _IbapiImports,
     _load_ibapi,
@@ -29,7 +30,6 @@ from .read_only import (
     SnapshotRequest,
 )
 
-_INFORMATIONAL_ERROR_CODES = {2104, 2106, 2107, 2108, 2158}
 _MARKET_DATA_TYPES = {
     1: "LIVE",
     2: "FROZEN",

@@ -49,6 +49,21 @@ def test_trailing_stop_uses_reported_trigger_not_trailing_amount() -> None:
     ) == Decimal("0.75")
 
 
+def test_capture_ignores_outside_rth_notice_but_retains_order_rejection():
+    class Wrapper:
+        pass
+
+    class Client:
+        def __init__(self, wrapper):
+            self.wrapper = wrapper
+
+    app = _build_capture_app(_IbapiImports(Client, Wrapper, object, object))
+    app.error(146, 2109, "Outside Regular Trading Hours is ignored")
+    assert app.errors == []
+    app.error(146, 109, "TWS price precaution")
+    assert any("code=109" in error for error in app.errors)
+
+
 def test_execution_capture_waits_for_matching_pnl_report() -> None:
     executions_done = Event()
     executions_done.set()

@@ -185,7 +185,7 @@ Neither permanent IDs alone nor absence from a partial snapshot proves a result.
 
 A missing/changed stop prevents sending its target. A failed post-target pair
 check stops all later tranches. Rejections, partial/full fills, disconnects,
-timeouts, and TWS warnings leave the attempt uncertain; the app does not retry,
+timeouts, and unclassified TWS warnings leave the attempt uncertain; the app does not retry,
 recreate a vanished stop, cancel a surviving order, or bypass a precaution.
 The journal retains the failure reason, OCA identities and planned layers across
 restarts. The blocking **Possible one-sided bracket** modal shows tranche cards
@@ -209,6 +209,19 @@ tranches remains required, including stop/target fills during creation, held or
 rejected legs, manual cancellation, and restart after an uncertain result. A
 `Submitted` or `PreSubmitted` status confirms broker acceptance, not execution.
 TWS can still require its independent manual Transmit decision.
+
+IBKR code 2109 (Outside RTH ignored for the order type/destination) is
+informational: TWS continues processing the order. The probe, snapshot reader,
+order listener and paper writers share the same explicit informational-code list.
+This warning does not prove acceptance, promise execution outside regular hours,
+or bypass a TWS precaution. Stop acceptance and all pre/post-target checks remain
+mandatory; missing acknowledgements and genuine rejections still block the attempt.
+The stop-first writer normalizes zero versus unset only for a price unused by
+the order type (STP limit price, LMT auxiliary price). Both STP LMT prices remain
+exact. It permits a returned `outsideRth=False` against the requested `True`
+only after code 2109 for that exact submitted order ID; a warning for another
+order cannot authorize that difference. Other mismatches identify the field
+and expected/observed values in the blocking dialog, with account IDs redacted.
 
 ## Available-position trailing conversion
 

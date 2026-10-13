@@ -12,6 +12,7 @@ _INFORMATIONAL_ERROR_CODES = {
     2106,  # Historical data farm connection is OK.
     2107,  # Historical data farm is inactive but available on demand.
     2108,  # Market data farm is inactive but available on demand.
+    2109,  # Outside RTH is ignored for this order; processing continues.
     2158,  # Sec-def data farm connection is OK.
 }
 

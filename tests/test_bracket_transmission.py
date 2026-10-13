@@ -71,7 +71,39 @@ def _writer(monkeypatch, mode="normal", quantity=2, snapshot=None):
 
         def placeOrder(self, oid, _contract, order):
             writes.append((oid, copy(order)))
+            if (
+                mode.startswith("outside-rth-warning")
+                and mode != "outside-rth-warning-wrong-order"
+            ):
+                self.wrapper.error(
+                    oid,
+                    2109,
+                    "Order Event Warning:Attribute 'Outside Regular Trading Hours' "
+                    "is ignored based on the order type and destination. "
+                    "PlaceOrder is now being processed.",
+                )
+                if mode == "outside-rth-warning-no-ack":
+                    return
+                if mode == "outside-rth-warning-rejected":
+                    self.wrapper.error(oid, 109, "TWS price precaution")
+                    return
             order = copy(order)
+            if mode == "outside-rth-warning-normalized":
+                order.outsideRth = False
+                if order.orderType == "STP":
+                    order.lmtPrice = 0.0
+                else:
+                    order.auxPrice = 0.0
+            if mode == "outside-rth-without-warning":
+                order.outsideRth = False
+            if mode == "unused-price-zero":
+                if order.orderType == "STP":
+                    order.lmtPrice = 0.0
+                else:
+                    order.auxPrice = 0.0
+            if mode == "outside-rth-warning-wrong-order":
+                self.wrapper.error(oid + 100, 2109, "Outside RTH ignored")
+                order.outsideRth = False
             order.permId = oid + 1000
             order.clientId = 17
             status = "Submitted" if order.orderType == "LMT" else "PreSubmitted"
@@ -262,8 +294,89 @@ def test_incomplete_history_is_blocked_before_any_order(monkeypatch):
     assert writes == []
 
 
-@pytest.mark.parametrize("fail_after_first", [False, True])
-def test_four_brackets_are_sent_and_verified_in_sequence(monkeypatch, fail_after_first):
+@pytest.mark.parametrize(
+    "mode",
+    ["outside-rth-warning", "outside-rth-warning-normalized", "unused-price-zero"],
+)
+def test_outside_rth_warning_does_not_abort_accepted_bracket(monkeypatch, mode):
+    snapshot, writes, reads = _writer(monkeypatch, mode)
+    receipt = _submit(snapshot)
+    assert receipt.order_ids == (501, 500)
+    assert [order.orderType for _, order in writes] == ["STP", "LMT"]
+    assert len([read for read in reads if read[0] == "orders"]) == 3
+
+
+@pytest.mark.parametrize(
+    "mode", ["outside-rth-without-warning", "outside-rth-warning-wrong-order"]
+)
+def test_changed_outside_rth_requires_warning_for_that_order(monkeypatch, mode):
+    snapshot, writes, _ = _writer(monkeypatch, mode)
+    with pytest.raises(ExecutionBlocked, match="outsideRth"):
+        _submit(snapshot)
+    assert len(writes) == 1
+
+
+@pytest.mark.parametrize(
+    "kind,field,value",
+    [
+        ("STP", "auxPrice", 22.5),
+        ("LMT", "lmtPrice", 35.0),
+        ("STP LMT", "lmtPrice", 0.0),
+        ("STP LMT", "auxPrice", 0.0),
+        ("STP", "totalQuantity", 2),
+        ("STP", "ocaGroup", "other/tranche-1"),
+        ("STP", "ocaType", 1),
+        ("STP", "parentId", 1),
+        ("STP", "tif", "DAY"),
+    ],
+)
+def test_normalization_keeps_active_prices_and_bracket_fields_exact(kind, field, value):
+    from ibapi.order import Order
+
+    expected = Order()
+    expected.orderType = kind
+    expected.auxPrice = 23.0
+    expected.lmtPrice = 36.8
+    expected.totalQuantity = 1
+    expected.ocaGroup = "app/tranche-1"
+    expected.ocaType = 2
+    expected.parentId = 0
+    expected.tif = "GTC"
+    expected.outsideRth = True
+    observed = copy(expected)
+    observed.outsideRth = False
+    setattr(observed, field, value)
+    differences = transport._bracket_order_mismatches(
+        observed, expected, outside_rth_ignored=True
+    )
+    assert len(differences) == 1
+    assert differences[0].startswith(field + " expected=")
+
+
+@pytest.mark.parametrize(
+    "mode", ["outside-rth-warning-no-ack", "outside-rth-warning-rejected"]
+)
+def test_outside_rth_warning_is_not_acceptance_and_does_not_hide_rejection(
+    monkeypatch, mode
+):
+    snapshot, writes, _ = _writer(monkeypatch, mode)
+    with pytest.raises(ExecutionBlocked, match="one-sided bracket"):
+        _submit(snapshot)
+    assert len(writes) == 1
+
+
+@pytest.mark.parametrize(
+    "fail_after_first,mode",
+    [
+        (False, "normal"),
+        (True, "missing-stop-after"),
+        (False, "outside-rth-warning"),
+        (False, "outside-rth-warning-normalized"),
+    ],
+)
+def test_four_brackets_are_sent_and_verified_in_sequence(
+    monkeypatch, fail_after_first, mode
+):
     from ibkr_options_manager.domain import (
         LayerRequest,
         PlanRequest,
@@ -271,9 +384,7 @@ def test_four_brackets_are_sent_and_verified_in_sequence(monkeypatch, fail_after
         build_exit_plan,
     )
 
-    snapshot, writes, reads = _writer(
-        monkeypatch, "missing-stop-after" if fail_after_first else "normal", quantity=4
-    )
+    snapshot, writes, reads = _writer(monkeypatch, mode, quantity=4)
     plan = build_exit_plan(
         snapshot,
         PlanRequest(

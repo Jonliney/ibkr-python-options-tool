@@ -67,6 +67,10 @@ def test_same_client_listener_handoff_callbacks_and_reconnect(monkeypatch):
     try:
         assert connected.wait(1)
         app = clients[0].wrapper
+        app.error(701, 2109, "Outside Regular Trading Hours is ignored")
+        assert health == ["connected"]
+        assert changes == []
+        assert active == {17}
         app.orderStatus(701, "Cancelled", 0, 0, 0, 801)
         app.orderStatus(701, "Cancelled", 0, 0, 0, 801)
         assert changes == ["hint"]
