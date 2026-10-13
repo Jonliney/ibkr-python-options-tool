@@ -8468,3 +8468,84 @@ def test_mstr_four_brackets_convert_five_contracts_beside_external_exit(tmp_path
     final = workbench._view_model.latest_snapshot()
     assert final is not None
     assert final.working_orders == external
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_order_hint_reconciles_manual_trail_cancellation_without_position_change(
+    tmp_path, terminal
+):
+    from ibkr_options_manager.broker.read_only import CapturedCompletedOrder
+
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    service = workbench._paper_execution
+    assert service is not None
+    entry = workbench._trailing_entries()[0]
+    broker = workbench._view_model._snapshots._broker
+    original_capture = broker.capture
+
+    def cancelled_capture(request):
+        captured = original_capture(request)
+        return replace(
+            captured,
+            orders=tuple(o for o in captured.orders if o.perm_id != entry.perm_ids[0]),
+            completed_orders=(
+                CapturedCompletedOrder(
+                    entry.account,
+                    entry.con_id,
+                    entry.perm_ids[0],
+                    entry.order_ids[0],
+                    17,
+                    "SELL",
+                    "TRAIL LIMIT",
+                    "",
+                    "Cancelled",
+                ),
+            )
+            if terminal
+            else (),
+        )
+
+    drafts = dict(workbench._drafts)
+    initial_quantity = workbench._view_model.latest_snapshot().position.quantity
+    # Stage an edit first; a new callback must invalidate it before confirmation.
+    client = TestClient(workbench.app)
+    client.post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"trailing_stop_{entry.perm_ids[0]}": "8.70",
+            f"trailing_limit_{entry.perm_ids[0]}": "8.60",
+        },
+    )
+    assert workbench._armed_trailing_change is not None
+    broker.capture = cancelled_capture
+    # Queue the event after review, without changing the held quantity.
+    workbench._pending_order_observation = True
+    workbench._pending_observation = True
+    worker = Thread(target=workbench._observation_loop, daemon=True)
+    worker.start()
+    workbench._observer_signal.set()
+    try:
+        for _ in range(100):
+            if workbench._protection_change_message:
+                break
+            Event().wait(0.01)
+        assert workbench._protection_change_message
+        assert (
+            workbench._view_model.latest_snapshot().position.quantity
+            == initial_quantity
+        )
+        assert workbench._drafts == drafts
+        assert workbench._armed_trailing_change is None
+        assert workbench._active_action_verified is False
+        fragment = client.get(workbench.path + "inventory-fragment")
+        assert fragment.headers["X-Protection-Change"]
+        page = client.get(workbench.path).text
+        assert ('data-layer-state="cancelled-trailing"' in page) is terminal
+        assert ("CHECK TWS" in page) is not terminal
+        assert workbench._trailing_entries()[0].state == (
+            "CANCELLED_CONFIRMED" if terminal else "SUBMITTED"
+        )
+    finally:
+        workbench.close()
+        worker.join(timeout=2)

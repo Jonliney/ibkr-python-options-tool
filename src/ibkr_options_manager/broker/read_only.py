@@ -139,6 +139,7 @@ class CapturedCompletedOrder:
     order_type: str
     oca_group: str
     status: str
+    completed_status: str = ""
 
 
 @dataclass(frozen=True, slots=True)

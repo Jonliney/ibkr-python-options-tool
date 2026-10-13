@@ -25,6 +25,7 @@ from ..execution import (
     require_paper_management_snapshot,
 )
 from ..ibkr_probe import _load_ibapi, _parse_error_arguments
+from ..order_observation import leased_client
 from ..price_update_trace import record_price_update_event
 from ..trailing import TrailingPlan, plan_entire_position
 
@@ -56,6 +57,7 @@ def _observed_trailing_offset(value: Any) -> Decimal | None:
 class IbkrPaperExecutionBroker:
     """Bounded paper writer for creation and exact app-owned order changes."""
 
+    @leased_client
     def change_trailing(
         self,
         snapshot: BrokerSnapshot,
@@ -264,6 +266,7 @@ class IbkrPaperExecutionBroker:
             if reader is not None:
                 reader.join(timeout=0.5)
 
+    @leased_client
     def submit_market(
         self,
         snapshot: BrokerSnapshot,
@@ -427,6 +430,7 @@ class IbkrPaperExecutionBroker:
             if reader is not None:
                 reader.join(timeout=0.5)
 
+    @leased_client
     def submit_trailing(
         self,
         snapshot: BrokerSnapshot,
@@ -540,6 +544,7 @@ class IbkrPaperExecutionBroker:
             if reader is not None:
                 reader.join(timeout=0.5)
 
+    @leased_client
     def submit(
         self,
         snapshot: BrokerSnapshot,
@@ -651,6 +656,7 @@ class IbkrPaperExecutionBroker:
             if reader is not None:
                 reader.join(timeout=0.5)
 
+    @leased_client
     def cancel_pair(
         self,
         snapshot: BrokerSnapshot,
@@ -800,6 +806,7 @@ class IbkrPaperExecutionBroker:
             if reader is not None:
                 reader.join(timeout=0.5)
 
+    @leased_client
     def cancel_pair_then_submit_market(
         self,
         snapshot: BrokerSnapshot,
@@ -978,6 +985,7 @@ class IbkrPaperExecutionBroker:
             if reader is not None:
                 reader.join(timeout=0.5)
 
+    @leased_client
     def cancel_pairs_then_submit_market(
         self,
         snapshot: BrokerSnapshot,
@@ -1153,6 +1161,7 @@ class IbkrPaperExecutionBroker:
             if reader is not None:
                 reader.join(timeout=0.5)
 
+    @leased_client
     def modify_prices(
         self,
         snapshot: BrokerSnapshot,

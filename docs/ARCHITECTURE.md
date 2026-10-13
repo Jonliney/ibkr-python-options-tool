@@ -38,6 +38,8 @@ construct IBKR contracts or orders.
 | `domain.planner` | `build_exit_plan`, price preview and rounding | Deep, deterministic planning module. It validates exact contract identity, allocation, quantities, prices, ticks, and logical OCA pairs without I/O. |
 | `broker.read_only` | request/capture values plus observation-only protocols | Transport seam for bounded portfolio and selected-contract captures. It deliberately contains no write method. |
 | `broker.ibkr` | `IbkrSnapshotBroker.capture` | Official-API read adapter. It collects callback evidence and returns an immutable capture. |
+| `order_observation` | `OrderObserver`, `borrow_client`, adapter lease decorator | Own-client real-time order hints and exclusive client-ID handoff to bounded readers/writers. No order-write or binding calls. |
+| `trailing_outcome` | `classify_trailing` | Pure exact-identity cancellation/fill evidence; absence and conflicts remain unresolved. |
 | `broker.observations` | `working_orders_from_capture` | Normalizes and deterministically orders broker observations once for both portfolio and selected-contract publishers. |
 | `portfolio` | `PortfolioCoordinator.refresh/current` | Publishes only a coherent option inventory and expires cached inventory by monotonic age. |
 | `snapshot` | `SnapshotCoordinator.refresh/current` | Resolves one exact option and publishes only a complete coherent domain snapshot. |

@@ -111,11 +111,14 @@ class ProductionSourceSafetyTests(unittest.TestCase):
             )
         )
 
-    def test_only_the_snapshot_and_writer_may_request_client_bound_orders(self) -> None:
+    def test_only_leased_adapters_and_nonzero_listener_request_own_orders(self) -> None:
         package = Path(__file__).parents[1] / "src" / "ibkr_options_manager"
         allowed_sources = {
             package / "broker" / "ibkr.py",
             package / "broker" / "execution.py",
+            # Observation-only same-submitter listener: client 0 is rejected
+            # at construction and its lease is released before captures/writes.
+            package / "order_observation.py",
         }
         violations: list[str] = []
 

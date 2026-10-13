@@ -70,6 +70,7 @@ from ...execution import (
     classify_journal_layer,
 )
 from ...observation import ObservationSettings, PositionObserver
+from ...order_observation import OrderObserver
 from ...price_update_trace import record_price_update_event
 from ...trailing import TrailingPlan, TrailingRequest, trailing_edit_prices
 from ..position_observation import VerifiedPositionChanges
@@ -178,6 +179,13 @@ class StarUIWorkbench:
         self._observe_positions = observe_positions and not demo_mode
         self._observer_client_id = observer_client_id
         self._observer: PositionObserver | None = None
+        self._order_observer: OrderObserver | None = None
+        self._order_observer_key: tuple[str, int, int] | None = None
+        self._order_observer_epoch = 0
+        self._pending_order_observation = False
+        self._order_health = "idle"
+        self._order_retry_at = 0.0
+        self._protection_change_message = ""
         self._observer_settings: ObservationSettings | None = None
         self._observer_generation = 0
         self._observer_signal = Event()
@@ -378,8 +386,13 @@ class StarUIWorkbench:
         with self._lock:
             self._closed = True
             observer = self._observer
+            order_observer = self._order_observer
+            self._order_observer_epoch += 1
+            self._order_observer = None
             self._observer = None
             self._observer_signal.set()
+        if order_observer is not None:
+            order_observer.stop()
         if observer is not None:
             observer.stop()
         if self._observation_thread is not None:
@@ -392,7 +405,10 @@ class StarUIWorkbench:
                     payload = json.dumps(
                         {
                             "revision": self._inventory_revision,
-                            "observer": self._observer_health,
+                            "observer": self._order_health
+                            if self._observer_health == "connected"
+                            and self._order_health in {"error", "disconnected"}
+                            else self._observer_health,
                         }
                     )
                 # A quiet position subscription still needs a visible liveness
@@ -414,6 +430,7 @@ class StarUIWorkbench:
                 headers={
                     "Cache-Control": "no-store",
                     "X-Inventory-Revision": str(self._inventory_revision),
+                    "X-Protection-Change": self._protection_change_message,
                     "X-Selected-Changed": "1"
                     if self._observation_requires_reload
                     else "0",
@@ -422,6 +439,48 @@ class StarUIWorkbench:
                     else "0",
                 },
             )
+
+    def _start_order_observer_locked(self) -> None:
+        if not self._observe_positions or self._closed or self._demo_mode:
+            return
+        key = (self._settings.account, self._settings.port, self._settings.client_id)
+        if self._order_observer is not None and self._order_observer_key == key:
+            if self._order_health in {"error", "disconnected"}:
+                try:
+                    self._order_observer.start()
+                    self._order_health = "connecting"
+                except RuntimeError:
+                    self._order_health = "error"
+            return
+        if self._order_observer is not None:
+            self._order_observer.stop()
+        self._order_observer_epoch += 1
+        epoch = self._order_observer_epoch
+
+        def hint() -> None:
+            if not self._closed and epoch == self._order_observer_epoch:
+                self._pending_order_observation = True
+                self._pending_observation = True
+                self._observer_signal.set()
+
+        def health(value: str) -> None:
+            if not self._closed and epoch == self._order_observer_epoch:
+                self._order_health = value
+                if value != "connected":
+                    hint()
+
+        self._order_observer_key = key
+        self._order_observer = OrderObserver(
+            *key,
+            self._settings.timeout_seconds,
+            hint,
+            health,
+        )
+        self._order_health = "connecting"
+        try:
+            self._order_observer.start()
+        except RuntimeError:
+            self._order_health = "error"
 
     def _start_observer_locked(self) -> None:
         if not self._observe_positions or self._closed:
@@ -451,6 +510,7 @@ class StarUIWorkbench:
             and self._observer_health in {"connecting", "connected"}
         ):
             return
+        self._start_order_observer_locked()
         if self._observer is None:
             self._observer = PositionObserver(
                 self._position_hint, self._position_health
@@ -511,15 +571,32 @@ class StarUIWorkbench:
                     and monotonic() >= self._observer_retry_at
                 ):
                     self._start_observer_locked()
+                if (
+                    self._order_health in {"error", "disconnected"}
+                    and monotonic() >= self._order_retry_at
+                ):
+                    self._order_retry_at = monotonic() + 5
+                    self._start_order_observer_locked()
                 if not self._pending_observation:
                     continue
                 self._pending_observation = False
+                order_hint = self._pending_order_observation
+                self._pending_order_observation = False
+                before_orders = self._state.working_orders
+                if order_hint:
+                    self._disarm_execution_locked()
                 previous_selected = self._selected_con_id
                 self._suppress_toasts = True
                 try:
                     self._refresh_locked(
                         auto_select=False, preserve_invalid_drafts=True
                     )
+                    if (
+                        order_hint
+                        and before_orders != self._state.working_orders
+                        and not self._protection_change_message
+                    ):
+                        self._protection_change_message = "Exit orders changed in TWS. Update this view to review current protection."
                     if self._state.status in {UiStatus.READY, UiStatus.BLOCKED}:
                         self._observation_requires_reload = (
                             previous_selected != self._selected_con_id
@@ -589,6 +666,8 @@ class StarUIWorkbench:
                 return self._page()
 
         with self._lock:
+            if self._pending_order_observation:
+                self._disarm_execution_locked()
             # Each response carries only feedback produced by this action.
             self._toast = None
             contract_locked = bool(self._unresolved_management_entries())
@@ -698,6 +777,7 @@ class StarUIWorkbench:
                 self._start_observer_locked()
                 self._submission_review_required = False
             elif action == "select":
+                self._protection_change_message = ""
                 self._disarm_execution_locked()
                 if not contract_locked:
                     self._save_form_locked(values)
@@ -712,6 +792,7 @@ class StarUIWorkbench:
                 else:
                     self._message = "This contract is no longer in session history."
             elif action == "acknowledge-position-change":
+                self._protection_change_message = ""
                 self._disarm_execution_locked()
                 self._position_changes.clear_selected_change()
             elif action.startswith("market-exit-arm:"):
@@ -2962,6 +3043,13 @@ class StarUIWorkbench:
             )
             if callable(record_trailing_prices):
                 record_trailing_prices(snapshot)
+            recorder = getattr(
+                self._paper_execution, "record_trailing_cancellations", None
+            )
+            cancellations = recorder(snapshot) if callable(recorder) else ()
+            if cancellations:
+                self._protection_change_message = "Trailing exit cancellation confirmed in TWS. Update this view to review protection."
+                self._disarm_execution_locked()
         except ExecutionBlocked as error:
             self._message = f"Journal reconciliation blocked: {error}"
             return
@@ -3414,15 +3502,16 @@ class StarUIWorkbench:
                       const slot = document.getElementById('position-inventory');
                       if (!slot) {{ saveDraft(); window.location.reload(); return; }}
                       slot.innerHTML = await response.text();
+                      const protection = response.headers.get('X-Protection-Change') || '';
                       const change = Number(response.headers.get('X-Selected-Quantity-Change') || '0');
                       const notice = document.getElementById('selected-quantity-notice');
                       const message = document.getElementById('selected-quantity-message');
                       if (notice && message) {{
-                        notice.hidden = change === 0;
+                        notice.hidden = change === 0 && !protection;
                         const count = Math.abs(change);
-                        message.textContent = change > 0
+                        message.textContent = protection || (change > 0
                           ? `${{count}} new ${{count === 1 ? 'contract was' : 'contracts were'}} added to this position in TWS. Update this view to plan brackets for the latest quantity.`
-                          : `${{count}} ${{count === 1 ? 'contract was' : 'contracts were'}} removed from this position in TWS. Update this view to review the remaining protection and draft quantities.`;
+                          : `${{count}} ${{count === 1 ? 'contract was' : 'contracts were'}} removed from this position in TWS. Update this view to review the remaining protection and draft quantities.`);
                       }}
                     }} catch (_) {{ /* The next heartbeat retries this revision. */ }}
                     finally {{ fetching = false; }}
@@ -4261,7 +4350,10 @@ class StarUIWorkbench:
                 "the remaining protection and draft quantities."
             )
         return Div(
-            Span(message, id="selected-quantity-message"),
+            Span(
+                self._protection_change_message or message,
+                id="selected-quantity-message",
+            ),
             Form(
                 Button(
                     "Update view",
@@ -4278,7 +4370,7 @@ class StarUIWorkbench:
             ),
             id="selected-quantity-notice",
             role="status",
-            hidden=delta == 0,
+            hidden=delta == 0 and not self._protection_change_message,
             cls="selected-quantity-notice",
         )
 
@@ -5829,7 +5921,7 @@ class StarUIWorkbench:
                 rows.append(self._active_layer_row(len(rows) + 1, *pair))
                 working_count += 1
         for entry in self._trailing_entries():
-            if entry.state == "SUBMITTED" and entry.perm_ids:
+            if entry.state in {"SUBMITTED", "CANCELLED_CONFIRMED"} and entry.perm_ids:
                 rows.append(self._trailing_layer_row(len(rows) + 1, entry))
 
         return Form(
@@ -5912,9 +6004,11 @@ class StarUIWorkbench:
             else "",
         )
         offset_unit = form.get(f"trailing_offset_unit_{entry.perm_ids[0]}", "dollars")
-        working = order is not None
+        cancelled = entry.state == "CANCELLED_CONFIRMED"
+        working = order is not None and not cancelled
         modifiable = bool(
-            order is not None
+            not cancelled
+            and order is not None
             and order.stop_price is not None
             and order.stop_price > 0
             and (not entry.trailing_limit_offset or order.limit_offset is not None)
@@ -5932,6 +6026,12 @@ class StarUIWorkbench:
             if sold and summary is not None and summary.realized_pnl is not None
             else "P&L pending"
             if sold
+            else (
+                f"{summary.quantity} filled; remainder cancelled"
+                if summary is not None
+                else "Position remains open"
+            )
+            if cancelled
             else "Verify order and fills"
         )
         result_tone = (
@@ -5949,7 +6049,13 @@ class StarUIWorkbench:
             Div(
                 Span(f"TRAIL {index}", cls="text-xs font-semibold"),
                 P(
-                    "Closed" if sold else "Active" if working else "CHECK TWS",
+                    "Cancelled"
+                    if cancelled
+                    else "Closed"
+                    if sold
+                    else "Active"
+                    if working
+                    else "CHECK TWS",
                     cls="mt-2 text-xs text-muted-foreground",
                 ),
                 cls="min-w-20",
@@ -6027,13 +6133,20 @@ class StarUIWorkbench:
             if not sold
             else Div(cls="min-w-0"),
             Div(
-                Span("SOLD" if sold else "VERIFY IN TWS", cls="sold-layer-status"),
+                Span(
+                    "CANCELLED" if cancelled else "SOLD" if sold else "VERIFY IN TWS",
+                    cls="sold-layer-status",
+                ),
                 Span(result, cls="sold-layer-result"),
                 cls="sold-layer-badge",
             )
             if sold or not working
             else None,
-            data_layer_state="sold-trailing" if sold else "trailing",
+            data_layer_state="cancelled-trailing"
+            if cancelled
+            else "sold-trailing"
+            if sold
+            else "trailing",
             data_result_tone=result_tone if sold else "verify",
             data_trailing_perm_id=entry.perm_ids[0],
             cls=(

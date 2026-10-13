@@ -52,3 +52,49 @@ and trailing stop-limit workflow.
 - For TWS event behavior, use [TWS event callback research](../../docs/research/TWS_EVENT_CALLBACKS.md)
   as background, then verify the actual callback and reconciliation behavior in
   paper TWS before relying on it.
+
+
+## Manual cancellation investigation (2026-10-13)
+
+Item 10 has been investigated; implementation and paper-TWS verification remain
+pending. Findings and official API references are in
+[Trailing cancellation callbacks](../../docs/research/TRAILING_CANCELLATION_CALLBACKS.md).
+
+The current dedicated observer subscribes only to positions. Cancelling a
+trailing order can leave position quantity unchanged, so it need not trigger a
+refresh. Even an exact completed-order cancellation currently leaves a trailing
+journal entry `SUBMITTED`: completed-order reconciliation handles bracket
+entries, not trailing entries. The existing manual-cancel demo models absence
+without completed cancellation evidence and deliberately shows `CHECK TWS`.
+
+Recommended sequence:
+
+1. Add deterministic trailing outcome reconciliation from complete fresh
+   snapshots, distinguishing cancellation, partial-fill plus cancellation,
+   filled, and disappearance without sufficient evidence. Preserve exact
+   journal ownership and execution evidence. Do not label `Inactive` cancelled
+   or infer a human cancellation from broker status alone.
+2. Add bounded periodic nonbinding order reconciliation (initial target:
+   15 seconds plus capture time) while connected, serialized with action
+   verification. Treat any visible order callback only as a refresh hint; the
+   separate nonzero observer ID is not guaranteed other-client order updates.
+3. Publish selected-order changes to the protection display without discarding
+   unsaved fields. Disarm stale reviews and show one confirmed protection-loss
+   notice. Keep item 11's unresolved treatment when the cause is not proven.
+4. Verify callback visibility and terminal history fields in paper TWS,
+   including same-day cancellation, partial fill then cancellation, reconnect,
+   restart, and unavailable completed history. Do not change Master Client or
+   bind manual orders to obtain notifications.
+
+
+## Item 10 implementation (2026-10-13)
+
+Implemented the same-submitter-client order listener, adapter connection leases,
+event-triggered snapshot reconciliation, exact terminal cancellation journal
+state, and selected-protection notice. Missed callbacks retain a 15-second
+recovery check; snapshots remain the authority. See
+[paper execution implementation notes](../../docs/PAPER_EXECUTION.md#event-driven-trailing-cancellation-observation).
+
+Item 10 remains unchecked pending actual paper-TWS cancellation, handoff/reconnect
+and terminal-field visibility verification. Item 11's unresolved-row dismissal
+interaction remains a separate follow-up.

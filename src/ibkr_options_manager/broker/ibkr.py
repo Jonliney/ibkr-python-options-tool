@@ -15,6 +15,7 @@ from ..ibkr_probe import (
     _select_market_rule,
     extract_api_safety_settings,
 )
+from ..order_observation import leased_client
 from .read_only import (
     BrokerCapture,
     CapturedCompletedOrder,
@@ -76,6 +77,7 @@ class IbkrSnapshotBroker:
     def __init__(self) -> None:
         self._connection_epoch = 0
 
+    @leased_client
     def capture(self, request: SnapshotRequest | PortfolioRequest) -> BrokerCapture:
         capture_started = monotonic()
         _trace_snapshot("capture_start", capture_kind=type(request).__name__)
@@ -417,6 +419,7 @@ def _build_capture_app(imports: _IbapiImports) -> Any:
                 order_type=str(getattr(order, "orderType", "")),
                 oca_group=str(getattr(order, "ocaGroup", "")),
                 status=str(getattr(state, "status", "")),
+                completed_status=str(getattr(state, "completedStatus", "")),
             )
 
         def completedOrdersEnd(self) -> None:

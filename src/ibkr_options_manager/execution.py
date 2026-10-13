@@ -1640,7 +1640,7 @@ class ExecutionJournal:
             trailing_entry = (
                 entry.fingerprint.startswith("trailing-conversion:")
                 and len(entry.fingerprint.removeprefix("trailing-conversion:")) == 64
-                and entry.state == "SUBMITTED"
+                and entry.state in {"SUBMITTED", "CANCELLED_CONFIRMED"}
                 and entry.trailing_quantity > 0
                 and len(entry.perm_ids) == 1
                 and entry.perm_ids[0] > 0
@@ -1698,6 +1698,31 @@ class ExecutionJournal:
                 changed = True
         if changed:
             self._write(tuple(entries))
+
+    def record_trailing_cancellations(
+        self, snapshot: BrokerSnapshot
+    ) -> tuple[JournalEntry, ...]:
+        """Persist only fresh, exact terminal cancellation evidence for owned trails."""
+        from .trailing_outcome import classify_trailing
+
+        entries = list(self._entries())
+        cancelled = []
+        for index, entry in enumerate(entries):
+            if entry.state != "SUBMITTED" or not entry.fingerprint.startswith(
+                "trailing-conversion:"
+            ):
+                continue
+            if classify_trailing(entry, snapshot).status == "CANCELLED":
+                updated = replace(
+                    entry,
+                    state="CANCELLED_CONFIRMED",
+                    resolution_captured_at=str(snapshot.captured_at),
+                )
+                entries[index] = updated
+                cancelled.append(updated)
+        if cancelled:
+            self._write(tuple(entries))
+        return tuple(cancelled)
 
     def record_trailing_prices(self, snapshot: BrokerSnapshot) -> None:
         """Keep the last positive TWS-reported trigger for an exact owned trail."""
@@ -2125,6 +2150,11 @@ class PaperExecutionService:
     def record_executions(self, snapshot: BrokerSnapshot) -> None:
         """Persist read-only fill and realized P&L observations."""
         self._journal.record_executions(snapshot)
+
+    def record_trailing_cancellations(
+        self, snapshot: BrokerSnapshot
+    ) -> tuple[JournalEntry, ...]:
+        return self._journal.record_trailing_cancellations(snapshot)
 
     def record_trailing_prices(self, snapshot: BrokerSnapshot) -> None:
         """Persist exact app-owned trailing prices observed in TWS."""

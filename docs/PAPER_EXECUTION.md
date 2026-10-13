@@ -645,3 +645,52 @@ can remain without exit protection.
 Verify with `.venv/bin/python -m pytest -q`. These demo and automated checks do
 not establish paper-TWS or live execution success. Paper-TWS verification is
 still required before a separately authorized live milestone.
+
+
+## Event-driven trailing cancellation observation
+
+The desktop now retains an observation-only order listener on the configured
+submitting client ID (normally 17), alongside the distinct position observer
+(normally 18). It requests `reqOpenOrders` on that nonzero client and receives
+own-client `openOrder` and `orderStatus` hints. It does not require a Master
+Client setting or bind manual orders. Order callbacks only request immediate
+fresh reconciliation; they never write broker or journal state themselves.
+
+Bounded captures and every paper transport entry point borrow an exclusive
+in-process lease for `(host, port, client ID)`. Borrowing disconnects and joins
+the listener before another connection opens; nested borrows keep it suspended.
+After the adapter disconnects, the listener reconnects and requests an own-client
+baseline. Baseline changes across the handoff also trigger reconciliation, and a
+15-second recovery hint handles omitted callbacks. Intentional handoffs reject
+late callbacks by generation and do not signal a broker disconnect. A listener
+that cannot release its socket/reader blocks the borrowing operation. External
+processes are not covered by the in-process lease; TWS client-ID collision errors
+still fail closed. This bridge keeps bounded snapshot/write verification intact;
+a fully shared persistent capture/write socket is a possible later refinement.
+
+Fresh complete order and execution history can mark an exact journal-owned
+trailing order `CANCELLED_CONFIRMED` only when it is absent from working orders
+and has a matching terminal `Cancelled` or `ApiCancelled` record. Partial fills
+are retained; disappearance, `Inactive`, incomplete history, stale connection,
+or contradictory evidence stays unresolved. Both `status` and `completedStatus`
+are retained. Only exact known terminal values are recognized, with contradictions
+blocking confirmation; descriptive completed-status text does not prove a result.
+The cancellation label does not claim who initiated it.
+
+The browser receives a protection-change notice through its existing two-second
+revision stream. Draft and active inputs remain mounted until the operator uses
+**Update view**; affected server-side confirmations are invalidated immediately.
+The updated view shows the cancelled trail and any partial-fill quantity, or
+`CHECK TWS` when terminal evidence is missing. A confirmed trail cancellation is
+recorded once and survives restart. This is observation and display behavior;
+existing paper-only write gates and TWS precautions still apply.
+
+Verification commands: `.venv/bin/python -m pytest -q`,
+`.venv/bin/python -m mypy`, `.venv/bin/python -m ruff check src tests`.
+Deterministic tests cover callback deduplication, wrong accounts, stale generations,
+client-ID handoffs/collisions, serialized reader/writer leases, cancellation with
+unchanged position, incomplete/conflicting history, partial fills and restart.
+Actual callback delivery, reconnect gaps and terminal-history fields still need
+the paper-TWS experiment described in
+[the research note](research/TRAILING_CANCELLATION_CALLBACKS.md). No live trading
+behavior has been added or validated.

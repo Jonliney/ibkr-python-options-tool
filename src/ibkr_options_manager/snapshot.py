@@ -229,6 +229,7 @@ def _publish(
                 order_type=order.order_type,
                 oca_group=order.oca_group,
                 status=order.status,
+                completed_status=order.completed_status,
             )
             for order in capture.completed_orders
             if order.account == request.expected_account
