@@ -49,6 +49,7 @@ from ...cancellation_trace import (
 from ...domain import (
     BrokerSnapshot,
     VerifiedOptionContract,
+    closing_order_allocation,
     preview_reference_prices,
     round_down_price,
     round_up_price,
@@ -1375,7 +1376,13 @@ class StarUIWorkbench:
             return
         plan = self._armed_trailing
         self._set_review_status_locked(
-            f"Review a trailing SELL for all {plan.quantity} held contracts."
+            f"Review a trailing SELL for {plan.quantity} contracts."
+            + (
+                f" {plan.reserved_quantity} contracts remain reserved by existing TWS orders; "
+                "those orders will stay unchanged."
+                if plan.reserved_quantity
+                else ""
+            )
             + (
                 f" It will replace {len(plan.candidates)} app-owned "
                 f"{'bracket' if len(plan.candidates) == 1 else 'brackets'}."
@@ -1424,7 +1431,7 @@ class StarUIWorkbench:
                 )
                 if (
                     refreshed != remaining
-                    or snapshot.position.quantity != plan.quantity
+                    or snapshot.position.quantity != plan.position_quantity
                 ):
                     raise ExecutionBlocked(
                         "a bracket or position changed during conversion"
@@ -5511,6 +5518,26 @@ class StarUIWorkbench:
             and snapshot.selected.con_id == self._selected_con_id
             else None
         )
+        preview_quantity: int | None = None
+        if selected is not None:
+            replaced_ids = {
+                order.perm_id
+                for _group, target, stop in self._active_oca_pairs()
+                for order in (target, stop)
+            }
+            reserved, failures = closing_order_allocation(
+                replace(
+                    selected,
+                    working_orders=tuple(
+                        order
+                        for order in selected.working_orders
+                        if order.key != selected.selected
+                        or order.perm_id not in replaced_ids
+                    ),
+                )
+            )
+            if not failures:
+                preview_quantity = int(selected.position.quantity) - reserved
         currency = selected.contract.currency if selected is not None else "USD"
         quote = selected.quote if selected is not None else None
         display_quote = (
@@ -5547,7 +5574,7 @@ class StarUIWorkbench:
                 "multiplier": format(multiplier, "f")
                 if multiplier is not None
                 else None,
-                "quantity": format(selected.position.quantity, "f"),
+                "quantity": preview_quantity,
                 "basis": format(selected.position.unit_basis, "f"),
                 "bands": [
                     {
@@ -5563,11 +5590,12 @@ class StarUIWorkbench:
         preview_change = (
             (preview_stop - selected.position.unit_basis)
             * multiplier
-            * selected.position.quantity
+            * preview_quantity
             if preview_stop is not None
             and preview_bid is not None
             and multiplier is not None
             and selected is not None
+            and preview_quantity is not None
             else None
         )
         outcome_text = (
@@ -5588,8 +5616,10 @@ class StarUIWorkbench:
                 DialogHeader(
                     DialogTitle("Set a trailing exit"),
                     DialogDescription(
-                        "Choose a trailing stop or trailing limit for all held "
-                        "contracts. Review the order before submitting it."
+                        "Choose a trailing stop or trailing limit for contracts available "
+                        "after replacing app-owned brackets. "
+                        "Contracts reserved by other TWS orders stay with those orders. "
+                        "Review the quantity before submitting."
                     ),
                 ),
                 Form(
@@ -7463,13 +7493,13 @@ class StarUIWorkbench:
                     "Set trailing exit",
                     (
                         "Confirm cancels every reviewed app-owned bracket, then "
-                        "submits one trailing SELL for all held contracts after a "
+                        f"submits one trailing SELL for {self._armed_trailing.quantity} contracts after a "
                         "fresh position check. There is a period without bracket "
                         "protection. A trailing limit can remain unfilled.",
                     )
                     if self._armed_trailing.candidates
                     else (
-                        "Confirm submits one trailing SELL for all held contracts "
+                        f"Confirm submits one trailing SELL for {self._armed_trailing.quantity} contracts "
                         "after a fresh position check. A trailing limit can remain "
                         "unfilled.",
                     ),
@@ -8109,6 +8139,14 @@ class StarUIWorkbench:
             self._review_cancellation_plan(candidate, index=index)
             for index, candidate in enumerate(plan.candidates, start=1)
         ]
+        if plan.reserved_quantity:
+            rows.append(
+                P(
+                    f"{plan.reserved_quantity} contracts remain reserved by existing TWS orders; "
+                    "those orders will stay unchanged.",
+                    cls="text-xs text-muted-foreground",
+                )
+            )
         price_lines = [
             self._review_order_line(
                 "TRAIL AMT",
@@ -8333,7 +8371,7 @@ def _trailing_preview_script(configuration: dict[str, Any] | None) -> str:
   }}));
   const bid = Number(config?.bid);
   const multiplier = Number(config?.multiplier);
-  const quantity = Number(config?.quantity);
+  const quantity = config?.quantity == null ? NaN : Number(config.quantity);
   const basis = Number(config?.basis);
   const roundDown = (value) => {{
     let candidate = value;

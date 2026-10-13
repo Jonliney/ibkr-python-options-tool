@@ -174,13 +174,21 @@ TWS may still apply its own order precaution and require the user to click
 **Transmit** there. The application must not bypass that independent TWS
 safety control.
 
-## Entire-position trailing conversion
+## Available-position trailing conversion
 
 The paper-only **Set a trailing exit** action reviews every active,
 app-owned OCA pair for the selected option and the current unassigned quantity.
 This first version requires a USD-denominated option.
-It blocks when any other working order exists for that contract, including a
-manual TWS order. The review requires a fresh bid, complete order and execution
+Coherent external SELL orders reserve their remaining quantity; complete
+external target/stop OCA pairs reserve that quantity once. Conversion replaces
+only journal-proven app-owned pairs and trails the held quantity minus these
+reservations, including any genuinely unassigned contracts. The review shows
+the trailing quantity and how many contracts remain reserved by unchanged TWS
+orders. For example, ten MSTR contracts with five externally reserved and four
+app brackets of 2 / 1 / 1 / 1 convert into one five-contract trail. There is no
+manual quantity override: opening orders, invalid quantities, duplicate IDs,
+malformed OCA groups, or excess exposure still block conversion.
+The review requires a fresh bid, complete order and execution
 history, an integral long position, and the verified contract's market rule.
 If the bid moves between staging and the fresh review, the review shows a
 recalculated initial stop and limit offset before confirmation. Account,
@@ -191,8 +199,12 @@ connection. Confirmation takes another fresh snapshot before submission.
 The app checks the exact pairs and position again before each cancellation.
 After the last pair is acknowledged cancelled, it refreshes the position,
 orders, fills, contract, and bid before submitting one SELL `TRAIL` or `TRAIL
-LIMIT` order for the full position. A changed quantity or contract, any working
-order, or an unusable quote stops the send. Each pair cancellation and the final
+LIMIT` order for the reviewed available quantity. The full held position is
+tracked separately from the trailing quantity. Any change to retained order
+identities, quantities, prices, or statuses stops conversion before the next
+cancellation or submission, even when the total reserved quantity is unchanged.
+A changed position, execution history, contract, or unusable quote also stops
+the send. Each pair cancellation and the final
 submission have separate durable journal records; an uncertain submission
 locks management of that contract until the TWS state is reviewed. The app never
 automatically retries the trailing submission.
@@ -540,8 +552,11 @@ Both actions require review and final confirmation.
 
 The service requires one journal-owned permanent ID and matching order ID,
 account, contract, client ID, order type, GTC, current stop, trail amount,
-limit gap, and full unfilled quantity. It blocks partial fills, any other
-working order for the option, invalid tick increments, stale or disconnected
+limit gap, and full unfilled quantity. A trail covering only the unreserved
+balance remains editable and cancellable beside coherent external exit orders.
+The total observed closing allocation must still fit the held position. It
+blocks partial fills, ambiguous or excessive external exposure, opening orders,
+invalid tick increments, stale or disconnected
 state, and manual changes observed after review. The writer requests the
 same-client open order again and verifies these fields before using the
 existing order ID; it leaves TWS order precautions active. For a gap change that
@@ -588,8 +603,8 @@ values are neutral in both server reviews and local edit previews.
 The selected-position toolbar exposes **Set all stops…**, **Raise stops to
 B/E**, **Cancel all exits**, and **Exit position now** for both working
 brackets and a working trail. There is still at most one working trail for
-an option, covering the full position; split trailing quantities are not
-supported. All management remains paper-only and restricted to journal-owned
+an option, covering the available quantity after external reservations; multiple
+app-owned trailing orders are not supported. All management remains paper-only and restricted to journal-owned
 orders. An external order or ambiguous exit set blocks the position exit.
 
 Set all stops applies a common premium trigger. For a trail, review derives a

@@ -26,7 +26,7 @@ from ..execution import (
 )
 from ..ibkr_probe import _load_ibapi, _parse_error_arguments
 from ..price_update_trace import record_price_update_event
-from ..trailing import TrailingPlan
+from ..trailing import TrailingPlan, plan_entire_position
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,9 +439,12 @@ class IbkrPaperExecutionBroker:
     ) -> PaperSubmission:
         """Submit one standalone paper trailing exit after the service's final check."""
         require_paper_management_snapshot(snapshot)
+        fresh = plan_entire_position(snapshot, (), plan.request)
         if (
-            plan.quantity != snapshot.position.quantity
-            or any(order.key == snapshot.selected for order in snapshot.working_orders)
+            plan.candidates
+            or plan.quantity != fresh.quantity
+            or plan.position_quantity != snapshot.position.quantity
+            or plan.retained_orders != fresh.retained_orders
             or plan.outside_rth != supports_outside_rth(snapshot)
             or plan.request.tif != "GTC"
         ):

@@ -148,7 +148,7 @@ def test_trailing_baseline_accepts_new_capture_epoch_but_rejects_basis_change() 
         )
 
 
-def test_trailing_plan_rejects_external_order_and_stale_bid() -> None:
+def test_trailing_plan_reserves_external_order_and_rejects_stale_bid() -> None:
     snapshot = _trailing_snapshot()
     external = WorkingOrder(
         perm_id=99,
@@ -160,12 +160,23 @@ def test_trailing_plan_rejects_external_order_and_stale_bid() -> None:
         remaining=Decimal("1"),
         status="Submitted",
     )
-    with pytest.raises(ExecutionBlocked, match="another working order"):
-        plan_entire_position(
-            replace(snapshot, working_orders=(external,)),
-            (),
-            TrailingRequest(Decimal("0.10"), "dollars"),
-        )
+    plan = plan_entire_position(
+        replace(snapshot, working_orders=(external,)),
+        (),
+        TrailingRequest(Decimal("0.10"), "dollars"),
+    )
+    assert plan.quantity == 1
+    assert plan.position_quantity == 2
+    assert plan.reserved_quantity == 1
+    assert plan.retained_orders == (external,)
+    fresh = replace(
+        snapshot,
+        connection_epoch=2,
+        working_orders=(replace(external, observed_at=Decimal("200")),),
+    )
+    PaperExecutionService.verify_trailing_baseline(fresh, plan)
+    refreshed = plan_entire_position(fresh, (), plan.request)
+    assert refreshed.retained_orders == plan.retained_orders
     with pytest.raises(ExecutionBlocked, match="couldn't verify a current bid"):
         plan_entire_position(
             replace(snapshot, quote=replace(snapshot.quote, fresh=False)),
@@ -424,10 +435,29 @@ def test_unassigned_trailing_submission_rejects_account_switch(tmp_path) -> None
 
 
 @pytest.mark.parametrize("with_limit", [False, True])
-def test_paper_trailing_writer_sends_one_exact_order(monkeypatch, with_limit) -> None:
+@pytest.mark.parametrize("external_quantity", [0, 1])
+def test_paper_trailing_writer_sends_one_exact_order(
+    monkeypatch, with_limit, external_quantity
+) -> None:
     from ibkr_options_manager.broker import execution as broker_execution
 
     snapshot = _trailing_snapshot()
+    if external_quantity:
+        snapshot = replace(
+            snapshot,
+            working_orders=(
+                WorkingOrder(
+                    perm_id=99,
+                    client_id=1,
+                    order_id=9,
+                    key=snapshot.selected,
+                    action="SELL",
+                    order_type="LMT",
+                    remaining=Decimal(external_quantity),
+                    status="Submitted",
+                ),
+            ),
+        )
     plan = plan_entire_position(
         snapshot,
         (),
@@ -487,7 +517,7 @@ def test_paper_trailing_writer_sends_one_exact_order(monkeypatch, with_limit) ->
     assert sent[0].orderType == ("TRAIL LIMIT" if with_limit else "TRAIL")
     assert sent[0].trailingPercent == 10
     assert sent[0].trailStopPrice == float(plan.initial_stop)
-    assert sent[0].totalQuantity == 2
+    assert sent[0].totalQuantity == 2 - external_quantity
     assert sent[0].transmit is True
     if with_limit:
         assert sent[0].lmtPriceOffset == float(plan.limit_offset)
@@ -3934,3 +3964,159 @@ def test_position_market_writer_rechecks_before_write(monkeypatch, tmp_path, fai
         assert writes[0].orderType == "MKT" and writes[0].tif == "GTC"
         assert writes[0].transmit
         assert not writes[0].overridePercentageConstraints
+
+
+@pytest.mark.parametrize(
+    "change", ["quantity", "price", "identity", "removed", "added"]
+)
+def test_partial_trailing_conversion_blocks_external_order_changes(tmp_path, change):
+    snapshot = _trailing_snapshot()
+    external = WorkingOrder(
+        perm_id=99,
+        client_id=1,
+        order_id=9,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("1"),
+        status="Submitted",
+        limit_price=Decimal("1.50"),
+    )
+    snapshot = replace(snapshot, working_orders=(external,))
+    plan = plan_entire_position(
+        snapshot, (), TrailingRequest(Decimal("0.10"), "dollars")
+    )
+    changes = {
+        "quantity": (replace(external, remaining=Decimal("2")),),
+        "price": (replace(external, limit_price=Decimal("1.55")),),
+        "identity": (replace(external, perm_id=100),),
+        "removed": (),
+        "added": (external, replace(external, perm_id=100, order_id=10)),
+    }
+
+    class Transport:
+        def submit_trailing(self, *args, **kwargs):
+            raise AssertionError("must not submit after an external order changes")
+
+    service = PaperExecutionService(
+        Transport(), ExecutionJournal(tmp_path / "orders.json")
+    )
+    with pytest.raises(ExecutionBlocked, match="other working orders changed"):
+        service.submit_entire_position_trailing(
+            replace(snapshot, working_orders=changes[change]),
+            plan,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "buy",
+        "fractional",
+        "duplicate",
+        "overallocated",
+        "pending_cancel",
+        "oca_mismatch",
+    ],
+)
+def test_partial_trailing_rejects_ambiguous_or_conflicting_external_exposure(invalid):
+    snapshot = _trailing_snapshot()
+    order = WorkingOrder(
+        perm_id=99,
+        client_id=1,
+        order_id=9,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("1"),
+        status="Submitted",
+    )
+    orders = {
+        "buy": (replace(order, action="BUY"),),
+        "fractional": (replace(order, remaining=Decimal("0.5")),),
+        "duplicate": (order, order),
+        "overallocated": (replace(order, remaining=Decimal("3")),),
+        "pending_cancel": (replace(order, status="PendingCancel"),),
+        "oca_mismatch": (
+            replace(order, oca_group="external"),
+            replace(
+                order,
+                perm_id=100,
+                order_id=10,
+                order_type="STP",
+                oca_group="external",
+                remaining=Decimal("2"),
+            ),
+        ),
+    }
+    with pytest.raises(ExecutionBlocked):
+        plan_entire_position(
+            replace(snapshot, working_orders=orders[invalid]),
+            (),
+            TrailingRequest(Decimal("0.10"), "dollars"),
+        )
+
+
+def test_partial_trailing_reserves_external_oca_pair_once_and_submits_exact_quantity(
+    tmp_path,
+):
+    snapshot = _trailing_snapshot()
+    order = WorkingOrder(
+        perm_id=99,
+        client_id=1,
+        order_id=9,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("1"),
+        status="Submitted",
+        oca_group="external",
+    )
+    snapshot = replace(
+        snapshot,
+        working_orders=(
+            order,
+            replace(order, perm_id=100, order_id=10, order_type="STP"),
+        ),
+    )
+    plan = plan_entire_position(
+        snapshot, (), TrailingRequest(Decimal("0.10"), "dollars")
+    )
+    assert plan.quantity == plan.reserved_quantity == 1
+
+    class Transport:
+        calls = 0
+
+        def submit_trailing(self, snapshot, submitted, **kwargs):
+            assert submitted.quantity == 1
+            assert submitted.retained_orders == plan.retained_orders
+            self.calls += 1
+            return SimpleNamespace(order_ids=(701,), perm_ids=(801,))
+
+    transport = Transport()
+    service = PaperExecutionService(
+        transport, ExecutionJournal(tmp_path / "orders.json")
+    )
+    receipt = service.submit_entire_position_trailing(
+        snapshot,
+        plan,
+        host="127.0.0.1",
+        port=7497,
+        client_id=17,
+        timeout_seconds=1,
+    )
+    assert receipt.entry.trailing_quantity == 1
+    with pytest.raises(ExecutionBlocked, match="already journaled"):
+        service.submit_entire_position_trailing(
+            snapshot,
+            plan,
+            host="127.0.0.1",
+            port=7497,
+            client_id=17,
+            timeout_seconds=1,
+        )
+    assert transport.calls == 1

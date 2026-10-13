@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from hashlib import sha256
 
@@ -11,6 +11,7 @@ from .domain import (
     ContractKey,
     VerifiedOptionContract,
     WorkingOrder,
+    closing_order_allocation,
     round_down_price,
     round_up_price,
     supports_outside_rth,
@@ -32,6 +33,9 @@ class TrailingPlan:
     request: TrailingRequest
     candidates: tuple[MarketExitCandidate, ...]
     quantity: int
+    position_quantity: int
+    reserved_quantity: int
+    retained_orders: tuple[WorkingOrder, ...]
     unassigned_quantity: int
     reference_price: Decimal
     initial_stop: Decimal
@@ -51,7 +55,7 @@ def plan_entire_position(
     candidates: tuple[MarketExitCandidate, ...],
     request: TrailingRequest,
 ) -> TrailingPlan:
-    """Plan the entire held position from owned pairs and free contracts."""
+    """Replace owned pairs and trail contracts unreserved by other exits."""
     position = snapshot.position.quantity
     if (
         not position.is_finite()
@@ -101,13 +105,41 @@ def plan_entire_position(
     matching_orders = tuple(
         order for order in snapshot.working_orders if order.key == snapshot.selected
     )
-    if {order.perm_id for order in matching_orders} != selected:
-        raise ExecutionBlocked(
-            "another working order exists for this option; review it in TWS"
+    if not selected.issubset({order.perm_id for order in matching_orders}):
+        raise ExecutionBlocked("a selected bracket leg is missing")
+    # Validate all observed exposure before excluding the pairs we will cancel.
+    _, failures = closing_order_allocation(snapshot)
+    for failure in failures:
+        if failure.code != "POSITION_FULLY_ALLOCATED":
+            raise ExecutionBlocked(failure.message)
+    retained_orders = tuple(
+        sorted(
+            (
+                replace(order, observed_at=Decimal("0"))
+                for order in matching_orders
+                if order.perm_id not in selected
+            ),
+            key=lambda order: order.perm_id,
         )
+    )
+    reserved, failures = closing_order_allocation(
+        replace(
+            snapshot,
+            working_orders=tuple(
+                order
+                for order in snapshot.working_orders
+                if order.key != snapshot.selected or order.perm_id not in selected
+            ),
+        )
+    )
+    if failures:
+        raise ExecutionBlocked(failures[0].message)
+    quantity = int(position) - reserved
     covered = sum((item.quantity for item in candidates), Decimal("0"))
-    if covered > position:
-        raise ExecutionBlocked("bracket quantities exceed the position")
+    if covered > quantity:
+        raise ExecutionBlocked("bracket quantities exceed the available position")
+    if quantity <= 0:
+        raise ExecutionBlocked("no contracts are available to trail")
     trail = (
         request.trail_value
         if request.trail_unit == "dollars"
@@ -145,6 +177,8 @@ def plan_entire_position(
         snapshot.selected.account,
         snapshot.selected.con_id,
         position,
+        retained_orders,
+        quantity,
         reference,
         snapshot.connection_epoch,
         tuple((c.target_perm_id, c.stop_perm_id, c.quantity) for c in candidates),
@@ -153,8 +187,11 @@ def plan_entire_position(
     return TrailingPlan(
         request=request,
         candidates=candidates,
-        quantity=int(position),
-        unassigned_quantity=int(position - covered),
+        quantity=quantity,
+        position_quantity=int(position),
+        reserved_quantity=reserved,
+        retained_orders=retained_orders,
+        unassigned_quantity=int(quantity - covered),
         reference_price=reference,
         initial_stop=initial_stop,
         limit_offset=limit_offset,

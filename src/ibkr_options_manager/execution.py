@@ -2219,11 +2219,10 @@ class PaperExecutionService:
             or order.stop_price <= 0
         ):
             raise ExecutionBlocked("the trailing order is no longer safely modifiable")
-        if any(
-            other.key == snapshot.selected and other.perm_id != perm_id
-            for other in snapshot.working_orders
-        ):
-            raise ExecutionBlocked("another closing order works for this option")
+        _, failures = closing_order_allocation(snapshot)
+        for failure in failures:
+            if failure.code != "POSITION_FULLY_ALLOCATED":
+                raise ExecutionBlocked(failure.message)
         try:
             expected_value = Decimal(entry.trailing_value)
             expected_offset = (
@@ -2597,13 +2596,13 @@ class PaperExecutionService:
         self.verify_trailing_baseline(snapshot, plan)
         if plan.candidates and snapshot.selected.account != plan.candidates[0].account:
             raise ExecutionBlocked("the account changed during conversion")
-        if any(order.key == snapshot.selected for order in snapshot.working_orders):
-            raise ExecutionBlocked("a closing order still works for this option")
         for candidate in plan.candidates:
             ids = {candidate.target_perm_id, candidate.stop_perm_id}
             if any(order.perm_id in ids for order in snapshot.working_orders):
                 raise ExecutionBlocked("a selected bracket leg is still working")
         fresh = plan_entire_position(snapshot, (), plan.request)
+        if fresh.quantity != plan.quantity:
+            raise ExecutionBlocked("the available trailing quantity changed")
         transport = self._transport
         if not isinstance(transport, PaperTrailingTransport):
             raise ExecutionBlocked("the paper transport cannot submit trailing orders")
@@ -2654,7 +2653,7 @@ class PaperExecutionService:
         require_paper_management_snapshot(snapshot)
         if snapshot.selected != plan.selected or snapshot.position.key != plan.selected:
             raise ExecutionBlocked("the selected account or option changed")
-        if snapshot.position.quantity != Decimal(plan.quantity):
+        if snapshot.position.quantity != Decimal(plan.position_quantity):
             raise ExecutionBlocked("the position quantity changed during conversion")
         if (
             snapshot.position.unit_basis != plan.position_basis
@@ -2673,6 +2672,24 @@ class PaperExecutionService:
             != plan.execution_ids
         ):
             raise ExecutionBlocked("an execution changed during conversion")
+        selected_ids = {
+            id_
+            for candidate in plan.candidates
+            for id_ in (candidate.target_perm_id, candidate.stop_perm_id)
+        }
+        retained = tuple(
+            sorted(
+                (
+                    replace(order, observed_at=Decimal("0"))
+                    for order in snapshot.working_orders
+                    if order.key == snapshot.selected
+                    and order.perm_id not in selected_ids
+                ),
+                key=lambda order: order.perm_id,
+            )
+        )
+        if retained != plan.retained_orders:
+            raise ExecutionBlocked("the other working orders changed during conversion")
         if snapshot.contract != plan.contract:
             raise ExecutionBlocked("the option contract changed during conversion")
 

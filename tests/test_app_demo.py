@@ -7562,7 +7562,7 @@ def test_trailing_conversion_dialog_shows_demo_position_prices() -> None:
     expected_change = (
         (expected_stop - snapshot.position.unit_basis)
         * snapshot.contract.multiplier
-        * snapshot.position.quantity
+        * Decimal("5")
     )
     expected_outcome = (
         f"+${expected_change:,.2f} gain"
@@ -8374,3 +8374,97 @@ def test_set_all_stops_trail_dialog_preserves_fields_when_conversion_unavailable
         assert result["disabled"], result
         assert result["after"] == result["before"]
         assert "bid" in result["error"].lower()
+
+
+def test_mstr_four_brackets_convert_five_contracts_beside_external_exit(tmp_path):
+    workbench = _trailing_scenario_workbench(tmp_path, "standard")
+    service = workbench._paper_execution
+    assert service is not None
+    journal = service._journal
+    journal._write(
+        (
+            *journal._entries(),
+            JournalEntry(
+                fingerprint="c" * 64,
+                account=DEMO_ACCOUNT,
+                con_id=1_001_500_251,
+                state="SUBMITTED",
+                order_ids=tuple(range(701, 709)),
+                perm_ids=tuple(range(801, 809)),
+                oca_prefix="mstr-four-brackets",
+                layers=tuple(
+                    JournalLayer(q, "4.00", "2.00", "GTC") for q in (2, 1, 1, 1)
+                ),
+            ),
+        )
+    )
+    workbench._select_locked(1_001_500_251)
+    before = workbench._view_model.latest_snapshot()
+    assert before is not None
+    external = tuple(
+        o for o in before.working_orders if o.perm_id not in range(801, 809)
+    )
+    assert len(external) == 1
+    client = TestClient(workbench.app)
+    page = client.post(
+        workbench.path + "action",
+        data={
+            "action": "trailing-convert-arm",
+            "trail_value": "25",
+            "trail_unit": "dollars",
+        },
+    )
+    plan = workbench._armed_trailing
+    assert plan is not None, workbench._message
+    assert plan.quantity == 5
+    assert len(plan.candidates) == 4
+    dialog = to_xml(workbench._trailing_conversion_dialog())
+    assert re.search(r'"quantity":\s*5', dialog)
+    assert "5 contracts remain reserved by existing TWS orders" in page.text
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    assert workbench._active_action_verified, workbench._message
+    client.post(workbench.path + "action", data={"action": "trailing-convert-confirm"})
+    entries = service.trailing_entries(account=DEMO_ACCOUNT, con_id=1_001_500_251)
+    assert len(entries) == 1, workbench._message
+    assert entries[0].trailing_quantity == 5
+    after = workbench._view_model.latest_snapshot()
+    assert after is not None
+    assert (
+        tuple(o for o in after.working_orders if o.perm_id == external[0].perm_id)
+        == external
+    )
+    assert not any(o.perm_id in range(801, 809) for o in after.working_orders)
+    # The new partial-position trail remains editable and cancellable beside TWS exits.
+    perm_id = entries[0].perm_ids[0]
+    client.post(
+        workbench.path + "action",
+        data={
+            "action": "active-update-arm",
+            f"trailing_stop_{perm_id}": "2.80",
+            f"trailing_limit_{perm_id}": "",
+        },
+    )
+    assert workbench._armed_trailing_change is not None, workbench._message
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    assert workbench._active_action_verified, workbench._message
+    client.post(workbench.path + "action", data={"action": "trailing-change-confirm"})
+    assert (
+        service.trailing_entries(account=DEMO_ACCOUNT, con_id=1_001_500_251)[
+            0
+        ].trailing_stop
+        == "2.80"
+    )
+    client.post(
+        workbench.path + "action", data={"action": f"trailing-delete-arm:{perm_id}"}
+    )
+    assert workbench._armed_trailing_change is not None, workbench._message
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    assert workbench._active_action_verified, workbench._message
+    client.post(workbench.path + "action", data={"action": "trailing-change-confirm"})
+    assert (
+        service.trailing_entries(account=DEMO_ACCOUNT, con_id=1_001_500_251)[0].state
+        == "CANCELLED_CONFIRMED"
+    )
+    final = workbench._view_model.latest_snapshot()
+    assert final is not None
+    assert final.working_orders == external
