@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from threading import Event, Thread
@@ -556,8 +557,14 @@ class IbkrPaperExecutionBroker:
         timeout_seconds: float,
     ) -> PaperSubmission:
         require_paper_execution_snapshot(snapshot, plan)
+        if not snapshot.executions_complete:
+            raise ExecutionBlocked(
+                "A complete execution baseline is required for stop-first brackets"
+            )
         imports = _load_ibapi()
         from ibapi.order import Order
+
+        submitted: dict[int, Any] = {}
 
         # ibapi is loaded lazily so that planning remains usable without TWS.
         # Its runtime classes cannot be named in static type checking.
@@ -569,6 +576,15 @@ class IbkrPaperExecutionBroker:
                 self.acks: dict[int, int] = {}
                 self.errors: list[str] = []
                 self.next_order_id = 0
+                self.orders: dict[int, tuple[Any, Any, str]] = {}
+                self.scan: dict[int, tuple[Any, Any, str]] | None = None
+                self.orders_done, self.positions_done, self.fills_done = (
+                    Event() for _ in range(3)
+                )
+                self.positions: list[tuple[Any, Decimal, Decimal]] = []
+                self.execution_ids: set[str] = set()
+                self.has_fill = False
+                self.execution_request_id = 80
 
             def nextValidId(self, order_id: int) -> None:
                 self.next_order_id = int(order_id)
@@ -581,8 +597,84 @@ class IbkrPaperExecutionBroker:
                 order: Any,
                 state: Any,
             ) -> None:
-                del contract, state
-                self.acks[int(order_id)] = int(getattr(order, "permId", 0) or 0)
+                self.next_order_id = max(self.next_order_id, int(order_id) + 1)
+                if int(order_id) in submitted and (
+                    not _same_option_identity(contract, snapshot)
+                    or _bracket_order_fields(order)
+                    != _bracket_order_fields(submitted[int(order_id)])
+                    or int(getattr(order, "clientId", -1)) != client_id
+                ):
+                    self.errors.append(
+                        "The acknowledged bracket does not match the submitted order"
+                    )
+                perm_id = int(getattr(order, "permId", 0) or 0)
+                if (
+                    self.acks.get(int(order_id), 0) > 0
+                    and self.acks[int(order_id)] != perm_id
+                ):
+                    self.errors.append("A bracket permanent order ID changed")
+                self.acks[int(order_id)] = perm_id
+                record = (
+                    copy(contract),
+                    copy(order),
+                    str(getattr(state, "status", "")),
+                )
+                self.orders[int(order_id)] = record
+                if self.scan is not None:
+                    self.scan[int(order_id)] = record
+
+            def openOrderEnd(self) -> None:
+                self.orders_done.set()
+
+            def orderStatus(
+                self,
+                order_id: int,
+                status: str,
+                filled: Any,
+                remaining: Any,
+                *args: Any,
+            ) -> None:
+                del args
+                if order_id in self.orders:
+                    contract, order, _ = self.orders[order_id]
+                    self.orders[order_id] = (contract, order, status)
+                if order_id in submitted:
+                    if Decimal(str(filled)) > 0:
+                        self.has_fill = True
+                    if status in {
+                        "Cancelled",
+                        "ApiCancelled",
+                        "PendingCancel",
+                        "Inactive",
+                        "Filled",
+                    }:
+                        self.errors.append(f"Order {order_id} reported {status}")
+
+            def position(
+                self, account: str, contract: Any, quantity: Any, cost: Any
+            ) -> None:
+                if (
+                    account == snapshot.selected.account
+                    and int(contract.conId) == snapshot.selected.con_id
+                ):
+                    self.positions.append(
+                        (copy(contract), Decimal(str(quantity)), Decimal(str(cost)))
+                    )
+
+            def positionEnd(self) -> None:
+                self.positions_done.set()
+
+            def execDetails(self, req_id: int, contract: Any, execution: Any) -> None:
+                if (
+                    req_id == self.execution_request_id
+                    and str(execution.acctNumber) == snapshot.selected.account
+                    and int(contract.conId) == snapshot.selected.con_id
+                ):
+                    self.execution_ids.add(str(execution.execId))
+
+            def execDetailsEnd(self, req_id: int) -> None:
+                if req_id == self.execution_request_id:
+                    self.fills_done.set()
 
             def error(self, req_id: int, *args: Any) -> None:
                 code, message = _parse_error_arguments(args)
@@ -594,6 +686,8 @@ class IbkrPaperExecutionBroker:
         app = App()
         reader: Thread | None = None
         deadline = monotonic() + timeout_seconds
+        active_group = ""
+        phase = "connection"
         try:
             app.connect(host, port, client_id)
             reader = Thread(
@@ -607,8 +701,29 @@ class IbkrPaperExecutionBroker:
 
             contract = _build_submission_contract(imports, snapshot)
             ids: list[int] = []
-            for pair in plan.pairs:
-                for intent, transmit in ((pair.target, False), (pair.stop, True)):
+            sent_ids: list[int] = []
+            active_group = ""
+            phase = "before first stop"
+            _verify_bracket_snapshot(
+                app, snapshot, submitted, sent_ids, client_id, deadline
+            )
+            base_order_id = app.next_order_id
+            for index, pair in enumerate(plan.pairs):
+                active_group = pair.stop.logical_oca_group
+                # Allocate IDs in send order. Receipts retain target/stop order
+                # for journal layer matching, even though the stop has the lower ID.
+                stop_id = base_order_id + index * 2
+                target_id = stop_id + 1
+                ids.extend((target_id, stop_id))
+                for intent, order_id in (
+                    (pair.stop, stop_id),
+                    (pair.target, target_id),
+                ):
+                    phase = (
+                        "stop acceptance"
+                        if order_id == stop_id
+                        else "target acceptance"
+                    )
                     order = Order()
                     order.action = intent.action
                     order.orderType = intent.order_type
@@ -618,7 +733,7 @@ class IbkrPaperExecutionBroker:
                     order.ocaGroup = intent.logical_oca_group
                     order.ocaType = intent.oca_type
                     order.outsideRth = intent.outside_rth
-                    order.transmit = transmit
+                    order.transmit = True
                     if intent.order_type == "LMT":
                         order.lmtPrice = float(intent.rounded_price)
                     elif intent.order_type == "STP LMT":
@@ -628,28 +743,36 @@ class IbkrPaperExecutionBroker:
                         order.lmtPrice = float(intent.limit_price)
                     else:
                         order.auxPrice = float(intent.rounded_price)
-                    order_id = app.next_order_id + len(ids)
+                    _wait_owned_orders(app, submitted, sent_ids, deadline)
+                    submitted[order_id] = copy(order)
+                    sent_ids.append(order_id)
                     app.placeOrder(order_id, contract, order)
-                    ids.append(order_id)
-
-            while (
-                len(app.acks) < len(ids) and not app.errors and monotonic() < deadline
-            ):
-                sleep(0.02)
-            if app.errors:
-                raise ExecutionBlocked("; ".join(app.errors))
-            if len(app.acks) != len(ids) or any(
-                not app.acks.get(order_id) for order_id in ids
-            ):
-                raise ExecutionOutcomeUnknown(
-                    "TWS did not acknowledge every submitted order before the "
-                    "deadline; "
-                    "it may still be awaiting a TWS Transmit confirmation"
-                )
+                    _wait_owned_orders(app, submitted, sent_ids, deadline)
+                    phase = "before target" if order_id == stop_id else "after target"
+                    _verify_bracket_snapshot(
+                        app, snapshot, submitted, sent_ids, client_id, deadline
+                    )
+                    # A callback can arrive as a fresh read finishes. Check again
+                    # before sending any next leg; post-target reads catch races.
+                    _wait_owned_orders(app, submitted, sent_ids, deadline)
             return PaperSubmission(
                 tuple(ids),
                 tuple(app.acks[order_id] for order_id in ids),
             )
+        except Exception as error:
+            if submitted:
+                details = "; ".join(
+                    f"{submitted[oid].orderType} {oid}: "
+                    f"{app.orders.get(oid, (None, None, 'missing'))[2]}, "
+                    f"permId={app.acks.get(oid, 0)}"
+                    for oid in submitted
+                )
+                raise ExecutionOutcomeUnknown(
+                    f"Possible one-sided bracket · {active_group} · {phase}: {error}. "
+                    f"Observed orders: {details}. Check TWS; "
+                    "no further tranches were sent"
+                ) from error
+            raise
         finally:
             if app.isConnected():
                 app.disconnect()
@@ -1542,3 +1665,193 @@ def _build_submission_contract(imports: Any, snapshot: BrokerSnapshot) -> Any:
     contract.conId = snapshot.contract.con_id
     contract.exchange = snapshot.contract.exchange
     return contract
+
+
+def _wait_owned_orders(
+    app: Any, submitted: dict[int, Any], ids: list[int], deadline: float
+) -> None:
+    while app.isConnected() and not app.errors and monotonic() < deadline:
+        if app.has_fill:
+            break
+        if all(
+            oid in app.orders
+            and app.orders[oid][2] in {"Submitted", "PreSubmitted"}
+            and app.acks.get(oid, 0) > 0
+            for oid in ids
+        ):
+            return
+        sleep(0.02)
+    raise ExecutionOutcomeUnknown(
+        "; ".join(app.errors)
+        or "Missing order acceptance, fill, timeout, or disconnect"
+    )
+
+
+def _same_option_identity(contract: Any, snapshot: BrokerSnapshot) -> bool:
+    c = snapshot.contract
+    return (
+        int(getattr(contract, "conId", 0)) == c.con_id
+        and str(getattr(contract, "secType", "")) == c.sec_type
+        and str(getattr(contract, "lastTradeDateOrContractMonth", "")) == c.expiry
+        and Decimal(str(getattr(contract, "strike", "NaN"))) == c.strike
+        and str(getattr(contract, "right", "")) == c.right
+        and Decimal(str(getattr(contract, "multiplier", "NaN"))) == c.multiplier
+        and str(getattr(contract, "currency", "")) == c.currency
+        and str(getattr(contract, "tradingClass", "")) == c.trading_class
+    )
+
+
+def _bracket_order_fields(order: Any) -> tuple[Any, ...]:
+    return tuple(
+        getattr(order, field, None)
+        for field in (
+            "account",
+            "action",
+            "orderType",
+            "totalQuantity",
+            "tif",
+            "ocaGroup",
+            "ocaType",
+            "parentId",
+            "lmtPrice",
+            "auxPrice",
+            "outsideRth",
+        )
+    )
+
+
+def _verify_bracket_snapshot(
+    app: Any,
+    snapshot: BrokerSnapshot,
+    submitted: dict[int, Any],
+    ids: list[int],
+    client_id: int,
+    deadline: float,
+) -> None:
+    from ibapi.execution import ExecutionFilter
+
+    if not snapshot.executions_complete:
+        raise ExecutionOutcomeUnknown(
+            "Execution baseline is incomplete; check TWS before transmitting"
+        )
+    app.scan = {}
+    app.orders_done.clear()
+    app.positions_done.clear()
+    app.fills_done.clear()
+    app.positions.clear()
+    app.execution_ids.clear()
+    app.reqAllOpenOrders()
+    app.reqPositions()
+    execution_filter = ExecutionFilter()
+    execution_filter.acctCode = snapshot.selected.account
+    app.execution_request_id += 1
+    app.reqExecutions(app.execution_request_id, execution_filter)
+    try:
+        while (
+            not all(
+                event.is_set()
+                for event in (app.orders_done, app.positions_done, app.fills_done)
+            )
+            and app.isConnected()
+            and not app.errors
+            and monotonic() < deadline
+        ):
+            sleep(0.02)
+        if (
+            not app.isConnected()
+            or app.errors
+            or app.has_fill
+            or not all(
+                event.is_set()
+                for event in (app.orders_done, app.positions_done, app.fills_done)
+            )
+        ):
+            raise ExecutionOutcomeUnknown("Fresh bracket checks failed; check TWS")
+        if len(app.positions) != 1:
+            raise ExecutionOutcomeUnknown(
+                "The position is missing or ambiguous; check TWS"
+            )
+        contract, quantity, cost = app.positions[0]
+        if (
+            not _same_option_identity(contract, snapshot)
+            or quantity != snapshot.position.quantity
+            or cost != snapshot.position.raw_average_cost
+        ):
+            raise ExecutionOutcomeUnknown(
+                "The position changed during bracket verification; check TWS"
+            )
+        if app.execution_ids != {
+            e.exec_id
+            for e in snapshot.executions
+            if e.account == snapshot.selected.account
+            and e.con_id == snapshot.selected.con_id
+        }:
+            raise ExecutionOutcomeUnknown(
+                "Executions changed during bracket verification; check TWS"
+            )
+        selected_orders = {
+            oid: record
+            for oid, record in app.scan.items()
+            if str(getattr(record[1], "account", "")) == snapshot.selected.account
+            and int(getattr(record[0], "conId", 0)) == snapshot.selected.con_id
+        }
+        # Existing outside reservations are not managed by this call. Compare
+        # their observed safety fields, and reject new/missing orders.
+        expected_existing = {
+            o.order_id: o for o in snapshot.working_orders if o.key == snapshot.selected
+        }
+        if set(selected_orders) != set(ids) | set(expected_existing):
+            raise ExecutionOutcomeUnknown(
+                "Working order set changed during bracket verification; check TWS"
+            )
+        for oid in ids:
+            contract, order, status = selected_orders[oid]
+            if (
+                not _same_option_identity(contract, snapshot)
+                or _bracket_order_fields(order) != _bracket_order_fields(submitted[oid])
+                or int(getattr(order, "clientId", -1)) != client_id
+                or int(order.permId) != app.acks[oid]
+                or int(order.permId) <= 0
+                or status not in {"Submitted", "PreSubmitted"}
+            ):
+                raise ExecutionOutcomeUnknown(
+                    "App-owned bracket changed during verification; check TWS"
+                )
+        for oid, prior in expected_existing.items():
+            _, order, status = selected_orders[oid]
+            if (
+                int(order.permId),
+                int(order.clientId),
+                str(order.action),
+                str(order.orderType),
+                Decimal(str(order.totalQuantity)),
+                str(order.tif),
+                str(order.ocaGroup),
+                int(order.parentId),
+                status,
+            ) != (
+                prior.perm_id,
+                prior.client_id,
+                prior.action,
+                prior.order_type,
+                prior.remaining,
+                prior.tif,
+                prior.oca_group or "",
+                prior.parent_id,
+                prior.status,
+            ):
+                raise ExecutionOutcomeUnknown(
+                    "An existing order changed during bracket verification; check TWS"
+                )
+            for field, price in (
+                ("lmtPrice", prior.limit_price),
+                ("auxPrice", prior.stop_price),
+            ):
+                if price is not None and Decimal(str(getattr(order, field))) != price:
+                    raise ExecutionOutcomeUnknown(
+                        "Existing order price changed during verification; check TWS"
+                    )
+        _wait_owned_orders(app, submitted, ids, deadline)
+    finally:
+        app.cancelPositions()
+        app.scan = None

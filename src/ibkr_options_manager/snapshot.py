@@ -56,6 +56,7 @@ class SnapshotCoordinator:
         self._max_age_seconds = max_age_seconds
         self._clock = clock
         self._current = SnapshotResult(SnapshotStatus.EMPTY, None, ())
+        self._closed_captures: dict[tuple[str, int], BrokerCapture] = {}
 
     def refresh(self, request: SnapshotRequest) -> SnapshotResult:
         self._current = SnapshotResult(SnapshotStatus.EMPTY, None, ())
@@ -65,6 +66,8 @@ class SnapshotCoordinator:
 
     def capture_closed_history(self, request: SnapshotRequest) -> BrokerCapture | None:
         """Read broker history without publishing an execution-eligible snapshot."""
+        key = (request.expected_account, request.option_con_id)
+        self._closed_captures.pop(key, None)
         capture = self._broker.capture(request)
         if (
             not capture.connected
@@ -87,7 +90,28 @@ class SnapshotCoordinator:
             != 1
         ):
             return None
+        self._closed_captures[key] = capture
         return capture
+
+    def closed_order_evidence(
+        self, account: str, con_id: int
+    ) -> tuple[frozenset[str], frozenset[int]] | None:
+        """Fresh read-only evidence; never grants order management authority."""
+        capture = self._closed_captures.get((account, con_id))
+        if (
+            capture is None
+            or self._clock() - capture.captured_at > self._max_age_seconds
+        ):
+            return None
+        orders = tuple(
+            order
+            for order in working_orders_from_capture(capture)
+            if order.key.account == account and order.key.con_id == con_id
+        )
+        return (
+            frozenset(order.oca_group for order in orders if order.oca_group),
+            frozenset(order.perm_id for order in orders),
+        )
 
     def current(self) -> SnapshotResult:
         snapshot = self._current.snapshot

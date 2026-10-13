@@ -68,6 +68,7 @@ from ...execution import (
     TrailingChangeCandidate,
     ambiguous_oca_prefixes,
     classify_journal_layer,
+    submission_pair_matches_plan,
 )
 from ...observation import ObservationSettings, PositionObserver
 from ...order_observation import OrderObserver
@@ -255,6 +256,7 @@ class StarUIWorkbench:
         self._launch_account_error = ""
         self._launch_refresh_in_progress = False
         self._submission_review_required = False
+        self._submission_review_error = ""
         self._lock = RLock()
         self.session_token = token_urlsafe(24)
         self.app, route = star_app(
@@ -693,6 +695,23 @@ class StarUIWorkbench:
                 self._disarm_execution_locked()
             # Each response carries only feedback produced by this action.
             self._toast = None
+            unresolved_brackets = self._unresolved_bracket_submissions()
+            if (
+                unresolved_brackets
+                and action
+                not in {
+                    "refresh",
+                    "select",
+                    "select-session-closed",
+                    "verify-bracket-exists",
+                    "resolve-cancelled-bracket",
+                    "acknowledge-position-change",
+                }
+                and not action.startswith("verify-cancelled-bracket:")
+            ):
+                self._disarm_execution_locked()
+                self._message = "Possible one-sided bracket. Check the listed tranches in TWS and refresh or verify their absence before making changes."
+                return self._page()
             contract_locked = bool(self._unresolved_management_entries())
             if contract_locked and action not in {
                 "refresh",
@@ -851,6 +870,7 @@ class StarUIWorkbench:
             elif action == "resolve-cancelled-bracket":
                 self._resolve_cancelled_bracket_locked(values)
             elif action.startswith("verify-cancelled-bracket:"):
+                self._submission_review_required = False
                 identity = action.partition(":")[2]
                 fingerprint, _, index_text = identity.partition(":")
                 self._recovery_requested_fingerprint = fingerprint
@@ -1294,6 +1314,7 @@ class StarUIWorkbench:
             self._disarm_execution_locked()
             self._message = "Draft or broker state changed; review the refreshed plan and start execution again."
             return
+        self._submission_review_error = ""
         try:
             receipt = self._paper_execution.submit(
                 candidate.snapshot,
@@ -1310,6 +1331,7 @@ class StarUIWorkbench:
                 stop_limit_unit=self._stop_configuration()[2],
             )
         except ExecutionOutcomeUnknown as error:
+            self._submission_review_error = str(error)
             self._drafts.pop(candidate.selection.con_id, None)
             self._message = (
                 f"Submission outcome is unknown: {error}. If TWS shows the complete "
@@ -3568,18 +3590,75 @@ class StarUIWorkbench:
         )
 
     def _submission_review_dialog(self) -> Any:
-        if not self._submission_review_required:
+        unresolved = self._unresolved_bracket_submissions()
+        if self._recovery_requested_fingerprint and unresolved:
             return None
+        if not self._submission_review_required and not unresolved:
+            return None
+        error = next(
+            (
+                entry.submission_error
+                for entry, _index, _outcome in unresolved
+                if entry.submission_error
+            ),
+            self._submission_review_error if self._submission_review_required else "",
+        )
         return Div(
             Dialog(
                 DialogContent(
                     DialogHeader(
-                        DialogTitle("Orders sent to TWS"),
+                        DialogTitle(
+                            "Possible one-sided bracket — check TWS"
+                            if unresolved
+                            else "Transmission not verified"
+                            if error
+                            else "Orders sent to TWS"
+                        ),
                         DialogDescription(
-                            "The orders were sent to TWS. Confirm or transmit them "
-                            "there if prompted, then refresh their status here."
+                            (
+                                f"{error}. Orders may already exist in TWS. "
+                                "Check both legs there, then refresh. Do not resubmit this draft."
+                            )
+                            if error
+                            else (
+                                "The orders were sent to TWS. Confirm or transmit them "
+                                "there if prompted, then refresh their status here."
+                            )
                         ),
                     ),
+                    P(
+                        "Further changes to this contract are blocked until every affected tranche is verified. A stop or target may be working without its matching leg.",
+                        role="alert",
+                        cls="text-sm text-destructive",
+                    )
+                    if unresolved
+                    else None,
+                    Div(
+                        *(
+                            Div(
+                                self._bracket_identity_card(entry, index),
+                                Form(
+                                    Button(
+                                        "Verify bracket no longer exists",
+                                        type="submit",
+                                        variant="outline",
+                                    ),
+                                    HTMLInput(
+                                        type="hidden",
+                                        name="action",
+                                        value=f"verify-cancelled-bracket:{entry.fingerprint}:{index}",
+                                    ),
+                                    action=f"/{self.session_token}/action",
+                                    method="post",
+                                    cls="mt-2",
+                                ),
+                            )
+                            for entry, index, _outcome in unresolved
+                        ),
+                        cls="grid max-h-[40vh] gap-3 overflow-y-auto",
+                    )
+                    if unresolved
+                    else None,
                     DialogFooter(
                         Form(
                             Button(
@@ -3597,7 +3676,7 @@ class StarUIWorkbench:
                 signal="submission_review",
                 default_open=True,
                 dismissible=False,
-                size="sm",
+                size="lg" if unresolved else "sm",
             ),
             data_submission_review=True,
         )
@@ -4749,6 +4828,43 @@ class StarUIWorkbench:
             ),
         )
 
+    def _bracket_identity_card(self, entry: JournalEntry, index: int) -> Any:
+        layer = entry.layers[index]
+        return Div(
+            P(
+                "Tranche ID · OCA group",
+                cls="text-xs text-muted-foreground",
+            ),
+            P(
+                _journal_oca_group(entry, index),
+                cls="mt-1 break-all text-sm",
+            ),
+            Div(
+                Span("LMT target", cls="text-muted-foreground"),
+                Span(
+                    f"{layer.target_price} · {layer.quantity} contracts",
+                ),
+                cls="mt-3 flex justify-between gap-3 text-sm",
+            ),
+            Div(
+                Span(
+                    f"{layer.stop_order_type} loss",
+                    cls="text-muted-foreground",
+                ),
+                Span(
+                    f"{layer.stop_price}"
+                    + (
+                        f" (LMT {layer.stop_limit_price})"
+                        if layer.stop_limit_price
+                        else ""
+                    )
+                    + f" · {layer.quantity} contracts",
+                ),
+                cls="mt-2 flex justify-between gap-3 text-sm",
+            ),
+            cls="rounded-md border border-border p-4",
+        )
+
     def _cancelled_bracket_recovery(
         self, outcomes: tuple[tuple[JournalEntry, int, LayerOutcome], ...]
     ) -> Any:
@@ -4806,40 +4922,7 @@ class StarUIWorkbench:
                     ),
                     Div(
                         *(
-                            Div(
-                                P(
-                                    "Tranche ID · OCA group",
-                                    cls="text-xs text-muted-foreground",
-                                ),
-                                P(
-                                    _journal_oca_group(entry, index),
-                                    cls="mt-1 break-all text-sm",
-                                ),
-                                Div(
-                                    Span("LMT target", cls="text-muted-foreground"),
-                                    Span(
-                                        f"{layer.target_price} · {layer.quantity} contracts",
-                                    ),
-                                    cls="mt-3 flex justify-between gap-3 text-sm",
-                                ),
-                                Div(
-                                    Span(
-                                        f"{layer.stop_order_type} loss",
-                                        cls="text-muted-foreground",
-                                    ),
-                                    Span(
-                                        f"{layer.stop_price}"
-                                        + (
-                                            f" (LMT {layer.stop_limit_price})"
-                                            if layer.stop_limit_price
-                                            else ""
-                                        )
-                                        + f" · {layer.quantity} contracts",
-                                    ),
-                                    cls="mt-2 flex justify-between gap-3 text-sm",
-                                ),
-                                cls="rounded-md border border-border p-4",
-                            )
+                            self._bracket_identity_card(entry, index)
                             for index, layer in enumerate(entry.layers)
                             if index == selected_index
                         ),
@@ -5273,14 +5356,15 @@ class StarUIWorkbench:
     def _submission_outcomes(
         self,
     ) -> tuple[tuple[JournalEntry, int, LayerOutcome], ...]:
-        if self._paper_execution is None or self._selected_con_id is None:
+        con_id = self._selected_con_id or self._selected_closed_con_id
+        if self._paper_execution is None or con_id is None:
             return ()
         reader = getattr(self._paper_execution, "submission_entries", None)
         if not callable(reader):
             return ()
         entries = reader(
             account=self._verified_selected_account(),
-            con_id=self._selected_con_id,
+            con_id=con_id,
         )
         ambiguous = ambiguous_oca_prefixes(entries)
         active_ids = frozenset(
@@ -5351,6 +5435,70 @@ class StarUIWorkbench:
             account=self._verified_selected_account(), con_id=self._selected_con_id
         )
         return entries
+
+    def _unresolved_bracket_submissions(
+        self,
+    ) -> tuple[tuple[JournalEntry, int, LayerOutcome], ...]:
+        snapshot = self._view_model.latest_snapshot()
+        verified = bool(
+            snapshot is not None
+            and snapshot.connected
+            and snapshot.complete
+            and snapshot.fresh
+            and snapshot.executions_complete
+            and not snapshot.errors
+            and snapshot.selected.account == self._verified_selected_account()
+            and snapshot.selected.con_id == self._selected_con_id
+        )
+        unresolved = []
+        for entry, index, outcome in self._submission_outcomes():
+            if not entry.submission_error and entry.state not in {
+                "PREPARED",
+                "SUBMISSION_UNKNOWN",
+            }:
+                continue
+            group_working = snapshot is not None and any(
+                order.key == snapshot.selected
+                and order.oca_group == _journal_oca_group(entry, index)
+                for order in snapshot.working_orders
+            )
+            closed_verified = False
+            if (
+                self._selected_con_id is None
+                and self._selected_closed_con_id == entry.con_id
+            ):
+                evidence = self._view_model.closed_order_evidence(
+                    entry.account, entry.con_id
+                )
+                if evidence is not None and self._state.status is UiStatus.READY:
+                    groups, perm_ids = evidence
+                    group_working = _journal_oca_group(entry, index) in groups or bool(
+                        {
+                            entry.layers[index].target_perm_id,
+                            entry.layers[index].stop_perm_id,
+                        }
+                        - {0}
+                        & perm_ids
+                    )
+                    closed_verified = True
+            settled = (
+                outcome.status == "ACTIVE"
+                and snapshot is not None
+                and submission_pair_matches_plan(entry, index, snapshot)
+            ) or (
+                not group_working
+                and outcome.status
+                in {
+                    "CANCELLED",
+                    "CLOSED_PROFIT",
+                    "CLOSED_LOSS",
+                    "CLOSED_FLAT",
+                    "CLOSED_PNL_UNKNOWN",
+                }
+            )
+            if not (verified or closed_verified) or not settled:
+                unresolved.append((entry, index, outcome))
+        return tuple(unresolved)
 
     def _pending_submissions(
         self,

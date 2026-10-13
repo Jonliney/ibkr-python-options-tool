@@ -167,12 +167,48 @@ submission. A concurrent manual change after the final snapshot is still
 possible; the snapshot is not an atomic reservation at TWS. Paper trading and
 TWS order precautions remain necessary checks before any later live milestone.
 
-The application transmits new app-owned SELL limit/stop OCA pairs. For each
-pair, it submits the limit order with `transmit=False`, followed by the stop
-with `transmit=True`, using the pair's unique OCA group and OCA type 2.
-TWS may still apply its own order precaution and require the user to click
-**Transmit** there. The application must not bypass that independent TWS
-safety control.
+The application creates new app-owned SELL limit/stop OCA pairs **stop first**.
+For each tranche, it sends the stop with `transmit=True`, verifies acceptance,
+then sends its profit target with `transmit=True` in the same unique OCA group
+and OCA type 2. IDs are allocated in ascending send order; receipts retain the
+journal's target/stop ordering. TWS precautions remain active.
+
+Before the first stop, before each target, and after each target, the writer takes
+fresh all-open-order, position, and execution reads on the same client connection.
+It checks full option identity, account/client/permanent IDs, prices, quantities,
+OCA fields, accepted status, unchanged existing orders, unchanged position cost
+and quantity, and the same execution IDs as the complete baseline. Every order
+already sent must remain accepted and present. Reads complete within the original
+bounded writer deadline; unique execution request IDs reject late prior responses.
+A final callback check runs immediately before each send and after each read.
+Neither permanent IDs alone nor absence from a partial snapshot proves a result.
+
+A missing/changed stop prevents sending its target. A failed post-target pair
+check stops all later tranches. Rejections, partial/full fills, disconnects,
+timeouts, and TWS warnings leave the attempt uncertain; the app does not retry,
+recreate a vanished stop, cancel a surviving order, or bypass a precaution.
+The journal retains the failure reason, OCA identities and planned layers across
+restarts. The blocking **Possible one-sided bracket** modal shows tranche cards
+with target/stop prices and quantities, plus observed IDs/statuses in the failure
+reason. Further changes to that contract stay blocked until a fresh snapshot
+verifies healthy pairs or resolved terminal outcomes without surviving legs.
+Refresh is available; **Verify bracket no longer exists** opens the existing
+operator-confirmed, broker-checked absence workflow. Merely dismissing a dialog,
+refreshing, or recording a fill cannot release an orphaned surviving order.
+If the position closes during the attempt, its closed-position view retains the
+warning. Complete, fresh, account/contract-scoped closed-history order evidence
+must also show no surviving OCA group or recorded sibling ID before a terminal
+fill releases the lock. This evidence expires and is invalidated on a failed
+read; it never grants permission to submit or manage a closed position.
+
+These reads are not atomic with submission. A stop can fill between the pre-target
+check and target transmission. The post-target check detects changed evidence and
+blocks further work, but cannot undo a sell or guarantee that OCA linkage will
+prevent an orphan or overfill in every race. Paper validation with four or more
+tranches remains required, including stop/target fills during creation, held or
+rejected legs, manual cancellation, and restart after an uncertain result. A
+`Submitted` or `PreSubmitted` status confirms broker acceptance, not execution.
+TWS can still require its independent manual Transmit decision.
 
 ## Available-position trailing conversion
 
@@ -363,8 +399,9 @@ touches manual orders. Any rejection, timeout, or incomplete acknowledgement
 fails closed with no retry.
 
 Price-only amendments use the same app-owned, same-client order IDs. The
-original OCA target is staged with `transmit=False` and its stop sends the
-pair, so a later amendment explicitly sets `transmit=True` on the selected
+legacy OCA target could have been staged with `transmit=False`; new brackets
+send the stop first and both legs with `transmit=True`. A later amendment also
+explicitly sets `transmit=True` on the selected
 order. TWS order precautions remain enabled. The app requires both an
 amendment callback and a subsequent `reqOpenOrders` result showing the exact
 requested price before reporting success. If the fresh check still shows the

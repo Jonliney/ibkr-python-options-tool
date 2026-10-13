@@ -100,11 +100,70 @@ class JournalEntry:
     trailing_tif: str = ""
     trailing_last_stop: str = ""
     trailing_last_limit: str = ""
+    submission_error: str = ""
 
 
 def _entry_oca_prefix(entry: JournalEntry) -> str:
     """Legacy attempts used the fingerprint prefix directly."""
     return entry.oca_prefix or entry.fingerprint[:12]
+
+
+def submission_pair_matches_plan(
+    entry: JournalEntry, index: int, snapshot: BrokerSnapshot
+) -> bool:
+    """Read-only proof of an intact, unfilled pair after uncertain creation."""
+    if not (
+        snapshot.connected
+        and snapshot.complete
+        and snapshot.fresh
+        and snapshot.executions_complete
+        and not snapshot.errors
+        and snapshot.selected.account == entry.account
+        and snapshot.selected.con_id == entry.con_id
+    ):
+        return False
+    allocated, failures = closing_order_allocation(snapshot)
+    if (
+        any(f.code != "POSITION_FULLY_ALLOCATED" for f in failures)
+        or allocated > snapshot.position.quantity
+    ):
+        return False
+    layer = entry.layers[index]
+    orders = tuple(
+        o
+        for o in snapshot.working_orders
+        if o.key == snapshot.selected
+        and o.oca_group == f"{_entry_oca_prefix(entry)}/tranche-{index + 1}"
+    )
+    if len(orders) != 2:
+        return False
+    target = next((o for o in orders if o.order_type == "LMT"), None)
+    stop = next((o for o in orders if o.order_type == layer.stop_order_type), None)
+    if target is None or stop is None:
+        return False
+    try:
+        return (
+            target.perm_id == layer.target_perm_id > 0
+            and stop.perm_id == layer.stop_perm_id > 0
+            and target.client_id == stop.client_id > 0
+            and all(
+                o.order_id > 0
+                and o.parent_id == 0
+                and o.action == "SELL"
+                and o.status in {"Submitted", "PreSubmitted"}
+                and o.remaining == Decimal(layer.quantity)
+                and o.tif == layer.tif
+                for o in orders
+            )
+            and target.limit_price == Decimal(layer.target_price)
+            and stop.stop_price == Decimal(layer.stop_price)
+            and (
+                layer.stop_order_type != "STP LMT"
+                or stop.limit_price == Decimal(layer.stop_limit_price)
+            )
+        )
+    except InvalidOperation:
+        return False
 
 
 def ambiguous_oca_prefixes(
@@ -1263,6 +1322,7 @@ class ExecutionJournal:
                     perm_ids=perm_ids,
                     snapshot_captured_at=entry.snapshot_captured_at,
                     oca_prefix=entry.oca_prefix,
+                    submission_error=entry.submission_error,
                     layers=layers,
                     fills=entry.fills,
                     trailing_quantity=entry.trailing_quantity,
@@ -1502,9 +1562,18 @@ class ExecutionJournal:
             else None
         )
 
-    def mark_unknown(self, fingerprint: str) -> JournalEntry:
-        """Record an indeterminate outcome; never retry it automatically."""
-        return self.record_submission(fingerprint, order_ids=(), perm_ids=())
+    def mark_unknown(self, fingerprint: str, *, reason: str = "") -> JournalEntry:
+        """Record an indeterminate outcome and its reason; never retry it."""
+        updated = self.record_submission(fingerprint, order_ids=(), perm_ids=())
+        if reason:
+            entries = list(self._entries())
+            for index in range(len(entries) - 1, -1, -1):
+                if entries[index].fingerprint == fingerprint:
+                    updated = replace(entries[index], submission_error=reason)
+                    entries[index] = updated
+                    self._write(tuple(entries))
+                    break
+        return updated
 
     def record_management_completion(
         self, fingerprint: str, *, order_ids: tuple[int, ...]
@@ -1860,6 +1929,7 @@ class ExecutionJournal:
                     snapshot_captured_at=str(item.get("snapshot_captured_at", "")),
                     resolution_captured_at=str(item.get("resolution_captured_at", "")),
                     oca_prefix=str(item.get("oca_prefix", "")),
+                    submission_error=str(item.get("submission_error", "")),
                     layers=tuple(
                         JournalLayer(
                             quantity=int(layer["quantity"]),
@@ -2094,7 +2164,7 @@ class PaperExecutionService:
             if not order_ids or len(order_ids) != len(perm_ids) or not all(perm_ids):
                 raise ExecutionBlocked("TWS acknowledgement was incomplete")
         except Exception as error:
-            self._journal.mark_unknown(entry.fingerprint)
+            self._journal.mark_unknown(entry.fingerprint, reason=str(error))
             if isinstance(error, ExecutionOutcomeUnknown):
                 raise
             raise ExecutionOutcomeUnknown(

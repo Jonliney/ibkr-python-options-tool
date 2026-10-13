@@ -121,6 +121,39 @@ def test_closed_history_capture_accepts_zero_position_only_with_complete_history
 
     broker.capture_value = replace(capture, executions_complete=False)
     assert coordinator.capture_closed_history(request()) is None
+
+
+def test_closed_order_evidence_is_scoped_fresh_and_invalidated_on_failure():
+    capture = replace(
+        complete_capture(),
+        positions=(),
+        completed_orders_complete=True,
+        executions_complete=True,
+    )
+    capture = replace(
+        capture, orders=(replace(capture.orders[0], oca_group="app/tranche-1"),)
+    )
+    now = Decimal("100")
+    broker = FakeReadOnlyBroker(capture)
+    coordinator = SnapshotCoordinator(
+        broker, max_age_seconds=Decimal("15"), clock=lambda: now
+    )
+    account, con_id = request().expected_account, request().option_con_id
+    assert coordinator.closed_order_evidence(account, con_id) is None
+    assert coordinator.capture_closed_history(request()) is not None
+    assert coordinator.closed_order_evidence(account, con_id) == (
+        frozenset({"app/tranche-1"}),
+        frozenset({capture.orders[0].perm_id}),
+    )
+    assert coordinator.closed_order_evidence("DU_OTHER", con_id) is None
+    assert coordinator.closed_order_evidence(account, con_id + 1) is None
+    assert coordinator.current().snapshot is None
+    now = Decimal("116")
+    assert coordinator.closed_order_evidence(account, con_id) is None
+    now = Decimal("100")
+    broker.capture_value = replace(capture, executions_complete=False)
+    assert coordinator.capture_closed_history(request()) is None
+    assert coordinator.closed_order_evidence(account, con_id) is None
     broker.capture_value = replace(capture, managed_accounts=("DU_OTHER",))
     assert coordinator.capture_closed_history(request()) is None
 

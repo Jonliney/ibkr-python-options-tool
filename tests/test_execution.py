@@ -810,155 +810,52 @@ def test_mismatched_outside_rth_pair_is_blocked_before_any_tws_write() -> None:
 
 
 @pytest.mark.parametrize("supported", [True, False])
-def test_paper_bracket_writer_sends_matching_outside_rth_flags(
-    monkeypatch,
-    supported: bool,
-) -> None:
-    from ibkr_options_manager.broker import execution as broker_execution
+def test_paper_bracket_writer_sends_matching_outside_rth_flags(monkeypatch, supported):
+    from test_bracket_transmission import _submit, _writer
 
-    snapshot = _snapshot()
+    snapshot = replace(_snapshot(), executions_complete=True)
     if not supported:
         snapshot = replace(
-            snapshot,
-            contract=replace(snapshot.contract, trading_class="AAPL"),
+            snapshot, contract=replace(snapshot.contract, trading_class="AAPL")
         )
-    plan = _plan(snapshot)
-    sent = []
-
-    class FakeWrapper:
-        def __init__(self) -> None:
-            pass
-
-    class FakeClient:
-        def __init__(self, wrapper) -> None:
-            self.wrapper = wrapper
-            self.connected = False
-
-        def connect(self, *_args) -> None:
-            self.connected = True
-            self.wrapper.nextValidId(500)
-
-        def run(self) -> None:
-            pass
-
-        def isConnected(self) -> bool:
-            return self.connected
-
-        def disconnect(self) -> None:
-            self.connected = False
-
-        def placeOrder(self, order_id, _contract, order) -> None:
-            sent.append((order.orderType, order.outsideRth, order.transmit))
-            order.permId = order_id + 1000
-            self.wrapper.openOrder(order_id, None, order, None)
-
-    monkeypatch.setattr(
-        broker_execution,
-        "_load_ibapi",
-        lambda: _IbapiImports(
-            FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace
-        ),
-    )
-
-    result = IbkrPaperExecutionBroker().submit(
-        snapshot,
-        plan,
-        host="127.0.0.1",
-        port=7497,
-        client_id=17,
-        timeout_seconds=1,
-    )
-
-    assert result.order_ids == (500, 501)
-    assert sent == [("LMT", supported, False), ("STP", supported, True)]
+    snapshot, writes, _ = _writer(monkeypatch, snapshot=snapshot)
+    result = _submit(snapshot)
+    assert result.order_ids == (501, 500)
+    assert [(o.orderType, o.outsideRth, o.transmit) for _, o in writes] == [
+        ("STP", supported, True),
+        ("LMT", supported, True),
+    ]
 
 
 @pytest.mark.parametrize("rejected", [False, True])
 def test_paper_writer_sends_one_stop_limit_leg_with_trigger_limit_and_oca(
-    monkeypatch,
-    rejected: bool,
-) -> None:
-    from ibkr_options_manager.broker import execution as broker_execution
+    monkeypatch, rejected
+):
+    from test_bracket_transmission import _submit, _writer
 
-    snapshot = _snapshot()
-    plan = _plan(snapshot, stop_order_type="STP LMT")
-    assert plan.pairs[0].stop.limit_price == Decimal("0.70")
-    sent = []
-
-    class FakeWrapper:
-        def __init__(self) -> None:
-            pass
-
-    class FakeClient:
-        def __init__(self, wrapper) -> None:
-            self.wrapper = wrapper
-            self.connected = False
-
-        def connect(self, *_args) -> None:
-            self.connected = True
-            self.wrapper.nextValidId(500)
-
-        def run(self) -> None:
-            pass
-
-        def isConnected(self) -> bool:
-            return self.connected
-
-        def disconnect(self) -> None:
-            self.connected = False
-
-        def placeOrder(self, order_id, _contract, order) -> None:
-            sent.append(
-                (
-                    order_id,
-                    order.orderType,
-                    order.auxPrice,
-                    order.lmtPrice,
-                    order.ocaGroup,
-                    order.ocaType,
-                    order.outsideRth,
-                    order.transmit,
-                )
-            )
-            if rejected and order.orderType == "STP LMT":
-                self.wrapper.error(order_id, 109, "TWS price precaution")
-                return
-            order.permId = order_id + 1000
-            self.wrapper.openOrder(order_id, None, order, None)
-
-    monkeypatch.setattr(
-        broker_execution,
-        "_load_ibapi",
-        lambda: _IbapiImports(
-            FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace
-        ),
+    snapshot, writes, _ = _writer(
+        monkeypatch, "stop-rejected" if rejected else "normal"
     )
+    plan = _plan(snapshot, stop_order_type="STP LMT")
+    assert plan.pairs[0].stop.limit_price == Decimal(".70")
     if rejected:
         with pytest.raises(ExecutionBlocked, match="TWS price precaution"):
-            IbkrPaperExecutionBroker().submit(
-                snapshot,
-                plan,
-                host="127.0.0.1",
-                port=7497,
-                client_id=17,
-                timeout_seconds=1,
-            )
+            _submit(snapshot, plan)
+        assert len(writes) == 1
     else:
-        receipt = IbkrPaperExecutionBroker().submit(
-            snapshot,
-            plan,
-            host="127.0.0.1",
-            port=7497,
-            client_id=17,
-            timeout_seconds=1,
-        )
-        assert receipt.order_ids == (500, 501)
-    assert [(row[1], row[5], row[6], row[7]) for row in sent] == [
-        ("LMT", 2, True, False),
-        ("STP LMT", 2, True, True),
-    ]
-    assert sent[0][4] == sent[1][4]
-    assert sent[1][2:4] == (0.75, 0.7)
+        receipt = _submit(snapshot, plan)
+        assert receipt.order_ids == (501, 500)
+        assert len(writes) == 2
+        assert writes[0][1].ocaGroup == writes[1][1].ocaGroup
+    stop = writes[0][1]
+    assert (
+        stop.orderType,
+        stop.auxPrice,
+        stop.lmtPrice,
+        stop.ocaType,
+        stop.outsideRth,
+        stop.transmit,
+    ) == ("STP LMT", 0.75, 0.70, 2, True, True)
 
 
 def test_stop_limit_off_tick_price_is_blocked_before_writer_connects() -> None:
@@ -4120,3 +4017,59 @@ def test_partial_trailing_reserves_external_oca_pair_once_and_submits_exact_quan
             timeout_seconds=1,
         )
     assert transport.calls == 1
+
+
+@pytest.mark.parametrize(
+    "change", ["none", "price", "quantity", "inactive", "extra", "stale"]
+)
+def test_uncertain_submission_pair_requires_complete_original_protection(change):
+    from ibkr_options_manager.execution import (
+        JournalLayer,
+        submission_pair_matches_plan,
+    )
+
+    snapshot = _trailing_snapshot()
+    entry = JournalEntry(
+        fingerprint="a" * 64,
+        account=snapshot.selected.account,
+        con_id=snapshot.selected.con_id,
+        state="RECONCILED",
+        submission_error="uncertain",
+        layers=(
+            JournalLayer(
+                quantity=2,
+                target_price="1.20",
+                stop_price=".75",
+                tif="GTC",
+                target_perm_id=101,
+                stop_perm_id=102,
+            ),
+        ),
+    )
+    orders = tuple(
+        WorkingOrder(
+            perm_id=101 + i,
+            client_id=17,
+            order_id=11 + i,
+            key=snapshot.selected,
+            action="SELL",
+            order_type=kind,
+            remaining=Decimal("2"),
+            status="Submitted",
+            oca_group="aaaaaaaaaaaa/tranche-1",
+            tif="GTC",
+            limit_price=Decimal("1.20") if kind == "LMT" else None,
+            stop_price=Decimal(".75") if kind == "STP" else None,
+        )
+        for i, kind in enumerate(("LMT", "STP"))
+    )
+    if change == "price":
+        orders = (replace(orders[0], limit_price=Decimal("1.25")), orders[1])
+    elif change == "quantity":
+        orders = (replace(orders[0], remaining=Decimal("1")), orders[1])
+    elif change == "inactive":
+        orders = (orders[0], replace(orders[1], status="Inactive"))
+    elif change == "extra":
+        orders = (*orders, replace(orders[0], perm_id=103, order_id=13))
+    snapshot = replace(snapshot, working_orders=orders, fresh=change != "stale")
+    assert submission_pair_matches_plan(entry, 0, snapshot) is (change == "none")

@@ -240,6 +240,7 @@ class PlannerViewModel:
         self._portfolio_lines: tuple[PortfolioPositionLine, ...] = ()
         self._bracket_forms: dict[int, PlanForm] = {}
         self._latest_snapshot: BrokerSnapshot | None = None
+        self._verified_closed_identity: set[tuple[str, int]] = set()
 
     def empty(self) -> ViewState:
         return _empty_state()
@@ -248,10 +249,20 @@ class PlannerViewModel:
         """Return the most recent coherent selected-position snapshot, if any."""
         return self._latest_snapshot
 
+    def closed_order_evidence(
+        self, account: str, con_id: int
+    ) -> tuple[frozenset[str], frozenset[int]] | None:
+        if (account, con_id) not in self._verified_closed_identity:
+            return None
+        reader = getattr(self._snapshots, "closed_order_evidence", None)
+        return reader(account, con_id) if callable(reader) else None
+
     def refresh_closed_history(
         self, settings: ConnectionSettings, baseline: BrokerSnapshot
     ) -> BrokerSnapshot | None:
         """Fetch exact-contract history for journal display only."""
+        key = (settings.account, baseline.selected.con_id)
+        self._verified_closed_identity.discard(key)
         capture = self._snapshots.capture_closed_history(
             SnapshotRequest(
                 host="127.0.0.1",
@@ -286,6 +297,7 @@ class PlannerViewModel:
             for field in identity
         ):
             return None
+        self._verified_closed_identity.add(key)
         return replace(
             baseline,
             complete=False,

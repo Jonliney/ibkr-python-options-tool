@@ -6977,7 +6977,9 @@ def test_unknown_submission_uses_guided_refresh_without_error_toast(
     )
 
     assert response.status_code == 200
-    assert "Orders sent to TWS" in response.text, workbench._status_message
+    assert "Transmission not verified" in response.text, workbench._status_message
+    assert "TWS did not acknowledge every order" in response.text
+    assert workbench._submission_review_error == "TWS did not acknowledge every order"
     assert "data-submission-review" in response.text
     assert "data-cancelled-bracket-recovery-dialog" not in response.text
     assert workbench._toast is None
@@ -8646,3 +8648,172 @@ def test_background_order_hint_preserves_trailing_review_only_when_verified(
     finally:
         workbench.close()
         worker.join(timeout=2)
+
+
+def test_submission_review_dialog_exposes_unknown_transmission_reason():
+    workbench = _demo_workbench()
+    workbench._submission_review_required = True
+    workbench._submission_review_error = (
+        "TWS did not acknowledge every submitted order before the deadline"
+    )
+    page = to_xml(workbench._submission_review_dialog())
+    assert "Transmission not verified" in page
+    assert workbench._submission_review_error in page
+    assert "Do not resubmit this draft" in page
+    assert "Orders sent to TWS" not in page
+
+
+def test_one_sided_bracket_modal_and_contract_lock_survive_refresh_and_restart(
+    tmp_path,
+):
+    from test_execution import _plan, _snapshot
+
+    journal = ExecutionJournal(tmp_path / "submission.json")
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    entry = journal.begin(snapshot, _plan(_snapshot()))
+    journal.mark_unknown(
+        entry.fingerprint,
+        reason="Possible one-sided bracket · stop vanished after target",
+    )
+    workbench._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(journal), journal
+    )
+    client = TestClient(workbench.app)
+    page = client.get(workbench.path).text
+    assert "Possible one-sided bracket" in page
+    assert "stop vanished after target" in page
+    assert f"{entry.oca_prefix or entry.fingerprint[:12]}/tranche-1" in page
+    assert "Tranche ID" in page and "LMT target" in page and "STP loss" in page
+    assert "Verify bracket no longer exists" in page
+    client.post(workbench.path + "action", data={"action": "trailing-convert-arm"})
+    assert "before making changes" in workbench._message
+    assert workbench._armed_trailing is None
+    refreshed = client.post(workbench.path + "action", data={"action": "refresh"})
+    assert "Possible one-sided bracket" in refreshed.text
+    restored = _demo_workbench()
+    restored._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(journal),
+        ExecutionJournal(tmp_path / "submission.json"),
+    )
+    restored.load_demo_data()
+    assert restored._submission_review_error == ""
+    restored_client = TestClient(restored.app)
+    assert "stop vanished after target" in restored_client.get(restored.path).text
+    recovery = restored_client.post(
+        restored.path + "action",
+        data={
+            "action": f"verify-cancelled-bracket:{entry.fingerprint}:0",
+        },
+    )
+    assert "data-cancelled-bracket-recovery-dialog" in recovery.text
+    assert "I confirm neither order is working" in recovery.text
+
+
+def test_filled_layer_with_a_surviving_leg_keeps_bracket_failure_lock(
+    tmp_path, monkeypatch
+):
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    from test_execution import _plan, _snapshot
+
+    journal = ExecutionJournal(tmp_path / "failure.json")
+    entry = journal.begin(snapshot, _plan(_snapshot()))
+    entry = journal.mark_unknown(entry.fingerprint, reason="Possible one-sided bracket")
+    monkeypatch.setattr(
+        workbench,
+        "_submission_outcomes",
+        lambda: (
+            (entry, 0, LayerOutcome("CLOSED_PROFIT", filled_quantity=Decimal("2"))),
+        ),
+    )
+    orphan = WorkingOrder(
+        perm_id=123,
+        client_id=17,
+        order_id=123,
+        key=snapshot.selected,
+        action="SELL",
+        order_type="LMT",
+        remaining=Decimal("2"),
+        status="Submitted",
+        oca_group=f"{entry.oca_prefix or entry.fingerprint[:12]}/tranche-1",
+    )
+    monkeypatch.setattr(
+        workbench._view_model,
+        "latest_snapshot",
+        lambda: replace(snapshot, executions_complete=True, working_orders=(orphan,)),
+    )
+    assert len(workbench._unresolved_bracket_submissions()) == 1
+    monkeypatch.setattr(
+        workbench._view_model,
+        "latest_snapshot",
+        lambda: replace(snapshot, executions_complete=True, working_orders=()),
+    )
+    assert workbench._unresolved_bracket_submissions() == ()
+
+
+def test_closed_position_keeps_failure_modal_until_fresh_orphan_absence(
+    tmp_path, monkeypatch
+):
+    from test_execution import _plan, _snapshot
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    journal = ExecutionJournal(tmp_path / "closed-failure.json")
+    entry = journal.begin(snapshot, _plan(_snapshot()))
+    entry = journal.mark_unknown(entry.fingerprint, reason="stop filled before target")
+    workbench._paper_execution = PaperExecutionService(
+        DemoPaperExecutionTransport(journal), journal
+    )
+    workbench._selected_closed_con_id = snapshot.selected.con_id
+    workbench._selected_con_id = None
+    assert workbench._submission_outcomes()[0][0].fingerprint == entry.fingerprint
+    # Closed history records the fill but must not infer sibling cancellation.
+    monkeypatch.setattr(
+        workbench,
+        "_submission_outcomes",
+        lambda: ((entry, 0, LayerOutcome("CLOSED_LOSS")),),
+    )
+    group = f"{entry.oca_prefix or entry.fingerprint[:12]}/tranche-1"
+    for evidence in (None, (frozenset({group}), frozenset({123}))):
+        monkeypatch.setattr(
+            workbench._view_model,
+            "closed_order_evidence",
+            lambda *_, result=evidence: result,
+        )
+        assert workbench._unresolved_bracket_submissions()
+        assert "stop filled before target" in to_xml(
+            workbench._submission_review_dialog()
+        )
+    monkeypatch.setattr(
+        workbench._view_model,
+        "closed_order_evidence",
+        lambda *_: (frozenset(), frozenset()),
+    )
+    assert workbench._unresolved_bracket_submissions() == ()
+
+
+def test_bracket_failure_lock_clears_only_after_fresh_healthy_pair_reconciliation(
+    tmp_path,
+):
+    workbench = _trailing_scenario_workbench(tmp_path, "convert")
+    service = workbench._paper_execution
+    snapshot = workbench._view_model.latest_snapshot()
+    assert service is not None and snapshot is not None
+    entry = service.submission_entries(
+        account=snapshot.selected.account, con_id=snapshot.selected.con_id
+    )[0]
+    service._journal.mark_unknown(
+        entry.fingerprint, reason="Possible one-sided bracket"
+    )
+    assert workbench._unresolved_bracket_submissions()
+    service.reconcile_snapshot(snapshot)
+    assert workbench._unresolved_bracket_submissions() == ()
+    workbench._submission_review_required = False
+    assert workbench._submission_review_dialog() is None
