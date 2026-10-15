@@ -13,7 +13,7 @@ from ibkr_options_manager.execution import (
     JournalEntry,
     PaperExecutionService,
 )
-from test_execution import _trailing_snapshot
+from support.orders import _trailing_snapshot
 
 
 def market_fixture(tmp_path):

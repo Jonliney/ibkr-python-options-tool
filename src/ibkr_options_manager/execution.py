@@ -5,11 +5,15 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from functools import wraps
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from threading import Lock, RLock
+from typing import TYPE_CHECKING, Concatenate, Protocol, runtime_checkable
 from uuid import uuid4
 
 from .domain import (
@@ -484,6 +488,76 @@ class PaperPriceUpdateTransport(Protocol):
     ) -> PaperSubmissionResult: ...
 
 
+class _JournalLock:
+    def __init__(self) -> None:
+        self.mutex = RLock()
+        self.depth = 0
+
+
+_JOURNAL_LOCKS: dict[Path, _JournalLock] = {}
+_JOURNAL_LOCKS_MUTEX = Lock()
+
+
+@contextmanager
+def _journal_transaction(path: Path) -> Iterator[None]:
+    """Serialize complete read/modify/write operations, including nested calls.
+
+    The sidecar inode remains stable when the JSON is atomically replaced.
+    Process contention fails closed; no lock spans broker I/O. Unix advisory
+    locks require every application writer to use this journal interface.
+    """
+    path = path.resolve()
+    with _JOURNAL_LOCKS_MUTEX:
+        state = _JOURNAL_LOCKS.setdefault(path, _JournalLock())
+    with state.mutex:
+        if state.depth:
+            state.depth += 1
+            try:
+                yield
+            finally:
+                state.depth -= 1
+            return
+        try:
+            import fcntl
+        except ImportError as error:
+            raise ExecutionBlocked(
+                "execution journal locking is unavailable"
+            ) from error
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise ExecutionBlocked(
+                    "execution journal is busy in another application instance"
+                ) from error
+            state.depth = 1
+            try:
+                yield
+            finally:
+                state.depth = 0
+        finally:
+            # Closing releases the OS lock even after an exception or crash.
+            os.close(descriptor)
+
+
+def _journal_update[**P, R](
+    method: Callable[Concatenate[ExecutionJournal, P], R],
+) -> Callable[Concatenate[ExecutionJournal, P], R]:
+    @wraps(method)
+    def update(self: ExecutionJournal, /, *args: P.args, **kwargs: P.kwargs) -> R:
+        try:
+            with _journal_transaction(self._path):
+                return method(self, *args, **kwargs)
+        except OSError as error:
+            raise ExecutionBlocked(
+                f"execution journal update failed: {error}"
+            ) from error
+
+    return update
+
+
 class ExecutionJournal:
     """Durable duplicate suppression for app-owned paper submissions."""
 
@@ -558,6 +632,7 @@ class ExecutionJournal:
             if entry.state in {"PREPARED", "SUBMISSION_UNKNOWN"}
         )
 
+    @_journal_update
     def confirm_unknown_management(
         self, snapshot: BrokerSnapshot, fingerprint: str, *, confirmed_in_tws: bool
     ) -> JournalEntry:
@@ -643,6 +718,7 @@ class ExecutionJournal:
             }
         )
 
+    @_journal_update
     def dismiss_cancelled_layer(
         self,
         snapshot: BrokerSnapshot,
@@ -713,6 +789,7 @@ class ExecutionJournal:
         self._write(tuple(entries))
         return updated
 
+    @_journal_update
     def begin(
         self,
         snapshot: BrokerSnapshot,
@@ -1027,6 +1104,7 @@ class ExecutionJournal:
                 return False
         return True
 
+    @_journal_update
     def confirm_cancelled_unknown(
         self,
         snapshot: BrokerSnapshot,
@@ -1108,6 +1186,7 @@ class ExecutionJournal:
         self._write(tuple(entries))
         return updated
 
+    @_journal_update
     def confirm_cancelled_layer(
         self,
         snapshot: BrokerSnapshot,
@@ -1241,6 +1320,7 @@ class ExecutionJournal:
         self._write(tuple(entries))
         return updated
 
+    @_journal_update
     def dismiss_cancelled_trailing(
         self, snapshot: BrokerSnapshot, fingerprint: str, attempt_captured_at: str
     ) -> JournalEntry:
@@ -1293,6 +1373,7 @@ class ExecutionJournal:
             market_quantity=int(candidate.quantity),
         )
 
+    @_journal_update
     def begin_management(
         self,
         snapshot: BrokerSnapshot,
@@ -1387,6 +1468,7 @@ class ExecutionJournal:
         self._write((*self._entries(), entry))
         return entry
 
+    @_journal_update
     def record_submission(
         self, fingerprint: str, *, order_ids: tuple[int, ...], perm_ids: tuple[int, ...]
     ) -> JournalEntry:
@@ -1437,6 +1519,7 @@ class ExecutionJournal:
             "execution journal entry disappeared before acknowledgement"
         )
 
+    @_journal_update
     def record_trailing_plan(
         self,
         fingerprint: str,
@@ -1466,6 +1549,7 @@ class ExecutionJournal:
         )
         self._write(tuple(entries))
 
+    @_journal_update
     def record_market_outcomes(self, snapshot: BrokerSnapshot) -> None:
         """Retain terminal evidence for market rows, including legacy quantities."""
         from .market_outcome import classify_market
@@ -1550,6 +1634,7 @@ class ExecutionJournal:
         if changed:
             self._write(tuple(entries))
 
+    @_journal_update
     def record_market_cancellation(
         self, candidate: MarketCancellationCandidate
     ) -> None:
@@ -1592,6 +1677,7 @@ class ExecutionJournal:
             and entry.fingerprint.startswith("trailing-conversion:")
         )
 
+    @_journal_update
     def record_trailing_change(self, candidate: TrailingChangeCandidate) -> None:
         entries = list(self._entries())
         matches = [
@@ -1639,6 +1725,7 @@ class ExecutionJournal:
         )
         self._write(tuple(entries))
 
+    @_journal_update
     def record_verified_price_updates(
         self,
         snapshot: BrokerSnapshot,
@@ -1700,6 +1787,7 @@ class ExecutionJournal:
         if replacements:
             self._write(tuple(entries))
 
+    @_journal_update
     def record_pair_cancellation(self, candidate: MarketExitCandidate) -> None:
         """Retain confirmed cancellation on the exact app-owned source layer."""
         entries = list(self._entries())
@@ -1775,6 +1863,7 @@ class ExecutionJournal:
             else None
         )
 
+    @_journal_update
     def mark_unknown(self, fingerprint: str, *, reason: str = "") -> JournalEntry:
         """Record an indeterminate outcome and its reason; never retry it."""
         updated = self.record_submission(fingerprint, order_ids=(), perm_ids=())
@@ -1788,6 +1877,7 @@ class ExecutionJournal:
                     break
         return updated
 
+    @_journal_update
     def record_management_completion(
         self, fingerprint: str, *, order_ids: tuple[int, ...]
     ) -> JournalEntry:
@@ -1809,6 +1899,7 @@ class ExecutionJournal:
             "management journal entry disappeared before acknowledgement"
         )
 
+    @_journal_update
     def record_completed_orders(self, snapshot: BrokerSnapshot) -> None:
         """Recover planned layer IDs from exact app OCA groups for display only."""
         self._recover_confirmed_cancellations()
@@ -1869,6 +1960,7 @@ class ExecutionJournal:
         if changed:
             self._write(tuple(entries))
 
+    @_journal_update
     def _recover_confirmed_cancellations(self) -> None:
         """Apply earlier completed app cancellation receipts to their source layers."""
         entries = list(self._entries())
@@ -1903,6 +1995,7 @@ class ExecutionJournal:
         if changed:
             self._write(tuple(entries))
 
+    @_journal_update
     def record_executions(self, snapshot: BrokerSnapshot) -> None:
         """Cache complete, exact-contract TWS fill evidence by permanent order ID."""
         if not snapshot.executions_complete:
@@ -1977,6 +2070,7 @@ class ExecutionJournal:
         if changed:
             self._write(tuple(entries))
 
+    @_journal_update
     def record_trailing_cancellations(
         self, snapshot: BrokerSnapshot
     ) -> tuple[JournalEntry, ...]:
@@ -2046,6 +2140,7 @@ class ExecutionJournal:
             self._write(tuple(entries))
         return tuple(cancelled)
 
+    @_journal_update
     def record_trailing_prices(self, snapshot: BrokerSnapshot) -> None:
         """Keep the last positive TWS-reported trigger for an exact owned trail."""
         entries = list(self._entries())
@@ -2092,6 +2187,7 @@ class ExecutionJournal:
         if changed:
             self._write(tuple(entries))
 
+    @_journal_update
     def reconcile_snapshot(
         self,
         snapshot: BrokerSnapshot,
@@ -2245,11 +2341,19 @@ class ExecutionJournal:
                 "execution journal contains an invalid entry"
             ) from error
 
+    @_journal_update
     def _write(self, entries: tuple[JournalEntry, ...]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._path.with_suffix(".tmp")
         temporary.write_text(json.dumps([asdict(entry) for entry in entries], indent=2))
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
         os.replace(temporary, self._path)
+        descriptor = os.open(self._path.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def require_paper_management_snapshot(snapshot: BrokerSnapshot) -> None:
@@ -2365,6 +2469,23 @@ class PaperExecutionService:
         self._transport = transport
         self._journal = journal
 
+    def _record_submission(
+        self,
+        fingerprint: str,
+        *,
+        order_ids: tuple[int, ...],
+        perm_ids: tuple[int, ...],
+    ) -> JournalEntry:
+        try:
+            return self._journal.record_submission(
+                fingerprint, order_ids=order_ids, perm_ids=perm_ids
+            )
+        except ExecutionBlocked as error:
+            raise ExecutionOutcomeUnknown(
+                f"TWS acknowledged the order but its journal receipt could not "
+                f"be saved: {error}"
+            ) from error
+
     def submit(
         self,
         snapshot: BrokerSnapshot,
@@ -2432,7 +2553,7 @@ class PaperExecutionService:
                 f"TWS submission was not fully acknowledged: {error}"
             ) from error
         return SubmissionReceipt(
-            self._journal.record_submission(
+            self._record_submission(
                 entry.fingerprint,
                 order_ids=order_ids,
                 perm_ids=perm_ids,
@@ -3057,7 +3178,7 @@ class PaperExecutionService:
             self._journal.mark_unknown(entry.fingerprint)
             raise
         return SubmissionReceipt(
-            self._journal.record_submission(
+            self._record_submission(
                 entry.fingerprint, order_ids=order_ids, perm_ids=perm_ids
             )
         )
@@ -3145,7 +3266,7 @@ class PaperExecutionService:
             self._journal.mark_unknown(entry.fingerprint)
             raise
         return SubmissionReceipt(
-            self._journal.record_submission(
+            self._record_submission(
                 entry.fingerprint,
                 order_ids=order_ids,
                 perm_ids=perm_ids,
@@ -3546,7 +3667,7 @@ class PaperExecutionService:
             self._journal.mark_unknown(entry.fingerprint)
             raise
         return SubmissionReceipt(
-            self._journal.record_submission(
+            self._record_submission(
                 entry.fingerprint,
                 order_ids=order_ids,
                 perm_ids=perm_ids,
@@ -3663,7 +3784,7 @@ class PaperExecutionService:
             self._journal.mark_unknown(entry.fingerprint)
             raise
         return SubmissionReceipt(
-            self._journal.record_submission(
+            self._record_submission(
                 entry.fingerprint,
                 order_ids=order_ids,
                 perm_ids=perm_ids,
@@ -3729,7 +3850,7 @@ class PaperExecutionService:
             self._journal.mark_unknown(entry.fingerprint)
             raise
         return SubmissionReceipt(
-            self._journal.record_submission(
+            self._record_submission(
                 entry.fingerprint,
                 order_ids=order_ids,
                 perm_ids=perm_ids,

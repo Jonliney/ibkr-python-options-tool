@@ -61,7 +61,7 @@ confirm the amendment. The demo acknowledges the exact amended legs and the
 next simulated read shows the new stop price. The app labels that result as
 simulated; it does not establish how TWS will acknowledge or fill the order.
 For a repeatable check with a fresh temporary demo journal, run
-`.venv/bin/python -m pytest -q tests/test_app_demo.py -k demo_weekend_stop_to_break_even_uses_acknowledged_price_update`.
+`.venv/bin/python -m pytest -q tests/test_app_orders.py -k demo_weekend_stop_to_break_even_uses_acknowledged_price_update`.
 The desktop demo journal itself persists across launches, so prior order
 attempts remain visible. It is separate from paper TWS history. A one-time
 NVDA example starts with three contracts awaiting

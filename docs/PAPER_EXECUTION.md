@@ -334,7 +334,7 @@ As with every stop-limit order, reaching the trigger does not guarantee a fill.
 
 Verification commands for this stack are `.venv/bin/python -m pytest -q
 tests/test_planner.py tests/test_execution.py tests/test_app_view_model.py
-tests/test_source_safety.py` and the focused `tests/test_app_demo.py -k
+tests/test_source_safety.py` and the focused `tests/test_app_workbench.py tests/test_app_orders.py -k
 'stop_limit'` server tests. Paper TWS testing during an eligible extended
 session remains necessary; simulation is not evidence of identical live
 behavior.
@@ -655,7 +655,7 @@ $8.10 LMT, multiplier 100, and three contracts, this is a $150 estimated loss. T
 shown prices, not a guaranteed fill or forecast of the trail's future movement.
 The projection uses verified observed remaining quantities and the staged
 candidate after review, without changing execution validation or order writes.
-Verify with `.venv/bin/python -m pytest -q tests/test_app_demo.py`.
+Verify with `.venv/bin/python -m pytest -q tests/test_app_trailing.py tests/test_app_browser.py`.
 
 Trail-only positions, trail changes and bracket-to-trail conversion reviews
 show one full-width `Projected P&L` card. It uses the shown trail limit, or the
@@ -789,8 +789,31 @@ External orders are never offered for cancellation by this layer.
 
 Verify with `.venv/bin/python -m pytest -q`; focused domain/transport coverage is
 in `tests/test_market_orders.py`, with UI lifecycle checks in
-`tests/test_app_demo.py`. Paper-TWS callback timing and out-of-hours behavior
+`tests/test_app_orders.py`. Paper-TWS callback timing and out-of-hours behavior
 still require verification. These changes do not authorize live transmission.
+
+### Journal transaction safety
+
+Journal read/modify/write operations now share a reentrant lock per canonical
+path within the process and a stable sidecar file lock between processes.
+Simultaneous confirmations cannot both persist the same new intent; writes on
+other contracts cannot overwrite each other's journal records. Process-level
+contention blocks the operation before transport. The lock covers journal I/O,
+never broker waits, and is released by the OS if the process exits.
+
+This uses Unix `flock` on a local filesystem with working advisory locks.
+Unsupported locking platforms fail closed. Every application writer must use
+`ExecutionJournal`; editing or replacing its files externally is unsupported.
+The sidecar lock file must remain in place while an instance is running.
+Temporary JSON is flushed with `fsync` before replacement, followed by a parent
+directory flush. This strengthens persistence ordering; it is not a claim that
+all hardware/filesystems survive every power-loss scenario.
+
+Intent read/write/flush/replacement failures prevent transmission. If transport
+acknowledges a submission but its receipt cannot be persisted, the service
+reports an unknown outcome and retains the blocking intent. Restart never
+automatically resends that plan. Offline regression tests for these boundaries
+and thread/process contention live in `tests/test_execution_journal.py`.
 
 
 ## Event-driven trailing cancellation observation

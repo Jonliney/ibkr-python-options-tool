@@ -1,9 +1,6 @@
-import os
 from decimal import Decimal
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ.setdefault("IBKR_OPTIONS_MANAGER_REDUCE_MOTION", "1")
-
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -31,6 +28,8 @@ from ibkr_options_manager.app.view_model import (
 )
 from ibkr_options_manager.app.window import PlannerWindow
 from ibkr_options_manager.domain import PriceBand
+
+pytestmark = pytest.mark.gui
 
 
 def state(

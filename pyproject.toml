@@ -32,6 +32,7 @@ where = ["src"]
 addopts = "--strict-markers --strict-config"
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = ["gui: requires Qt (and, for WebEngine tests, loopback socket access)"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -54,9 +55,6 @@ extend-exclude = ["src/ibkr_options_manager/app/web/components"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/test_app_demo.py" = ["E402"]
 
 [tool.starui]
 component_dir = "src/ibkr_options_manager/app/web/components/ui"

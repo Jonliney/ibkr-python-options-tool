@@ -54,5 +54,6 @@ neutral grey on a dedicated line. The comparison line is currently hidden in
 the UI, while its calculation and live updates remain available.
 
 Verification: `.venv/bin/python -m pytest -q tests/test_outcome.py
-tests/test_app_demo.py -k 'not reset_active_prices and not embedded_webview and
-not webview'`. Embedded Qt WebEngine tests require a working GUI environment.
+tests/test_app_workbench.py tests/test_app_orders.py tests/test_app_trailing.py`.
+Embedded Qt WebEngine tests are separately selectable with `-m gui` and require
+a working GUI environment and loopback socket access.

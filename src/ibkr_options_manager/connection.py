@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ipaddress import ip_address
+from math import isfinite
 
 
 def validate_paper_connection(
@@ -26,8 +27,8 @@ def validate_paper_connection(
         raise ValueError("expected_account is required")
     if not expected_account.strip().upper().startswith("DU"):
         raise ValueError("expected_account must be a paper account ID")
-    if timeout_seconds <= 0:
-        raise ValueError("timeout_seconds must be positive")
+    if not isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive and finite")
 
 
 __all__ = ["validate_paper_connection"]

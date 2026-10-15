@@ -121,6 +121,7 @@ _STATIC_DIR = Path(__file__).with_name("static")
 _ASSETS_DIR = Path(__file__).with_name("assets")
 _LAYER_TARGET_LABEL = "LMT"
 _LAYER_STOP_LABEL = "STP"
+_INVENTORY_HEARTBEAT_SECONDS = 2.0
 # StarHTML 0.7.0's position.js imports Floating UI from a CDN. Keep the same
 # plugin and API, but serve its dependency locally inside the loopback webview.
 _LOCAL_POSITION_PLUGIN = Plugin(  # type: ignore[no-untyped-call]
@@ -420,7 +421,7 @@ class StarUIWorkbench:
                 # A quiet position subscription still needs a visible liveness
                 # signal. The browser treats missed heartbeats as a lost stream.
                 yield f"data: {payload}\n\n"
-                await asyncio.sleep(2)
+                await asyncio.sleep(_INVENTORY_HEARTBEAT_SECONDS)
 
         return StreamingResponse(
             stream(),

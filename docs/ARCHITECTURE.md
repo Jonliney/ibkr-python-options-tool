@@ -109,6 +109,15 @@ Run from the repository root:
 The embedded-webview regression test binds an ephemeral loopback port. It must
 run in an environment that permits local socket binding.
 
+Tests are grouped with the registered `gui` marker. Run `pytest -q -m 'not gui'`
+for domain/transport/journal/HTTP tests and `pytest -q -m gui` for Qt/WebEngine
+tests, using the project interpreter shown above. Both groups remain part of
+the unfiltered suite. `tests/conftest.py` owns the session QApplication, cleans
+up GUI timers/windows and workbenches, and isolates persisted application state.
+Shared synthetic builders live under `tests/support/`; collected test modules
+do not import one another. Web tests are separated into workbench, orders,
+trailing and browser files.
+
 The WebView rejects non-loopback requests. StarHTML's positioning plugin must
 therefore load its Floating UI dependency from packaged local assets. A failed
 JavaScript module import prevents reactive controls such as Settings from

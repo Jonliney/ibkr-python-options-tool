@@ -8,7 +8,7 @@ from ibkr_options_manager.execution import ExecutionJournal, JournalEntry, Journ
 from ibkr_options_manager.trailing_outcome import classify_trailing
 
 # Reuse the broker snapshot fixture with all freshness and history barriers.
-from test_execution import _trailing_snapshot as _snapshot
+from support.orders import _trailing_snapshot as _snapshot
 
 
 def evidence():

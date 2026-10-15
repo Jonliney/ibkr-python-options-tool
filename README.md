@@ -80,3 +80,9 @@ Local verification from the repository root:
 .venv/bin/python -m mypy
 .venv/bin/python -m ruff check src tests
 ```
+
+Use `.venv/bin/python -m pytest -q -m 'not gui'` for domain, transport,
+journal and HTTP workbench checks, or `-m gui` for Qt/WebEngine checks. The full
+command above includes both groups. Browser tests require loopback socket
+access. Tests isolate preferences, journals and traces in temporary directories.
+See [test suite audit](docs/TEST_SUITE_AUDIT.md) for the coverage rationale.

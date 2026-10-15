@@ -13,17 +13,11 @@ from ibkr_options_manager.broker.execution import (
 )
 from ibkr_options_manager.domain import (
     BrokerSnapshot,
-    ContractKey,
     LayerRequest,
-    MarketRule,
     ObservedCompletedOrder,
     ObservedExecution,
-    ObservedPosition,
     PlanRequest,
-    PriceBand,
-    Quote,
     RemainderPolicy,
-    VerifiedOptionContract,
     WorkingOrder,
     build_exit_plan,
 )
@@ -43,59 +37,7 @@ from ibkr_options_manager.execution import (
 )
 from ibkr_options_manager.ibkr_probe import _IbapiImports
 from ibkr_options_manager.trailing import TrailingRequest, plan_entire_position
-
-
-def _snapshot(*, read_only_api: bool = False) -> BrokerSnapshot:
-    key = ContractKey(account="DU1234567", con_id=917_864_414)
-    return BrokerSnapshot(
-        selected=key,
-        connected=True,
-        read_only_api=read_only_api,
-        api_read_only_observed=True,
-        localhost_only=True,
-        paper_account_verified=True,
-        complete=True,
-        fresh=True,
-        connection_epoch=1,
-        errors=(),
-        contract=VerifiedOptionContract(
-            con_id=key.con_id,
-            sec_type="OPT",
-            expiry="20260916",
-            strike=Decimal("7605"),
-            right="C",
-            multiplier=Decimal("100"),
-            currency="USD",
-            trading_class="SPXW",
-            exchange="SMART",
-            local_symbol="SPXW  260916C07605000",
-        ),
-        position=ObservedPosition(
-            key=key,
-            quantity=Decimal("2"),
-            raw_average_cost=Decimal("100"),
-            unit_basis=Decimal("1.00"),
-        ),
-        working_orders=(),
-        quote=Quote(
-            bid=Decimal("0.95"),
-            ask=Decimal("1.05"),
-            last=Decimal("1.00"),
-            close=Decimal("0.90"),
-            market_data_type="DELAYED",
-            fresh=True,
-        ),
-        market_rule=MarketRule(
-            exchange="SMART",
-            bands=(PriceBand(Decimal("0"), Decimal("0.05")),),
-        ),
-    )
-
-
-def _trailing_snapshot() -> BrokerSnapshot:
-    return replace(
-        _snapshot(), executions_complete=True, completed_orders_complete=True
-    )
+from support.orders import _plan, _snapshot, _trailing_snapshot
 
 
 def test_trailing_plan_covers_all_unassigned_contracts_and_fixed_limit_offset() -> None:
@@ -523,21 +465,7 @@ def test_paper_trailing_writer_sends_one_exact_order(
         assert sent[0].lmtPriceOffset == float(plan.limit_offset)
 
 
-@pytest.mark.parametrize("trail_unit", [None, "dollars", "percent", "wrong-ack"])
-@pytest.mark.parametrize("cancel", [False, True])
-@pytest.mark.parametrize("cancel_event", ["status", "202", "both"])
-@pytest.mark.parametrize("reject", [False, True])
-@pytest.mark.parametrize("manual_gap_change", [False, True])
-@pytest.mark.parametrize(
-    ("prior_gap", "next_gap"),
-    [
-        (None, None),
-        (None, Decimal("0.10")),
-        (Decimal("0.05"), None),
-        (Decimal("0.05"), Decimal("0.10")),
-    ],
-)
-def test_trailing_change_writer_verifies_exact_order_before_write(
+def _exercise_trailing_change(
     monkeypatch,
     trail_unit: str | None,
     cancel_event: str,
@@ -733,6 +661,66 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
         )
 
 
+# Cross only inputs that reach the same operation. Cancellation callback variants
+# do not affect amendments, and manual changes stop before any write/callback.
+_GAP_TRANSITIONS = [
+    pytest.param(None, None, id="plain-to-plain"),
+    pytest.param(None, Decimal("0.10"), id="plain-to-limit"),
+    pytest.param(Decimal("0.05"), None, id="limit-to-plain"),
+    pytest.param(Decimal("0.05"), Decimal("0.10"), id="limit-to-limit"),
+]
+
+
+@pytest.mark.parametrize("prior_gap", [None, Decimal("0.05")], ids=["plain", "limit"])
+@pytest.mark.parametrize("cancel", [False, True], ids=["amend", "cancel"])
+def test_trailing_manual_gap_change_blocks_before_write(monkeypatch, prior_gap, cancel):
+    _exercise_trailing_change(
+        monkeypatch,
+        trail_unit=None,
+        cancel_event="status",
+        cancel=cancel,
+        reject=False,
+        manual_gap_change=True,
+        prior_gap=prior_gap,
+        next_gap=None,
+    )
+
+
+@pytest.mark.parametrize("prior_gap", [None, Decimal("0.05")], ids=["plain", "limit"])
+@pytest.mark.parametrize("event", ["status", "202", "both", "rejected"])
+def test_trailing_cancel_verifies_order_and_requires_acknowledgement(
+    monkeypatch, prior_gap, event
+):
+    _exercise_trailing_change(
+        monkeypatch,
+        trail_unit=None,
+        cancel_event=event,
+        cancel=True,
+        reject=event == "rejected",
+        manual_gap_change=False,
+        prior_gap=prior_gap,
+        next_gap=None,
+    )
+
+
+@pytest.mark.parametrize(("prior_gap", "next_gap"), _GAP_TRANSITIONS)
+@pytest.mark.parametrize("trail_unit", [None, "dollars", "percent", "wrong-ack"])
+@pytest.mark.parametrize("reject", [False, True], ids=["accepted", "rejected"])
+def test_trailing_amendment_preserves_exact_rule_and_requires_acknowledgement(
+    monkeypatch, prior_gap, next_gap, trail_unit, reject
+):
+    _exercise_trailing_change(
+        monkeypatch,
+        trail_unit=trail_unit,
+        cancel_event="status",
+        cancel=False,
+        reject=reject,
+        manual_gap_change=False,
+        prior_gap=prior_gap,
+        next_gap=next_gap,
+    )
+
+
 @pytest.mark.parametrize(
     "event",
     [
@@ -748,7 +736,7 @@ def test_trailing_cancel_confirmation_is_scoped_and_never_hides_rejection(
     monkeypatch, event
 ):
     def run():
-        test_trailing_change_writer_verifies_exact_order_before_write(
+        _exercise_trailing_change(
             monkeypatch,
             trail_unit=None,
             cancel_event=event,
@@ -784,36 +772,6 @@ def test_cancel_order_supplies_the_required_empty_order_cancel_options() -> None
     assert calls[0][0] == 701
     assert vars(calls[0][1])["manualOrderCancelTime"] == ""
     assert vars(calls[0][1])["extOperator"] == ""
-
-
-def _plan(
-    snapshot: BrokerSnapshot,
-    *,
-    stop_order_type: str = "STP",
-    stop_limit_offset: Decimal = Decimal("5"),
-):
-    return build_exit_plan(
-        snapshot,
-        PlanRequest(
-            tranche_size=2,
-            target_percentages=(Decimal("20"),),
-            stop_loss_percentage=Decimal("25"),
-            remainder_policy=RemainderPolicy.NEXT_RUNG,
-            tif="GTC",
-            layers=(
-                LayerRequest(
-                    quantity=2,
-                    target_price=Decimal("1.20"),
-                    stop_price=Decimal("0.75"),
-                    tif="GTC",
-                    target_percentage=Decimal("20"),
-                ),
-            ),
-            paper_execution_mode=True,
-            stop_order_type=stop_order_type,
-            stop_limit_offset=stop_limit_offset,
-        ),
-    )
 
 
 def test_outside_rth_defaults_on_only_for_documented_index_options() -> None:
@@ -867,7 +825,7 @@ def test_mismatched_outside_rth_pair_is_blocked_before_any_tws_write() -> None:
 
 @pytest.mark.parametrize("supported", [True, False])
 def test_paper_bracket_writer_sends_matching_outside_rth_flags(monkeypatch, supported):
-    from test_bracket_transmission import _submit, _writer
+    from support.brackets import _submit, _writer
 
     snapshot = replace(_snapshot(), executions_complete=True)
     if not supported:
@@ -887,7 +845,7 @@ def test_paper_bracket_writer_sends_matching_outside_rth_flags(monkeypatch, supp
 def test_paper_writer_sends_one_stop_limit_leg_with_trigger_limit_and_oca(
     monkeypatch, rejected
 ):
-    from test_bracket_transmission import _submit, _writer
+    from support.brackets import _submit, _writer
 
     snapshot, writes, _ = _writer(
         monkeypatch, "stop-rejected" if rejected else "normal"

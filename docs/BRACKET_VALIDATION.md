@@ -84,7 +84,7 @@ Further validation gaps:
 ## Reproducible automated checks
 
 ```sh
-.venv/bin/python -m pytest -q tests/test_bracket_transmission.py tests/test_execution.py tests/test_order_observation.py tests/test_snapshot.py tests/test_app_demo.py
+.venv/bin/python -m pytest -q tests/test_bracket_transmission.py tests/test_execution.py tests/test_order_observation.py tests/test_snapshot.py tests/test_app_orders.py
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check src tests
 .venv/bin/mypy src

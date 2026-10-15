@@ -1,6 +1,10 @@
 import ast
 import unittest
+from functools import cache
+from importlib.util import resolve_name
 from pathlib import Path
+
+import pytest
 
 from ibkr_options_manager.broker import IbkrPaperExecutionBroker, IbkrSnapshotBroker
 from ibkr_options_manager.ibkr_probe import IbkrReadOnlyBroker
@@ -67,7 +71,7 @@ class ProductionSourceSafetyTests(unittest.TestCase):
         for source in sources:
             if source == writer:
                 continue
-            tree = ast.parse(source.read_text(), filename=str(source))
+            tree = _source_tree(source)
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
@@ -77,10 +81,10 @@ class ProductionSourceSafetyTests(unittest.TestCase):
 
         self.assertEqual(violations, [])
 
-    def test_isolated_writer_cancels_only_the_explicit_selected_pair(self) -> None:
+    def test_writer_uses_explicit_cancel_arguments_and_no_global_cancel(self) -> None:
         package = Path(__file__).parents[1] / "src" / "ibkr_options_manager"
         writer = package / "broker" / "execution.py"
-        tree = ast.parse(writer.read_text(), filename=str(writer))
+        tree = _source_tree(writer)
         calls = {
             _called_name(node.func)
             for node in ast.walk(tree)
@@ -98,12 +102,8 @@ class ProductionSourceSafetyTests(unittest.TestCase):
             for call in ast.walk(tree)
             if isinstance(call, ast.Call) and _called_name(call.func) == "cancelOrder"
         ]
-        cancel_arguments = {
-            _attribute_name(call.args[0])
-            for call in cancel_calls
-            if len(call.args) == 2
-        }
-        self.assertEqual(cancel_arguments, {None})
+        self.assertTrue(cancel_calls)
+        self.assertTrue(all(len(call.args) == 2 for call in cancel_calls))
         self.assertTrue(
             all(
                 isinstance(call.args[1], ast.Call)
@@ -126,7 +126,7 @@ class ProductionSourceSafetyTests(unittest.TestCase):
         for source in sorted(package.rglob("*.py")):
             if source in allowed_sources:
                 continue
-            tree = ast.parse(source.read_text(), filename=str(source))
+            tree = _source_tree(source)
             for node in ast.walk(tree):
                 if (
                     isinstance(node, ast.Call)
@@ -141,11 +141,9 @@ class ProductionSourceSafetyTests(unittest.TestCase):
         violations: list[str] = []
 
         for source in sorted(domain.rglob("*.py")):
-            tree = ast.parse(source.read_text(), filename=str(source))
-            for node in ast.walk(tree):
-                module = _imported_module(node)
-                if module and module.split(".", 1)[0] in {"ibapi", "PySide6"}:
-                    violations.append(f"{source.name}:{node.lineno}:{module}")
+            tree = _source_tree(source)
+            package = ".".join(source.parent.relative_to(domain.parent.parent).parts)
+            violations.extend(_domain_import_violations(tree, package, source.name))
 
         self.assertEqual(violations, [])
 
@@ -158,18 +156,64 @@ def _called_name(node: ast.expr) -> str | None:
     return None
 
 
-def _attribute_name(node: ast.expr) -> str | None:
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    return None
+@cache
+def _source_tree(source: Path) -> ast.Module:
+    return ast.parse(source.read_text(), filename=str(source))
 
 
-def _imported_module(node: ast.AST) -> str | None:
-    if isinstance(node, ast.ImportFrom):
-        return node.module
-    if isinstance(node, ast.Import) and node.names:
-        return node.names[0].name
-    return None
+def _domain_import_violations(tree, package, filename):
+    forbidden = (
+        "ibapi",
+        "PySide6",
+        "starhtml",
+        "starlette",
+        "uvicorn",
+        "ibkr_options_manager.app",
+        "ibkr_options_manager.broker",
+        "ibkr_options_manager.execution",
+        "ibkr_options_manager.ibkr_probe",
+    )
+    violations = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:
+                module = resolve_name("." * node.level + module, package)
+            modules = [module, *(f"{module}.{a.name}" for a in node.names)]
+        else:
+            continue
+        for module in modules:
+            if any(
+                module == root or module.startswith(root + ".") for root in forbidden
+            ):
+                violations.append(f"{filename}:{node.lineno}:{module}")
+    return violations
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "import os, ibapi.client",
+        "from ..broker import IbkrSnapshotBroker",
+        "from .. import app",
+        "from ibkr_options_manager import execution",
+        "from PySide6 import QtWidgets",
+    ],
+)
+def test_domain_guard_detects_transport_and_gui_import_forms(statement):
+    assert _domain_import_violations(
+        ast.parse(statement), "ibkr_options_manager.domain", "synthetic.py"
+    )
+
+
+def test_domain_guard_allows_stdlib_and_domain_imports():
+    assert not _domain_import_violations(
+        ast.parse("import decimal, typing\nfrom .model import BrokerSnapshot"),
+        "ibkr_options_manager.domain",
+        "synthetic.py",
+    )
 
 
 if __name__ == "__main__":

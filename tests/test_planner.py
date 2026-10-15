@@ -1016,9 +1016,12 @@ def test_order_callback_sequence_and_unrelated_orders_do_not_change_fingerprint(
         oca_group=None,
     )
 
-    first = build_exit_plan(complete_snapshot(), canonical_request())
+    stop = replace(target, perm_id=12, order_id=102, order_type="STP")
+    first = build_exit_plan(
+        complete_snapshot(working_orders=(target, stop)), canonical_request()
+    )
     second = build_exit_plan(
-        complete_snapshot(working_orders=(unrelated,)),
+        complete_snapshot(working_orders=(unrelated, stop, target)),
         canonical_request(),
     )
 
