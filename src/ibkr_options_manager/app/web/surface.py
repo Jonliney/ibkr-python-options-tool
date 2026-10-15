@@ -9401,7 +9401,8 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
         form.querySelectorAll('[data-active-input="stop"]').forEach((input) => {{
           input.value = rate.toFixed(2);
           const exact = form.querySelector(`[data-active-exact-stop="${{input.dataset.activePermId}}"]`);
-          if (exact) exact.value = String(value.rounded);
+          // Submit the displayed decimal, not the binary float's noisy tail.
+          if (exact) exact.value = reviewNumber(value.rounded);
           const offsetField = form.querySelector(`[data-active-stop-limit-offset="${{input.dataset.activePermId}}"]`);
           const unitField = form.querySelector(`[data-active-stop-limit-unit="${{input.dataset.activePermId}}"]`);
           if (offsetField) offsetField.value = offsetOverride?.checked && input.dataset.activeStopLimitPrice ? offsetValue.value : '';

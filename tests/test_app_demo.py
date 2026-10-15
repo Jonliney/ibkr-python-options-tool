@@ -4763,6 +4763,74 @@ def test_reset_active_prices_restores_target_and_stop_after_move_to_be() -> None
     ]
 
 
+@pytest.mark.parametrize("mode", ["price", "return"])
+def test_bulk_active_stop_submits_the_displayed_decimal_price(mode) -> None:
+    QApplication.instance() or QApplication([])
+    view = QWebEngineView()
+    loop = QEventLoop()
+    results = []
+    script = _live_active_script(
+        {
+            "basis": "2.36185",
+            "multiplier": "100",
+            "bands": [{"low": "0", "increment": "0.01"}],
+        }
+    )
+    html = """<form id="active-form">
+      <input data-active-input="target" data-active-perm-id="1"
+        data-live-layer="1" data-active-initial="20"
+        data-active-original="2.84" value="20">
+      <input data-active-input="stop" data-active-perm-id="1"
+        data-live-layer="1" data-active-initial="-34.80"
+        data-active-original="1.54" value="-34.80">
+      <input data-active-exact-stop="1" name="active_stop_price_1">
+      <input data-active-quantity="1" value="2">
+      <input data-raise-stops-only>
+      </form>
+      <div data-stop-dialog>
+        <div data-stop-mode-group><button data-value="return">%</button></div>
+        <input data-stop-dialog-value value="1.66">
+        <span data-stop-input-label></span><span data-stop-dialog-inverse></span>
+        <span data-stop-dialog-summary></span><span data-stop-dialog-error></span>
+        <button data-apply-all-stops>Apply</button>
+      </div>
+      <span data-active-review-stop="1"></span>"""
+
+    def inspect(loaded):
+        if not loaded:
+            loop.quit()
+            return
+        view.page().runJavaScript(
+            (
+                """document.querySelector('[data-stop-mode-group] button').click();
+             document.querySelector('[data-stop-dialog-value]').value = '-30';
+             const input = document.querySelector('[data-stop-dialog-value]');
+             input.dispatchEvent(new Event('input'));
+             """
+                if mode == "return"
+                else ""
+            )
+            + """(() => {
+          document.querySelector('[data-apply-all-stops]').click();
+          return JSON.stringify({
+            price: document.querySelector('[data-active-exact-stop="1"]').value,
+            percentage: document.querySelector('[data-active-input="stop"]').value,
+            review: document.querySelector('[data-active-review-stop="1"]').textContent
+          });
+        })()""",
+            lambda value: (results.append(value), loop.quit()),
+        )
+
+    view.loadFinished.connect(inspect)
+    view.setHtml(html + f"<script>{script}</script>")
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    view.close()
+    assert len(results) == 1
+    submitted = json.loads(results[0])
+    assert submitted == {"price": "1.66", "percentage": "-29.72", "review": "$1.66"}
+
+
 def test_staged_cancel_uses_entry_animation_on_page_render() -> None:
     QApplication.instance() or QApplication([])
     workbench = _demo_workbench()
@@ -5031,9 +5099,12 @@ def test_stop_above_bid_warns_even_when_below_ask() -> None:
 
 
 @pytest.mark.parametrize("safe_quote", [False, True])
-@pytest.mark.parametrize("exact_price", [False, True])
-def test_active_stop_accepts_positive_return_from_entry(
-    monkeypatch, safe_quote, exact_price
+@pytest.mark.parametrize(
+    "basis_text,stop_return,exact_stop",
+    [("10.00", "50", None), ("10.03", "49.55", "15.00"), ("2.36185", "-29.72", "1.66")],
+)
+def test_active_stop_review_preserves_validated_exact_price(
+    monkeypatch, safe_quote, basis_text, stop_return, exact_stop
 ) -> None:
     from ibkr_options_manager.app.view_model import WorkingOrderLine
 
@@ -5041,7 +5112,7 @@ def test_active_stop_accepts_positive_return_from_entry(
     workbench.load_demo_data()
     snapshot = workbench._view_model.latest_snapshot()
     assert snapshot is not None
-    basis = Decimal("10.03" if exact_price else "10.00")
+    basis = Decimal(basis_text)
     group = "owned/tranche-1"
     target = WorkingOrder(
         perm_id=101,
@@ -5146,18 +5217,32 @@ def test_active_stop_accepts_positive_return_from_entry(
     target_return = format((Decimal("25.00") / basis - 1) * 100, "f")
     values = {
         "active_target_101": target_return,
-        "active_stop_101": "49.55" if exact_price else "50",
+        "active_stop_101": stop_return,
     }
-    if exact_price:
-        values["active_stop_price_101"] = "15.00"
+    if exact_stop:
+        values["active_stop_price_101"] = exact_stop
         workbench._arm_price_updates_locked(
-            {**values, "active_stop_price_101": "15.10"}
+            {
+                **values,
+                "active_stop_price_101": str(
+                    Decimal(exact_stop) + Decimal("0.0000000000000001")
+                ),
+            }
+        )
+        assert not workbench._armed_price_updates
+        workbench._arm_price_updates_locked(
+            {
+                **values,
+                "active_stop_price_101": str(Decimal(exact_stop) + Decimal("0.10")),
+            }
         )
         assert not workbench._armed_price_updates
     workbench._arm_price_updates_locked(values)
 
     assert len(workbench._armed_price_updates) == 1
-    assert workbench._armed_price_updates[0].stop_price == Decimal("15.00")
+    assert workbench._armed_price_updates[0].stop_price == Decimal(
+        exact_stop or "15.00"
+    )
     assert workbench._armed_price_updates[0].target_price is None
     assert sent == []
     assert workbench._armed_execution_deadline is not None
