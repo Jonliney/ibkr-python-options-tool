@@ -3626,6 +3626,62 @@ def test_cancelled_bracket_with_a_fill_cannot_be_rebuilt(tmp_path) -> None:
         journal.begin(refreshed, plan)
 
 
+def test_position_market_exit_accepts_a_new_capture_counter(tmp_path):
+    service = PaperExecutionService(
+        SimpleNamespace(), ExecutionJournal(tmp_path / "exit.json")
+    )
+    snapshot = _trailing_snapshot()
+    plan = service.prepare_position_market_exit(
+        snapshot, target_perm_ids=(), expected_client_id=17
+    )
+    service.verify_position_exit_baseline(
+        replace(snapshot, connection_epoch=snapshot.connection_epoch + 1), plan
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["basis", "cost", "contract", "account", "stale", "completed-history", "errors"],
+)
+def test_position_market_exit_new_capture_still_rejects_material_changes(
+    tmp_path, change
+):
+    service = PaperExecutionService(
+        SimpleNamespace(), ExecutionJournal(tmp_path / "exit.json")
+    )
+    snapshot = _trailing_snapshot()
+    plan = service.prepare_position_market_exit(
+        snapshot, target_perm_ids=(), expected_client_id=17
+    )
+    fresh = replace(snapshot, connection_epoch=snapshot.connection_epoch + 1)
+    if change == "basis":
+        fresh = replace(
+            fresh,
+            position=replace(fresh.position, unit_basis=fresh.position.unit_basis + 1),
+        )
+    elif change == "cost":
+        fresh = replace(
+            fresh,
+            position=replace(
+                fresh.position, raw_average_cost=fresh.position.raw_average_cost + 1
+            ),
+        )
+    elif change == "contract":
+        fresh = replace(
+            fresh, contract=replace(fresh.contract, strike=fresh.contract.strike + 1)
+        )
+    elif change == "account":
+        fresh = replace(fresh, selected=replace(fresh.selected, account="DU9876543"))
+    elif change == "stale":
+        fresh = replace(fresh, fresh=False)
+    elif change == "completed-history":
+        fresh = replace(fresh, completed_orders_complete=False)
+    elif change == "errors":
+        fresh = replace(fresh, errors=("unclassified TWS error",))
+    with pytest.raises(ExecutionBlocked):
+        service.verify_position_exit_baseline(fresh, plan)
+
+
 def test_position_market_exit_covers_unassigned_and_suppresses_restart_duplicate(
     tmp_path,
 ):
@@ -3656,7 +3712,7 @@ def test_position_market_exit_covers_unassigned_and_suppresses_restart_duplicate
     [
         "quantity",
         "fills",
-        "epoch",
+        "invalid-epoch",
         "external",
         "incomplete",
         "disconnect",
@@ -3703,8 +3759,8 @@ def test_position_exit_fails_closed_and_persists_unknown(tmp_path, failure):
                 ),
             ),
         )
-    elif failure == "epoch":
-        fresh = replace(snapshot, connection_epoch=snapshot.connection_epoch + 1)
+    elif failure == "invalid-epoch":
+        fresh = replace(snapshot, connection_epoch=0)
     elif failure == "external":
         fresh = replace(
             snapshot,

@@ -71,8 +71,9 @@ from ...execution import (
     submission_pair_matches_plan,
 )
 from ...observation import ObservationSettings, PositionObserver
-from ...order_observation import OrderObserver
+from ...order_observation import OrderObserver, borrow_client
 from ...price_update_trace import record_price_update_event
+from ...redaction import redact_accounts
 from ...trailing import TrailingPlan, TrailingRequest, trailing_edit_prices
 from ..position_observation import VerifiedPositionChanges
 from ..view_model import (
@@ -1825,6 +1826,13 @@ class StarUIWorkbench:
         cancellation = self._armed_cancellation
         cancellations = self._armed_cancellations
         trailing = self._armed_trailing
+        review_kind = (
+            "Market exit review"
+            if self._armed_position_exit is not None or market_exits
+            else "Trailing exit"
+            if trailing is not None or self._armed_trailing_change is not None
+            else "Bracket cancellation"
+        )
         if (
             self._paper_execution is None
             or self._selected_con_id is None
@@ -1880,7 +1888,7 @@ class StarUIWorkbench:
             )
         if snapshot is None:
             self._disarm_execution_locked()
-            self._message = "Execution blocked: the fresh snapshot is unavailable."
+            self._message = f"{review_kind} blocked: the fresh snapshot is unavailable."
             return
         try:
             if self._armed_position_exit is not None:
@@ -1897,7 +1905,9 @@ class StarUIWorkbench:
                     target_perm_ids=self._active_target_perm_ids(),
                     expected_client_id=self._settings.client_id,
                 )
-                if refreshed != plan:
+                # Baseline verification above covers position/contract/fills.
+                # The new capture's diagnostic epoch is expected to advance.
+                if refreshed.pairs != plan.pairs or refreshed.trail != plan.trail:
                     raise ExecutionBlocked("the position exits changed after review")
             elif trailing is not None:
                 self._armed_trailing = self._verify_trailing_review_locked(
@@ -1960,8 +1970,7 @@ class StarUIWorkbench:
         except ExecutionBlocked as error:
             self._disarm_execution_locked()
             self._message = (
-                f"{'Trailing exit' if trailing is not None else 'Execution'} "
-                f"blocked: {error}. Review the latest state again."
+                f"{review_kind} blocked: {error}. Review the latest state again."
             )
             return
         self._active_action_verified = True
@@ -2355,7 +2364,17 @@ class StarUIWorkbench:
         self._announce_reconciliation_locked()
         snapshot = self._view_model.latest_snapshot()
         if snapshot is None:
-            raise ExecutionBlocked("the fresh position snapshot is unavailable")
+            details = (
+                "; ".join(
+                    validation.message
+                    for validation in state.validations
+                    if validation.blocking
+                )
+                or state.status_message
+            )
+            raise ExecutionBlocked(
+                f"the fresh position snapshot is unavailable: {details}"
+            )
         return snapshot
 
     def _arm_selected_market_exit_locked(self, values: dict[str, str]) -> None:
@@ -2392,64 +2411,154 @@ class StarUIWorkbench:
             self._message = "Review the position exit before confirming."
             return
         cancelled = 0
-        try:
-            for index, pair in enumerate(plan.pairs):
-                snapshot = self._position_exit_snapshot_locked()
-                service.verify_position_exit_baseline(snapshot, plan)
-                fresh = service.prepare_position_market_exit(
-                    snapshot,
-                    target_perm_ids=self._active_target_perm_ids(),
-                    expected_client_id=self._settings.client_id,
-                )
-                if fresh.pairs != plan.pairs[index:] or fresh.trail != plan.trail:
-                    raise ExecutionBlocked(
-                        "the working exits changed during cancellation"
-                    )
-                service.cancel_pair(
-                    snapshot,
-                    pair,
-                    host="127.0.0.1",
-                    port=self._settings.port,
-                    client_id=self._settings.client_id,
-                    timeout_seconds=self._settings.timeout_seconds,
-                )
-                cancelled += 1
-            if plan.trail is not None:
-                snapshot = self._position_exit_snapshot_locked()
-                service.verify_position_exit_baseline(snapshot, plan)
-                fresh = service.prepare_position_market_exit(
-                    snapshot,
-                    target_perm_ids=self._active_target_perm_ids(),
-                    expected_client_id=self._settings.client_id,
-                )
-                if fresh.pairs or fresh.trail != plan.trail:
-                    raise ExecutionBlocked(
-                        "the trailing exit changed during cancellation"
-                    )
-                service.submit_trailing_change(
-                    snapshot,
-                    plan.trail,
-                    host="127.0.0.1",
-                    port=self._settings.port,
-                    client_id=self._settings.client_id,
-                    timeout_seconds=self._settings.timeout_seconds,
-                )
-                cancelled += 1
-            snapshot = self._position_exit_snapshot_locked()
-            service.submit_position_market_exit(
-                snapshot,
-                plan,
-                host="127.0.0.1",
-                port=self._settings.port,
-                client_id=self._settings.client_id,
-                timeout_seconds=self._settings.timeout_seconds,
+        total = len(plan.pairs) + int(plan.trail is not None)
+        market_attempted = False
+        phase = "starting"
+        run_id = uuid4().hex
+        started = monotonic()
+
+        def trace(event: str, **fields: Any) -> None:
+            record_cancellation_event(
+                event,
+                run_id=run_id,
+                phase=phase,
+                cancelled_count=cancelled,
+                exit_count=total,
+                elapsed_ms=round((monotonic() - started) * 1000, 1),
+                **fields,
             )
+
+        def fresh_snapshot(bracket_number: int | None) -> BrokerSnapshot:
+            snapshot_started = monotonic()
+            token = current_snapshot_context.set((run_id, phase, bracket_number))
+            trace("position_exit_snapshot_start", bracket_number=bracket_number)
+            try:
+                snapshot = self._position_exit_snapshot_locked()
+                trace(
+                    "position_exit_snapshot_complete",
+                    available=True,
+                    duration_ms=round((monotonic() - snapshot_started) * 1000, 1),
+                )
+                return snapshot
+            except Exception as error:
+                trace(
+                    "position_exit_snapshot_complete",
+                    available=False,
+                    reason=redact_accounts(str(error), (plan.selected.account,)),
+                    duration_ms=round((monotonic() - snapshot_started) * 1000, 1),
+                )
+                raise
+            finally:
+                current_snapshot_context.reset(token)
+
+        trace("position_exit_started")
+        try:
+            # Keep the observer paused across the whole sequence. Nested broker
+            # reads/writes retain their own leases and all per-exit checks.
+            with borrow_client(
+                "127.0.0.1", self._settings.port, self._settings.client_id
+            ):
+                for index, pair in enumerate(plan.pairs):
+                    phase = f"before_bracket_{index + 1}"
+                    snapshot = fresh_snapshot(index + 1)
+                    service.verify_position_exit_baseline(snapshot, plan)
+                    fresh = service.prepare_position_market_exit(
+                        snapshot,
+                        target_perm_ids=self._active_target_perm_ids(),
+                        expected_client_id=self._settings.client_id,
+                    )
+                    if fresh.pairs != plan.pairs[index:] or fresh.trail != plan.trail:
+                        raise ExecutionBlocked(
+                            "the working exits changed during cancellation"
+                        )
+                    phase = f"cancel_bracket_{index + 1}"
+                    cancellation_token = current_cancellation_context.set(
+                        (run_id, index + 1)
+                    )
+                    trace("position_exit_cancel_start", bracket_number=index + 1)
+                    try:
+                        service.cancel_pair(
+                            snapshot,
+                            pair,
+                            host="127.0.0.1",
+                            port=self._settings.port,
+                            client_id=self._settings.client_id,
+                            timeout_seconds=self._settings.timeout_seconds,
+                        )
+                    finally:
+                        current_cancellation_context.reset(cancellation_token)
+                    cancelled += 1
+                    trace("position_exit_cancel_complete", bracket_number=index + 1)
+                if plan.trail is not None:
+                    phase = "before_trail"
+                    snapshot = fresh_snapshot(None)
+                    service.verify_position_exit_baseline(snapshot, plan)
+                    fresh = service.prepare_position_market_exit(
+                        snapshot,
+                        target_perm_ids=self._active_target_perm_ids(),
+                        expected_client_id=self._settings.client_id,
+                    )
+                    if fresh.pairs or fresh.trail != plan.trail:
+                        raise ExecutionBlocked(
+                            "the trailing exit changed during cancellation"
+                        )
+                    phase = "cancel_trail"
+                    trace("position_exit_cancel_start")
+                    service.submit_trailing_change(
+                        snapshot,
+                        plan.trail,
+                        host="127.0.0.1",
+                        port=self._settings.port,
+                        client_id=self._settings.client_id,
+                        timeout_seconds=self._settings.timeout_seconds,
+                    )
+                    cancelled += 1
+                    trace("position_exit_cancel_complete")
+                phase = "before_market"
+                snapshot = fresh_snapshot(None)
+                service.verify_position_exit_baseline(snapshot, plan)
+                if any(order.key == plan.selected for order in snapshot.working_orders):
+                    raise ExecutionBlocked(
+                        "a closing order still works for this option"
+                    )
+                phase = "submit_market"
+                market_attempted = True
+                trace("position_exit_market_start")
+                service.submit_position_market_exit(
+                    snapshot,
+                    plan,
+                    host="127.0.0.1",
+                    port=self._settings.port,
+                    client_id=self._settings.client_id,
+                    timeout_seconds=self._settings.timeout_seconds,
+                )
+                trace("position_exit_market_acknowledged")
+                phase = "after_market"
+                refresh_token = current_snapshot_context.set((run_id, phase, None))
+                try:
+                    self._refresh_after_acknowledged_write_locked(
+                        "TWS acknowledged the position market exit. Check TWS for fills.",
+                        include_quote=False,
+                    )
+                finally:
+                    current_snapshot_context.reset(refresh_token)
+                trace("position_exit_complete")
         except Exception as error:
-            self._message = f"Position exit stopped after {cancelled} cancellations: {error}. Check TWS and refresh."
-        else:
-            self._refresh_after_acknowledged_write_locked(
-                "TWS acknowledged the position market exit. Check TWS for fills.",
-                include_quote=False,
+            reason = redact_accounts(str(error), (plan.selected.account,))
+            summary = f"{cancelled} of {total} exits confirmed cancelled. " + (
+                "Market sell status is unconfirmed."
+                if market_attempted
+                else "Market sell was not submitted."
+            )
+            self._message = (
+                f"Position exit stopped: {summary} {reason}. Check TWS and refresh."
+            )
+            if cancelled or market_attempted:
+                self._protection_change_message = f"{summary} Last verified: {plan.quantity} held contracts. Check current protection in TWS and refresh."
+            trace(
+                "position_exit_stopped",
+                market_attempted=market_attempted,
+                reason=reason,
             )
         finally:
             self._disarm_execution_locked()
@@ -7443,6 +7552,16 @@ class StarUIWorkbench:
     ) -> Any:
         if self._armed_position_exit is not None:
             return self._position_exit_projection()
+        if (
+            self._armed_cancellation is not None
+            or self._armed_cancellations
+            or (
+                self._armed_trailing_change is not None
+                and self._armed_trailing_change.cancel
+            )
+        ):
+            return None
+        trail_only = self._trail_only_projection()
         baseline, outcome, config = projection
         partial = (
             not config["unresolved"]
@@ -7528,10 +7647,39 @@ class StarUIWorkbench:
                         if partial or estimate
                         else ""
                     ),
-                ),
-                cls="outcome-projection-pair grid grid-cols-2",
+                )
+                if not trail_only
+                else None,
+                cls="outcome-projection-pair grid "
+                + ("grid-cols-1" if trail_only else "grid-cols-2"),
             ),
+            P(
+                "Uses the shown LMT, or STP without a limit. Stops can slip; limits may not fill.",
+                cls="mt-2 text-xs text-muted-foreground",
+            )
+            if trail_only
+            else None,
             data_outcome_projection=True,
+        )
+
+    def _trail_only_projection(self) -> bool:
+        if self._armed_trailing is not None:
+            # Conversion replaces the currently displayed brackets with a trail.
+            return True
+        if self._current_layers() or self._pending_submissions():
+            return False
+        if any(
+            order.order_type in {"LMT", "STP", "STP LMT"}
+            for order in self._state.working_orders
+        ):
+            return False
+        return (
+            self._armed_trailing_change is not None
+            or any(
+                order.order_type in {"TRAIL", "TRAIL LIMIT"}
+                for order in self._state.working_orders
+            )
+            or any(entry.state == "SUBMITTED" for entry in self._trailing_entries())
         )
 
     def _position_exit_bid(self) -> Decimal | None:
@@ -7549,7 +7697,7 @@ class StarUIWorkbench:
             or not snapshot.fresh
             or snapshot.errors
             or not snapshot.paper_account_verified
-            or snapshot.connection_epoch != plan.connection_epoch
+            or snapshot.connection_epoch <= 0
             or snapshot.position.quantity != plan.quantity
             or snapshot.position.unit_basis != plan.basis
             or snapshot.position.raw_average_cost != plan.raw_average_cost
@@ -7701,6 +7849,7 @@ class StarUIWorkbench:
             entry.state == "SUBMITTED" for entry in self._trailing_entries()
         )
         has_staged_action = bool(action_rows)
+        outcome_projection = self._outcome_projection(projection)
         review_badge = (
             Badge("TRAILING EXIT", variant="outline", cls="text-[10px]")
             if trailing is not None
@@ -7772,7 +7921,9 @@ class StarUIWorkbench:
                 cls="flex min-h-0 flex-1 items-center justify-center px-6",
             ),
             Div(
-                Div(self._outcome_projection(projection), cls="mx-4 mb-3"),
+                Div(outcome_projection, cls="mx-4 mb-3")
+                if outcome_projection is not None
+                else None,
                 self._review_alert() if draft_rows else None,
                 self._execution_control(),
                 cls="border-t border-border pt-4",
@@ -10558,6 +10709,10 @@ def _toast_notice(message: str) -> _ToastNotice | None:
     """Notify only when a problem needs attention; successes are explicit."""
     normalized = " ".join(message.split())
     lowered = normalized.lower()
+    if lowered.startswith("position exit stopped:"):
+        return _ToastNotice(
+            "Market exit stopped", normalized.partition(":")[2].strip(), "error"
+        )
     if "paper bracket confirmation expired" in lowered:
         return _ToastNotice(
             "Review expired",
@@ -10639,6 +10794,7 @@ def _toast_notice(message: str) -> _ToastNotice | None:
         "Execution blocked": "Couldn't send bracket orders",
         "Trailing exit blocked": "Couldn't review trailing exit",
         "Market exit blocked": "Couldn't send the market sell",
+        "Market exit review blocked": "Couldn't review market sell",
         "Bracket cancellation blocked": "Couldn't cancel bracket orders",
         "Price update blocked": "Couldn't change prices",
         "Plan blocked by validation": "Plan needs attention",

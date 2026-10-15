@@ -694,7 +694,7 @@ def test_working_trail_input_opens_active_review(
               const gapReview = review.querySelector(
                 '[data-trailing-review-limit]').textContent;
               const gain = document.querySelector('[data-gain-value]').textContent;
-              const tones = () => ['gain', 'loss'].map((kind) => {
+              const tones = () => ['gain'].map((kind) => {
                 const node = document.querySelector(`[data-live-metric="${kind}"]`);
                 const percent = node.querySelector(`[data-${kind}-percent]`);
                 const amount = node.querySelector(`[data-${kind}-value]`);
@@ -735,6 +735,7 @@ def test_working_trail_input_opens_active_review(
               gap.dispatchEvent(new Event('input', { bubbles: true }));
               const zeroTones = tones();
               return JSON.stringify({
+                stopMetricHidden: !document.querySelector('[data-live-metric="loss"]'),
                 positiveTones, negativeTones, unknownTones, zeroTones,
                 stopDisabled: stop?.matches(':disabled'),
                 gapDisabled: gap?.matches(':disabled'),
@@ -764,10 +765,11 @@ def test_working_trail_input_opens_active_review(
     gain = (Decimal("8.65") - workbench._state.unit_basis) * workbench._state.multiplier
     gain *= Decimal(workbench._state.working_orders[0].remaining)
     assert json.loads(observations[0]) == {
-        "positiveTones": [{"tone": ["text-emerald-400"], "sameColour": True}] * 2,
-        "negativeTones": [{"tone": ["text-rose-400"], "sameColour": True}] * 2,
-        "unknownTones": [{"tone": ["text-muted-foreground"], "sameColour": True}] * 2,
-        "zeroTones": [{"tone": ["text-muted-foreground"], "sameColour": True}] * 2,
+        "stopMetricHidden": True,
+        "positiveTones": [{"tone": ["text-emerald-400"], "sameColour": True}],
+        "negativeTones": [{"tone": ["text-rose-400"], "sameColour": True}],
+        "unknownTones": [{"tone": ["text-muted-foreground"], "sameColour": True}],
+        "zeroTones": [{"tone": ["text-muted-foreground"], "sameColour": True}],
         "stopDisabled": False,
         "gapDisabled": False,
         "firstReview": True,
@@ -7849,6 +7851,12 @@ def test_trail_projection_uses_limit_estimate_in_staged_review(
     assert baseline == observed
     assert baseline.covered_quantity == Decimal("3")
     assert baseline.expected_gain is not None
+    initial_projection = to_xml(
+        workbench._outcome_projection(workbench._projection_state())
+    )
+    assert 'data-live-metric="gain"' in initial_projection
+    assert 'data-live-metric="loss"' not in initial_projection
+    assert "P&L at STP" not in initial_projection
     reviewed = client.post(
         workbench.path + "action",
         data={
@@ -7875,10 +7883,106 @@ def test_trail_projection_uses_limit_estimate_in_staged_review(
     assert "Remove limit gap" not in review
     assert "trails use the shown LMT" in reviewed.text
     assert _money(expected) in reviewed.text
+    projection_markup = to_xml(
+        workbench._outcome_projection(workbench._projection_state())
+    )
+    assert 'data-live-metric="loss"' not in projection_markup
+    assert "grid-cols-1" in projection_markup
+    assert "Stops can slip; limits may not fill" in projection_markup
     snapshot = workbench._view_model.latest_snapshot()
     assert snapshot is not None
     workbench._view_model._latest_snapshot = replace(snapshot, fresh=False)
     assert workbench._projection_state()[1].expected_gain is None
+
+
+@pytest.mark.parametrize("extra", ["bracket", "draft", "pending"])
+def test_trail_with_other_bracket_work_keeps_both_projection_cards(
+    tmp_path, monkeypatch, extra
+):
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    if extra == "bracket":
+        from ibkr_options_manager.app.view_model import WorkingOrderLine
+
+        workbench._state = replace(
+            workbench._state,
+            working_orders=(
+                *workbench._state.working_orders,
+                WorkingOrderLine(
+                    perm_id=900,
+                    action="SELL",
+                    order_type="LMT",
+                    remaining="1",
+                    status="Submitted",
+                ),
+            ),
+        )
+    elif extra == "draft":
+        from ibkr_options_manager.app.view_model import DraftLayerForm
+
+        workbench._drafts[workbench._selected_con_id] = (
+            DraftLayerForm(
+                quantity="1",
+                target_price="12.04",
+                stop_price="6.88",
+                target_percentage="40",
+                stop_percentage="20",
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            workbench,
+            "_pending_submissions",
+            lambda: ((None, 0, LayerOutcome("UNKNOWN")),),
+        )
+    projection = to_xml(workbench._outcome_projection(workbench._projection_state()))
+    assert 'data-live-metric="gain"' in projection
+    assert 'data-live-metric="loss"' in projection
+    assert "grid-cols-2" in projection
+
+
+@pytest.mark.parametrize("scenario", ["convert", "working-trail"])
+def test_cancellation_only_review_hides_projection_and_cancel_changes_restores_it(
+    tmp_path, scenario
+):
+    workbench = _trailing_scenario_workbench(tmp_path, scenario)
+    client = TestClient(workbench.app)
+    assert workbench._outcome_projection(workbench._projection_state()) is not None
+    page = client.post(
+        workbench.path + "action", data={"action": "cancel-all-active"}
+    ).text
+    assert (
+        workbench._armed_cancellation
+        or workbench._armed_cancellations
+        or (
+            workbench._armed_trailing_change and workbench._armed_trailing_change.cancel
+        )
+    )
+    assert workbench._outcome_projection(workbench._projection_state()) is None
+    assert "data-outcome-projection" not in page
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    assert workbench._outcome_projection(workbench._projection_state()) is None
+    client.post(workbench.path + "action", data={"action": "cancel-staged"})
+    assert workbench._outcome_projection(workbench._projection_state()) is not None
+
+
+def test_trail_conversion_review_replaces_two_cards_with_one(tmp_path):
+    workbench = _trailing_scenario_workbench(tmp_path, "convert")
+    client = TestClient(workbench.app)
+    assert 'data-live-metric="loss"' in to_xml(
+        workbench._outcome_projection(workbench._projection_state())
+    )
+    client.post(
+        workbench.path + "action",
+        data={
+            "action": "trailing-convert-arm",
+            "trail_value": "25",
+            "trail_unit": "dollars",
+        },
+    )
+    assert workbench._armed_trailing is not None, workbench._message
+    projection = to_xml(workbench._outcome_projection(workbench._projection_state()))
+    assert 'data-live-metric="gain"' in projection
+    assert 'data-live-metric="loss"' not in projection
 
 
 def test_trail_absolute_limit_matches_expected_gain(tmp_path: Path) -> None:
@@ -7958,23 +8062,28 @@ def test_outdated_trail_gap_form_does_not_remove_limit(tmp_path: Path) -> None:
         (None, "text-muted-foreground"),
     ],
 )
+@pytest.mark.parametrize("trail_only", [False, True])
 def test_projection_metrics_use_sign_colour_in_server_review(
-    tmp_path: Path, value: Decimal | None, tone: str
+    tmp_path: Path, value: Decimal | None, tone: str, monkeypatch, trail_only
 ) -> None:
     workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    monkeypatch.setattr(workbench, "_trail_only_projection", lambda: trail_only)
     baseline, outcome, config = workbench._projection_state()
     outcome = replace(outcome, expected_gain=value, max_loss=value)
     page = to_xml(workbench._outcome_projection((baseline, outcome, config)))
-    for metric in ("gain", "loss"):
+    for metric in ("gain",) if trail_only else ("gain", "loss"):
         metric_node = re.search(rf'<p[^>]*data-live-metric="{metric}"[^>]*>', page)
         assert metric_node is not None
         for candidate in ("text-emerald-400", "text-rose-400", "text-muted-foreground"):
             assert (candidate in metric_node.group()) == (candidate == tone)
     assert "Projected P&amp;L" in page
-    assert "P&amp;L at STP" in page
+    assert ("P&amp;L at STP" in page) is (not trail_only)
     assert "Brackets use the profit-taking LMT" in page
     assert "trails use the shown LMT, or STP without a LMT" in page
-    assert "stop-limit orders can remain unfilled" in page
+    if trail_only:
+        assert "Stops can slip; limits may not fill" in page
+    else:
+        assert "stop-limit orders can remain unfilled" in page
 
 
 @pytest.mark.parametrize("limit", ["8.10", ""])
@@ -8430,6 +8539,67 @@ def test_sell_all_bid_projection_includes_only_verified_realized_pnl(
         assert f"{'+' if expected >= 0 else '-'}${abs(expected):,.2f}" in projection
 
 
+@pytest.mark.parametrize("scenario", ["convert", "working-trail"])
+@pytest.mark.parametrize("change_quantity", [False, True])
+def test_sell_all_review_and_confirm_accept_new_capture_counters(
+    tmp_path, monkeypatch, scenario, change_quantity
+):
+    workbench = _trailing_scenario_workbench(tmp_path, scenario)
+    broker = workbench._view_model._snapshots._broker
+    original_capture = broker.capture
+    epoch = 1
+
+    def capture(request):
+        nonlocal epoch
+        result = original_capture(request)
+        if isinstance(request, SnapshotRequest):
+            epoch += 1
+            result = replace(result, connection_epoch=epoch)
+            if result.quote is not None:
+                result = replace(
+                    result, quote=replace(result.quote, market_data_type="LIVE")
+                )
+            if change_quantity:
+                result = replace(
+                    result,
+                    positions=tuple(
+                        replace(position, quantity=position.quantity + 1)
+                        if position.contract.con_id == request.option_con_id
+                        else position
+                        for position in result.positions
+                    ),
+                )
+        return result
+
+    monkeypatch.setattr(broker, "capture", capture)
+    service = workbench._paper_execution
+    writes = []
+    original_market = service._transport.submit_market
+
+    def market(*args, **kwargs):
+        writes.append(args[1].quantity)
+        return original_market(*args, **kwargs)
+
+    monkeypatch.setattr(service._transport, "submit_market", market)
+    client = TestClient(workbench.app)
+    client.post(workbench.path + "action", data={"action": "market-exit-selected"})
+    assert workbench._armed_position_exit is not None
+    quantity = workbench._armed_position_exit.quantity
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    if change_quantity:
+        assert not workbench._active_action_verified
+        assert writes == []
+        assert "position quantity changed after review" in workbench._message
+        assert workbench._toast.title == "Couldn't review market sell"
+        return
+    assert workbench._active_action_verified, workbench._message
+    assert workbench._position_exit_bid() is not None
+    assert writes == []
+    client.post(workbench.path + "action", data={"action": "position-exit-confirm"})
+    assert writes == [quantity], workbench._message
+    assert epoch >= 4
+
+
 def test_set_trail_trigger_uses_fresh_bid_and_preserves_limit_gap(tmp_path):
     workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
     perm_id = workbench._trailing_entries()[0].perm_ids[0]
@@ -8474,6 +8644,112 @@ def test_raise_trail_stop_to_be_does_not_lower_a_higher_fresh_stop(tmp_path):
     assert workbench._trailing_entries()[0].trailing_stop == "8.80"
 
 
+@pytest.mark.parametrize("failure", [None, "snapshot", "market-ack"])
+def test_position_exit_three_pairs_keeps_lease_and_reports_partial_failure(
+    tmp_path, monkeypatch, failure
+):
+    from ibkr_options_manager.order_observation import _slot, borrow_client
+
+    workbench = _trailing_scenario_workbench(tmp_path, "convert")
+    service = workbench._paper_execution
+    assert service is not None
+    journal = service._journal
+    entry = journal.submission_entries(
+        account=DEMO_ACCOUNT, con_id=workbench._selected_con_id
+    )[0]
+    entry = replace(
+        entry,
+        expected_order_count=6,
+        layers=tuple(
+            replace(
+                entry.layers[0],
+                quantity=1,
+                target_perm_id=810101 + 2 * index,
+                stop_perm_id=810102 + 2 * index,
+            )
+            for index in range(3)
+        ),
+        order_ids=tuple(range(910101, 910107)),
+        perm_ids=tuple(range(810101, 810107)),
+    )
+    journal._write((entry,))
+    client = TestClient(workbench.app)
+    client.post(workbench.path + "action", data={"action": "refresh"})
+    client.post(workbench.path + "action", data={"action": "market-exit-selected"})
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    assert workbench._active_action_verified, workbench._message
+    trace_path = tmp_path / "position-exit.jsonl"
+    monkeypatch.setenv("IBKR_OPTIONS_MANAGER_CANCEL_TRACE", str(trace_path))
+    handoffs = []
+    listener = SimpleNamespace(
+        _pause=lambda: handoffs.append("pause"),
+        _resume=lambda: handoffs.append("resume"),
+    )
+    slot = _slot("127.0.0.1", 7497, 17)
+    monkeypatch.setattr(slot, "listener", listener)
+    broker = workbench._view_model._snapshots._broker
+    original_capture = broker.capture
+    reads = 0
+
+    def capture(request):
+        nonlocal reads
+        with borrow_client("127.0.0.1", 7497, 17):
+            result = original_capture(request)
+            if isinstance(request, SnapshotRequest):
+                reads += 1
+                if failure == "snapshot" and reads == 3:
+                    result = replace(
+                        result,
+                        errors=(
+                            f"synthetic broker snapshot failure for {DEMO_ACCOUNT}",
+                        ),
+                    )
+            return result
+
+    monkeypatch.setattr(broker, "capture", capture)
+    markets = []
+    original_market = service._transport.submit_market
+
+    def market(*args, **kwargs):
+        markets.append(args[1].quantity)
+        assert handoffs == ["pause"]
+        if failure == "market-ack":
+            raise ExecutionOutcomeUnknown("synthetic lost market acknowledgement")
+        return original_market(*args, **kwargs)
+
+    monkeypatch.setattr(service._transport, "submit_market", market)
+    client.post(workbench.path + "action", data={"action": "position-exit-confirm"})
+    final_entry = journal.submission_entries(
+        account=entry.account, con_id=entry.con_id
+    )[0]
+    if failure == "snapshot":
+        assert markets == []
+        assert [layer.cancelled for layer in final_entry.layers] == [True, True, False]
+        assert "synthetic broker snapshot failure" in workbench._message
+        assert "2 of 3 exits confirmed cancelled" in workbench._message
+        assert "Market sell was not submitted" in workbench._protection_change_message
+        assert workbench._toast.title == "Market exit stopped"
+        assert DEMO_ACCOUNT not in workbench._message
+    elif failure == "market-ack":
+        assert markets == [Decimal("3")]
+        assert all(layer.cancelled for layer in final_entry.layers)
+        assert "Market sell status is unconfirmed" in workbench._message
+        assert "was not submitted" not in workbench._message
+        assert service.unresolved_management_entries(
+            account=entry.account, con_id=entry.con_id
+        )
+    else:
+        assert markets == [Decimal("3")], workbench._message
+        assert all(layer.cancelled for layer in final_entry.layers)
+    assert handoffs == ["pause", "resume"]
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert DEMO_ACCOUNT not in trace_path.read_text()
+    assert len({event["run_id"] for event in events}) == 1
+    assert any(event["event"] == "position_exit_stopped" for event in events) is (
+        failure is not None
+    )
+
+
 def test_position_exit_stops_if_position_changes_after_trail_cancellation(
     tmp_path, monkeypatch
 ):
@@ -8509,7 +8785,8 @@ def test_position_exit_stops_if_position_changes_after_trail_cancellation(
     client.post(workbench.path + "action", data={"action": "position-exit-confirm"})
     assert markets == []
     assert workbench._trailing_entries()[0].state == "CANCELLED_CONFIRMED"
-    assert "stopped after 1 cancellations" in workbench._message
+    assert "1 of 1 exits confirmed cancelled" in workbench._message
+    assert "Market sell was not submitted" in workbench._message
 
 
 @pytest.mark.parametrize("bid_state", ["fresh", "missing", "stale", "below-stop"])

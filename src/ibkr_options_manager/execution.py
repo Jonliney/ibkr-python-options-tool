@@ -346,6 +346,7 @@ class PositionMarketExitPlan:
     basis: Decimal
     raw_average_cost: Decimal
     execution_ids: frozenset[str]
+    # Diagnostic capture counter; new captures are verified by broker facts.
     connection_epoch: int
     pairs: tuple[MarketExitCandidate, ...]
     trail: TrailingChangeCandidate | None = None
@@ -2506,6 +2507,7 @@ class PaperExecutionService:
             or not contract.strike.is_finite()
             or contract.strike <= 0
             or snapshot.position.key != snapshot.selected
+            or snapshot.connection_epoch <= 0
             or not quantity.is_finite()
             or quantity <= 0
             or quantity != quantity.to_integral_value()
@@ -2575,27 +2577,39 @@ class PaperExecutionService:
         snapshot: BrokerSnapshot, plan: PositionMarketExitPlan
     ) -> None:
         require_paper_management_snapshot(snapshot)
-        if (
-            snapshot.selected != plan.selected
-            or snapshot.contract != plan.contract
-            or snapshot.position.key != plan.selected
-            or snapshot.position.quantity != plan.quantity
-            or snapshot.position.unit_basis != plan.basis
-            or snapshot.position.raw_average_cost != plan.raw_average_cost
-            or snapshot.connection_epoch != plan.connection_epoch
-            or not snapshot.executions_complete
-            or not snapshot.completed_orders_complete
-            or frozenset(
-                item.exec_id
-                for item in snapshot.executions
-                if item.account == plan.selected.account
-                and item.con_id == plan.selected.con_id
-            )
-            != plan.execution_ids
-        ):
-            raise ExecutionBlocked(
-                "the position, contract, connection, or fills changed after review"
-            )
+        if snapshot.connection_epoch <= 0 or snapshot.errors:
+            raise ExecutionBlocked("a valid, error-free broker capture is required")
+        if not snapshot.executions_complete or not snapshot.completed_orders_complete:
+            raise ExecutionBlocked("complete order and execution history is required")
+        # The adapter increments connection_epoch for every bounded capture.
+        # Fresh, coherent captures must agree on broker facts, not this counter.
+        comparisons = (
+            ("selected account/option", snapshot.selected, plan.selected),
+            ("option contract", snapshot.contract, plan.contract),
+            ("position identity", snapshot.position.key, plan.selected),
+            ("position quantity", snapshot.position.quantity, plan.quantity),
+            ("position basis", snapshot.position.unit_basis, plan.basis),
+            (
+                "position cost",
+                snapshot.position.raw_average_cost,
+                plan.raw_average_cost,
+            ),
+            (
+                "fills",
+                frozenset(
+                    item.exec_id
+                    for item in snapshot.executions
+                    if item.account == plan.selected.account
+                    and item.con_id == plan.selected.con_id
+                ),
+                plan.execution_ids,
+            ),
+        )
+        changed = [
+            label for label, observed, expected in comparisons if observed != expected
+        ]
+        if changed:
+            raise ExecutionBlocked(f"{', '.join(changed)} changed after review")
 
     def submit_position_market_exit(
         self,

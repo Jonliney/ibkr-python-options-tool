@@ -646,9 +646,16 @@ The projection uses verified observed remaining quantities and the staged
 candidate after review, without changing execution validation or order writes.
 Verify with `.venv/bin/python -m pytest -q tests/test_app_demo.py`.
 
-Outcome projection uses the same labels for brackets and trails: `Projected
-P&L` and `P&L at STP`. The latter is a hypothetical result at the trigger, not
-a maximum loss or guaranteed fill price. Tooltips state the price assumptions
+Trail-only positions, trail changes and bracket-to-trail conversion reviews
+show one full-width `Projected P&L` card. It uses the shown trail limit, or the
+stop trigger without a limit; stops can slip and limits may not fill. Brackets,
+mixed bracket/trail positions, and trails with bracket drafts or pending
+brackets retain both `Projected P&L` and `P&L at STP`. The latter is a
+hypothetical result at the trigger, not a maximum loss or guaranteed fill price.
+Cancellation-only reviews hide the entire projection until the review is
+abandoned or completed, since cancelling an exit does not realise P&L.
+These are presentation rules; projected amounts and execution checks are unchanged.
+Tooltips state the price assumptions
 and explain slippage and non-execution of stop-limit orders. Positive P&L and
 return percentages are green, negative values are red, and zero or unavailable
 values are neutral in both server reviews and local edit previews.
@@ -696,7 +703,7 @@ and states that market fills may differ and additional exit fees are excluded.
 
 Position exit requires review, a fresh verification, and final confirmation
 within ten seconds. It checks the reviewed position quantity, basis, full
-contract, connection epoch, and execution IDs before each cancellation and
+contract, connection health, and execution IDs before each cancellation and
 again before market submission. After cancellation, no working order for the
 option may remain. The market writer reads all open orders, positions, and
 executions on its own connection before writing; a changed quantity, cost,
@@ -707,6 +714,30 @@ management across restarts, and duplicate attempts are not automatically
 retried. If cancellation succeeds but the position subsequently changes, the
 sell stops and the UI reports how many cancellations completed; the contracts
 can remain without exit protection.
+
+The complete position-exit sequence holds one client lease, keeping the order
+observer paused through all cancellations, fresh reads, market submission and
+the acknowledgement refresh. This avoids repeated observer reconnects between
+steps; the adapters still use bounded connections and retain every per-exit
+snapshot and writer check. Cancellations are not blindly batched or retried.
+
+If a read fails partway through, the UI preserves the underlying validation
+reason and reports the number of confirmed cancellations and whether market
+submission was attempted. A lost market acknowledgement remains unconfirmed,
+with the durable management lock intact. A partial-exit banner labels the held
+quantity as last verified; it is not evidence of current protection. Refresh
+and check TWS before deciding how to manage remaining contracts. Position-exit
+trace events share one run ID across snapshot and cancellation phases, recording
+durations, progress and account-redacted failure reasons. Earlier logs that only
+recorded a generic snapshot-unavailable error cannot establish its broker cause.
+
+The adapter's `connection_epoch` advances on every bounded snapshot capture;
+it is diagnostic metadata, not a persistent connection identity. A new positive
+capture counter alone does not invalidate sell-all review or its bid estimate.
+Every read must still be connected, complete and fresh, with unchanged account,
+contract, quantity, basis, cost and fills. The exit-order set must also match
+before cancellation or submission. Material baseline differences name the
+changed fields, and a blocked market-exit review uses its own toast title.
 
 Verify with `.venv/bin/python -m pytest -q`. These demo and automated checks do
 not establish paper-TWS or live execution success. Paper-TWS verification is
