@@ -683,6 +683,17 @@ bracket quantities: it reviews all app-owned exit cancellations and one market
 sell for the **entire held position**, including unassigned contracts. Row-level
 market exits keep their existing per-layer scope.
 
+The toolbar tooltip is **Sell all brackets now**. Its review retains the full
+held quantity. The market sell still includes contracts without brackets. SELL MKT
+shows an approximate price at the latest usable observed bid. Projected P&L
+adds verified realised bracket P&L to `(bid - basis) * multiplier * held quantity`;
+the return uses held plus verified sold contract cost, as elsewhere in the UI.
+The estimate is display-only and never supplies a limit price to the market
+order. Delayed bids are labelled; missing, stale or frozen bids are unavailable.
+Unresolved realised or trailing-fill evidence leaves the total P&L unknown.
+The market review hides the STP outcome, since those exits will be cancelled,
+and states that market fills may differ and additional exit fees are excluded.
+
 Position exit requires review, a fresh verification, and final confirmation
 within ten seconds. It checks the reviewed position quantity, basis, full
 contract, connection epoch, and execution IDs before each cancellation and

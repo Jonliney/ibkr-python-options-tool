@@ -3878,14 +3878,14 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert 'aria-label="Raise stops to B/E"' in header
     assert re.search(r'<button[^>]*type="button"[^>]*data-move-stops-to-be', header)
     assert 'aria-label="Cancel all exits"' in header
-    assert 'aria-label="Exit position now"' in header
+    assert 'aria-label="Sell all brackets now"' in header
     assert 'data-orientation="vertical"' in header
     assert 'form="active-form" name="action" value="market-exit-selected"' in header
     assert 'form="active-form" name="action" value="cancel-all-active"' in header
     assert (
         header.index('aria-label="Raise stops to B/E"')
         < header.index('aria-label="Cancel all exits"')
-        < header.index('aria-label="Exit position now"')
+        < header.index('aria-label="Sell all brackets now"')
         < header.index('aria-label="Split draft layer quantities"')
     )
     assert header.index('aria-label="Set all stops…"') < header.index(
@@ -8266,7 +8266,7 @@ def test_trail_toolbar_cancel_and_position_exit_require_review(
         "Set all stops…",
         "Raise stops to B/E",
         "Cancel all exits",
-        "Exit position now",
+        "Sell all brackets now",
     ):
         assert f'aria-label="{label}"' in page
     reviewed = client.post(workbench.path + "action", data={"action": action})
@@ -8287,6 +8287,147 @@ def test_trail_toolbar_cancel_and_position_exit_require_review(
         else ["cancel-trail", ("market", Decimal("3"))]
     )
     assert workbench._trailing_entries()[0].state == "CANCELLED_CONFIRMED"
+
+
+@pytest.mark.parametrize("bid", [Decimal("10.40"), Decimal("8.40")])
+def test_sell_all_review_estimates_entire_position_at_bid(tmp_path, monkeypatch, bid):
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    snapshot = replace(
+        snapshot,
+        quote=replace(snapshot.quote, bid=bid, fresh=True, market_data_type="LIVE"),
+    )
+    monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: snapshot)
+    client = TestClient(workbench.app)
+    page = client.post(
+        workbench.path + "action", data={"action": "market-exit-selected"}
+    ).text
+    plan = workbench._armed_position_exit
+    assert plan is not None, workbench._message
+    assert plan.quantity == snapshot.position.quantity
+    assert f"≈ ${bid}" in page
+    assert (
+        "Sells the entire held position, including contracts without brackets."
+        not in page
+    )
+    assert "Sell all brackets now" in page
+    assert "Entire held position</span>" not in page
+    projection = to_xml(workbench._outcome_projection(workbench._projection_state()))
+    expected = (bid - plan.basis) * plan.contract.multiplier * plan.quantity
+    assert f"{'+' if expected >= 0 else '-'}${abs(expected):,.2f}" in projection
+    assert "Market fills may differ" in projection
+    assert "P&L at STP" not in projection
+    assert 'data-live-metric="gain"' not in projection
+    assert 'data-live-metric="loss"' not in projection
+    assert not workbench._active_action_verified
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "missing",
+        "stale",
+        "frozen",
+        "zero",
+        "nan",
+        "wrong-quantity",
+        "stale-snapshot",
+        "delayed",
+    ],
+)
+def test_sell_all_bid_estimate_handles_unusable_and_delayed_quotes(
+    tmp_path, monkeypatch, problem
+):
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    client = TestClient(workbench.app)
+    client.post(workbench.path + "action", data={"action": "market-exit-selected"})
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    quote = replace(snapshot.quote, fresh=True, market_data_type="LIVE")
+    if problem == "missing":
+        quote = replace(quote, bid=None)
+    elif problem == "stale":
+        quote = replace(quote, fresh=False)
+    elif problem == "frozen":
+        quote = replace(quote, market_data_type="FROZEN")
+    elif problem == "zero":
+        quote = replace(quote, bid=Decimal("0"))
+    elif problem == "nan":
+        quote = replace(quote, bid=Decimal("NaN"))
+    elif problem == "delayed":
+        quote = replace(quote, market_data_type="DELAYED")
+    elif problem == "wrong-quantity":
+        snapshot = replace(
+            snapshot,
+            position=replace(
+                snapshot.position, quantity=snapshot.position.quantity + 1
+            ),
+        )
+    elif problem == "stale-snapshot":
+        snapshot = replace(snapshot, fresh=False)
+    snapshot = replace(snapshot, quote=quote)
+    monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: snapshot)
+    projection = to_xml(workbench._outcome_projection(workbench._projection_state()))
+    if problem == "delayed":
+        assert "delayed bid" in projection
+        assert workbench._position_exit_bid() == quote.bid
+    else:
+        assert workbench._position_exit_bid() is None
+        assert "Bid unavailable" in projection
+        assert "Unknown" in projection
+
+
+@pytest.mark.parametrize("realized", [Decimal("15.25"), None, "trailing-fill"])
+def test_sell_all_bid_projection_includes_only_verified_realized_pnl(
+    tmp_path, monkeypatch, realized
+):
+    workbench = _trailing_scenario_workbench(tmp_path, "working-trail")
+    snapshot = workbench._view_model.latest_snapshot()
+    assert snapshot is not None
+    snapshot = replace(
+        snapshot, quote=replace(snapshot.quote, fresh=True, market_data_type="LIVE")
+    )
+    monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: snapshot)
+    TestClient(workbench.app).post(
+        workbench.path + "action", data={"action": "market-exit-selected"}
+    )
+    plan = workbench._armed_position_exit
+    bid = workbench._position_exit_bid()
+    assert plan is not None and bid is not None
+    if realized == "trailing-fill":
+        monkeypatch.setattr(
+            workbench,
+            "_trailing_entries",
+            lambda: (SimpleNamespace(fills=("unresolved fill",)),),
+        )
+    monkeypatch.setattr(
+        workbench,
+        "_submission_outcomes",
+        lambda: (
+            (
+                None,
+                0,
+                LayerOutcome(
+                    "CLOSED_PROFIT",
+                    filled_quantity=Decimal("1"),
+                    realized_pnl=Decimal("15.25")
+                    if realized == "trailing-fill"
+                    else realized,
+                    currency=plan.contract.currency,
+                ),
+            ),
+        ),
+    )
+    projection = to_xml(workbench._position_exit_projection())
+    if realized is None or realized == "trailing-fill":
+        assert "Verified realised P&amp;L is incomplete" in projection
+        assert "Unknown" in projection
+    else:
+        expected = (
+            realized + (bid - plan.basis) * plan.contract.multiplier * plan.quantity
+        )
+        assert f"{'+' if expected >= 0 else '-'}${abs(expected):,.2f}" in projection
 
 
 def test_set_trail_trigger_uses_fresh_bid_and_preserves_limit_gap(tmp_path):

@@ -4693,7 +4693,7 @@ class StarUIWorkbench:
                                     form="active-form",
                                     name="action",
                                     value="market-exit-selected",
-                                    aria_label="Exit position now",
+                                    aria_label="Sell all brackets now",
                                     disabled=self._paper_execution is None
                                     or bool(self._armed_price_updates)
                                     or self._armed_position_exit is not None
@@ -4701,9 +4701,7 @@ class StarUIWorkbench:
                                 ),
                                 delay_duration=250,
                             ),
-                            TooltipContent(
-                                "Cancel app-owned exits, then market-sell the entire position"
-                            ),
+                            TooltipContent("Sell all brackets now"),
                         ),
                         self._trailing_conversion_dialog() if active_pairs else None,
                         cls="flex items-center gap-2",
@@ -7443,6 +7441,8 @@ class StarUIWorkbench:
     def _outcome_projection(
         self, projection: tuple[PositionOutcome, PositionOutcome, dict[str, Any]]
     ) -> Any:
+        if self._armed_position_exit is not None:
+            return self._position_exit_projection()
         baseline, outcome, config = projection
         partial = (
             not config["unresolved"]
@@ -7534,6 +7534,91 @@ class StarUIWorkbench:
             data_outcome_projection=True,
         )
 
+    def _position_exit_bid(self) -> Decimal | None:
+        """A display-only bid estimate; never a market order price constraint."""
+        plan = self._armed_position_exit
+        snapshot = self._view_model.latest_snapshot()
+        if (
+            plan is None
+            or snapshot is None
+            or snapshot.selected != plan.selected
+            or self._selected_con_id != plan.selected.con_id
+            or snapshot.contract != plan.contract
+            or not snapshot.connected
+            or not snapshot.complete
+            or not snapshot.fresh
+            or snapshot.errors
+            or not snapshot.paper_account_verified
+            or snapshot.connection_epoch != plan.connection_epoch
+            or snapshot.position.quantity != plan.quantity
+            or snapshot.position.unit_basis != plan.basis
+            or snapshot.position.raw_average_cost != plan.raw_average_cost
+            or not snapshot.quote.fresh
+            or snapshot.quote.market_data_type not in {"LIVE", "DELAYED"}
+            or snapshot.quote.bid is None
+            or not snapshot.quote.bid.is_finite()
+            or snapshot.quote.bid <= 0
+        ):
+            return None
+        return snapshot.quote.bid
+
+    def _position_exit_projection(self) -> Any:
+        plan = self._armed_position_exit
+        assert plan is not None
+        bid = self._position_exit_bid()
+        realized, sold = Decimal("0"), Decimal("0")
+        history_known = callable(
+            getattr(self._paper_execution, "submission_entries", None)
+        ) and not any(entry.fills for entry in self._trailing_entries())
+        for _entry, _index, outcome in self._submission_outcomes():
+            if outcome.status.startswith("CLOSED_"):
+                if (
+                    outcome.realized_pnl is None
+                    or outcome.currency != plan.contract.currency
+                ):
+                    history_known = False
+                else:
+                    realized += outcome.realized_pnl
+                    sold += outcome.filled_quantity
+            elif outcome.status not in {"ACTIVE", "CANCELLED"}:
+                history_known = False
+        pnl = (
+            realized + (bid - plan.basis) * plan.contract.multiplier * plan.quantity
+            if bid is not None and history_known
+            else None
+        )
+        cost = plan.basis * plan.contract.multiplier * (plan.quantity + sold)
+        snapshot = self._view_model.latest_snapshot()
+        quote_label = (
+            "delayed bid"
+            if snapshot is not None and snapshot.quote.market_data_type == "DELAYED"
+            else "latest bid"
+        )
+        return Div(
+            H3("Outcome projection", cls="mb-3 text-sm font-semibold"),
+            _metric(
+                "Projected P&L",
+                Span(
+                    Span("≈", aria_label="Estimated") if pnl is not None else None,
+                    _projection_gain_value(pnl, None, cost),
+                    cls="inline-flex items-start gap-1",
+                ),
+                _pnl_tone(pnl),
+                live_key="market",
+                help_text="Verified realised P&L plus (bid minus average price) times multiplier times all held contracts. Return uses the cost of held and verified sold contracts. Market fills may differ; additional exit fees are excluded.",
+            ),
+            P(
+                f"Estimate at the {quote_label}. Market fills may differ; additional exit fees excluded."
+                if bid is not None and history_known
+                else "Bid unavailable. Refresh prices to estimate this market exit."
+                if bid is None
+                else "Verified realised P&L is incomplete; the total estimate is unavailable.",
+                cls="mt-2 text-xs text-muted-foreground",
+            ),
+            data_outcome_projection=True,
+            data_position_market_projection=True,
+        )
+
     def _review(
         self, projection: tuple[PositionOutcome, PositionOutcome, dict[str, Any]]
     ) -> Any:
@@ -7550,6 +7635,7 @@ class StarUIWorkbench:
         action_rows: list[Any] = []
         if self._armed_position_exit is not None:
             plan = self._armed_position_exit
+            bid = self._position_exit_bid()
             action_rows = [
                 self._review_cancellation_plan(pair, index=index)
                 for index, pair in enumerate(plan.pairs, start=1)
@@ -7565,7 +7651,13 @@ class StarUIWorkbench:
                     lines=(
                         self._review_order_line(
                             "SELL MKT",
-                            Span("Entire held position", cls="text-xs font-semibold"),
+                            Span(
+                                f"≈ ${_review_number(bid)}"
+                                if bid is not None
+                                else "Bid unavailable",
+                                title="Bid estimate; actual market fill may differ",
+                                cls="text-xs font-semibold",
+                            ),
                             "text-rose-400",
                         ),
                     ),
@@ -10633,7 +10725,7 @@ def _busy_submit_script() -> str:
 
 def _metric(
     label: str,
-    value: str,
+    value: Any,
     tone: str,
     *,
     live_key: str | None = None,
