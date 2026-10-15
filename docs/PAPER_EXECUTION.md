@@ -785,6 +785,29 @@ are retained. Only exact known terminal values are recognized, with contradictio
 blocking confirmation; descriptive completed-status text does not prove a result.
 The cancellation label does not claim who initiated it.
 
+Confirmed cancelled trailing rows use the same neutral grey badge and
+"Remove this cancelled layer from view" tooltip as cancelled bracket layers.
+Removing a trail sets a durable display-only flag after exact fresh cancellation
+verification. It retains the journal entry, fills and P&L history across refresh
+and restart, and sends no order or cancellation. Active or uncertain trails cannot be
+hidden. A hidden row is shown again if current working-order evidence conflicts
+with its cancellation or the selected snapshot is unavailable or unverified.
+
+The trailing writer accepts cancellation code `202` only after sending a cancel
+for that exact order ID. It also accepts exact `Cancelled`/`ApiCancelled` status
+callbacks. A `202` for a different order, before the cancel, or during amendment
+does not confirm success; other broker errors still block completion.
+Before sending, the cancellation intent durably records its source trailing
+fingerprint, order ID and permanent ID. If its acknowledgement is lost, fresh
+complete reconciliation can complete that linked attempt when the exact source
+has terminal cancellation evidence and fills have been reconciled. The snapshot
+must be later than the intent. This works across restart and when a prior
+refresh already marked the source cancelled. It does not clear unrelated
+uncertain actions or infer cancellation from absence or a fill. Older intents
+without an explicit source link retain the manual verification path; they are
+not matched by guessing from the remaining order count. Failure details are
+retained in the cancellation attempt for diagnosis.
+
 The browser receives a protection-change notice through its existing two-second
 revision stream. Draft and active inputs remain mounted until the operator uses
 **Update view**; affected server-side confirmations are invalidated immediately.

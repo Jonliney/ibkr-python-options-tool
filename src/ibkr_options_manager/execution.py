@@ -101,6 +101,10 @@ class JournalEntry:
     trailing_last_stop: str = ""
     trailing_last_limit: str = ""
     submission_error: str = ""
+    cancellation_source: str = ""
+    cancellation_order_id: int = 0
+    cancellation_perm_id: int = 0
+    hidden_from_workspace: bool = False
 
 
 def _entry_oca_prefix(entry: JournalEntry) -> str:
@@ -1214,6 +1218,36 @@ class ExecutionJournal:
         self._write(tuple(entries))
         return updated
 
+    def dismiss_cancelled_trailing(
+        self, snapshot: BrokerSnapshot, fingerprint: str, attempt_captured_at: str
+    ) -> JournalEntry:
+        """Hide an exact cancelled trail, retaining all order and fill history."""
+        from .trailing_outcome import classify_trailing
+
+        self.record_executions(snapshot)
+        entries = list(self._entries())
+        matches = [
+            index
+            for index, entry in enumerate(entries)
+            if entry.fingerprint == fingerprint
+            and entry.snapshot_captured_at == attempt_captured_at
+            and entry.fingerprint.startswith("trailing-conversion:")
+            and entry.account == snapshot.selected.account
+            and entry.con_id == snapshot.selected.con_id
+            and entry.state == "CANCELLED_CONFIRMED"
+        ]
+        if len(matches) != 1:
+            raise ExecutionBlocked(
+                "the cancelled trailing record is missing or ambiguous"
+            )
+        index = matches[0]
+        if classify_trailing(entries[index], snapshot).status != "CANCELLED":
+            raise ExecutionBlocked("refresh and verify the trailing cancellation first")
+        updated = replace(entries[index], hidden_from_workspace=True)
+        entries[index] = updated
+        self._write(tuple(entries))
+        return updated
+
     def begin_market_exit(
         self, snapshot: BrokerSnapshot, candidate: MarketExitCandidate
     ) -> JournalEntry:
@@ -1243,10 +1277,19 @@ class ExecutionJournal:
         material: tuple[object, ...],
         expected_order_count: int,
         allow_unknown_price_retry: bool = False,
+        trailing_cancellation: TrailingChangeCandidate | None = None,
     ) -> JournalEntry:
         """Reserve a management attempt, retaining any indeterminate predecessor."""
         if not operation or expected_order_count <= 0:
             raise ExecutionBlocked("management journal entry is incomplete")
+        if trailing_cancellation is not None and (
+            operation != "cancel-trailing"
+            or not trailing_cancellation.cancel
+            or trailing_cancellation.order.key != snapshot.selected
+            or trailing_cancellation.order.order_id <= 0
+            or trailing_cancellation.order.perm_id <= 0
+        ):
+            raise ExecutionBlocked("the trailing cancellation identity is invalid")
         if self.unresolved_management_entries(
             account=snapshot.selected.account, con_id=snapshot.selected.con_id
         ):
@@ -1292,6 +1335,15 @@ class ExecutionJournal:
             state="PREPARED",
             expected_order_count=expected_order_count,
             snapshot_captured_at=str(snapshot.captured_at),
+            cancellation_source=trailing_cancellation.entry_fingerprint
+            if trailing_cancellation is not None
+            else "",
+            cancellation_order_id=trailing_cancellation.order.order_id
+            if trailing_cancellation is not None
+            else 0,
+            cancellation_perm_id=trailing_cancellation.order.perm_id
+            if trailing_cancellation is not None
+            else 0,
         )
         self._write((*self._entries(), entry))
         return entry
@@ -1324,6 +1376,10 @@ class ExecutionJournal:
                     snapshot_captured_at=entry.snapshot_captured_at,
                     oca_prefix=entry.oca_prefix,
                     submission_error=entry.submission_error,
+                    cancellation_source=entry.cancellation_source,
+                    cancellation_order_id=entry.cancellation_order_id,
+                    cancellation_perm_id=entry.cancellation_perm_id,
+                    hidden_from_workspace=entry.hidden_from_workspace,
                     layers=layers,
                     fills=entry.fills,
                     trailing_quantity=entry.trailing_quantity,
@@ -1584,18 +1640,11 @@ class ExecutionJournal:
         for index in range(len(entries) - 1, -1, -1):
             entry = entries[index]
             if entry.fingerprint == fingerprint:
-                updated = JournalEntry(
-                    fingerprint=entry.fingerprint,
-                    account=entry.account,
-                    con_id=entry.con_id,
+                updated = replace(
+                    entry,
                     state="COMPLETED",
-                    expected_order_count=entry.expected_order_count,
                     order_ids=order_ids,
                     perm_ids=(),
-                    snapshot_captured_at=entry.snapshot_captured_at,
-                    oca_prefix=entry.oca_prefix,
-                    layers=entry.layers,
-                    fills=entry.fills,
                 )
                 entries[index] = updated
                 self._write(tuple(entries))
@@ -1775,6 +1824,7 @@ class ExecutionJournal:
         """Persist only fresh, exact terminal cancellation evidence for owned trails."""
         from .trailing_outcome import classify_trailing
 
+        self.record_executions(snapshot)
         entries = list(self._entries())
         cancelled = []
         for index, entry in enumerate(entries):
@@ -1790,7 +1840,50 @@ class ExecutionJournal:
                 )
                 entries[index] = updated
                 cancelled.append(updated)
-        if cancelled:
+        # An uncertain cancellation receipt is distinct from the source order.
+        # Resolve only an explicitly linked attempt using fresh terminal evidence,
+        # including when the source was already reconciled by an earlier refresh.
+        resolved = False
+        for index, attempt in enumerate(entries):
+            if (
+                not attempt.fingerprint.startswith("cancel-trailing:")
+                or attempt.state not in {"PREPARED", "SUBMISSION_UNKNOWN"}
+                or not attempt.cancellation_source
+                or attempt.cancellation_order_id <= 0
+                or attempt.cancellation_perm_id <= 0
+                or attempt.account != snapshot.selected.account
+                or attempt.con_id != snapshot.selected.con_id
+            ):
+                continue
+            try:
+                captured = Decimal(attempt.snapshot_captured_at)
+                later = captured.is_finite() and snapshot.captured_at > captured
+            except (InvalidOperation, ValueError):
+                later = False
+            sources = [
+                entry
+                for entry in entries
+                if entry.fingerprint == attempt.cancellation_source
+                and entry.fingerprint.startswith("trailing-conversion:")
+                and entry.account == attempt.account
+                and entry.con_id == attempt.con_id
+                and entry.order_ids == (attempt.cancellation_order_id,)
+                and entry.perm_ids == (attempt.cancellation_perm_id,)
+                and entry.state in {"SUBMITTED", "CANCELLED_CONFIRMED"}
+            ]
+            if (
+                later
+                and len(sources) == 1
+                and classify_trailing(sources[0], snapshot).status == "CANCELLED"
+            ):
+                entries[index] = replace(
+                    attempt,
+                    state="COMPLETED",
+                    order_ids=(attempt.cancellation_order_id,),
+                    resolution_captured_at=str(snapshot.captured_at),
+                )
+                resolved = True
+        if cancelled or resolved:
             self._write(tuple(entries))
         return tuple(cancelled)
 
@@ -1931,6 +2024,12 @@ class ExecutionJournal:
                     resolution_captured_at=str(item.get("resolution_captured_at", "")),
                     oca_prefix=str(item.get("oca_prefix", "")),
                     submission_error=str(item.get("submission_error", "")),
+                    cancellation_source=str(item.get("cancellation_source", "")),
+                    cancellation_order_id=int(item.get("cancellation_order_id", 0)),
+                    cancellation_perm_id=int(item.get("cancellation_perm_id", 0)),
+                    hidden_from_workspace=bool(
+                        item.get("hidden_from_workspace", False)
+                    ),
                     layers=tuple(
                         JournalLayer(
                             quantity=int(layer["quantity"]),
@@ -2214,6 +2313,13 @@ class PaperExecutionService:
             snapshot, fingerprint, attempt_captured_at, layer_index
         )
 
+    def dismiss_cancelled_trailing(
+        self, snapshot: BrokerSnapshot, fingerprint: str, attempt_captured_at: str
+    ) -> JournalEntry:
+        return self._journal.dismiss_cancelled_trailing(
+            snapshot, fingerprint, attempt_captured_at
+        )
+
     def record_completed_orders(self, snapshot: BrokerSnapshot) -> None:
         """Persist exact layer identifiers found in completed TWS orders."""
         self._journal.record_completed_orders(snapshot)
@@ -2447,6 +2553,7 @@ class PaperExecutionService:
         entry = self._journal.begin_management(
             snapshot,
             operation="cancel-trailing" if candidate.cancel else "amend-trailing",
+            trailing_cancellation=candidate if candidate.cancel else None,
             material=(
                 candidate.entry_fingerprint,
                 candidate.order.order_id,
@@ -2476,8 +2583,8 @@ class PaperExecutionService:
                 raise ExecutionOutcomeUnknown(
                     "TWS did not acknowledge the exact trailing order"
                 )
-        except Exception:
-            self._journal.mark_unknown(entry.fingerprint)
+        except Exception as error:
+            self._journal.mark_unknown(entry.fingerprint, reason=str(error))
             raise
         completed = self._journal.record_management_completion(
             entry.fingerprint, order_ids=(candidate.order.order_id,)

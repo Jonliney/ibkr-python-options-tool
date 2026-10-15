@@ -894,6 +894,8 @@ class StarUIWorkbench:
                 self._verify_management_locked(values)
             elif action.startswith("dismiss-cancelled:"):
                 self._dismiss_cancelled_layer_locked(action)
+            elif action.startswith("dismiss-cancelled-trail:"):
+                self._dismiss_cancelled_trailing_locked(action)
             elif action == "cancel-staged":
                 self._disarm_execution_locked()
                 self._set_review_status_locked(
@@ -2418,6 +2420,27 @@ class StarUIWorkbench:
         except (ExecutionBlocked, ValueError) as error:
             self._message = f"Cancelled row could not be removed: {error}"
             return
+
+    def _dismiss_cancelled_trailing_locked(self, action: str) -> None:
+        if self._paper_execution is None or self._selected_con_id is None:
+            self._message = "Select a position before removing a cancelled row."
+            return
+        identity = action.removeprefix("dismiss-cancelled-trail:")
+        fingerprint, separator, captured_at = identity.rpartition(":")
+        snapshot = self._view_model.latest_snapshot()
+        if (
+            not separator
+            or snapshot is None
+            or snapshot.selected.con_id != self._selected_con_id
+        ):
+            self._message = "Refresh the selected position before removing this row."
+            return
+        try:
+            self._paper_execution.dismiss_cancelled_trailing(
+                snapshot, fingerprint, captured_at
+            )
+        except ExecutionBlocked as error:
+            self._message = f"Cancelled row could not be removed: {error}"
 
     def _position_exit_snapshot_locked(
         self, *, include_quote: bool = False
@@ -4688,11 +4711,18 @@ class StarUIWorkbench:
             Form(
                 Label(
                     HTMLInput(
-                        type="checkbox", name="confirmed", value="yes", required=True
+                        type="checkbox",
+                        name="confirmed",
+                        value="yes",
+                        required=True,
+                        cls="mt-0.5 shrink-0",
                     ),
-                    "I checked TWS: no change is awaiting Transmit, and the displayed "
-                    "orders and fills match this contract.",
-                    cls="mt-3 flex items-start gap-2 text-sm",
+                    Span(
+                        "I checked TWS: no change is awaiting Transmit, and the displayed "
+                        "orders and fills match this contract.",
+                        cls="min-w-0 flex-1 leading-normal",
+                    ),
+                    cls="mt-3 flex w-full items-start gap-2 text-sm",
                 ),
                 HTMLInput(type="hidden", name="action", value="verify-management"),
                 HTMLInput(
@@ -4701,6 +4731,7 @@ class StarUIWorkbench:
                 Button("Verify order status", type="submit", cls="mt-3"),
                 action=f"/{self.session_token}/action",
                 method="post",
+                cls="col-start-2 min-w-0 w-full",
             ),
             data_contract_lockdown=True,
             cls="mb-4 shrink-0 border-amber-500/50 bg-amber-500/10 text-amber-100",
@@ -6275,6 +6306,27 @@ class StarUIWorkbench:
                 working_count += 1
         for entry in self._trailing_entries():
             if entry.state in {"SUBMITTED", "CANCELLED_CONFIRMED"} and entry.perm_ids:
+                snapshot = self._view_model.latest_snapshot()
+                if (
+                    entry.hidden_from_workspace
+                    and entry.state == "CANCELLED_CONFIRMED"
+                    and snapshot is not None
+                    and snapshot.fresh
+                    and snapshot.complete
+                    and snapshot.connected
+                    and not snapshot.errors
+                    and snapshot.selected.account == entry.account
+                    and snapshot.selected.con_id == entry.con_id
+                    and not any(
+                        order.key == snapshot.selected
+                        and (
+                            order.perm_id in entry.perm_ids
+                            or order.order_id in entry.order_ids
+                        )
+                        for order in snapshot.working_orders
+                    )
+                ):
+                    continue
                 rows.append(self._trailing_layer_row(len(rows) + 1, entry))
 
         return Form(
@@ -6357,10 +6409,10 @@ class StarUIWorkbench:
             else "",
         )
         offset_unit = form.get(f"trailing_offset_unit_{entry.perm_ids[0]}", "dollars")
-        cancelled = entry.state == "CANCELLED_CONFIRMED"
-        working = order is not None and not cancelled
+        cancelled = entry.state == "CANCELLED_CONFIRMED" and order is None
+        working = order is not None and entry.state == "SUBMITTED"
         modifiable = bool(
-            not cancelled
+            working
             and order is not None
             and order.stop_price is not None
             and order.stop_price > 0
@@ -6473,6 +6525,23 @@ class StarUIWorkbench:
                 Button(
                     Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
                     name="action",
+                    value=(
+                        f"dismiss-cancelled-trail:{entry.fingerprint}:"
+                        f"{entry.snapshot_captured_at}"
+                    ),
+                    type="submit",
+                    variant="outline",
+                    size="icon",
+                    aria_label=f"Remove cancelled trail {index} from view",
+                    cls="relative z-[3] mt-5",
+                ),
+                "Remove this cancelled layer from view",
+            )
+            if cancelled
+            else _button_tooltip(
+                Button(
+                    Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
+                    name="action",
                     value=f"trailing-delete-arm:{entry.perm_ids[0]}",
                     type="submit",
                     variant="outline",
@@ -6500,7 +6569,11 @@ class StarUIWorkbench:
             else "sold-trailing"
             if sold
             else "trailing",
-            data_result_tone=result_tone if sold else "verify",
+            data_result_tone="cancelled"
+            if cancelled
+            else result_tone
+            if sold
+            else "verify",
             data_trailing_perm_id=entry.perm_ids[0],
             cls=(
                 "layer-row-grid items-start gap-3 border-t border-border py-4 "

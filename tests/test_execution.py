@@ -525,6 +525,7 @@ def test_paper_trailing_writer_sends_one_exact_order(
 
 @pytest.mark.parametrize("trail_unit", [None, "dollars", "percent", "wrong-ack"])
 @pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("cancel_event", ["status", "202", "both"])
 @pytest.mark.parametrize("reject", [False, True])
 @pytest.mark.parametrize("manual_gap_change", [False, True])
 @pytest.mark.parametrize(
@@ -539,6 +540,7 @@ def test_paper_trailing_writer_sends_one_exact_order(
 def test_trailing_change_writer_verifies_exact_order_before_write(
     monkeypatch,
     trail_unit: str | None,
+    cancel_event: str,
     cancel: bool,
     reject: bool,
     manual_gap_change: bool,
@@ -624,6 +626,8 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
             self.connected = False
 
         def reqOpenOrders(self) -> None:
+            if cancel_event == "early-202":
+                self.wrapper.error(500, 202, "Order Canceled")
             self.wrapper.openOrder(
                 500,
                 SimpleNamespace(conId=snapshot.selected.con_id),
@@ -635,6 +639,9 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
 
         def placeOrder(self, order_id, _contract, amended) -> None:
             writes.append("amend")
+            if cancel_event == "amend-202":
+                self.wrapper.error(order_id, 202, "Order Canceled")
+                return
             if reject:
                 self.wrapper.error(order_id, 201, "simulated rejection")
                 return
@@ -654,16 +661,26 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
             FakeClient, FakeWrapper, SimpleNamespace, SimpleNamespace
         ),
     )
-    monkeypatch.setattr(
-        broker_execution,
-        "_cancel_order",
-        lambda app, order_id: (
-            writes.append("cancel"),
+
+    def cancel_order(app, order_id):
+        writes.append("cancel")
+        if reject:
             app.error(order_id, 201, "simulated rejection")
-            if reject
-            else app.orderStatus(order_id, "Cancelled", 0, 0),
-        ),
-    )
+            return
+        if cancel_event == "reject-then-202":
+            app.error(order_id, 201, "simulated rejection")
+        if cancel_event == "status-then-202":
+            app.orderStatus(order_id, "Cancelled", 0, 0)
+        if cancel_event != "status":
+            app.error(
+                order_id + int(cancel_event == "wrong-202"), 202, "Order Canceled"
+            )
+        if cancel_event == "202-then-reject":
+            app.error(order_id, 201, "simulated rejection")
+        if cancel_event in {"status", "both"}:
+            app.orderStatus(order_id, "Cancelled", 0, 0)
+
+    monkeypatch.setattr(broker_execution, "_cancel_order", cancel_order)
     if manual_gap_change:
         with pytest.raises(ExecutionBlocked, match="changed in TWS before write"):
             IbkrPaperExecutionBroker().change_trailing(
@@ -714,6 +731,45 @@ def test_trailing_change_writer_verifies_exact_order_before_write(
         assert broker_execution._observed_trailing_offset(order.trailingPercent) == (
             Decimal("5") if trail_unit == "percent" else None
         )
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        "early-202",
+        "amend-202",
+        "wrong-202",
+        "reject-then-202",
+        "202-then-reject",
+        "status-then-202",
+    ],
+)
+def test_trailing_cancel_confirmation_is_scoped_and_never_hides_rejection(
+    monkeypatch, event
+):
+    def run():
+        test_trailing_change_writer_verifies_exact_order_before_write(
+            monkeypatch,
+            trail_unit=None,
+            cancel_event=event,
+            cancel=event != "amend-202",
+            reject=False,
+            manual_gap_change=False,
+            prior_gap=None,
+            next_gap=None,
+        )
+
+    if event == "status-then-202":
+        run()
+    elif event == "early-202":
+        with pytest.raises(ExecutionBlocked, match="not available"):
+            run()
+    else:
+        with pytest.raises(
+            ExecutionOutcomeUnknown,
+            match="simulated rejection" if "reject" in event else "202",
+        ):
+            run()
 
 
 def test_cancel_order_supplies_the_required_empty_order_cancel_options() -> None:

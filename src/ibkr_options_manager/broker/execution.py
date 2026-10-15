@@ -165,6 +165,14 @@ class IbkrPaperExecutionBroker:
 
             def error(self, req_id: int, *args: Any) -> None:
                 code, message = _parse_error_arguments(args)
+                if (
+                    self.sent
+                    and candidate.cancel
+                    and req_id == prior.order_id
+                    and code == 202
+                ):
+                    self.acknowledged.set()
+                    return
                 if code not in _INFORMATIONAL_ERROR_CODES:
                     self.errors.append(
                         f"IBKR error reqId={req_id} code={code}: {message}"
@@ -625,8 +633,7 @@ class IbkrPaperExecutionBroker:
                     if differences:
                         self.errors.append(
                             "The acknowledged bracket does not match "
-                            "the submitted order: "
-                            + "; ".join(differences)
+                            "the submitted order: " + "; ".join(differences)
                         )
                 perm_id = int(getattr(order, "permId", 0) or 0)
                 if (

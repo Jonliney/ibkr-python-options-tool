@@ -9029,8 +9029,9 @@ def test_mstr_four_brackets_convert_five_contracts_beside_external_exit(tmp_path
 
 
 @pytest.mark.parametrize("terminal", [False, True])
+@pytest.mark.parametrize("pending_cancel", [False, True])
 def test_order_hint_reconciles_manual_trail_cancellation_without_position_change(
-    tmp_path, terminal
+    tmp_path, terminal, pending_cancel
 ):
     from ibkr_options_manager.broker.read_only import CapturedCompletedOrder
 
@@ -9076,6 +9077,27 @@ def test_order_hint_reconciles_manual_trail_cancellation_without_position_change
         },
     )
     assert workbench._armed_trailing_change is not None
+    if pending_cancel:
+        before = workbench._view_model.latest_snapshot()
+        before = replace(before, captured_at=before.captured_at - 1)
+        candidate = service.prepare_trailing_change(
+            before, perm_id=entry.perm_ids[0], expected_client_id=17, cancel=True
+        )
+
+        class LostCancellationAck:
+            def change_trailing(self, *_args, **_kwargs):
+                raise ExecutionOutcomeUnknown("lost cancellation acknowledgement")
+
+        service._transport = LostCancellationAck()
+        with pytest.raises(ExecutionOutcomeUnknown):
+            service.submit_trailing_change(
+                before,
+                candidate,
+                host="127.0.0.1",
+                port=7497,
+                client_id=17,
+                timeout_seconds=1,
+            )
     broker.capture = cancelled_capture
     # Queue the event after review, without changing the held quantity.
     workbench._pending_order_observation = True
@@ -9104,6 +9126,31 @@ def test_order_hint_reconciles_manual_trail_cancellation_without_position_change
         assert workbench._trailing_entries()[0].state == (
             "CANCELLED_CONFIRMED" if terminal else "SUBMITTED"
         )
+        assert ("data-contract-lockdown" in page) is (pending_cancel and not terminal)
+        if terminal:
+            assert 'data-result-tone="cancelled"' in page
+            assert "Remove this cancelled layer from view" in page
+            hidden = client.post(
+                workbench.path + "action",
+                data={
+                    "action": (
+                        f"dismiss-cancelled-trail:{entry.fingerprint}:"
+                        f"{entry.snapshot_captured_at}"
+                    )
+                },
+            )
+            assert 'data-layer-state="cancelled-trailing"' not in hidden.text
+            assert workbench._trailing_entries()[0].hidden_from_workspace
+            assert workbench._trailing_entries()[0].perm_ids == entry.perm_ids
+            refreshed = client.post(
+                workbench.path + "action", data={"action": "refresh"}
+            )
+            assert 'data-layer-state="cancelled-trailing"' not in refreshed.text
+            assert (
+                ExecutionJournal(service._journal._path)
+                .find(entry.fingerprint)
+                .hidden_from_workspace
+            )
     finally:
         workbench.close()
         worker.join(timeout=2)
