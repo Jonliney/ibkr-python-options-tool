@@ -105,6 +105,8 @@ class JournalEntry:
     cancellation_order_id: int = 0
     cancellation_perm_id: int = 0
     hidden_from_workspace: bool = False
+    market_quantity: int = 0
+    market_reference_bid: str = ""
 
 
 def _entry_oca_prefix(entry: JournalEntry) -> str:
@@ -343,6 +345,26 @@ class TrailingChangeCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class MarketCancellationCandidate:
+    entry_fingerprint: str
+    order: WorkingOrder
+
+
+@runtime_checkable
+class PaperMarketCancellationTransport(Protocol):
+    def cancel_market(
+        self,
+        snapshot: BrokerSnapshot,
+        candidate: MarketCancellationCandidate,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmissionResult: ...
+
+
+@dataclass(frozen=True, slots=True)
 class PositionMarketExitPlan:
     selected: ContractKey
     contract: VerifiedOptionContract
@@ -525,6 +547,7 @@ class ExecutionJournal:
                         "trailing-conversion:",
                         "amend-trailing:",
                         "cancel-trailing:",
+                        "cancel-market:",
                     )
                 )
             ):
@@ -1267,6 +1290,7 @@ class ExecutionJournal:
                 candidate.quantity,
             ),
             expected_order_count=1,
+            market_quantity=int(candidate.quantity),
         )
 
     def begin_management(
@@ -1278,6 +1302,8 @@ class ExecutionJournal:
         expected_order_count: int,
         allow_unknown_price_retry: bool = False,
         trailing_cancellation: TrailingChangeCandidate | None = None,
+        market_cancellation: MarketCancellationCandidate | None = None,
+        market_quantity: int = 0,
     ) -> JournalEntry:
         """Reserve a management attempt, retaining any indeterminate predecessor."""
         if not operation or expected_order_count <= 0:
@@ -1290,6 +1316,15 @@ class ExecutionJournal:
             or trailing_cancellation.order.perm_id <= 0
         ):
             raise ExecutionBlocked("the trailing cancellation identity is invalid")
+        if market_cancellation is not None and (
+            trailing_cancellation is not None
+            or operation != "cancel-market"
+            or market_cancellation.order.key != snapshot.selected
+            or market_cancellation.order.order_id <= 0
+            or market_cancellation.order.perm_id <= 0
+        ):
+            raise ExecutionBlocked("the market cancellation identity is invalid")
+        cancellation = trailing_cancellation or market_cancellation
         if self.unresolved_management_entries(
             account=snapshot.selected.account, con_id=snapshot.selected.con_id
         ):
@@ -1335,14 +1370,18 @@ class ExecutionJournal:
             state="PREPARED",
             expected_order_count=expected_order_count,
             snapshot_captured_at=str(snapshot.captured_at),
-            cancellation_source=trailing_cancellation.entry_fingerprint
-            if trailing_cancellation is not None
+            market_quantity=market_quantity,
+            market_reference_bid=str(snapshot.quote.bid)
+            if market_quantity and snapshot.quote.bid is not None
             else "",
-            cancellation_order_id=trailing_cancellation.order.order_id
-            if trailing_cancellation is not None
+            cancellation_source=cancellation.entry_fingerprint
+            if cancellation is not None
+            else "",
+            cancellation_order_id=cancellation.order.order_id
+            if cancellation is not None
             else 0,
-            cancellation_perm_id=trailing_cancellation.order.perm_id
-            if trailing_cancellation is not None
+            cancellation_perm_id=cancellation.order.perm_id
+            if cancellation is not None
             else 0,
         )
         self._write((*self._entries(), entry))
@@ -1380,6 +1419,8 @@ class ExecutionJournal:
                     cancellation_order_id=entry.cancellation_order_id,
                     cancellation_perm_id=entry.cancellation_perm_id,
                     hidden_from_workspace=entry.hidden_from_workspace,
+                    market_quantity=entry.market_quantity,
+                    market_reference_bid=entry.market_reference_bid,
                     layers=layers,
                     fills=entry.fills,
                     trailing_quantity=entry.trailing_quantity,
@@ -1424,6 +1465,121 @@ class ExecutionJournal:
             trailing_tif=tif,
         )
         self._write(tuple(entries))
+
+    def record_market_outcomes(self, snapshot: BrokerSnapshot) -> None:
+        """Retain terminal evidence for market rows, including legacy quantities."""
+        from .market_outcome import classify_market
+
+        self.record_executions(snapshot)
+        entries = list(self._entries())
+        changed = False
+        for index, entry in enumerate(entries):
+            if (
+                entry.account != snapshot.selected.account
+                or entry.con_id != snapshot.selected.con_id
+                or not entry.fingerprint.startswith(
+                    ("market-exit:", "market-exit-many:", "market-exit-position:")
+                )
+            ):
+                continue
+            outcome = classify_market(entry, snapshot)
+            updated = entry
+            if outcome.status == "FILLED" and not entry.market_quantity:
+                updated = replace(entry, market_quantity=int(outcome.filled_quantity))
+            elif outcome.status == "CANCELLED" and entry.state == "SUBMITTED":
+                updated = replace(entry, state="CANCELLED_CONFIRMED")
+            if updated != entry:
+                entries[index] = updated
+                changed = True
+        if (
+            snapshot.connected
+            and snapshot.complete
+            and snapshot.fresh
+            and not snapshot.errors
+            and snapshot.executions_complete
+            and snapshot.completed_orders_complete
+            and snapshot.paper_account_verified
+        ):
+            for index, attempt in enumerate(entries):
+                if (
+                    not attempt.fingerprint.startswith("cancel-market:")
+                    or attempt.state not in {"PREPARED", "SUBMISSION_UNKNOWN"}
+                    or not attempt.cancellation_source
+                    or attempt.cancellation_order_id <= 0
+                    or attempt.cancellation_perm_id <= 0
+                    or attempt.account != snapshot.selected.account
+                    or attempt.con_id != snapshot.selected.con_id
+                ):
+                    continue
+                try:
+                    captured = Decimal(attempt.snapshot_captured_at)
+                    later = captured.is_finite() and snapshot.captured_at > captured
+                except (InvalidOperation, ValueError):
+                    later = False
+                sources = [
+                    source
+                    for source in entries
+                    if source.fingerprint == attempt.cancellation_source
+                    and source.account == attempt.account
+                    and source.con_id == attempt.con_id
+                    and source.order_ids == (attempt.cancellation_order_id,)
+                    and source.perm_ids == (attempt.cancellation_perm_id,)
+                ]
+                terminal = [
+                    item
+                    for item in snapshot.completed_orders
+                    if item.account == attempt.account
+                    and item.con_id == attempt.con_id
+                    and item.perm_id == attempt.cancellation_perm_id
+                    and item.order_id == attempt.cancellation_order_id
+                ]
+                if (
+                    later
+                    and len(sources) == len(terminal) == 1
+                    and (terminal[0].status or terminal[0].completed_status)
+                    in {"Cancelled", "ApiCancelled"}
+                    and classify_market(sources[0], snapshot).status == "CANCELLED"
+                ):
+                    entries[index] = replace(
+                        attempt,
+                        state="COMPLETED",
+                        order_ids=(attempt.cancellation_order_id,),
+                        resolution_captured_at=str(snapshot.captured_at),
+                    )
+                    changed = True
+        if changed:
+            self._write(tuple(entries))
+
+    def record_market_cancellation(
+        self, candidate: MarketCancellationCandidate
+    ) -> None:
+        entries = list(self._entries())
+        matches = [
+            i
+            for i, entry in enumerate(entries)
+            if entry.fingerprint == candidate.entry_fingerprint
+            and entry.account == candidate.order.key.account
+            and entry.con_id == candidate.order.key.con_id
+            and entry.state == "SUBMITTED"
+            and entry.order_ids == (candidate.order.order_id,)
+            and entry.perm_ids == (candidate.order.perm_id,)
+        ]
+        if len(matches) != 1:
+            raise ExecutionBlocked("the app-owned market journal record changed")
+        index = matches[0]
+        entries[index] = replace(entries[index], state="CANCELLED_CONFIRMED")
+        self._write(tuple(entries))
+
+    def market_entries(self, *, account: str, con_id: int) -> tuple[JournalEntry, ...]:
+        return tuple(
+            entry
+            for entry in self._entries()
+            if entry.account == account
+            and entry.con_id == con_id
+            and entry.fingerprint.startswith(
+                ("market-exit:", "market-exit-many:", "market-exit-position:")
+            )
+        )
 
     def trailing_entries(
         self, *, account: str, con_id: int
@@ -1755,6 +1911,9 @@ class ExecutionJournal:
         ambiguous = ambiguous_oca_prefixes(entries)
         changed = False
         for index, entry in enumerate(entries):
+            market_entry = entry.fingerprint.startswith(
+                ("market-exit:", "market-exit-many:", "market-exit-position:")
+            )
             bracket_entry = len(entry.fingerprint) == 64
             trailing_entry = (
                 entry.fingerprint.startswith("trailing-conversion:")
@@ -1767,7 +1926,7 @@ class ExecutionJournal:
             if (
                 entry.account != snapshot.selected.account
                 or entry.con_id != snapshot.selected.con_id
-                or not (bracket_entry or trailing_entry)
+                or not (bracket_entry or trailing_entry or market_entry)
                 or (
                     bracket_entry
                     and (entry.account, entry.con_id, _entry_oca_prefix(entry))
@@ -2024,6 +2183,8 @@ class ExecutionJournal:
                     resolution_captured_at=str(item.get("resolution_captured_at", "")),
                     oca_prefix=str(item.get("oca_prefix", "")),
                     submission_error=str(item.get("submission_error", "")),
+                    market_quantity=int(item.get("market_quantity", 0)),
+                    market_reference_bid=str(item.get("market_reference_bid", "")),
                     cancellation_source=str(item.get("cancellation_source", "")),
                     cancellation_order_id=int(item.get("cancellation_order_id", 0)),
                     cancellation_perm_id=int(item.get("cancellation_perm_id", 0)),
@@ -2359,6 +2520,128 @@ class PaperExecutionService:
         self, *, account: str, con_id: int
     ) -> tuple[JournalEntry, ...]:
         return self._journal.trailing_entries(account=account, con_id=con_id)
+
+    def record_market_outcomes(self, snapshot: BrokerSnapshot) -> None:
+        self._journal.record_market_outcomes(snapshot)
+
+    def market_entries(self, *, account: str, con_id: int) -> tuple[JournalEntry, ...]:
+        return self._journal.market_entries(account=account, con_id=con_id)
+
+    def prepare_market_cancellation(
+        self, snapshot: BrokerSnapshot, *, perm_id: int, expected_client_id: int
+    ) -> MarketCancellationCandidate:
+        require_paper_management_snapshot(snapshot)
+        if (
+            snapshot.errors
+            or not snapshot.executions_complete
+            or not snapshot.completed_orders_complete
+        ):
+            raise ExecutionBlocked("fresh complete order and fill history is required")
+        contract = snapshot.contract
+        if (
+            snapshot.position.key != snapshot.selected
+            or contract.con_id != snapshot.selected.con_id
+            or contract.sec_type != "OPT"
+            or contract.currency != "USD"
+            or not contract.expiry
+            or contract.right not in {"C", "P"}
+            or not contract.trading_class
+            or not contract.multiplier.is_finite()
+            or contract.multiplier <= 0
+            or not contract.strike.is_finite()
+            or contract.strike <= 0
+        ):
+            raise ExecutionBlocked(
+                "the selected option contract is incomplete or changed"
+            )
+        entries = [
+            entry
+            for entry in self.market_entries(
+                account=snapshot.selected.account, con_id=snapshot.selected.con_id
+            )
+            if entry.state == "SUBMITTED"
+            and entry.perm_ids == (perm_id,)
+            and len(entry.order_ids) == 1
+        ]
+        orders = [
+            order
+            for order in snapshot.working_orders
+            if order.key == snapshot.selected and order.perm_id == perm_id
+        ]
+        if len(entries) != 1 or len(orders) != 1:
+            raise ExecutionBlocked(
+                "the app-owned market order is missing or ambiguous; it may have filled"
+            )
+        entry, order = entries[0], orders[0]
+        if (
+            order.order_id != entry.order_ids[0]
+            or order.client_id != expected_client_id
+            or order.action != "SELL"
+            or order.order_type != "MKT"
+            or order.tif != "GTC"
+            or order.oca_group
+            or order.parent_id
+            or order.remaining <= 0
+            or order.status not in {"Submitted", "PreSubmitted"}
+        ):
+            raise ExecutionBlocked("the market order is no longer safely cancellable")
+        return MarketCancellationCandidate(
+            entry.fingerprint, replace(order, observed_at=Decimal("0"))
+        )
+
+    def cancel_market(
+        self,
+        snapshot: BrokerSnapshot,
+        candidate: MarketCancellationCandidate,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> SubmissionReceipt:
+        fresh = self.prepare_market_cancellation(
+            snapshot, perm_id=candidate.order.perm_id, expected_client_id=client_id
+        )
+        if fresh != candidate:
+            raise ExecutionBlocked(
+                "the market order changed after review; check fills and review again"
+            )
+        transport = self._transport
+        if not isinstance(transport, PaperMarketCancellationTransport):
+            raise ExecutionBlocked("the paper transport cannot cancel market orders")
+        entry = self._journal.begin_management(
+            snapshot,
+            operation="cancel-market",
+            market_cancellation=candidate,
+            material=(
+                candidate.entry_fingerprint,
+                candidate.order.order_id,
+                candidate.order.perm_id,
+                candidate.order.remaining,
+            ),
+            expected_order_count=1,
+        )
+        try:
+            result = transport.cancel_market(
+                snapshot,
+                candidate,
+                host=host,
+                port=port,
+                client_id=client_id,
+                timeout_seconds=timeout_seconds,
+            )
+            if tuple(result.order_ids) != (candidate.order.order_id,):
+                raise ExecutionOutcomeUnknown(
+                    "TWS did not acknowledge the exact market cancellation"
+                )
+        except Exception as error:
+            self._journal.mark_unknown(entry.fingerprint, reason=str(error))
+            raise
+        completed = self._journal.record_management_completion(
+            entry.fingerprint, order_ids=(candidate.order.order_id,)
+        )
+        self._journal.record_market_cancellation(candidate)
+        return SubmissionReceipt(completed)
 
     def prepare_trailing_change(
         self,
@@ -2739,6 +3022,7 @@ class PaperExecutionService:
         entry = self._journal.begin_management(
             snapshot,
             operation="market-exit-position",
+            market_quantity=int(plan.quantity),
             material=(
                 plan.selected,
                 plan.contract,
@@ -3412,6 +3696,7 @@ class PaperExecutionService:
         entry = self._journal.begin_management(
             snapshot,
             operation="market-exit-many",
+            market_quantity=int(sum(item.quantity for item in candidates)),
             material=tuple(
                 value
                 for candidate in candidates

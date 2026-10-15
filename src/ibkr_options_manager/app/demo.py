@@ -32,6 +32,7 @@ from ..execution import (
     JournalEntry,
     JournalFill,
     JournalLayer,
+    MarketCancellationCandidate,
     MarketExitCandidate,
     PositionMarketExitPlan,
     PriceUpdateCandidate,
@@ -409,6 +410,30 @@ class DemoReadOnlyBroker:
                         else None,
                     )
                 )
+            for entry in self._journal.market_entries(
+                account=account, con_id=position.contract.con_id
+            ):
+                if (
+                    entry.state == "SUBMITTED"
+                    and len(entry.order_ids) == len(entry.perm_ids) == 1
+                    and entry.market_quantity > 0
+                ):
+                    orders.append(
+                        CapturedOrder(
+                            perm_id=entry.perm_ids[0],
+                            client_id=17,
+                            order_id=entry.order_ids[0],
+                            account=account,
+                            con_id=entry.con_id,
+                            action="SELL",
+                            order_type="MKT",
+                            remaining=Decimal(entry.market_quantity),
+                            status="Submitted",
+                            oca_group=None,
+                            parent_id=0,
+                            tif="GTC",
+                        )
+                    )
         return tuple(orders)
 
     def capture(
@@ -704,6 +729,24 @@ class DemoPaperExecutionTransport:
             + 1
         )
         return PaperSubmission((order_id,), (perm_id,))
+
+    def cancel_market(
+        self,
+        snapshot: BrokerSnapshot,
+        candidate: MarketCancellationCandidate,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmission:
+        del host, port, client_id, timeout_seconds
+        if candidate.order not in tuple(
+            replace(order, observed_at=Decimal("0"))
+            for order in snapshot.working_orders
+        ):
+            raise ValueError("the simulated market order changed")
+        return PaperSubmission((candidate.order.order_id,), ())
 
     def change_trailing(
         self,

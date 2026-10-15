@@ -48,6 +48,7 @@ class ProductionSourceSafetyTests(unittest.TestCase):
                 "submit_trailing",
                 "change_trailing",
                 "cancel_pair",
+                "cancel_market",
                 "cancel_pair_then_submit_market",
                 "cancel_pairs_then_submit_market",
                 "modify_prices",

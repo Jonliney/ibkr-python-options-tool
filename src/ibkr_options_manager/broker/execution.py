@@ -18,6 +18,7 @@ from ..domain import BrokerSnapshot, PlanResult, supports_outside_rth
 from ..execution import (
     ExecutionBlocked,
     ExecutionOutcomeUnknown,
+    MarketCancellationCandidate,
     MarketExitCandidate,
     PositionMarketExitPlan,
     PriceUpdateCandidate,
@@ -62,6 +63,138 @@ def _observed_trailing_offset(value: Any) -> Decimal | None:
 
 class IbkrPaperExecutionBroker:
     """Bounded paper writer for creation and exact app-owned order changes."""
+
+    @leased_client
+    def cancel_market(
+        self,
+        snapshot: BrokerSnapshot,
+        candidate: MarketCancellationCandidate,
+        *,
+        host: str,
+        port: int,
+        client_id: int,
+        timeout_seconds: float,
+    ) -> PaperSubmission:
+        """Cancel one exact same-client app-owned MKT; never submit a replacement."""
+        require_paper_management_snapshot(snapshot)
+        prior = candidate.order
+        if (
+            prior.key != snapshot.selected
+            or prior.client_id != client_id
+            or prior.order_type != "MKT"
+            or prior.action != "SELL"
+            or prior.order_id <= 0
+            or prior.perm_id <= 0
+            or prior.remaining <= 0
+        ):
+            raise ExecutionBlocked("the selected market order does not match TWS")
+        imports = _load_ibapi()
+
+        class App(imports.EWrapper, imports.EClient):  # type: ignore[name-defined, misc]
+            def __init__(self) -> None:
+                imports.EWrapper.__init__(self)
+                imports.EClient.__init__(self, self)
+                self.ready = Event()
+                self.orders_done = Event()
+                self.acknowledged = Event()
+                self.observed: list[tuple[Any, Any, Any]] = []
+                self.remaining: Decimal | None = None
+                self.status = ""
+                self.errors: list[str] = []
+                self.sent = False
+
+            def nextValidId(self, order_id: int) -> None:
+                self.ready.set()
+
+            def openOrder(
+                self, order_id: int, contract: Any, order: Any, state: Any
+            ) -> None:
+                if int(order_id) == prior.order_id and not self.sent:
+                    self.observed.append((contract, order, state))
+
+            def openOrderEnd(self) -> None:
+                self.orders_done.set()
+
+            def orderStatus(self, order_id: int, status: str, *args: Any) -> None:
+                if int(order_id) != prior.order_id:
+                    return
+                if not self.sent:
+                    self.status = status
+                    try:
+                        self.remaining = Decimal(str(args[1]))
+                    except (IndexError, InvalidOperation, ValueError):
+                        self.errors.append("TWS returned an invalid market quantity")
+                elif status in {"Cancelled", "ApiCancelled"}:
+                    self.acknowledged.set()
+                elif status in {"Filled", "Inactive"}:
+                    self.errors.append(
+                        f"market order changed to {status} while cancelling"
+                    )
+
+            def error(self, req_id: int, *args: Any) -> None:
+                code, message = _parse_error_arguments(args)
+                if self.sent and req_id == prior.order_id and code == 202:
+                    self.acknowledged.set()
+                elif code not in _INFORMATIONAL_ERROR_CODES:
+                    self.errors.append(
+                        f"IBKR error reqId={req_id} code={code}: {message}"
+                    )
+
+        app = App()
+        reader: Thread | None = None
+        deadline = monotonic() + timeout_seconds
+        try:
+            app.connect(host, port, client_id)
+            reader = Thread(
+                target=app.run, name="ibkr-market-cancel-reader", daemon=True
+            )
+            reader.start()
+            if not app.ready.wait(max(0, deadline - monotonic())):
+                raise ExecutionBlocked("TWS did not issue a next valid order ID")
+            app.reqOpenOrders()
+            if (
+                not app.orders_done.wait(max(0, deadline - monotonic()))
+                or app.errors
+                or len(app.observed) != 1
+            ):
+                raise ExecutionBlocked("the same-client market order was not verified")
+            contract, order, state = app.observed[0]
+            if (
+                int(contract.conId) != snapshot.selected.con_id
+                or str(order.account) != snapshot.selected.account
+                or int(order.permId) != prior.perm_id
+                or int(order.clientId) != client_id
+                or str(order.action) != "SELL"
+                or str(order.orderType) != "MKT"
+                or str(order.tif) != prior.tif
+                or str(getattr(order, "ocaGroup", ""))
+                or int(getattr(order, "parentId", 0)) != 0
+                or app.status not in {"Submitted", "PreSubmitted"}
+                or str(state.status) not in {"Submitted", "PreSubmitted"}
+                or app.remaining != prior.remaining
+            ):
+                raise ExecutionBlocked(
+                    "the market order changed in TWS before cancellation"
+                )
+            app.sent = True
+            _cancel_order(app, prior.order_id)
+            while (
+                not app.acknowledged.is_set()
+                and not app.errors
+                and monotonic() < deadline
+            ):
+                sleep(0.02)
+            if app.errors or not app.acknowledged.is_set():
+                raise ExecutionOutcomeUnknown(
+                    "; ".join(app.errors)
+                    or "TWS did not acknowledge market cancellation"
+                )
+            return PaperSubmission((prior.order_id,), ())
+        finally:
+            if app.isConnected():
+                app.disconnect()
+            if reader is not None:
+                reader.join(timeout=2)
 
     @leased_client
     def change_trailing(

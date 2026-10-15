@@ -61,6 +61,7 @@ from ...execution import (
     ExecutionOutcomeUnknown,
     JournalEntry,
     LayerOutcome,
+    MarketCancellationCandidate,
     MarketExitCandidate,
     PaperExecutionService,
     PositionMarketExitPlan,
@@ -70,6 +71,7 @@ from ...execution import (
     classify_journal_layer,
     submission_pair_matches_plan,
 )
+from ...market_outcome import classify_market
 from ...observation import ObservationSettings, PositionObserver
 from ...order_observation import OrderObserver, borrow_client
 from ...price_update_trace import record_price_update_event
@@ -207,6 +209,7 @@ class StarUIWorkbench:
         self._armed_market_exit: MarketExitCandidate | None = None
         self._armed_position_exit: PositionMarketExitPlan | None = None
         self._armed_market_exits: tuple[MarketExitCandidate, ...] = ()
+        self._armed_market_cancellation: MarketCancellationCandidate | None = None
         self._armed_cancellation: MarketExitCandidate | None = None
         self._armed_cancellations: tuple[MarketExitCandidate, ...] = ()
         self._armed_trailing: TrailingPlan | None = None
@@ -736,6 +739,7 @@ class StarUIWorkbench:
                 "active-action-execute",
                 "market-exit-confirm",
                 "cancel-pair-confirm",
+                "market-cancel-confirm",
                 "active-update-arm",
                 "price-update-confirm",
                 "execute-arm",
@@ -748,6 +752,7 @@ class StarUIWorkbench:
                     action in trading_actions
                     or action.startswith("market-exit-arm:")
                     or action.startswith("cancel-pair-arm:")
+                    or action.startswith("market-cancel-arm:")
                     or action.startswith("trailing-change-arm:")
                     or action.startswith("trailing-delete-arm:")
                 )
@@ -890,6 +895,10 @@ class StarUIWorkbench:
                     )
             elif action == "verify-bracket-exists":
                 self._verify_bracket_exists_locked(values)
+            elif action.startswith("market-cancel-arm:"):
+                self._arm_market_cancellation_locked(action)
+            elif action == "market-cancel-confirm":
+                self._cancel_market_locked()
             elif action == "verify-management":
                 self._verify_management_locked(values)
             elif action.startswith("dismiss-cancelled:"):
@@ -996,6 +1005,7 @@ class StarUIWorkbench:
                     continue
                 self._paper_execution.record_completed_orders(snapshot)
                 self._paper_execution.record_executions(snapshot)
+                self._paper_execution.record_market_outcomes(snapshot)
             except ExecutionBlocked as error:
                 self._message = f"Closed history reconciliation blocked: {error}"
             except Exception:
@@ -1183,6 +1193,7 @@ class StarUIWorkbench:
         self._armed_market_exit = None
         self._armed_position_exit = None
         self._armed_market_exits = ()
+        self._armed_market_cancellation = None
         self._armed_cancellation = None
         self._armed_cancellations = ()
         self._armed_trailing = None
@@ -1897,7 +1908,9 @@ class StarUIWorkbench:
         cancellations = self._armed_cancellations
         trailing = self._armed_trailing
         review_kind = (
-            "Market exit review"
+            "Market cancellation"
+            if self._armed_market_cancellation is not None
+            else "Market exit review"
             if self._armed_position_exit is not None or market_exits
             else "Trailing exit"
             if trailing is not None or self._armed_trailing_change is not None
@@ -1909,6 +1922,7 @@ class StarUIWorkbench:
             or (
                 self._armed_position_exit is None
                 and not market_exits
+                and self._armed_market_cancellation is None
                 and cancellation is None
                 and not cancellations
                 and trailing is None
@@ -1935,7 +1949,8 @@ class StarUIWorkbench:
                 self._plan_form(self._drafts.get(self._selected_con_id, ())),
                 **(
                     {"include_quote": False}
-                    if cancellation is not None
+                    if self._armed_market_cancellation is not None
+                    or cancellation is not None
                     or cancellations
                     or (
                         self._armed_trailing_change is not None
@@ -1961,7 +1976,16 @@ class StarUIWorkbench:
             self._message = f"{review_kind} blocked: the fresh snapshot is unavailable."
             return
         try:
-            if self._armed_position_exit is not None:
+            if self._armed_market_cancellation is not None:
+                candidate_market = self._armed_market_cancellation
+                fresh_market = self._paper_execution.prepare_market_cancellation(
+                    snapshot,
+                    perm_id=candidate_market.order.perm_id,
+                    expected_client_id=self._settings.client_id,
+                )
+                if fresh_market != candidate_market:
+                    raise ExecutionBlocked("the market order changed after review")
+            elif self._armed_position_exit is not None:
                 plan = self._armed_position_exit
                 if set(self._active_target_perm_ids()) != {
                     pair.target_perm_id for pair in plan.pairs
@@ -2631,7 +2655,7 @@ class StarUIWorkbench:
                 try:
                     self._refresh_after_acknowledged_write_locked(
                         "TWS acknowledged the position market exit. Check TWS for fills.",
-                        include_quote=False,
+                        include_quote=True,
                     )
                 finally:
                     current_snapshot_context.reset(refresh_token)
@@ -3290,6 +3314,11 @@ class StarUIWorkbench:
             )
             if callable(record_executions):
                 record_executions(snapshot)
+            record_market_outcomes = getattr(
+                self._paper_execution, "record_market_outcomes", None
+            )
+            if callable(record_market_outcomes):
+                record_market_outcomes(snapshot)
             record_trailing_prices = getattr(
                 self._paper_execution, "record_trailing_prices", None
             )
@@ -4284,6 +4313,16 @@ class StarUIWorkbench:
             else:
                 realized += summary.realized_pnl
             has_recorded_fill = has_recorded_fill or bool(entry.fills)
+        for entry in self._market_entries(con_id):
+            rows.append(
+                self._market_layer_row(len(rows) + 1, entry, closed_position=True)
+            )
+            market_outcome = classify_market(entry, None)
+            if market_outcome.status != "FILLED" or market_outcome.realized_pnl is None:
+                pnl_verified = False
+            else:
+                realized += market_outcome.realized_pnl
+            has_recorded_fill = has_recorded_fill or bool(entry.fills)
         symbol, contract_detail = _position_identity(position.local_symbol)
         title = f"{symbol} {contract_detail}".strip()
         result = (
@@ -4822,6 +4861,13 @@ class StarUIWorkbench:
             # Partial trailing fills are not included in the held/total and
             # outcome projection yet; avoid presenting zero as a verified result.
             realized = None
+        for entry in self._market_entries():
+            if entry.fills:
+                market_outcome = classify_market(entry, selected_snapshot)
+                if market_outcome.realized_pnl is None:
+                    realized = None
+                elif realized is not None:
+                    realized += market_outcome.realized_pnl
         working_trails = any(entry.state == "SUBMITTED" for entry in trailing_entries)
         return self._workspace_content(
             self._selected_quantity_notice(),
@@ -5007,12 +5053,18 @@ class StarUIWorkbench:
             Div(
                 ScrollArea(
                     self._existing_layers_panel(active_pairs, outcomes)
-                    if active_pairs or outcomes or trailing_entries
+                    if active_pairs
+                    or outcomes
+                    or trailing_entries
+                    or self._market_entries()
                     else None,
                     Div(
                         self._draft_panel(
                             show_empty_state=not (
-                                active_pairs or outcomes or trailing_entries
+                                active_pairs
+                                or outcomes
+                                or trailing_entries
+                                or self._market_entries()
                             )
                         ),
                         cls=(
@@ -5971,6 +6023,183 @@ class StarUIWorkbench:
             target.perm_id for _group, target, _stop in self._active_oca_pairs()
         )
 
+    def _market_entries(self, con_id: int | None = None) -> tuple[JournalEntry, ...]:
+        selected = con_id if con_id is not None else self._selected_con_id
+        reader = getattr(self._paper_execution, "market_entries", None)
+        if selected is None or not callable(reader):
+            return ()
+        return cast(
+            tuple[JournalEntry, ...],
+            reader(account=self._settings.account, con_id=selected),
+        )
+
+    def _market_layer_row(
+        self, index: int, entry: JournalEntry, *, closed_position: bool = False
+    ) -> Any:
+        snapshot = self._view_model.latest_snapshot()
+        outcome = classify_market(entry, None if closed_position else snapshot)
+        order = outcome.order
+        quantity = outcome.quantity
+        filled = outcome.filled_quantity
+        sold = outcome.status == "FILLED"
+        cancelled = outcome.status == "CANCELLED"
+        working = (
+            outcome.status in {"WORKING", "PARTIAL"}
+            and order is not None
+            and order.client_id == self._settings.client_id
+        )
+        bid = (
+            snapshot.quote.bid
+            if not closed_position
+            and snapshot is not None
+            and snapshot.fresh
+            and snapshot.connected
+            and not snapshot.errors
+            and snapshot.quote.fresh
+            and snapshot.selected.account == entry.account
+            and snapshot.selected.con_id == entry.con_id
+            else None
+        )
+        if bid is None or not bid.is_finite() or bid <= 0:
+            bid = _decimal_value(entry.market_reference_bid)
+        if bid is not None and (not bid.is_finite() or bid <= 0):
+            bid = None
+        price = outcome.average_price if sold else bid
+        text = _price_text(price) if price is not None else "—"
+        if not sold and price is not None:
+            text = f"≈ {text}"
+        status = (
+            "Filled"
+            if sold
+            else "Cancelled"
+            if cancelled
+            else "Partially filled"
+            if working and filled
+            else "Working"
+            if working
+            else "CHECK TWS"
+        )
+        cancel_control = (
+            _button_tooltip(
+                Button(
+                    Icon("lucide:trash-2", cls="size-4", aria_hidden="true"),
+                    variant="outline",
+                    size="icon",
+                    type="submit",
+                    name="action",
+                    value=f"market-cancel-arm:{order.perm_id}" if order else "",
+                    aria_label=f"Cancel market order {index}",
+                    disabled=not working,
+                    cls="mt-5",
+                ),
+                "Cancel this active market order",
+            )
+            if not closed_position and not sold and not cancelled
+            else Div(cls="min-w-0")
+        )
+        return Div(
+            Div(
+                Span(f"MKT {index}", cls="text-xs font-semibold"),
+                P(status, cls="mt-2 text-xs text-muted-foreground"),
+                P(f"{filled} filled", cls="mt-1 text-xs text-muted-foreground")
+                if working and filled
+                else None,
+                cls="min-w-20",
+            ),
+            Div(
+                _field(
+                    "MKT fill" if sold else "MKT",
+                    Input(
+                        id=f"market-price-{index}",
+                        value=text,
+                        disabled=True,
+                        aria_label="Market fill price"
+                        if sold
+                        else "Estimated market price from bid",
+                    ),
+                    input_id=f"market-price-{index}",
+                ),
+                cls="market-price-field min-w-0",
+            ),
+            _field(
+                "Quantity",
+                Input(
+                    id=f"market-quantity-{index}",
+                    value=str(order.remaining if order else quantity or "—"),
+                    disabled=True,
+                ),
+                input_id=f"market-quantity-{index}",
+            ),
+            cancel_control,
+            data_layer_state="sold-market"
+            if sold
+            else "cancelled-market"
+            if cancelled
+            else "market",
+            data_market_perm_id=entry.perm_ids[0] if entry.perm_ids else "",
+            cls="layer-row-grid items-start gap-3 border-t border-border py-4 first:border-t-0 market-layer-row",
+        )
+
+    def _arm_market_cancellation_locked(self, action: str) -> None:
+        self._disarm_execution_locked()
+        service = self._paper_execution
+        snapshot = self._view_model.latest_snapshot()
+        if service is None or self._selected_con_id is None or snapshot is None:
+            self._message = "Select and refresh the market order's position before reviewing cancellation."
+            return
+        try:
+            self._armed_market_cancellation = service.prepare_market_cancellation(
+                snapshot,
+                perm_id=int(action.removeprefix("market-cancel-arm:")),
+                expected_client_id=self._settings.client_id,
+            )
+        except (ValueError, ExecutionBlocked) as error:
+            self._message = f"Market cancellation blocked: {error}"
+            return
+        self._set_review_status_locked(
+            "Review cancellation of this app-owned market order. No replacement order will be sent."
+        )
+
+    def _cancel_market_locked(self) -> None:
+        if self._expire_confirmation_locked(require_deadline=True):
+            self._message = "Review expired. Review the market cancellation again."
+            return
+        candidate = self._armed_market_cancellation
+        service = self._paper_execution
+        if (
+            service is None
+            or self._selected_con_id is None
+            or candidate is None
+            or not self._active_action_verified
+        ):
+            self._message = "Review the market cancellation before confirming."
+            return
+        try:
+            snapshot = self._position_exit_snapshot_locked()
+            service.cancel_market(
+                snapshot,
+                candidate,
+                host="127.0.0.1",
+                port=self._settings.port,
+                client_id=self._settings.client_id,
+                timeout_seconds=self._settings.timeout_seconds,
+            )
+            self._refresh_after_acknowledged_write_locked(
+                "TWS acknowledged the market cancellation. Check TWS for fills.",
+                include_quote=False,
+            )
+        except (
+            ValueError,
+            InvalidOperation,
+            ExecutionBlocked,
+            ExecutionOutcomeUnknown,
+        ) as error:
+            self._message = f"Market cancellation stopped: {redact_accounts(str(error), (self._settings.account,))}. Check TWS and refresh."
+        except Exception:
+            self._message = "Market cancellation outcome is unknown. Check TWS and refresh before another action."
+        finally:
+            self._disarm_execution_locked()
+
     def _trailing_entries(self, con_id: int | None = None) -> tuple[JournalEntry, ...]:
         selected = con_id if con_id is not None else self._selected_con_id
         if self._paper_execution is None or selected is None:
@@ -6328,6 +6557,9 @@ class StarUIWorkbench:
                 ):
                     continue
                 rows.append(self._trailing_layer_row(len(rows) + 1, entry))
+
+        for entry in self._market_entries():
+            rows.append(self._market_layer_row(len(rows) + 1, entry))
 
         return Form(
             ScrollArea(
@@ -7696,7 +7928,8 @@ class StarUIWorkbench:
         if self._armed_position_exit is not None:
             return self._position_exit_projection()
         if (
-            self._armed_cancellation is not None
+            self._armed_market_cancellation is not None
+            or self._armed_cancellation is not None
             or self._armed_cancellations
             or (
                 self._armed_trailing_change is not None
@@ -7924,7 +8157,29 @@ class StarUIWorkbench:
         price_updates = self._armed_price_updates
         armed_execution = self._armed_execution
         action_rows: list[Any] = []
-        if self._armed_position_exit is not None:
+        if self._armed_market_cancellation is not None:
+            candidate_market = self._armed_market_cancellation
+            action_rows = [
+                self._review_oca_pair(
+                    index=1,
+                    name="MKT",
+                    quantity=format(candidate_market.order.remaining, "f"),
+                    tif=candidate_market.order.tif,
+                    lines=(
+                        Div(
+                            Span(
+                                "CANCEL MARKET ORDER",
+                                cls="block text-xs font-semibold text-amber-300",
+                            ),
+                            Span(
+                                f"TWS order {candidate_market.order.order_id}",
+                                cls="mt-1 block text-xs font-semibold text-amber-300",
+                            ),
+                        ),
+                    ),
+                )
+            ]
+        elif self._armed_position_exit is not None:
             plan = self._armed_position_exit
             bid = self._position_exit_bid()
             action_rows = [
@@ -8001,7 +8256,9 @@ class StarUIWorkbench:
             else Badge("MKT EXIT", variant="outline", cls="text-[10px]")
             if market_exits or self._armed_position_exit is not None
             else Badge("CANCEL", variant="outline", cls="text-[10px]")
-            if cancellation is not None or cancellations
+            if self._armed_market_cancellation is not None
+            or cancellation is not None
+            or cancellations
             else Badge("PRICE UPDATE", variant="outline", cls="text-[10px]")
             if price_updates
             else Badge("DRAFT", variant="outline", cls="text-[10px]")
@@ -8141,7 +8398,8 @@ class StarUIWorkbench:
             (self._armed_market_exit,) if self._armed_market_exit is not None else ()
         )
         if (
-            self._armed_position_exit is not None
+            self._armed_market_cancellation is not None
+            or self._armed_position_exit is not None
             or self._armed_cancellation is not None
             or self._armed_cancellations
             or market_exits
@@ -8149,6 +8407,17 @@ class StarUIWorkbench:
             or self._armed_trailing_change is not None
         ) and not self._active_action_verified:
             return self._reviewed_active_action_controls()
+        if self._armed_market_cancellation is not None:
+            return self._staged_action_controls(
+                confirm_action="market-cancel-confirm",
+                busy_text="Cancelling…",
+                impact=(
+                    "Cancel market sell",
+                    (
+                        "Confirm requests cancellation of this app-owned market order. It may fill before TWS receives the cancellation; contracts that do not fill remain held.",
+                    ),
+                ),
+            )
         if self._armed_position_exit is not None:
             return self._staged_action_controls(
                 confirm_action="position-exit-confirm",

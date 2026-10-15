@@ -9420,3 +9420,129 @@ def test_bracket_failure_lock_clears_only_after_fresh_healthy_pair_reconciliatio
     assert workbench._unresolved_bracket_submissions() == ()
     workbench._submission_review_required = False
     assert workbench._submission_review_dialog() is None
+
+
+@pytest.mark.parametrize("failure", [None, "fill", "quantity", "expired"])
+def test_market_layer_shows_acknowledged_order_and_cancel_race(
+    tmp_path, monkeypatch, failure
+):
+    workbench = _trailing_scenario_workbench(tmp_path, "convert")
+    client = TestClient(workbench.app)
+    client.post(workbench.path + "action", data={"action": "market-exit-selected"})
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    submitted = client.post(
+        workbench.path + "action", data={"action": "position-exit-confirm"}
+    )
+    assert 'data-layer-state="market"' in submitted.text, workbench._message
+    assert "Working" in submitted.text
+    assert "≈" in submitted.text
+    assert "Confirm cancellation" not in submitted.text
+    assert "Cancel this active market order" in submitted.text
+    entry = workbench._market_entries()[0]
+    assert entry.market_quantity == 3
+    assert entry.state == "SUBMITTED"
+    snapshot = workbench._view_model.latest_snapshot()
+    order = next(o for o in snapshot.working_orders if o.order_type == "MKT")
+    service = workbench._paper_execution
+    calls = []
+    original = service._transport.cancel_market
+
+    def cancel(*args, **kwargs):
+        calls.append(args[1].order.order_id)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service._transport, "cancel_market", cancel)
+    # Clicking the trash control only stages the existing sidebar flow.
+    staged = client.post(
+        workbench.path + "action", data={"action": f"market-cancel-arm:{order.perm_id}"}
+    )
+    assert calls == []
+    sidebar = staged.text.split("ACTION REVIEW", maxsplit=1)[1]
+    assert "CANCEL MARKET ORDER" in sidebar
+    assert f"TWS order {order.order_id}" in sidebar
+    assert "Review cancellation" in sidebar
+    assert 'value="market-cancel-confirm"' not in sidebar
+    assert workbench._active_action_verified is False
+    assert "Outcome projection" not in sidebar
+    # A direct confirm cannot bypass the fresh Review step.
+    client.post(workbench.path + "action", data={"action": "market-cancel-confirm"})
+    assert calls == []
+    reviewed = client.post(
+        workbench.path + "action", data={"action": "active-action-execute"}
+    )
+    assert workbench._active_action_verified, workbench._message
+    assert 'value="market-cancel-confirm"' in reviewed.text
+    assert calls == []
+    if failure in {"fill", "quantity"}:
+        orders = () if failure == "fill" else (replace(order, remaining=Decimal("1")),)
+        monkeypatch.setattr(
+            workbench,
+            "_position_exit_snapshot_locked",
+            lambda: replace(snapshot, working_orders=orders),
+        )
+    elif failure == "expired":
+        workbench._armed_execution_deadline = 0
+    result = client.post(
+        workbench.path + "action", data={"action": "market-cancel-confirm"}
+    )
+    assert calls == ([order.order_id] if failure is None else [])
+    if failure == "fill":
+        assert "may have filled" in workbench._message
+    elif failure == "quantity":
+        assert "changed after review" in workbench._message
+    elif failure == "expired":
+        assert "Review expired" in workbench._message
+    else:
+        assert 'data-layer-state="cancelled-market"' in result.text
+        assert workbench._market_entries()[0].state == "CANCELLED_CONFIRMED"
+
+
+def test_filled_market_layer_shows_actual_fill_and_closed_position_history(
+    tmp_path, monkeypatch
+):
+    from ibkr_options_manager.domain import ObservedExecution
+
+    workbench = _trailing_scenario_workbench(tmp_path, "convert")
+    client = TestClient(workbench.app)
+    client.post(workbench.path + "action", data={"action": "market-exit-selected"})
+    client.post(workbench.path + "action", data={"action": "active-action-execute"})
+    client.post(workbench.path + "action", data={"action": "position-exit-confirm"})
+    service = workbench._paper_execution
+    entry = workbench._market_entries()[0]
+    snapshot = workbench._view_model.latest_snapshot()
+    filled = replace(
+        snapshot,
+        working_orders=(),
+        executions=(
+            ObservedExecution(
+                exec_id="market.01",
+                account=entry.account,
+                con_id=entry.con_id,
+                perm_id=entry.perm_ids[0],
+                side="SLD",
+                quantity=Decimal("3"),
+                price=Decimal("9.11"),
+                time="now",
+                realized_pnl=Decimal("153"),
+                currency="USD",
+            ),
+        ),
+    )
+    service.record_executions(filled)
+    monkeypatch.setattr(workbench._view_model, "latest_snapshot", lambda: filled)
+    entry = workbench._market_entries()[0]
+    row = to_xml(workbench._market_layer_row(1, entry))
+    assert 'data-layer-state="sold-market"' in row
+    assert 'value="9.11"' in row
+    assert "≈" not in row
+    assert "Confirm cancellation" not in row
+    position = next(p for p in workbench._state.positions if p.con_id == entry.con_id)
+    workbench._session_closed_positions[entry.con_id] = position
+    closed = to_xml(workbench._closed_session_workspace(entry.con_id))
+    assert 'data-layer-state="sold-market"' in closed
+    assert "153.00" in closed
+    restored = ExecutionJournal(service._journal._path).market_entries(
+        account=entry.account, con_id=entry.con_id
+    )[0]
+    assert restored.market_quantity == 3
+    assert len(restored.fills) == 1

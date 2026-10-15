@@ -755,6 +755,44 @@ not establish paper-TWS or live execution success. Paper-TWS verification is
 still required before a separately authorized live milestone.
 
 
+## Market exit layers and cancellation
+
+App-owned market exits have their own MKT layer in the held-position workspace
+and the session's closed-position history. All market submission paths save the
+requested quantity before calling the transport and retain the acknowledged
+order/permanent IDs. The row shows a disabled approximate bid field and remaining
+quantity while working, with recorded partial fills shown separately. Its price
+is an estimate, never a limit price. Unavailable bids show a dash. The MKT input spans both price columns; the
+approximation symbol identifies an estimate. Confirmed complete SELL executions replace
+that estimate with the actual weighted average fill price and retain realized
+P&L in closed-position history. Disappearance alone remains CHECK TWS. Legacy
+records without quantity need exact terminal Filled evidence and complete fills
+before their quantity is recovered; partial executions alone cannot prove full
+completion. Market fills remain in the durable journal across restart.
+
+The trash control uses the same tooltip treatment as bracket and trail controls
+and stages cancellation in the Action Review sidebar. The sidebar uses the shared
+cancellation card, Cancel changes control, fresh Review step and ten-second final
+Confirm window. There is no market-specific confirmation dialog. Review and
+Confirm each verify the exact journal-owned same-client standalone SELL MKT/GTC
+order; changed remaining quantity or order identity blocks cancellation. A direct
+Confirm without a verified review, or after expiry, cannot send a cancellation. The isolated paper writer re-reads its own open orders and
+checks account, contract ID, permanent ID, client ID, type, TIF, grouping, status
+and remaining quantity before cancelling only that order ID. It accepts exact
+terminal cancellation callbacks or code 202 for that ID after the request;
+rejections, fills, timeout and incomplete acknowledgements remain uncertain.
+A market order can fill between these checks and cancellation: the control does
+not guarantee that a fill can be prevented. Unknown outcomes are durably locked,
+with no automatic write retry. A later complete snapshot with exact linked
+terminal cancellation evidence can resolve a lost cancellation acknowledgement.
+External orders are never offered for cancellation by this layer.
+
+Verify with `.venv/bin/python -m pytest -q`; focused domain/transport coverage is
+in `tests/test_market_orders.py`, with UI lifecycle checks in
+`tests/test_app_demo.py`. Paper-TWS callback timing and out-of-hours behavior
+still require verification. These changes do not authorize live transmission.
+
+
 ## Event-driven trailing cancellation observation
 
 The desktop now retains an observation-only order listener on the configured

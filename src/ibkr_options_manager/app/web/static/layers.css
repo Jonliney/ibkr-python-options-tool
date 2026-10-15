@@ -131,6 +131,10 @@
   grid-template-columns: 5rem minmax(10rem, 1fr) minmax(10rem, 1fr) minmax(5rem, 0.6fr) 2.25rem;
 }
 
+.market-price-field {
+  grid-column: span 2;
+}
+
 .oca-layer-list > [data-layer-state]:last-child {
   border-bottom: 0;
 }
@@ -394,10 +398,12 @@
 @container (max-width: 36rem) {
   .layer-row-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .layer-row-grid > :first-child { grid-column: 1 / -1; }
-  .layer-row-grid > :nth-child(5) { justify-self: end; }
+  .layer-row-grid > :nth-child(5),
+  .market-layer-row > :last-child { justify-self: end; }
 }
 @container (max-width: 20rem) {
   .layer-row-grid { grid-template-columns: minmax(0, 1fr); }
+  .market-price-field { grid-column: span 1; }
 }
 
 
