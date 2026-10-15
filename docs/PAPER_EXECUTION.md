@@ -257,6 +257,17 @@ the send. Each pair cancellation and the final
 submission have separate durable journal records; an uncertain submission
 locks management of that contract until the TWS state is reviewed. The app never
 automatically retries the trailing submission.
+Conversion holds one client lease through the entire cancellation, submission
+and acknowledgement-refresh sequence, keeping the order listener paused rather
+than reconnecting it between every bounded read and write. All fresh checks
+remain in place, including a fresh bid for the final trailing plan. A stopped
+conversion reports confirmed bracket cancellations, the underlying read or
+validation failure, and whether trailing submission was attempted. If submission
+may have occurred without an acknowledgement, its status remains unconfirmed
+and the durable management lock remains. Partial conversions show a protection
+warning with the last verified held quantity; they do not automatically resume.
+Snapshot, cancellation and submission timing events share one run ID, with
+account-redacted failure details, in the cancellation trace.
 The final snapshot is not an atomic reservation at TWS; a manual change after
 that read can still race the send, so the acknowledged order must be checked in
 TWS.

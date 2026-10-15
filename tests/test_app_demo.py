@@ -8644,9 +8644,12 @@ def test_raise_trail_stop_to_be_does_not_lower_a_higher_fresh_stop(tmp_path):
     assert workbench._trailing_entries()[0].trailing_stop == "8.80"
 
 
-@pytest.mark.parametrize("failure", [None, "snapshot", "market-ack"])
-def test_position_exit_three_pairs_keeps_lease_and_reports_partial_failure(
-    tmp_path, monkeypatch, failure
+@pytest.mark.parametrize(
+    "failure", [None, "snapshot", "final-snapshot", "quantity", "ack"]
+)
+@pytest.mark.parametrize("exit_kind", ["market", "trail"])
+def test_multi_bracket_exit_keeps_lease_and_reports_partial_failure(
+    tmp_path, monkeypatch, failure, exit_kind
 ):
     from ibkr_options_manager.order_observation import _slot, borrow_client
 
@@ -8675,7 +8678,18 @@ def test_position_exit_three_pairs_keeps_lease_and_reports_partial_failure(
     journal._write((entry,))
     client = TestClient(workbench.app)
     client.post(workbench.path + "action", data={"action": "refresh"})
-    client.post(workbench.path + "action", data={"action": "market-exit-selected"})
+    client.post(
+        workbench.path + "action",
+        data=(
+            {"action": "market-exit-selected"}
+            if exit_kind == "market"
+            else {
+                "action": "trailing-convert-arm",
+                "trail_value": "25",
+                "trail_unit": "dollars",
+            }
+        ),
+    )
     client.post(workbench.path + "action", data={"action": "active-action-execute"})
     assert workbench._active_action_verified, workbench._message
     trace_path = tmp_path / "position-exit.jsonl"
@@ -8697,45 +8711,79 @@ def test_position_exit_three_pairs_keeps_lease_and_reports_partial_failure(
             result = original_capture(request)
             if isinstance(request, SnapshotRequest):
                 reads += 1
-                if failure == "snapshot" and reads == 3:
+                if (failure == "snapshot" and reads == 3) or (
+                    failure == "final-snapshot" and reads == 4
+                ):
                     result = replace(
                         result,
                         errors=(
                             f"synthetic broker snapshot failure for {DEMO_ACCOUNT}",
                         ),
                     )
+                if failure == "quantity" and reads == 3:
+                    result = replace(
+                        result,
+                        positions=tuple(
+                            replace(position, quantity=position.quantity + 1)
+                            if position.contract.con_id == request.option_con_id
+                            else position
+                            for position in result.positions
+                        ),
+                    )
             return result
 
     monkeypatch.setattr(broker, "capture", capture)
     markets = []
-    original_market = service._transport.submit_market
+    method = "submit_market" if exit_kind == "market" else "submit_trailing"
+    original_market = getattr(service._transport, method)
+    label = "Market sell" if exit_kind == "market" else "Trailing exit"
 
     def market(*args, **kwargs):
         markets.append(args[1].quantity)
         assert handoffs == ["pause"]
-        if failure == "market-ack":
-            raise ExecutionOutcomeUnknown("synthetic lost market acknowledgement")
+        if failure == "ack":
+            raise ExecutionOutcomeUnknown("synthetic lost exit acknowledgement")
         return original_market(*args, **kwargs)
 
-    monkeypatch.setattr(service._transport, "submit_market", market)
-    client.post(workbench.path + "action", data={"action": "position-exit-confirm"})
+    monkeypatch.setattr(service._transport, method, market)
+    client.post(
+        workbench.path + "action",
+        data={
+            "action": "position-exit-confirm"
+            if exit_kind == "market"
+            else "trailing-convert-confirm"
+        },
+    )
     final_entry = journal.submission_entries(
         account=entry.account, con_id=entry.con_id
     )[0]
-    if failure == "snapshot":
+    if failure in {"snapshot", "final-snapshot", "quantity"}:
         assert markets == []
-        assert [layer.cancelled for layer in final_entry.layers] == [True, True, False]
-        assert "synthetic broker snapshot failure" in workbench._message
-        assert "2 of 3 exits confirmed cancelled" in workbench._message
-        assert "Market sell was not submitted" in workbench._protection_change_message
-        assert workbench._toast.title == "Market exit stopped"
+        expected_count = 3 if failure == "final-snapshot" else 2
+        assert [layer.cancelled for layer in final_entry.layers] == [
+            index < expected_count for index in range(3)
+        ]
+        assert (
+            "quantity changed"
+            if failure == "quantity"
+            else "synthetic broker snapshot failure"
+        ) in workbench._message
+        assert f"{expected_count} of 3" in workbench._message
+        assert f"{label} was not submitted" in workbench._protection_change_message
+        assert workbench._toast.title == (
+            "Market exit stopped" if exit_kind == "market" else "Trailing exit stopped"
+        )
         assert DEMO_ACCOUNT not in workbench._message
-    elif failure == "market-ack":
+    elif failure == "ack":
         assert markets == [Decimal("3")]
         assert all(layer.cancelled for layer in final_entry.layers)
-        assert "Market sell status is unconfirmed" in workbench._message
+        assert f"{label} status is unconfirmed" in workbench._message
         assert "was not submitted" not in workbench._message
         assert service.unresolved_management_entries(
+            account=entry.account, con_id=entry.con_id
+        )
+        restarted = ExecutionJournal(journal._path)
+        assert restarted.unresolved_management_entries(
             account=entry.account, con_id=entry.con_id
         )
     else:
@@ -8745,7 +8793,12 @@ def test_position_exit_three_pairs_keeps_lease_and_reports_partial_failure(
     events = [json.loads(line) for line in trace_path.read_text().splitlines()]
     assert DEMO_ACCOUNT not in trace_path.read_text()
     assert len({event["run_id"] for event in events}) == 1
-    assert any(event["event"] == "position_exit_stopped" for event in events) is (
+    stopped_event = (
+        "position_exit_stopped"
+        if exit_kind == "market"
+        else "trailing_conversion_stopped"
+    )
+    assert any(event["event"] == stopped_event for event in events) is (
         failure is not None
     )
 

@@ -1531,83 +1531,151 @@ class StarUIWorkbench:
         ):
             self._message = "Review the trailing exit before confirming it."
             return
+        service = self._paper_execution
         cancelled = 0
+        submission_attempted = False
+        phase = "starting"
+        run_id = uuid4().hex
+        started = monotonic()
+
+        def trace(event: str, **fields: Any) -> None:
+            record_cancellation_event(
+                event,
+                run_id=run_id,
+                phase=phase,
+                cancelled_count=cancelled,
+                exit_count=len(plan.candidates),
+                elapsed_ms=round((monotonic() - started) * 1000, 1),
+                **fields,
+            )
+
+        def fresh_snapshot(bracket_number: int | None) -> BrokerSnapshot:
+            snapshot_started = monotonic()
+            token = current_snapshot_context.set((run_id, phase, bracket_number))
+            trace("trailing_conversion_snapshot_start", bracket_number=bracket_number)
+            try:
+                snapshot = self._position_exit_snapshot_locked(
+                    include_quote=bracket_number is None
+                )
+                trace(
+                    "trailing_conversion_snapshot_complete",
+                    available=True,
+                    duration_ms=round((monotonic() - snapshot_started) * 1000, 1),
+                )
+                return snapshot
+            except Exception as error:
+                trace(
+                    "trailing_conversion_snapshot_complete",
+                    available=False,
+                    reason=redact_accounts(str(error), (plan.selected.account,)),
+                    duration_ms=round((monotonic() - snapshot_started) * 1000, 1),
+                )
+                raise
+            finally:
+                current_snapshot_context.reset(token)
+
+        trace("trailing_conversion_started")
         try:
-            for index, candidate in enumerate(plan.candidates):
-                state = self._view_model.select_position(
-                    self._selected_con_id,
-                    self._plan_form(self._drafts.get(self._selected_con_id, ())),
-                    include_quote=False,
-                )
-                self._apply_state_locked(state)
-                self._record_refresh_time_locked()
-                self._announce_reconciliation_locked()
-                snapshot = self._view_model.latest_snapshot()
-                if snapshot is None:
-                    raise ExecutionBlocked("the fresh bracket snapshot is unavailable")
-                self._paper_execution.verify_trailing_baseline(snapshot, plan)
-                remaining = plan.candidates[index:]
-                if set(self._active_target_perm_ids()) != {
-                    item.target_perm_id for item in remaining
-                }:
-                    raise ExecutionBlocked("the active bracket set changed")
-                refreshed = self._paper_execution.prepare_market_exits(
-                    snapshot,
-                    target_perm_ids=tuple(item.target_perm_id for item in remaining),
-                    expected_client_id=self._settings.client_id,
-                )
-                if (
-                    refreshed != remaining
-                    or snapshot.position.quantity != plan.position_quantity
-                ):
-                    raise ExecutionBlocked(
-                        "a bracket or position changed during conversion"
+            with borrow_client(
+                "127.0.0.1", self._settings.port, self._settings.client_id
+            ):
+                for index, candidate in enumerate(plan.candidates):
+                    phase = f"before_bracket_{index + 1}"
+                    snapshot = fresh_snapshot(index + 1)
+                    service.verify_trailing_baseline(snapshot, plan)
+                    remaining = plan.candidates[index:]
+                    if set(self._active_target_perm_ids()) != {
+                        item.target_perm_id for item in remaining
+                    }:
+                        raise ExecutionBlocked("the active bracket set changed")
+                    refreshed = service.prepare_market_exits(
+                        snapshot,
+                        target_perm_ids=tuple(
+                            item.target_perm_id for item in remaining
+                        ),
+                        expected_client_id=self._settings.client_id,
                     )
-                self._paper_execution.cancel_pair(
+                    if (
+                        refreshed != remaining
+                        or snapshot.position.quantity != plan.position_quantity
+                    ):
+                        raise ExecutionBlocked(
+                            "a bracket or position changed during conversion"
+                        )
+                    phase = f"cancel_bracket_{index + 1}"
+                    token = current_cancellation_context.set((run_id, index + 1))
+                    trace("trailing_conversion_cancel_start", bracket_number=index + 1)
+                    try:
+                        service.cancel_pair(
+                            snapshot,
+                            candidate,
+                            host="127.0.0.1",
+                            port=self._settings.port,
+                            client_id=self._settings.client_id,
+                            timeout_seconds=self._settings.timeout_seconds,
+                        )
+                    finally:
+                        current_cancellation_context.reset(token)
+                    cancelled += 1
+                    trace(
+                        "trailing_conversion_cancel_complete", bracket_number=index + 1
+                    )
+                phase = "before_trail"
+                snapshot = fresh_snapshot(None)
+                service.verify_trailing_baseline(snapshot, plan)
+                selected_ids = {
+                    perm_id
+                    for candidate in plan.candidates
+                    for perm_id in (candidate.target_perm_id, candidate.stop_perm_id)
+                }
+                if any(
+                    order.perm_id in selected_ids for order in snapshot.working_orders
+                ):
+                    raise ExecutionBlocked("a selected bracket leg is still working")
+                phase = "submit_trail"
+                submission_attempted = True
+                trace("trailing_conversion_submit_start")
+                service.submit_entire_position_trailing(
                     snapshot,
-                    candidate,
+                    plan,
                     host="127.0.0.1",
                     port=self._settings.port,
                     client_id=self._settings.client_id,
                     timeout_seconds=self._settings.timeout_seconds,
                 )
-                cancelled += 1
-            state = self._view_model.select_position(
-                self._selected_con_id,
-                self._plan_form(self._drafts.get(self._selected_con_id, ())),
-            )
-            self._apply_state_locked(state)
-            self._record_refresh_time_locked()
-            self._announce_reconciliation_locked()
-            snapshot = self._view_model.latest_snapshot()
-            if snapshot is None:
-                raise ExecutionBlocked("the final position snapshot is unavailable")
-            self._paper_execution.submit_entire_position_trailing(
-                snapshot,
-                plan,
-                host="127.0.0.1",
-                port=self._settings.port,
-                client_id=self._settings.client_id,
-                timeout_seconds=self._settings.timeout_seconds,
-            )
-        except (ExecutionBlocked, ExecutionOutcomeUnknown) as error:
-            self._message = (
-                f"Trailing exit stopped after cancelling {cancelled} of "
-                f"{len(plan.candidates)} brackets: {error}. Check TWS and refresh."
-                if plan.candidates
-                else f"Trailing exit stopped: {error}. Check TWS and refresh."
-            )
+                trace("trailing_conversion_acknowledged")
+                phase = "after_trail"
+                refresh_token = current_snapshot_context.set((run_id, phase, None))
+                try:
+                    self._refresh_after_acknowledged_write_locked(
+                        "TWS acknowledged the trailing exit. Check TWS for Transmit or fills.",
+                        include_quote=False,
+                    )
+                finally:
+                    current_snapshot_context.reset(refresh_token)
+                trace("trailing_conversion_complete")
         except Exception as error:
-            self._message = (
-                f"Trailing exit outcome is unknown after {cancelled} "
-                f"cancellations: {error}. Check TWS and refresh."
-                if plan.candidates
-                else f"Trailing exit outcome is unknown: {error}. Check TWS and refresh."
+            reason = redact_accounts(str(error), (plan.selected.account,))
+            summary = (
+                f"{cancelled} of {len(plan.candidates)} brackets confirmed cancelled. "
+                + (
+                    "Trailing exit status is unconfirmed."
+                    if submission_attempted
+                    else "Trailing exit was not submitted."
+                )
             )
-        else:
-            self._refresh_after_acknowledged_write_locked(
-                "TWS acknowledged the trailing exit. Check TWS for Transmit or fills.",
-                include_quote=False,
+            self._message = (
+                f"Trailing exit stopped: {summary} {reason}. Check TWS and refresh."
+            )
+            if cancelled or submission_attempted:
+                self._protection_change_message = (
+                    f"{summary} Last verified: {plan.position_quantity} held contracts. "
+                    "Check current protection in TWS and refresh."
+                )
+            trace(
+                "trailing_conversion_stopped",
+                submission_attempted=submission_attempted,
+                reason=reason,
             )
         finally:
             self._disarm_execution_locked()
@@ -2351,13 +2419,15 @@ class StarUIWorkbench:
             self._message = f"Cancelled row could not be removed: {error}"
             return
 
-    def _position_exit_snapshot_locked(self) -> BrokerSnapshot:
+    def _position_exit_snapshot_locked(
+        self, *, include_quote: bool = False
+    ) -> BrokerSnapshot:
         if self._selected_con_id is None:
             raise ExecutionBlocked("select a position before reviewing an exit")
         state = self._view_model.select_position(
             self._selected_con_id,
             self._plan_form(self._drafts.get(self._selected_con_id, ())),
-            include_quote=False,
+            include_quote=include_quote,
         )
         self._apply_state_locked(state)
         self._record_refresh_time_locked()
@@ -10709,6 +10779,10 @@ def _toast_notice(message: str) -> _ToastNotice | None:
     """Notify only when a problem needs attention; successes are explicit."""
     normalized = " ".join(message.split())
     lowered = normalized.lower()
+    if lowered.startswith("trailing exit stopped:"):
+        return _ToastNotice(
+            "Trailing exit stopped", normalized.partition(":")[2].strip(), "error"
+        )
     if lowered.startswith("position exit stopped:"):
         return _ToastNotice(
             "Market exit stopped", normalized.partition(":")[2].strip(), "error"
