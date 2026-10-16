@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from collections.abc import Sequence
 from decimal import Decimal
+from pathlib import Path
+from threading import Event
 from time import monotonic
+from time import time as wall_time
 from typing import Any
 
 from .broker import IbkrSnapshotBroker, SnapshotRequest
@@ -13,6 +17,7 @@ from .capability import ProbeConfig, ProbeReport, run_capability_probe
 from .ibkr_probe import IbapiUnavailableError, IbkrReadOnlyBroker
 from .redaction import redact_account, redact_accounts
 from .snapshot import SnapshotCoordinator, SnapshotResult, SnapshotStatus
+from .trade_history import TradeHistoryCollector, TradeHistoryStore
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -103,6 +108,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--diagnostic",
         action="store_true",
         help="include local contract and order details; account remains redacted",
+    )
+    collect = commands.add_parser(
+        "collect", help="save read-only one-minute option bid history locally"
+    )
+    collect.add_argument("--account", required=True, help="exact paper account ID")
+    collect.add_argument("--port", type=int, default=7497)
+    collect.add_argument("--client-id", type=int, default=19)
+    collect.add_argument("--timeout", type=float, default=30.0)
+    collect.add_argument("--database", type=Path)
+    collect.add_argument(
+        "--execution-timezone",
+        help="TWS login timezone (IANA name) for execution times without a zone",
+    )
+    collect.add_argument("--once", action="store_true", help="collect once and exit")
+    collect.add_argument(
+        "--interval", type=int, default=60, help="seconds between passes (minimum 60)"
     )
     return parser
 
@@ -236,6 +257,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "collect":
+        return _collect_history(args)
+
     try:
         if args.command == "snapshot":
             request = SnapshotRequest(
@@ -289,6 +313,59 @@ def _decimal_text(value: Decimal | None) -> str | None:
 
 def _now_decimal() -> Decimal:
     return Decimal(str(monotonic()))
+
+
+def _collect_history(args: argparse.Namespace) -> int:
+    from .broker.history import IbkrHistorySource
+    from .broker.read_only import PortfolioRequest
+    from .execution import default_paper_journal_path
+
+    store = None
+    try:
+        if args.interval < 60:
+            raise ValueError("collector interval must be at least 60 seconds")
+        request = PortfolioRequest(
+            "127.0.0.1",
+            args.port,
+            args.client_id,
+            args.account.strip().upper(),
+            args.timeout,
+        )
+        store = TradeHistoryStore(
+            args.database
+            or default_paper_journal_path().with_name("trade-history.sqlite3"),
+            execution_timezone=args.execution_timezone,
+        )
+        collector = TradeHistoryCollector(store, IbkrHistorySource())
+        while True:
+            try:
+                counts = collector.collect(request, int(wall_time()))
+                failed = counts["errors"] > 0
+                output = {"status": "PARTIAL" if failed else "COLLECTED", **counts}
+            except (
+                IbapiUnavailableError,
+                RuntimeError,
+                ValueError,
+                OSError,
+                sqlite3.Error,
+            ) as error:
+                failed = True
+                output = {
+                    "status": "BLOCKED",
+                    "error": redact_accounts(str(error), (request.expected_account,)),
+                }
+            print(json.dumps(output, sort_keys=True), flush=True)
+            if args.once:
+                return 2 if failed else 0
+            Event().wait(args.interval)
+    except KeyboardInterrupt:
+        return 0
+    except (ValueError, OSError, sqlite3.Error) as error:
+        print(json.dumps({"status": "BLOCKED", "error": str(error)}))
+        return 2
+    finally:
+        if store is not None:
+            store.close()
 
 
 if __name__ == "__main__":

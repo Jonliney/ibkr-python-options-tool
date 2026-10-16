@@ -45,6 +45,19 @@ deterministic simulated positions:
 The simulated-data header is deliberately prominent and the process never
 opens a TWS connection or exposes order transmission.
 
+## Trade history collection
+
+The read-only [trade history collector](docs/TRADE_HISTORY_COLLECTOR.md) saves
+one-minute option bid high/low/close bars, fills and position observations to a
+local SQLite database. Run it separately from the desktop app:
+
+```sh
+.venv/bin/ibkr-options-manager collect --account DU1234567
+```
+
+It retains tracked contracts after sale and retries history on reconnect.
+Dashboard metrics and position analysis tabs are planned follow-up work.
+
 ## Paper execution (explicit opt-in)
 
 The normal launch remains read-only. To expose the two-click paper submission
@@ -72,6 +85,12 @@ journal-proven app-owned, complete active OCA pairs, **Sell now
 cancels that layer's app-owned LMT/STP pair, verifies the cancellation, then
 submits a standalone MKT without touching external orders. See
 [paper-execution notes](docs/PAPER_EXECUTION.md).
+
+The [manual paper-TWS acceptance suite](docs/MANUAL_TWS_ACCEPTANCE.md) provides
+contract fixtures, exact quantities, bracket/trailing/market-exit journeys,
+failure and recovery drills, invalid-input checks, and a copyable evidence log.
+It distinguishes runnable desktop cases from conditional market observations
+and failures requiring controlled injection.
 
 Local verification from the repository root:
 
