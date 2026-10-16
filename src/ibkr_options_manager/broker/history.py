@@ -69,6 +69,7 @@ class IbkrHistorySource:
                     for p in app.position_evidence
                     if p.contract.con_id in verified_ids
                 ),
+                positions_complete=not errors,
             )
 
     def history(

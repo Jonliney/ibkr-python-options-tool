@@ -154,6 +154,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         observer_client_id=args.observer_client_id,
         save_account=save_paper_account if not args.demo_data else None,
         demo_journal_dir=demo_journal_dir,
+        history_path=None
+        if args.demo_data
+        else default_paper_journal_path().with_name("trade-history.sqlite3"),
+        home_dashboard=args.con_id is None and args.demo_scenario == "standard",
     )
     window.refresh_on_launch()
     window.show()

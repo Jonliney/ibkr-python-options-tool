@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Thread
 from time import monotonic, sleep
@@ -46,6 +47,8 @@ class StarUIPlannerWindow(QMainWindow):
         observer_client_id: int = 18,
         save_account: Callable[[str], None] | None = None,
         demo_journal_dir: TemporaryDirectory[str] | None = None,
+        history_path: Path | None = None,
+        home_dashboard: bool = False,
     ) -> None:
         super().__init__()
         self._demo_mode = demo_mode
@@ -60,6 +63,8 @@ class StarUIPlannerWindow(QMainWindow):
             observe_positions=observe_positions,
             observer_client_id=observer_client_id,
             save_account=save_account,
+            history_path=history_path,
+            home_dashboard=home_dashboard,
         )
         self._server, self._thread, port = _start_local_server(self._surface.app)
         self._url = QUrl(f"http://127.0.0.1:{port}{self._surface.path}")

@@ -3,14 +3,17 @@ from __future__ import annotations
 # ruff: noqa: E501
 import asyncio
 import json
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from secrets import token_urlsafe
+from tempfile import TemporaryDirectory
 from threading import Event, RLock, Thread
 from time import monotonic
+from time import time as wall_time
 from typing import Any, cast
 from uuid import uuid4
 
@@ -41,6 +44,7 @@ from starhtml.plugins import Plugin
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from ...broker.read_only import CapturedContract, CapturedExecution, CapturedPosition
 from ...cancellation_trace import (
     current_cancellation_context,
     current_snapshot_context,
@@ -71,12 +75,15 @@ from ...execution import (
     classify_journal_layer,
     submission_pair_matches_plan,
 )
+from ...journal import JournalRow, load_journal
 from ...market_outcome import classify_market
 from ...observation import ObservationSettings, PositionObserver
 from ...order_observation import OrderObserver, borrow_client
 from ...price_update_trace import record_price_update_event
 from ...redaction import redact_accounts
+from ...trade_history import Discovery, TradeHistoryStore
 from ...trailing import TrailingPlan, TrailingRequest, trailing_edit_prices
+from ..demo_history import seed_demo_history
 from ..position_observation import VerifiedPositionChanges
 from ..view_model import (
     ConnectionSettings,
@@ -116,6 +123,13 @@ from .components.ui.separator import Separator
 from .components.ui.toast import Toaster
 from .components.ui.toggle_group import ToggleGroup, ToggleGroupItem
 from .components.ui.tooltip import Tooltip, TooltipContent, TooltipTrigger
+from .journal_view import (
+    app_navigation,
+    dashboard,
+    entry_timing_results,
+    position_analysis,
+    position_tabs,
+)
 
 _STATIC_DIR = Path(__file__).with_name("static")
 _ASSETS_DIR = Path(__file__).with_name("assets")
@@ -172,11 +186,35 @@ class StarUIWorkbench:
         observe_positions: bool = False,
         observer_client_id: int = 18,
         save_account: Callable[[str], None] | None = None,
+        history_path: Path | None = None,
+        home_dashboard: bool = False,
     ) -> None:
         _register_bundled_icons()
         self._view_model = view_model
         self._demo_mode = demo_mode
         self._demo_scenario = demo_scenario
+        self._history_temporary = (
+            TemporaryDirectory(prefix="ibkr-history-") if history_path is None else None
+        )
+        if history_path is None:
+            assert self._history_temporary is not None
+            history_path = Path(self._history_temporary.name) / "history.sqlite3"
+        self._history_path = history_path
+        self._history_error = ""
+        self._main_view = "dashboard" if home_dashboard else "positions"
+        self._position_view = "management"
+        self._analysis_trade_id: str | None = None
+        self._insight_generation = 0
+        self._insight_revision = 0
+        self._journal_stop = Decimal(25)
+        self._journal_target = Decimal(20)
+        try:
+            if demo_mode:
+                seed_demo_history(self._history_path)
+            else:
+                TradeHistoryStore(self._history_path).close()
+        except (ValueError, OSError, sqlite3.Error) as error:
+            self._history_error = f"Saved history unavailable: {error}"
         self._demo_closed_con_id = (
             initial_con_id if demo_scenario == "closed-trail" else None
         )
@@ -276,6 +314,7 @@ class StarUIWorkbench:
             hdrs=(
                 Link(rel="stylesheet", href="/starui.css"),
                 Link(rel="stylesheet", href="/layers.css"),
+                Link(rel="stylesheet", href="/journal.css"),
             ),
             htmlkw={"lang": "en", "data_theme": "dark"},
             bodykw={"cls": "min-h-screen bg-background text-foreground"},
@@ -286,6 +325,9 @@ class StarUIWorkbench:
         route(f"/{self.session_token}/inventory-events")(self._inventory_events)
         route(f"/{self.session_token}/inventory-fragment")(self._inventory_fragment)
         route(f"/{self.session_token}/action", methods=["POST"])(self._action)
+        route(f"/{self.session_token}/journal-insights", methods=["POST"])(
+            self._journal_insights
+        )
         self._notifications_enabled = True
 
     @property
@@ -643,10 +685,82 @@ class StarUIWorkbench:
                     self._suppress_toasts = False
                     self._inventory_revision += 1
 
+    async def _journal_insights(self, request: Request) -> HTMLResponse:
+        values = {str(k): str(v) for k, v in (await request.form()).items()}
+        with self._lock:
+            try:
+                stop, target = _journal_thresholds(values)
+                generation = int(values.get("generation", "0"))
+                revision = int(values.get("revision", "0"))
+            except (ValueError, InvalidOperation):
+                return HTMLResponse("Invalid entry timing settings", status_code=422)
+            if (
+                self._main_view != "dashboard"
+                or generation != self._insight_generation
+                or revision <= self._insight_revision
+            ):
+                return HTMLResponse("Entry timing view changed", status_code=409)
+            self._journal_stop, self._journal_target = stop, target
+            self._insight_revision = revision
+            return HTMLResponse(
+                to_xml(
+                    entry_timing_results(self._journal_rows(), stop=stop, target=target)
+                )
+            )
+
     async def _action(self, request: Request) -> Any:
         form = await request.form()
         values = {str(key): str(value) for key, value in form.items()}
         action = values.get("action", "save-draft")
+
+        if action in {
+            "show-dashboard",
+            "show-positions",
+            "show-analysis",
+            "show-management",
+            "open-trade",
+            "journal-filter",
+        }:
+            with self._lock:
+                self._disarm_execution_locked()
+                self._toast = None
+                if action == "journal-filter":
+                    try:
+                        stop, target = _journal_thresholds(values)
+                        self._journal_stop, self._journal_target = stop, target
+                        self._history_error = ""
+                    except (ValueError, InvalidOperation):
+                        self._history_error = "Choose a stop between 0 and 100%, and a positive target up to 10,000%."
+                elif action == "show-dashboard":
+                    self._main_view = "dashboard"
+                elif action == "show-positions":
+                    self._main_view, self._position_view = "positions", "management"
+                    self._analysis_trade_id = None
+                elif action == "show-analysis":
+                    self._main_view, self._position_view = "positions", "analysis"
+                    self._analysis_trade_id = None
+                elif action == "open-trade":
+                    row_id = values.get("trade_id", "")
+                    if any(r.row_id == row_id for r in self._journal_rows()):
+                        self._analysis_trade_id = row_id
+                        self._main_view, self._position_view = "positions", "analysis"
+                    else:
+                        self._history_error = (
+                            "This saved trade is unavailable for the selected account."
+                        )
+                elif action == "show-management":
+                    row = self._analysis_row(self._journal_rows())
+                    if row is None or row.contract.con_id in {
+                        p.con_id for p in self._state.positions
+                    }:
+                        if (
+                            row is not None
+                            and row.contract.con_id != self._selected_con_id
+                        ):
+                            self._select_locked(row.contract.con_id)
+                        self._position_view = "management"
+                        self._analysis_trade_id = None
+                return self._page()
 
         if action == "launch-refresh":
             # Retry is deliberately a single foreground request.  The retry
@@ -826,6 +940,7 @@ class StarUIWorkbench:
                 self._start_observer_locked()
                 self._submission_review_required = False
             elif action == "select":
+                self._analysis_trade_id = None
                 self._protection_change_message = ""
                 self._disarm_execution_locked()
                 if not contract_locked:
@@ -1100,6 +1215,33 @@ class StarUIWorkbench:
     ) -> None:
         if state.status is not UiStatus.READY:
             return
+        positions = self._view_model.portfolio_positions()
+        try:
+            store = TradeHistoryStore(self._history_path)
+            try:
+                store.register(
+                    self._settings.account,
+                    Discovery(
+                        tuple(p.contract for p in positions),
+                        (),
+                        positions=tuple(
+                            CapturedPosition(
+                                p.key.account,
+                                p.contract,
+                                p.quantity,
+                                p.raw_average_cost,
+                            )
+                            for p in positions
+                            if p.quantity > 0
+                        ),
+                        positions_complete=True,
+                    ),
+                    int(wall_time()),
+                )
+            finally:
+                store.close()
+        except (ValueError, OSError, sqlite3.Error) as error:
+            self._history_error = f"Position history could not be saved: {error}"
         if self._session_position_account != self._settings.account:
             self._session_seen_positions.clear()
             self._session_closed_positions.clear()
@@ -1158,6 +1300,48 @@ class StarUIWorkbench:
         snapshot = self._view_model.latest_snapshot()
         if snapshot is not None and snapshot.complete and snapshot.fresh:
             self._session_contract_snapshots[con_id] = snapshot
+            if not self._demo_mode:
+                try:
+                    contract = snapshot.contract
+                    captured = CapturedContract(
+                        contract.con_id,
+                        contract.sec_type,
+                        contract.expiry,
+                        contract.strike,
+                        contract.right,
+                        contract.multiplier,
+                        contract.currency,
+                        contract.trading_class,
+                        contract.exchange,
+                        contract.local_symbol,
+                    )
+                    fills = tuple(
+                        CapturedExecution(
+                            f.exec_id,
+                            f.account,
+                            f.con_id,
+                            f.perm_id,
+                            f.side,
+                            f.quantity,
+                            f.price,
+                            f.time,
+                            f.realized_pnl,
+                            f.currency,
+                        )
+                        for f in snapshot.executions
+                        if f.account == snapshot.selected.account and f.con_id == con_id
+                    )
+                    store = TradeHistoryStore(self._history_path)
+                    try:
+                        store.register(
+                            snapshot.selected.account,
+                            Discovery((captured,), fills),
+                            int(wall_time()),
+                        )
+                    finally:
+                        store.close()
+                except (ValueError, OSError, sqlite3.Error) as error:
+                    self._history_error = f"Fill history could not be saved: {error}"
 
     def _plan_form(self, layers: tuple[DraftLayerForm, ...]) -> PlanForm:
         stop_type, offset, unit = self._stop_configuration()
@@ -3652,6 +3836,28 @@ class StarUIWorkbench:
             return None
         return targets[min(index, len(targets) - 1)], stops[min(index, len(stops) - 1)]
 
+    def _journal_rows(self) -> tuple[JournalRow, ...]:
+        try:
+            store = TradeHistoryStore(self._history_path)
+            try:
+                return load_journal(
+                    store,
+                    self._settings.account,
+                    stop=self._journal_stop,
+                    target=self._journal_target,
+                )
+            finally:
+                store.close()
+        except (ValueError, OSError, sqlite3.Error) as error:
+            self._history_error = f"Saved history unavailable: {error}"
+            return ()
+
+    def _analysis_row(self, rows: tuple[JournalRow, ...]) -> JournalRow | None:
+        if self._analysis_trade_id is not None:
+            return next((r for r in rows if r.row_id == self._analysis_trade_id), None)
+        con_id = self._selected_closed_con_id or self._selected_con_id
+        return next((r for r in rows if r.contract.con_id == con_id), None)
+
     def _page(self) -> Any:
         self._expire_confirmation_locked()
         state = self._state
@@ -3661,13 +3867,41 @@ class StarUIWorkbench:
             if self._submission_review_required
             else self._cancelled_bracket_recovery(self._submission_outcomes())
         )
-        if self._selected_closed_con_id in self._session_closed_positions:
+        if self._main_view == "dashboard":
+            self._insight_generation += 1
+            self._insight_revision = 0
+            content = dashboard(
+                self._journal_rows(),
+                self.path,
+                stop=self._journal_stop,
+                target=self._journal_target,
+                generation=self._insight_generation,
+                error=self._history_error,
+            )
+        elif self._position_view == "analysis":
+            rows = self._journal_rows()
+            content = Div(
+                Div(self._inventory(), id="position-inventory"),
+                position_analysis(
+                    self._analysis_row(rows),
+                    rows,
+                    self.path,
+                    stop=self._journal_stop,
+                    target=self._journal_target,
+                ),
+                cls="journal-position-layout",
+            )
+        elif self._selected_closed_con_id in self._session_closed_positions:
             closed_workspace, closed_review = self._closed_session_workspace(
                 self._selected_closed_con_id
             )
             content = Div(
                 Div(self._inventory(), id="position-inventory"),
-                closed_workspace,
+                Div(
+                    position_tabs(self.path, "management"),
+                    closed_workspace,
+                    cls="journal-management",
+                ),
                 closed_review,
                 cls="grid h-[calc(100vh-3.5rem)] min-h-0 grid-cols-[16rem_minmax(0,1fr)_19rem] overflow-hidden border-t border-border",
             )
@@ -3691,7 +3925,11 @@ class StarUIWorkbench:
             )
             content = Div(
                 Div(self._inventory(), id="position-inventory"),
-                self._workspace(title),
+                Div(
+                    position_tabs(self.path, "management"),
+                    self._workspace(title),
+                    cls="journal-management",
+                ),
                 self._review(projection),
                 cls="grid h-[calc(100vh-3.5rem)] min-h-0 grid-cols-[16rem_minmax(0,1fr)_19rem] overflow-hidden border-t border-border",
             )
@@ -3736,7 +3974,7 @@ class StarUIWorkbench:
                     try {{ sessionStorage.setItem(restoreKey, JSON.stringify(fields)); }} catch (_) {{}}
                   }};
                   document.addEventListener('click', event => {{
-                    if (event.target.closest('#position-change-update')) saveDraft();
+                    if (event.target.closest('#position-change-update, .journal-navigation')) saveDraft();
                   }});
                   let seen = '{self._inventory_revision}';
                   const setEventStatus = (state, label) => {{
@@ -3811,6 +4049,7 @@ class StarUIWorkbench:
             if self._observe_positions
             else None,
             self._header(),
+            app_navigation(self.path, self._main_view),
             content,
             self._toast_component(),
             self._launch_connection_dialog(),
@@ -3818,7 +4057,7 @@ class StarUIWorkbench:
             recovery_dialog,
             Script(_busy_submit_script()),
             Script(_paper_confirmation_countdown_script()),
-            cls="h-screen overflow-hidden bg-background text-foreground selection:bg-primary selection:text-primary-foreground",
+            cls="journal-shell h-screen overflow-hidden bg-background text-foreground selection:bg-primary selection:text-primary-foreground",
         )
 
     def _submission_review_dialog(self) -> Any:
@@ -4391,8 +4630,18 @@ class StarUIWorkbench:
 
     def _inventory(self) -> Any:
         rows = []
+        analysis_row = (
+            self._analysis_row(self._journal_rows())
+            if self._position_view == "analysis"
+            else None
+        )
+        selected_con_id = (
+            analysis_row.contract.con_id
+            if analysis_row is not None
+            else self._selected_con_id
+        )
         for position in self._state.positions:
-            selected = position.con_id == self._selected_con_id
+            selected = position.con_id == selected_con_id
             symbol, contract_detail = _position_identity(position.local_symbol)
             rows.append(
                 Form(
@@ -11349,3 +11598,16 @@ def _breakeven(outcomes: list[tuple[Decimal, Decimal]]) -> str:
         if floor >= 0:
             return f"Layer {index} ({_money(floor)})"
     return "—"
+
+
+def _journal_thresholds(values: dict[str, str]) -> tuple[Decimal, Decimal]:
+    stop = Decimal(values.get("journal_stop", "25"))
+    target = Decimal(values.get("journal_target", "20"))
+    if (
+        not stop.is_finite()
+        or not target.is_finite()
+        or not 0 < stop < 100
+        or not 0 < target <= 10000
+    ):
+        raise ValueError("invalid entry timing thresholds")
+    return stop, target

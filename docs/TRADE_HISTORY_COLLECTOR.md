@@ -1,9 +1,10 @@
 # Trade history collector
 
-This first milestone collects durable inputs for later trade analysis. It is a
+The collector supplies durable inputs for [trade analysis](TRADE_JOURNAL.md). It is a
 separate read-only process; opening the desktop app does **not** start it.
-The dashboard and a second position tab are future work. The existing position
-workbench remains unchanged.
+The desktop dashboard and position Analysis tab read this same database. The
+desktop also records verified position observations and selected-contract fills;
+minute-price backfilling still requires this collector process.
 
 ## Run
 
@@ -128,20 +129,19 @@ not rely on recovering them 24 hours later:
 - [Historical-data limitations](https://interactivebrokers.github.io/tws-api/historical_limitations.html)
 - [Execution retrieval](https://interactivebrokers.github.io/tws-api/executions_commissions.html)
 
-## Later analysis and UI
+## Analysis and UI
 
 Retain separate concepts for actual position/fill evidence and the contract's
-counterfactual price path through expiry. Future trade grouping must handle
-partial fills, scale-ins, scale-outs, re-entries and execution corrections before
-publishing W/L rates. Unknown entry times and incomplete coverage must remain
-visible. Post-sale prices must not change actual realized P&L.
+counterfactual price path through expiry. The database-backed dashboard groups
+long trades from flat to flat, resolving execution corrections. Partial fills,
+scale-ins, scale-outs and re-entries are retained. Unknown entry times and
+incomplete coverage remain visible. Post-sale prices do not change actual
+realized P&L. See [journal calculations and limitations](TRADE_JOURNAL.md).
 
-The intended position UI can have the current management view as its first tab
-and analysis as its second. Dashboard inputs can include average adverse/favorable
-excursions, drawdown before first reaching a target, and stop-before-target
-sequences. These require the ordered path; a single global high/low or an average
-alone cannot answer them. Entry-minute bars may contain pre-fill prices and need
-explicit treatment. No analysis screens or order-rule changes ship in this step.
+Positions now have Management and Analysis views. The dashboard reports average
+observed adverse/favorable excursions and configurable stop-level-before-target
+sequences. Entry-minute bars are excluded; scale-in paths start after the final
+buy. No order rules are changed by journal thresholds.
 
 ## Verification
 

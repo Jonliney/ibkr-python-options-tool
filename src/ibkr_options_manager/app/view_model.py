@@ -249,6 +249,10 @@ class PlannerViewModel:
         """Return the most recent coherent selected-position snapshot, if any."""
         return self._latest_snapshot
 
+    def portfolio_positions(self) -> tuple[PortfolioPosition, ...]:
+        """Verified inventory for durable observation history, never a write gate."""
+        return self._portfolio_positions
+
     def closed_order_evidence(
         self, account: str, con_id: int
     ) -> tuple[frozenset[str], frozenset[int]] | None:

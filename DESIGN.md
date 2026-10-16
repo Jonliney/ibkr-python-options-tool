@@ -2,6 +2,10 @@
 name: IBKR Options Manager
 description: A read-only desktop passage plan for inspecting one verified option exit route.
 colors:
+  # StarUI trade-journal scope only; legacy Qt tokens below remain unchanged.
+  journal-positive: "#6ee7b7"
+  journal-negative: "#fda4af"
+  journal-warning: "#fde68a"
   instrument-ground: "#071a2b"
   risk-ground: "#061622"
   control-panel: "#0a2233"
@@ -277,3 +281,58 @@ Route marks use strict line geometry: basis is a heavier solid line, quote and t
 - **Don't** use hydrographic magenta as a general brand accent; reserve it for the immutable safety banner, planned targets, selection, and blocking states.
 - **Don't** depend on route animation; reduced-motion mode must remain complete and immediately legible.
 - **Don't** support a window smaller than 1120 × 820px without first redesigning and retesting the information layout.
+
+
+## StarUI Trade Journal — Scoped Extension
+
+This section applies only to the embedded StarHTML/StarUI Dashboard and position Analysis views implemented in `src/ibkr_options_manager/app/web/journal_view.py` and `static/journal.css`. The preceding marine palette, Avenir/SF Mono typography, square Qt controls, and minimum-window guidance describe the legacy Qt interface; this addition preserves that record without applying it to these web views. Shared web primitives remain governed by `static/starui.css` and `static/layers.css`. This is an additive record of the implemented journal, not a migration of the legacy design system.
+
+### Overview
+
+The journal extends the incumbent neutral-black workbench as a calm analytical surface. One open working plane contains metrics, charts, insights, and trade rows, separated by hairline rules rather than individual cards. Historical performance stays inspectable through sample qualifications and per-trade drill-down. The page opens with the simple title “Dashboard”; no subtitle, source badge, or global Trades/Currency controls compete with its content.
+
+### Colors
+
+Use inherited StarUI `--background`, `--foreground`, `--muted-foreground`, `--card`, and `--border` roles; do not apply the legacy marine fields. Positive and negative results use the journal-prefixed frontmatter colors, with numeric signs and descriptive labels carrying the meaning. The warning color qualifies incomplete evidence. The close-price stroke is positive green, the observed high/low range is a translucent wash of that color, and reference lines use neutral dashed strokes.
+
+**The Journal Signed-Value Rule.** Performance color reinforces the signed number and label; it never replaces them.
+
+### Typography
+
+Inherit the StarUI sans-serif family. The journal uses compact labels and table text, restrained section headings, and larger tabular metric values: captions at .75rem, table values at .8rem, supporting copy at .875rem, section titles at .95rem, page titles at 1.65rem, and metrics at 1.7rem. Metric weight is 550; page titles use 650. Prices, percentages, table data, and timestamps use tabular figures rather than inheriting the legacy SF Mono requirement.
+
+### Layout
+
+Main navigation exposes Dashboard and Positions; position navigation exposes Management and Analysis. The dashboard is a centered, scrollable plane capped at 100rem, with 2rem vertical and 2.5rem horizontal padding. Four-column metric registers and three-column excursion registers share top/bottom rules and vertical dividers. The equity/entry-insight split uses 1.8fr alongside a minimum-22rem insight column; at 1250px and below, the equity share contracts to 1.4fr. Entry timing owns its settings locally beside its heading. Position views retain a 16rem inventory rail. At 1250px and below, horizontal padding contracts to 1.5rem, the rail to 14rem, and metric type to 1.45rem. Wide tables scroll horizontally.
+
+### Elevation & Depth
+
+Journal sections have no shadows or raised cards; the bundled StarUI settings popup retains its own popover treatment. Inherited neutral surfaces, whitespace, and one-pixel rules establish depth. The chart's translucent observation range is evidence, not ornamental elevation.
+
+### Shapes
+
+Navigation is flat with a two-pixel active underline. The per-trade entry selector retains gently rounded corners (.35rem). Entry-timing settings inherit bundled StarUI control and dropdown shapes. These observed web treatments are scoped exceptions to the legacy Qt square-control guidance.
+
+### Components
+
+- **Navigation:** Muted inactive labels brighten on hover; the active label and underline use foreground. Main navigation identifies the current page. Closed entries disable Management.
+- **Control provenance:** Journal controls use bundled StarUI primitives; the tables, SVG charts, and analytical layout remain custom StarHTML/CSS. This records component reuse without claiming that every pixel is supplied by StarUI.
+- **Entry-timing settings:** A ghost funnel icon button opens a 16rem-wide panel aligned to the heading. Reuse DropdownMenu positioning and dismissal with dialog semantics for the labelled StarUI numeric inputs. Stop and target settings update after a 180ms typing debounce, with local busy/error status and no Apply action. Partial refresh replaces only the insight results, preserving input focus and the open panel without a page reload.
+- **Entry selector:** Visible labels accompany compact bordered controls. Buttons brighten their surface on hover. Journal keyboard focus uses a two-pixel foreground outline offset by three pixels.
+- **Entry-timing results:** Show target reach, the median pre-target dip among unambiguous paths, and returns to entry after the target among paths with sufficient follow-up. Compare stop-level recoveries in a compact ruled table; highlight the selected level using the muted surface and an accessible selected-level label. Keep exclusions and sample counts visible.
+- **Metric registers:** Large tabular values sit above concise qualifications. Keep the shared ruled strip rather than wrapping each value in a card.
+- **Trade and fill tables:** Left-aligned, tabular data with muted headers, one-pixel row rules, and understated hover feedback. Underlined text actions open trade analysis.
+- **Price-path chart:** Observed close prices and high/low ranges share a real elapsed-time axis. Break strokes and ranges whenever observations are not one minute apart; isolated observations render as dots. Entry and exit references use neutral line styles. SVG titles and accessible labels describe charts; visible qualifications identify data limits.
+- **Motion:** Navigation and text-action color changes use 140ms ease-out only when reduced motion is not requested. No animation is needed to interpret history.
+
+**The Journal Evidence-Gap Rule.** Missing observations remain visible as disconnected chart segments; never interpolate a continuous observed path across a missing minute.
+
+**The Journal Local-Settings Rule.** Entry-timing controls belong to Entry timing; editing them refreshes its results while preserving the active input and panel.
+
+### Do's and Don'ts
+
+- **Do** retain sample-count, gross-return, ambiguity, and incomplete-history qualifications alongside the values they explain.
+- **Do** distinguish realized outcomes from observed excursions and hypothetical threshold sequences through labels.
+- **Do** preserve the neutral workbench, tabular numbers, shared rules, visible focus, and signed-result colors in future journal extensions.
+- **Don't** introduce a card mosaic, decorative chart, or hidden interpolation into these historical views.
+- **Don't** promote these scoped web decisions into replacement rules for the legacy Qt interface.

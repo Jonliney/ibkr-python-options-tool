@@ -1112,7 +1112,8 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert "Cancel this active layer" in page.text
     assert ">State<" not in page.text
     assert "requires a second confirmation" not in page.text
-    assert 'aria-current="page"' not in page.text
+    # Order rows are not page navigation; the new app navigation is.
+    assert 'aria-current="page"' not in active_form
     assert 'data-active-initial="' in page.text
     assert 'data-live-price="active-target-1"' in page.text
     assert 'data-live-outcome="active-target-1"' in page.text

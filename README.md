@@ -56,7 +56,14 @@ local SQLite database. Run it separately from the desktop app:
 ```
 
 It retains tracked contracts after sale and retries history on reconnect.
-Dashboard metrics and position analysis tabs are planned follow-up work.
+The [trade dashboard and position Analysis tab](docs/TRADE_JOURNAL.md) use the
+same database for prices, fills, position changes and saved closed holdings.
+The normal desktop launch opens the dashboard; **Positions → Management**
+retains the existing order workbench. Preview populated illustrative history with:
+
+```sh
+.venv/bin/ibkr-options-manager-gui --demo-data
+```
 
 ## Paper execution (explicit opt-in)
 

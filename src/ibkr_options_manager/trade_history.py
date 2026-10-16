@@ -45,6 +45,7 @@ class Discovery:
     fills: tuple[CapturedExecution, ...]
     errors: tuple[str, ...] = ()
     positions: tuple[CapturedPosition, ...] = ()
+    positions_complete: bool = False
 
 
 class HistorySource(Protocol):
@@ -136,7 +137,7 @@ class TradeHistoryStore:
         self.db = sqlite3.connect(path)
         self.db.execute("PRAGMA foreign_keys=ON")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
+        if version not in (0, 1, 2):
             self.db.close()
             raise ValueError("unsupported trade history schema")
         self.db.executescript("""
@@ -177,8 +178,48 @@ class TradeHistoryStore:
                 timestamp INTEGER NOT NULL, source_timezone TEXT NOT NULL,
                 PRIMARY KEY(account, exec_id)
             );
-            PRAGMA user_version=1;
+            CREATE TABLE IF NOT EXISTS portfolio_state (
+                account TEXT NOT NULL, con_id INTEGER NOT NULL,
+                quantity TEXT NOT NULL, average_cost TEXT NOT NULL,
+                first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+                closed_at INTEGER, PRIMARY KEY(account, con_id)
+            );
+            CREATE TABLE IF NOT EXISTS portfolio_captures (
+                account TEXT PRIMARY KEY, observed_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS final_marks (
+                con_id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL,
+                price TEXT NOT NULL, kind TEXT NOT NULL
+            );
         """)
+        with self.db:
+            if version == 1:
+                latest = self.db.execute(
+                    "SELECT p.account,p.con_id,p.quantity,p.average_cost,"
+                    "MIN(p.observed_at),MAX(p.observed_at) "
+                    "FROM position_observations p GROUP BY p.account,p.con_id"
+                ).fetchall()
+                # Fetch quantity/cost from the actual last row, rather than an
+                # arbitrary row selected alongside an aggregate.
+                for account, con_id, _quantity, _cost, first, last in latest:
+                    quantity, cost = self.db.execute(
+                        "SELECT quantity,average_cost FROM position_observations "
+                        "WHERE account=? AND con_id=? AND observed_at=?",
+                        (account, con_id, last),
+                    ).fetchone()
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO portfolio_state VALUES(?,?,?,?,?,?,?)",
+                        (
+                            account,
+                            con_id,
+                            quantity,
+                            cost,
+                            first,
+                            last,
+                            last if Decimal(quantity) == 0 else None,
+                        ),
+                    )
+            self.db.execute("PRAGMA user_version=2")
 
     def close(self) -> None:
         self.db.close()
@@ -213,6 +254,13 @@ class TradeHistoryStore:
             ):
                 raise ValueError("invalid position evidence")
         with self.db:
+            if discovery.positions_complete:
+                previous_capture = self.db.execute(
+                    "SELECT observed_at FROM portfolio_captures WHERE account=?",
+                    (account,),
+                ).fetchone()
+                if previous_capture and previous_capture[0] > now:
+                    raise ValueError("portfolio observation predates saved state")
             if discovery.errors:
                 self.db.execute(
                     "INSERT OR REPLACE INTO discovery_errors VALUES(?,?,?)",
@@ -290,6 +338,37 @@ class TradeHistoryStore:
                         "VALUES(?,?,?,?,?)",
                         (account, con_id, now, *values),
                     )
+                self.db.execute(
+                    "INSERT INTO portfolio_state VALUES(?,?,?,?,?,?,NULL) "
+                    "ON CONFLICT(account,con_id) DO UPDATE SET "
+                    "quantity=excluded.quantity,average_cost=excluded.average_cost,"
+                    "last_seen=excluded.last_seen,closed_at=NULL",
+                    (account, con_id, *values, now, now),
+                )
+            if discovery.positions_complete:
+                current = {p.contract.con_id for p in discovery.positions}
+                previous_rows = self.db.execute(
+                    "SELECT con_id,quantity,average_cost FROM portfolio_state "
+                    "WHERE account=? AND closed_at IS NULL",
+                    (account,),
+                ).fetchall()
+                for con_id, _quantity, cost in previous_rows:
+                    if con_id in current:
+                        continue
+                    self.db.execute(
+                        "UPDATE portfolio_state SET quantity='0',last_seen=?,"
+                        "closed_at=? WHERE account=? AND con_id=?",
+                        (now, now, account, con_id),
+                    )
+                    self.db.execute(
+                        "INSERT OR REPLACE INTO position_observations "
+                        "VALUES(?,?,?,'0',?)",
+                        (account, con_id, now, cost),
+                    )
+                self.db.execute(
+                    "INSERT OR REPLACE INTO portfolio_captures VALUES(?,?)",
+                    (account, now),
+                )
 
     def tracked(self, account: str) -> list[tuple[CapturedContract, int]]:
         return [
