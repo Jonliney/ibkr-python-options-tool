@@ -8,7 +8,6 @@ from decimal import Decimal
 from typing import Any
 
 from starhtml import (
-    H1,
     H2,
     H3,
     Circle,
@@ -737,13 +736,21 @@ def dashboard(
 
 
 def _price_sequence(sequence: str) -> Any:
+    content: tuple[Any, ...]
     if sequence in ("High before low", "Low before high"):
         high_first = sequence == "High before low"
         letters = ("H", "L") if high_first else ("L", "H")
         content = (
-            Span(letters[0], cls="journal-positive" if high_first else "journal-negative"),
-            Icon("lucide:move-down-right" if high_first else "lucide:move-up-right", cls="size-4"),
-            Span(letters[1], cls="journal-negative" if high_first else "journal-positive"),
+            Span(
+                letters[0], cls="journal-positive" if high_first else "journal-negative"
+            ),
+            Icon(
+                "lucide:move-down-right" if high_first else "lucide:move-up-right",
+                cls="size-4",
+            ),
+            Span(
+                letters[1], cls="journal-negative" if high_first else "journal-positive"
+            ),
         )
     elif sequence == "Same minute · order unknown":
         content = (Icon("lucide:clock-3", cls="size-4"), Span("H / L"))
@@ -820,7 +827,11 @@ def _history_table(rows: tuple[JournalRow, ...], path: str) -> Any:
                             if row.analysis
                             else "",
                         ),
-                        Td(_price_sequence(row.analysis.sequence if row.analysis else "Unknown")),
+                        Td(
+                            _price_sequence(
+                                row.analysis.sequence if row.analysis else "Unknown"
+                            )
+                        ),
                         Td(
                             _form(
                                 path,
@@ -939,26 +950,15 @@ def _price_chart(row: JournalRow) -> Any:
     )
 
 
-def position_analysis(
-    row: JournalRow | None,
-    rows: tuple[JournalRow, ...],
-    path: str,
-    *,
-    stop: Decimal,
-    target: Decimal,
-) -> Any:
+def _analysis_sidebar(row: JournalRow | None) -> Any:
     if row is None:
         return Div(
-            H1("Position analysis"),
-            position_tabs(path, "analysis"),
-            P(
-                "No saved entry is available for this position yet.",
-                cls="journal-muted",
-            ),
-            cls="journal-analysis journal-empty",
+            H2("Trade summary", cls="px-4 py-4 text-sm font-semibold"),
+            P("No saved trade statistics yet.", cls="journal-muted px-4"),
+            cls="journal-analysis-sidebar",
+            aria_label="Trade summary",
         )
     analysis = row.analysis
-    related = tuple(r for r in rows if r.contract.con_id == row.contract.con_id)
     c = row.contract.currency
 
     def outcome(label: str, price: Decimal | None, detail: str) -> Any:
@@ -971,18 +971,94 @@ def position_analysis(
         )
 
     return Div(
+        H2("Trade summary", cls="px-4 py-4 text-sm font-semibold"),
         Div(
             Div(
-                H1(trade_label(row)),
-                P(
-                    f"{row.status} · {row.quantity.normalize():f} contracts · {row.coverage}",
-                    cls="journal-muted",
+                _metric(
+                    "Entry price",
+                    money(row.entry_price, c),
+                    stamp(row.entry_at, full=True),
                 ),
+                _metric(
+                    "Actual gross P&L",
+                    money(row.realized_pnl, c),
+                    percent(row.actual_return)
+                    if row.realized_pnl is not None
+                    else "Available after a fully matched close",
+                    tone=_tone(row.realized_pnl),
+                ),
+                _metric(
+                    "Average observed price",
+                    money(analysis.average if analysis else None, c),
+                    "Arithmetic mean of minute closes",
+                ),
+                cls="journal-analysis-stat-group",
+            ),
+            Div(
+                outcome(
+                    "Worst observed",
+                    analysis.low if analysis else None,
+                    money(analysis.low if analysis else None, c) + " bid",
+                ),
+                outcome(
+                    "Best observed",
+                    analysis.high if analysis else None,
+                    money(analysis.high if analysis else None, c) + " bid",
+                ),
+                outcome(
+                    "Hold to final session",
+                    row.final_price,
+                    "Final bid estimate · not settlement",
+                )
+                if row.final_kind == "expiry_bid"
+                else _metric(
+                    "Hold to expiration", "—", "Final-session value not captured"
+                ),
+                cls="journal-analysis-stat-group",
+            ),
+            cls="journal-analysis-statistics",
+        ),
+        cls="journal-analysis-sidebar",
+        role="complementary",
+        aria_label="Trade summary",
+    )
+
+
+def position_analysis(
+    row: JournalRow | None,
+    rows: tuple[JournalRow, ...],
+    path: str,
+    *,
+    stop: Decimal,
+    target: Decimal,
+    position_header: Any,
+) -> tuple[Any, Any]:
+    if row is None:
+        center = Div(
+            position_header,
+            position_tabs(path, "analysis"),
+            P(
+                "No saved entry is available for this position yet.",
+                cls="journal-muted",
+            ),
+            cls="journal-analysis",
+        )
+        return center, _analysis_sidebar(None)
+    analysis = row.analysis
+    related = tuple(r for r in rows if r.contract.con_id == row.contract.con_id)
+    c = row.contract.currency
+
+    center = Div(
+        position_header,
+        position_tabs(path, "analysis", row),
+        Div(
+            P(
+                f"{row.status} · {row.quantity.normalize():f} contracts · {row.coverage}",
+                cls="journal-muted",
             ),
             _form(path, "show-dashboard", "Back to dashboard", cls="journal-back"),
             cls="journal-title-row",
         ),
-        position_tabs(path, "analysis", row),
         Form(
             Label("Entry / trade", fr="journal-entry"),
             Select(
@@ -1005,45 +1081,6 @@ def position_analysis(
         )
         if len(related) > 1
         else None,
-        Div(
-            _metric(
-                "Entry price", money(row.entry_price, c), stamp(row.entry_at, full=True)
-            ),
-            _metric(
-                "Actual gross P&L",
-                money(row.realized_pnl, c),
-                percent(row.actual_return)
-                if row.realized_pnl is not None
-                else "Available after a fully matched close",
-                tone=_tone(row.realized_pnl),
-            ),
-            _metric(
-                "Average observed price",
-                money(analysis.average if analysis else None, c),
-                "Arithmetic mean of minute closes",
-            ),
-            cls="journal-metrics journal-metrics-three",
-        ),
-        Div(
-            outcome(
-                "Worst observed",
-                analysis.low if analysis else None,
-                money(analysis.low if analysis else None, c) + " bid",
-            ),
-            outcome(
-                "Best observed",
-                analysis.high if analysis else None,
-                money(analysis.high if analysis else None, c) + " bid",
-            ),
-            outcome(
-                "Hold to final session",
-                row.final_price,
-                "Final bid estimate · not settlement",
-            )
-            if row.final_kind == "expiry_bid"
-            else _metric("Hold to expiration", "—", "Final-session value not captured"),
-            cls="journal-metrics journal-metrics-three",
-        ),
         Div(
             H2("Price path after entry"),
             Span(
@@ -1094,6 +1131,7 @@ def position_analysis(
         cls="journal-analysis",
         data_position_analysis=True,
     )
+    return center, _analysis_sidebar(row)
 
 
 def _fill_table(row: JournalRow) -> Any:

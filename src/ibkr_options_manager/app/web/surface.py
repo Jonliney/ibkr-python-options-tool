@@ -3880,15 +3880,19 @@ class StarUIWorkbench:
             )
         elif self._position_view == "analysis":
             rows = self._journal_rows()
+            analysis_row = self._analysis_row(rows)
+            analysis_content, analysis_summary = position_analysis(
+                analysis_row,
+                rows,
+                self.path,
+                stop=self._journal_stop,
+                target=self._journal_target,
+                position_header=self._analysis_position_header(analysis_row),
+            )
             content = Div(
                 Div(self._inventory(), id="position-inventory"),
-                position_analysis(
-                    self._analysis_row(rows),
-                    rows,
-                    self.path,
-                    stop=self._journal_stop,
-                    target=self._journal_target,
-                ),
+                analysis_content,
+                analysis_summary,
                 cls="journal-position-layout",
             )
         elif self._selected_closed_con_id in self._session_closed_positions:
@@ -3898,7 +3902,6 @@ class StarUIWorkbench:
             content = Div(
                 Div(self._inventory(), id="position-inventory"),
                 Div(
-                    position_tabs(self.path, "management"),
                     closed_workspace,
                     cls="journal-management",
                 ),
@@ -3926,7 +3929,6 @@ class StarUIWorkbench:
             content = Div(
                 Div(self._inventory(), id="position-inventory"),
                 Div(
-                    position_tabs(self.path, "management"),
                     self._workspace(title),
                     cls="journal-management",
                 ),
@@ -4350,6 +4352,55 @@ class StarUIWorkbench:
             data_launch_connection=state,
         )
 
+    def _analysis_position_header(self, row: JournalRow | None) -> Any:
+        snapshot = self._view_model.latest_snapshot()
+        con_id = row.contract.con_id if row else self._selected_con_id
+        closed = row is not None and row.status.startswith("Closed")
+        current = (
+            snapshot
+            if snapshot is not None
+            and snapshot.selected.con_id == con_id == self._selected_con_id
+            and not closed
+            else None
+        )
+        contract = row.contract if row else current.contract if current else None
+        title = _contract_display_name(contract) if contract else "Position analysis"
+        if current is not None:
+            return self._workspace(title, header_only=True)
+        currency = contract.currency if contract else "USD"
+        quantity = f"{'0' if closed else '—'} / {row.quantity:g}" if row else "— / —"
+        return Div(
+            H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
+            Div(
+                _contract_header_metric("Held / total", quantity),
+                _contract_header_metric(
+                    "Available",
+                    "0" if closed else "—",
+                ),
+                _contract_header_metric(
+                    "Average price",
+                    _header_price(
+                        row.entry_price if row else None,
+                        currency,
+                    ),
+                ),
+                _contract_header_metric(
+                    "Last bid",
+                    _header_price(None, currency),
+                ),
+                _contract_header_metric(
+                    "Last ask",
+                    _header_price(None, currency),
+                ),
+                _contract_header_metric(
+                    "Realised P&L",
+                    _header_pnl(row.realized_pnl if row else None, currency),
+                ),
+                cls="contract-header-facts",
+            ),
+            cls="position-analysis-header",
+        )
+
     def _header(self) -> Any:
         state = self._state
         snapshot = self._view_model.latest_snapshot()
@@ -4564,19 +4615,17 @@ class StarUIWorkbench:
                 realized += market_outcome.realized_pnl
             has_recorded_fill = has_recorded_fill or bool(entry.fills)
         symbol, contract_detail = _position_identity(position.local_symbol)
-        title = f"{symbol} {contract_detail}".strip()
+        snapshot = self._session_contract_snapshots.get(con_id)
+        title = (
+            _contract_display_name(snapshot.contract)
+            if snapshot is not None
+            else f"{symbol} {contract_detail}".strip()
+        )
         result = (
             _header_pnl(realized, "USD") if pnl_verified and has_recorded_fill else "—"
         )
-        center = self._workspace_content(
-            Div(
-                H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
-                Div(
-                    self._add_layer_control(disabled=True),
-                    cls="ml-auto flex flex-wrap items-center justify-end gap-2",
-                ),
-                cls="flex flex-wrap items-center gap-4",
-            ),
+        header = (
+            H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
             Div(
                 _contract_header_metric("Held / total", "0 / 0"),
                 _contract_header_metric("Available", "0"),
@@ -4585,6 +4634,15 @@ class StarUIWorkbench:
                 _contract_header_metric("Last ask", "—"),
                 _contract_header_metric("Realised P&L", result),
                 cls="contract-header-facts",
+            ),
+            position_tabs(self.path, "management"),
+        )
+        center = self._workspace_content(
+            Div(
+                self._add_layer_control(disabled=True),
+                cls="position-management-actions",
+                role="toolbar",
+                aria_label="Position management actions",
             ),
             Div(
                 ScrollArea(
@@ -4605,6 +4663,7 @@ class StarUIWorkbench:
                 ),
                 cls="mt-5 min-h-0 flex-1 overflow-hidden",
             ),
+            header=header,
             data_closed_session=True,
         )
         review = Div(
@@ -4972,15 +5031,19 @@ class StarUIWorkbench:
             cls="selected-quantity-notice",
         )
 
-    def _workspace_content(self, *children: Any, **attributes: Any) -> Any:
+    def _workspace_content(
+        self, *children: Any, header: tuple[Any, ...] = (), **attributes: Any
+    ) -> Any:
         locked = bool(self._unresolved_management_entries())
         if not locked:
             return Div(
+                *header,
                 *children,
                 cls="workspace-content flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6",
                 **attributes,
             )
         return Div(
+            *header,
             self._management_lock_notice(),
             Fieldset(*children, disabled=True, cls="contents"),
             cls="workspace-content flex min-w-0 min-h-0 flex-col overflow-hidden px-8 py-6",
@@ -5046,7 +5109,7 @@ class StarUIWorkbench:
             TooltipContent("Add a draft layer"),
         )
 
-    def _workspace(self, title: str) -> Any:
+    def _workspace(self, title: str, *, header_only: bool = False) -> Any:
         coverage, _, _ = self._order_coverage()
         active_pairs = self._active_oca_pairs()
         outcomes = self._submission_outcomes()
@@ -5119,10 +5182,46 @@ class StarUIWorkbench:
                 elif realized is not None:
                     realized += market_outcome.realized_pnl
         working_trails = any(entry.state == "SUBMITTED" for entry in trailing_entries)
-        return self._workspace_content(
-            self._selected_quantity_notice(),
+        facts = (
             Div(
-                H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
+                _contract_header_metric(
+                    "Held / total",
+                    self._header_quantity(outcomes, selected_snapshot),
+                ),
+                _contract_header_metric(
+                    "Available",
+                    f"{planning_available:g}" if draft_allowed else "—",
+                    adornment=self._coverage_dialog(
+                        coverage,
+                        selected_snapshot,
+                        uncertain_app_orders=any(
+                            outcome.status in {"PENDING", "UNKNOWN", "GROUP_COLLISION"}
+                            for _entry, _index, outcome in outcomes
+                        ),
+                    ),
+                ),
+                _contract_header_metric(
+                    "Average price", _header_price(basis, currency)
+                ),
+                _contract_header_metric(
+                    "Last bid", _header_price(quote.bid if quote else None, currency)
+                ),
+                _contract_header_metric(
+                    "Last ask", _header_price(quote.ask if quote else None, currency)
+                ),
+                _contract_header_metric(
+                    "Realised P&L", _header_pnl(realized, currency)
+                ),
+                cls="contract-header-facts",
+            )
+            if selected_snapshot is not None
+            else None
+        )
+        heading = H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight")
+        if header_only:
+            return Div(heading, facts, cls="position-analysis-header")
+        return self._workspace_content(
+            Div(
                 Div(
                     Div(
                         self._set_stops_dialog(
@@ -5264,41 +5363,11 @@ class StarUIWorkbench:
                     ),
                     cls="ml-auto flex flex-wrap items-center justify-end gap-2",
                 ),
-                cls="flex flex-wrap items-center gap-4",
+                cls="position-management-actions flex flex-wrap items-center gap-4",
+                role="toolbar",
+                aria_label="Position management actions",
             ),
-            Div(
-                _contract_header_metric(
-                    "Held / total",
-                    self._header_quantity(outcomes, selected_snapshot),
-                ),
-                _contract_header_metric(
-                    "Available",
-                    f"{planning_available:g}" if draft_allowed else "—",
-                    adornment=self._coverage_dialog(
-                        coverage,
-                        selected_snapshot,
-                        uncertain_app_orders=any(
-                            outcome.status in {"PENDING", "UNKNOWN", "GROUP_COLLISION"}
-                            for _entry, _index, outcome in outcomes
-                        ),
-                    ),
-                ),
-                _contract_header_metric(
-                    "Average price", _header_price(basis, currency)
-                ),
-                _contract_header_metric(
-                    "Last bid", _header_price(quote.bid if quote else None, currency)
-                ),
-                _contract_header_metric(
-                    "Last ask", _header_price(quote.ask if quote else None, currency)
-                ),
-                _contract_header_metric(
-                    "Realised P&L", _header_pnl(realized, currency)
-                ),
-                cls="contract-header-facts",
-            )
-            if selected_snapshot is not None
-            else None,
+            self._selected_quantity_notice(),
             self._submission_attention(outcomes),
             Div(
                 ScrollArea(
@@ -5336,6 +5405,7 @@ class StarUIWorkbench:
                 ),
                 cls="mt-5 min-h-0 flex-1 overflow-hidden",
             ),
+            header=(heading, facts, position_tabs(self.path, "management")),
         )
 
     def _bracket_identity_card(self, entry: JournalEntry, index: int) -> Any:
@@ -11020,7 +11090,7 @@ def _position_identity(local_symbol: str) -> tuple[str, str]:
     )
 
 
-def _contract_display_name(contract: VerifiedOptionContract) -> str:
+def _contract_display_name(contract: VerifiedOptionContract | CapturedContract) -> str:
     """Use verified contract fields for the selected position heading."""
     try:
         expiry = datetime.strptime(contract.expiry, "%Y%m%d")

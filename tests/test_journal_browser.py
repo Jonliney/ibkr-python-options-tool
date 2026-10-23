@@ -27,6 +27,7 @@ def test_journal_views_render_at_desktop_and_minimum_size(tmp_path):
         for r in workbench._journal_rows()
         if r.contract.con_id == workbench._selected_con_id
     )
+    analysis_widths = {}
     try:
         for name, action in (
             ("dashboard", {"action": "show-dashboard"}),
@@ -34,7 +35,7 @@ def test_journal_views_render_at_desktop_and_minimum_size(tmp_path):
             ("management", {"action": "show-management"}),
         ):
             client.post(workbench.path + "action", data=action)
-            for width in (1500, 1120):
+            for width in (1500, 1120, 2560):
                 view.resize(width, 920)
                 loop = QEventLoop()
                 observations = []
@@ -52,7 +53,31 @@ def test_journal_views_render_at_desktop_and_minimum_size(tmp_path):
                             dashboard: !!document.querySelector(
                               '[data-journal-dashboard]'),
                             analysis: !!document.querySelector(
-                              '[data-position-analysis]')
+                              '[data-position-analysis]'),
+                            analysisSidebar: !!document.querySelector(
+                              '.journal-analysis-sidebar'),
+                            workspaceWidth: document.querySelector(
+                              '.journal-analysis,.workspace-content')
+                              ?.getBoundingClientRect().width,
+                            analysisMetrics: document.querySelectorAll(
+                              '.journal-analysis-sidebar .journal-metric').length,
+                            positionHierarchy: (() => {
+                              const scope = document.querySelector(
+                                '.journal-analysis,.journal-management');
+                              if (!scope) return true;
+                              const title = scope.querySelector('h1');
+                              const facts = scope.querySelector(
+                                '.contract-header-facts');
+                              const tabs = scope.querySelector(
+                                '.journal-position-tabs');
+                              const actions = scope.querySelector(
+                                '.position-management-actions');
+                              const box = element => element.getBoundingClientRect();
+                              return !!(title && facts && tabs)
+                                && box(title).bottom <= box(facts).top
+                                && box(facts).bottom <= box(tabs).top
+                                && (!actions || box(tabs).bottom <= box(actions).top);
+                            })()
                         })""",
                             lambda result: (
                                 observations.append(json.loads(result)),
@@ -81,6 +106,13 @@ def test_journal_views_render_at_desktop_and_minimum_size(tmp_path):
                 assert observations[0]["chart"]
                 assert observations[0]["dashboard"] == (name == "dashboard")
                 assert observations[0]["analysis"] == (name == "analysis")
+                assert observations[0]["positionHierarchy"]
+                assert observations[0]["analysisSidebar"] == (name == "analysis")
+                if name == "analysis":
+                    analysis_widths[width] = observations[0]["workspaceWidth"]
+                    assert observations[0]["analysisMetrics"] == 6
+                elif name == "management":
+                    assert observations[0]["workspaceWidth"] == analysis_widths[width]
                 QTest.qWait(150)  # allow the rendered compositor frame to reach grab()
                 view.grab().save(str(screenshots / f"{name}-{width}.png"))
     finally:
