@@ -170,3 +170,154 @@ def test_entry_settings_update_in_place_and_keep_input_focus(tmp_path):
         server.should_exit = True
         thread.join(timeout=2)
         workbench.close()
+
+
+def test_equity_points_pointer_keyboard_and_resize(tmp_path):
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    client = TestClient(workbench.app)
+    client.post(workbench.path + "action", data={"action": "show-dashboard"})
+    server, thread, port = _start_local_server(workbench.app)
+    view = QWebEngineView()
+    view.resize(1500, 920)
+    view.show()
+    loop = QEventLoop()
+    seen = []
+    try:
+
+        def loaded(ok):
+            assert ok
+
+            def ready(value):
+                if not value:
+                    seen.append(False)
+                    loop.quit()
+                    return
+                view.page().runJavaScript(
+                    """(() => {
+                  const root = document.querySelector('[data-interactive-equity]');
+                  const svg = root.querySelector('svg');
+                  const points = [...root.querySelectorAll('[data-equity-point]')];
+                  const box = svg.getBoundingClientRect();
+                  svg.dispatchEvent(new PointerEvent('pointermove', {
+                    clientX:box.right-12, clientY:box.top+100, bubbles:true
+                  }));
+                  const pointer = root.querySelector('[data-equity-tooltip]')
+                    .textContent.includes('788.50');
+                  points[points.length-1].focus();
+                  points[points.length-1].dispatchEvent(new KeyboardEvent(
+                    'keydown', {key:'ArrowLeft', bubbles:true}));
+                  const keyboard = document.activeElement === points[points.length-2]
+                    && points[points.length-2].getAttribute('aria-pressed') === 'true';
+                  const tooltip = root.querySelector('[data-equity-tooltip]');
+                  const tipBox = tooltip.getBoundingClientRect();
+                  const rootBox = root.getBoundingClientRect();
+                  const dayValue = tooltip.querySelector('[data-equity-day-value]');
+                  const totalValue = tooltip.querySelector('[data-equity-total-value]');
+                  const valueAlignment = Math.abs(dayValue.getBoundingClientRect().right
+                    - totalValue.getBoundingClientRect().right) < 1;
+                  const label = tooltip.querySelector('.journal-tooltip-values')
+                    .children[2].getBoundingClientRect();
+                  const spacing = totalValue.getBoundingClientRect().left
+                    - label.right >= 30;
+                  const positive = dayValue.classList.contains('journal-positive')
+                    && dayValue.textContent.startsWith('+');
+                  const negativePoint = points.find(p =>
+                    p.dataset.dayTone === 'journal-negative');
+                  negativePoint.focus();
+                  const negative = dayValue.classList.contains('journal-negative')
+                    && dayValue.textContent.startsWith('-');
+                  points[points.length-2].focus();
+                  const section = root.closest('.journal-equity-section');
+                  const fullHeight = box.height > 300 && Math.abs(rootBox.bottom -
+                    (section.getBoundingClientRect().bottom -
+                    parseFloat(getComputedStyle(section).paddingBottom))) < 2;
+                  const tooltipFits = !tooltip.hidden && tipBox.left >= rootBox.left
+                    && tipBox.right <= rootBox.right + 1;
+                  points[points.length-2].dispatchEvent(new KeyboardEvent(
+                    'keydown', {key:'Escape', bubbles:true}));
+                  const dismissed = tooltip.hidden;
+                  points[points.length-2].dispatchEvent(new MouseEvent('click'));
+                  const reopened = !tooltip.hidden;
+                  const day = points[points.length-2].dataset.day;
+                  root.querySelector('[data-day-trades]').click();
+                  const history = [...document.querySelectorAll('[data-history-day]')];
+                  const visible = history.filter(row => !row.hidden);
+                  const filtered = visible.length > 0 && visible.every(row =>
+                    row.dataset.historyDay === day &&
+                    row.dataset.historyCurrency === root.dataset.currency);
+                  const clear = document.querySelector('[data-clear-history-day]');
+                  const filterShown = !clear.hidden;
+                  clear.click();
+                  const cleared = clear.hidden && history.every(row => !row.hidden);
+                  points[points.length-2].focus();
+                  const last = points[points.length-1];
+                  const width = Math.abs(Number(last.getAttribute('cx'))
+                    - (box.width-12)) < 1;
+                  return JSON.stringify({pointer, keyboard, width, tooltipFits,
+                    dismissed, reopened, filtered, filterShown, cleared,
+                    valueAlignment, spacing, positive, negative, fullHeight,
+                    count:points.length,
+                    text:root.querySelector('[data-equity-tooltip]').textContent});
+                })()""",
+                    lambda result: (seen.append(json.loads(result)), loop.quit()),
+                )
+
+            wait_for_javascript(
+                view,
+                "document.querySelector('[data-equity-point]') && "
+                "Math.abs(Number(document.querySelector('.journal-equity-chart')"
+                ".getAttribute('viewBox').split(' ')[2]) - "
+                "document.querySelector('.journal-equity-chart')"
+                ".getBoundingClientRect().width) < 1",
+                ready,
+                timeout=5,
+            )
+
+        view.loadFinished.connect(loaded)
+        view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
+        QTimer.singleShot(10000, loop.quit)
+        loop.exec()
+        assert seen and seen[0]
+        assert seen[0]["pointer"] and seen[0]["keyboard"] and seen[0]["width"]
+        assert all(
+            seen[0][key]
+            for key in (
+                "valueAlignment",
+                "spacing",
+                "positive",
+                "negative",
+                "fullHeight",
+            )
+        )
+        assert seen[0]["tooltipFits"] and seen[0]["dismissed"] and seen[0]["reopened"]
+        assert seen[0]["filtered"] and seen[0]["filterShown"] and seen[0]["cleared"]
+        assert seen[0]["count"] == len(
+            {
+                r.exit_at // 86400
+                for r in workbench._journal_rows()
+                if r.exit_at is not None and r.realized_pnl is not None
+            }
+        )
+        view.resize(1120, 920)
+        resize_loop = QEventLoop()
+        resize_seen = []
+        wait_for_javascript(
+            view,
+            "Math.abs(Number([...document.querySelectorAll('[data-equity-point]')]"
+            ".at(-1).getAttribute('cx')) - (document.querySelector("
+            "'.journal-equity-chart').getBoundingClientRect().width-12)) < 1",
+            lambda value: (resize_seen.append(value), resize_loop.quit()),
+            timeout=3,
+        )
+        QTimer.singleShot(4000, resize_loop.quit)
+        resize_loop.exec()
+        assert resize_seen == [True]
+        QTest.qWait(150)
+        view.grab().save(str(tmp_path / "equity-point-selected.png"))
+    finally:
+        view.close()
+        view.deleteLater()
+        server.should_exit = True
+        thread.join(timeout=2)
+        workbench.close()

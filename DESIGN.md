@@ -289,7 +289,7 @@ This section applies only to the embedded StarHTML/StarUI Dashboard and position
 
 ### Overview
 
-The journal extends the incumbent neutral-black workbench as a calm analytical surface. One open working plane contains metrics, charts, insights, and trade rows, separated by hairline rules rather than individual cards. Historical performance stays inspectable through sample qualifications and per-trade drill-down. The page opens with the simple title “Dashboard”; no subtitle, source badge, or global Trades/Currency controls compete with its content.
+The journal extends the incumbent neutral-black workbench as a calm analytical surface. One open working plane contains metrics, charts, insights, and trade rows, separated by hairline rules rather than individual cards. Historical performance stays inspectable through sample qualifications and per-trade drill-down. The active Dashboard tab identifies the page: the content opens directly with metrics, without a page heading, subtitle, source badge, or global Trades/Currency controls.
 
 ### Colors
 
@@ -299,11 +299,11 @@ Use inherited StarUI `--background`, `--foreground`, `--muted-foreground`, `--ca
 
 ### Typography
 
-Inherit the StarUI sans-serif family. The journal uses compact labels and table text, restrained section headings, and larger tabular metric values: captions at .75rem, table values at .8rem, supporting copy at .875rem, section titles at .95rem, page titles at 1.65rem, and metrics at 1.7rem. Metric weight is 550; page titles use 650. Prices, percentages, table data, and timestamps use tabular figures rather than inheriting the legacy SF Mono requirement.
+Inherit the StarUI sans-serif family. The journal uses compact labels and table text, restrained section headings, and larger tabular metric values: captions at .75rem, table values at .8rem, supporting copy at .875rem, section titles at .95rem, per-trade page titles at 1.65rem, and metrics at 1.7rem. Metric weight is 550; per-trade page titles use 650. The Dashboard has no repeated page title. Use UK English (`en-GB`) for user-facing copy, including “realised”. Prices, percentages, table data, and timestamps use tabular figures rather than inheriting the legacy SF Mono requirement.
 
 ### Layout
 
-Main navigation exposes Dashboard and Positions; position navigation exposes Management and Analysis. The dashboard is a centered, scrollable plane capped at 100rem, with 2rem vertical and 2.5rem horizontal padding. Four-column metric registers and three-column excursion registers share top/bottom rules and vertical dividers. The equity/entry-insight split uses 1.8fr alongside a minimum-22rem insight column; at 1250px and below, the equity share contracts to 1.4fr. Entry timing owns its settings locally beside its heading. Position views retain a 16rem inventory rail. At 1250px and below, horizontal padding contracts to 1.5rem, the rail to 14rem, and metric type to 1.45rem. Wide tables scroll horizontally.
+Main navigation exposes Dashboard and Positions; position navigation exposes Management and Analysis. The dashboard is a centered, scrollable plane capped at 100rem, with 2rem vertical and 2.5rem horizontal padding. The Dashboard opens with five metric columns, vertical dividers, and a bottom rule; this first register has no top rule or top padding. Per-trade excursion registers retain three columns and their existing rules. The equity/entry-insight split uses 1.8fr alongside a minimum-22rem insight column; at 1250px and below, the equity share contracts to 1.4fr. Entry timing owns its settings locally beside its heading. Position views retain a 16rem inventory rail. At 1250px and below, horizontal padding contracts to 1.5rem, the rail to 14rem, and per-trade metric type to 1.45rem; Dashboard metric type becomes 1.4rem. Wide tables scroll horizontally.
 
 ### Elevation & Depth
 
@@ -320,7 +320,8 @@ Navigation is flat with a two-pixel active underline. The per-trade entry select
 - **Entry-timing settings:** A ghost funnel icon button opens a 16rem-wide panel aligned to the heading. Reuse DropdownMenu positioning and dismissal with dialog semantics for the labelled StarUI numeric inputs. Stop and target settings update after a 180ms typing debounce, with local busy/error status and no Apply action. Partial refresh replaces only the insight results, preserving input focus and the open panel without a page reload.
 - **Entry selector:** Visible labels accompany compact bordered controls. Buttons brighten their surface on hover. Journal keyboard focus uses a two-pixel foreground outline offset by three pixels.
 - **Entry-timing results:** Show target reach, the median pre-target dip among unambiguous paths, and returns to entry after the target among paths with sufficient follow-up. Compare stop-level recoveries in a compact ruled table; highlight the selected level using the muted surface and an accessible selected-level label. Keep exclusions and sample counts visible.
-- **Metric registers:** Large tabular values sit above concise qualifications. Keep the shared ruled strip rather than wrapping each value in a card.
+- **Metric registers:** Large tabular values sit above concise qualifications. The Dashboard’s five metrics are Win rate, Gross realised P&L, Realised R:R, Average biggest dip, and Average peak gain. Realised R:R compares the average magnitude of closed losses with average closed wins, normalised to 1:x; display an unavailable value when either side is absent, and keep currencies separate. Use direct captions such as “Based on N trades” and “Includes prices after selling”. Keep the shared ruled strip rather than wrapping each value in a card.
+- **Realised P&L chart:** Fill the available width and height beside Entry timing with a daily SVG curve, grouped by UTC close date and spaced by elapsed calendar time. Point details contain only day/month, day P&L and cumulative P&L, with right-aligned signed amounts in a separate column, a two-rem column gap, and green gains/rose losses. The interactive point-anchored tooltip includes a borderless underlined StarUI link-style “View trades” action that filters history to that day and currency; “All dates” clears it without changing summary stats. Pointer, touch and keyboard inspection remain available, including Escape dismissal. ResizeObserver recalculates geometry. Keep currency curves separate and label values as gross, excluding fees and FX.
 - **Trade and fill tables:** Left-aligned, tabular data with muted headers, one-pixel row rules, and understated hover feedback. Underlined text actions open trade analysis.
 - **Price-path chart:** Observed close prices and high/low ranges share a real elapsed-time axis. Break strokes and ranges whenever observations are not one minute apart; isolated observations render as dots. Entry and exit references use neutral line styles. SVG titles and accessible labels describe charts; visible qualifications identify data limits.
 - **Motion:** Navigation and text-action color changes use 140ms ease-out only when reduced motion is not requested. No animation is needed to interpret history.
@@ -329,10 +330,12 @@ Navigation is flat with a two-pixel active underline. The per-trade entry select
 
 **The Journal Local-Settings Rule.** Entry-timing controls belong to Entry timing; editing them refreshes its results while preserving the active input and panel.
 
+**The Journal Inspectable-Point Rule.** Realised P&L points expose the same trade and cumulative values through pointer, touch, and keyboard inspection.
+
 ### Do's and Don'ts
 
 - **Do** retain sample-count, gross-return, ambiguity, and incomplete-history qualifications alongside the values they explain.
-- **Do** distinguish realized outcomes from observed excursions and hypothetical threshold sequences through labels.
+- **Do** distinguish realised outcomes from observed excursions and hypothetical threshold sequences through labels.
 - **Do** preserve the neutral workbench, tabular numbers, shared rules, visible focus, and signed-result colors in future journal extensions.
 - **Don't** introduce a card mosaic, decorative chart, or hidden interpolation into these historical views.
 - **Don't** promote these scoped web decisions into replacement rules for the legacy Qt interface.

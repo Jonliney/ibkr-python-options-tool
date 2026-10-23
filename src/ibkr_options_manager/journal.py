@@ -230,6 +230,14 @@ class JournalSummary:
     stop_then_target: int
     sequence_count: int
     ambiguous_count: int
+    average_loss: Decimal | None
+    average_win: Decimal | None
+
+    @property
+    def reward_per_risk(self) -> Decimal | None:
+        if self.average_loss is None or self.average_win is None:
+            return None
+        return self.average_win / self.average_loss
 
     @property
     def win_rate(self) -> Decimal | None:
@@ -275,6 +283,12 @@ def summarize(rows: tuple[JournalRow, ...]) -> JournalSummary:
         sequences.count(True),
         sum(s is not None for s in sequences),
         sequences.count(None),
+        sum((-p for p in closed if p < 0), ZERO) / sum(p < 0 for p in closed)
+        if any(p < 0 for p in closed)
+        else None,
+        sum((p for p in closed if p > 0), ZERO) / sum(p > 0 for p in closed)
+        if any(p > 0 for p in closed)
+        else None,
     )
 
 

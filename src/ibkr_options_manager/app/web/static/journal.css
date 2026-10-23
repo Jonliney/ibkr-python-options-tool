@@ -13,7 +13,7 @@
 .journal-position-tabs form { height: 100%; }
 .journal-position-tab:disabled { opacity: .4; cursor: not-allowed; }
 .journal-dashboard, .journal-analysis { min-width: 0; min-height: 0; overflow-y: auto; padding: 2rem 2.5rem; scrollbar-color: #525252 transparent; scrollbar-width: thin; }
-.journal-dashboard { flex: 1; width: 100%; max-width: 100rem; margin-inline: auto; border-top: 1px solid var(--border); }
+.journal-dashboard { flex: 1; width: 100%; border-top: 1px solid var(--border); }
 .journal-analysis { padding-top: 1.75rem; }
 .journal-analysis > .journal-position-tabs { margin: .5rem 0 1.5rem; }
 .journal-title-row, .journal-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 1.25rem; }
@@ -56,7 +56,10 @@
 .journal-history-table :is(td, th):first-child, .journal-fill-table :is(td, th):first-child { padding-left: 0; }
 .journal-history-table td:nth-child(3), .journal-history-table td:nth-child(4), .journal-history-table td:nth-child(5) { white-space: nowrap; }
 .journal-history-table tr:hover td { background: rgb(255 255 255 / 2%); }
-.journal-history-table .journal-caption { display: block; }
+.journal-history-table td .journal-caption { display: block; }
+.journal-price-sequence { display: inline-flex; vertical-align: middle; }
+.journal-price-sequence-content { display: inline-flex; align-items: center; gap: .5rem; color: var(--muted-foreground); font-weight: 600; white-space: nowrap; }
+.journal-price-sequence-content > svg { flex: 0 0 auto; }
 .journal-contract { display: block; font-weight: 550; white-space: nowrap; margin-bottom: .15rem; }
 .journal-table-link, .journal-back { color: var(--muted-foreground); background: transparent; font-size: .8rem; border: 0; padding: .5rem; text-decoration: underline; text-underline-offset: .25rem; cursor: pointer; white-space: nowrap; }
 .journal-footnote { margin: 1.2rem 0 .25rem; max-width: 100ch; }
@@ -108,9 +111,29 @@
 .journal-insight-settings .journal-caption { margin: .2rem 0 0; min-height: 1.25rem; }
 .journal-entry-results[aria-busy="true"] { opacity: .65; }
 .journal-equity-section { display: flex; flex-direction: column; }
-.journal-equity-section > div:not(.journal-section-heading) { margin-block: auto; }
+.journal-equity-group { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 @media (max-width: 1250px) {
   .journal-chart-layout { grid-template-columns: minmax(0, 1.4fr) minmax(22rem, 1fr); }
 }
 [data-entry-timing] [data-slot="dropdown-menu-content"] { width: 16rem; padding: 1rem; }
 .journal-nav-tab, .journal-position-tab { border-radius: 0; }
+.journal-dashboard > .journal-dashboard-metrics { border-top: 0; padding-top: 0; grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.journal-interactive-equity { position: relative; display: flex; flex-direction: column; flex: 1; width: 100%; min-width: 0; min-height: 0; }
+.journal-interactive-equity .journal-equity-chart { flex: 1; width: 100%; height: 0; min-height: 15rem; }
+.journal-equity-point { fill: #6ee7b7; cursor: pointer; outline: none; }
+.journal-equity-point.is-selected, .journal-equity-point:focus-visible { fill: var(--foreground); stroke: #6ee7b7; stroke-width: 2; r: 5.5; }
+.journal-chart-tooltip { position: absolute; z-index: 5; width: max-content; max-width: min(20rem, 100%); box-sizing: border-box; padding: .65rem .85rem; border: 1px solid var(--border); border-radius: .375rem; background: var(--popover, var(--background)); color: var(--foreground); font-size: .75rem; line-height: 1.6; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; pointer-events: auto; }
+.journal-chart-tooltip[hidden] { display: none; }
+@media (max-width: 1250px) {
+  .journal-dashboard-metrics .journal-metric-label { font-size: .75rem; }
+  .journal-dashboard-metrics .journal-metric-value { font-size: 1.4rem; }
+}
+
+.journal-chart-tooltip [data-day-trades] { margin-top: .65rem; padding: 0; height: 1.75rem; border-radius: 0; text-decoration: underline; text-underline-offset: .25rem; font-size: .75rem; }
+.journal-history-controls { display: flex; align-items: center; gap: .75rem; }
+.journal-history-table tr[hidden], [data-clear-history-day][hidden] { display: none; }
+
+.journal-tooltip-date { margin: 0 0 .5rem; font-weight: 550; }
+.journal-tooltip-values { display: grid; grid-template-columns: auto minmax(5.5rem, auto); column-gap: 2rem; row-gap: .25rem; align-items: baseline; }
+.journal-tooltip-values > :nth-child(odd) { color: var(--muted-foreground); }
+.journal-tooltip-values > :nth-child(even) { text-align: right; white-space: nowrap; }

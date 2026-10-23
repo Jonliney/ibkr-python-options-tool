@@ -98,15 +98,18 @@ def test_dashboard_filters_analysis_and_management_roundtrip():
         html = client.post(
             workbench.path + "action", data={"action": "show-dashboard"}
         ).text
-        assert ">Dashboard</h1>" in html and "75%" in html
+        assert ">Dashboard</h1>" not in html and "75%" in html
+        assert 'lang="en-GB"' in html
+        assert "Realised R:R" in html and "1:0.84" in html
+        assert "Based on 11 trades" in html
         assert "Illustrative history" not in html
         assert "Saved account history" not in html
         assert 'name="journal_status"' not in html
         assert 'name="journal_currency"' not in html
         assert ">Apply<" not in html
         assert 'data-slot="dropdown-menu-trigger"' in html
-        assert "Cumulative gross realized" in html
-        assert "Entry unknown" in html
+        assert "Daily cumulative gross realised" in html
+        assert "Closed · entry unknown" in html
         assert "Order changes" not in html
         rows = workbench._journal_rows()
         selected = next(
@@ -119,6 +122,7 @@ def test_dashboard_filters_analysis_and_management_roundtrip():
         assert "data-position-analysis" in html
         assert "Order of extremes" in html and "Average observed price" in html
         assert "Contract position observations" in html
+        assert selected.coverage in html
         html = client.post(
             workbench.path + "action", data={"action": "show-management"}
         ).text
@@ -351,3 +355,57 @@ def test_dashboard_keeps_currency_totals_separate_without_a_filter(tmp_path):
         assert 'name="journal_currency"' not in html
     finally:
         store.close()
+
+
+def test_realised_risk_reward_uses_average_loss_and_win(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    seed_demo_history(path)
+    store = TradeHistoryStore(path)
+    try:
+        row = load_journal(store, DEMO_ACCOUNT)[0]
+        winning = replace(row, realized_pnl=D(200))
+        losing = replace(row, realized_pnl=D(-200))
+        summary = summarize(
+            (
+                winning,
+                losing,
+                replace(row, realized_pnl=D(0)),
+                replace(row, realized_pnl=None),
+            )
+        )
+        assert summary.average_loss == 200 and summary.average_win == 200
+        assert summary.reward_per_risk == 1
+        assert summarize((winning,)).reward_per_risk is None
+        assert summarize((losing,)).reward_per_risk is None
+        assert summarize((replace(row, realized_pnl=D(0)),)).reward_per_risk is None
+    finally:
+        store.close()
+
+
+def test_equity_chart_groups_close_dates_and_sums_daily_pnl():
+    from starhtml import to_xml
+
+    from ibkr_options_manager.app.web.journal_view import _equity_chart
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    try:
+        original = next(
+            r for r in workbench._journal_rows() if r.realized_pnl is not None
+        )
+        rows = (
+            replace(original, row_id="a", exit_at=86400, realized_pnl=D(100)),
+            replace(original, row_id="b", exit_at=90000, realized_pnl=D(-40)),
+            replace(original, row_id="c", exit_at=259200, realized_pnl=D(10)),
+            replace(original, row_id="unknown", exit_at=None, realized_pnl=D(1000)),
+        )
+        html = to_xml(_equity_chart(rows[::-1]))
+        assert html.count("data-point-label=") == 2
+        assert "02 Jan · Day P&amp;L $60.00 · Cumulative P&amp;L $60.00" in html
+        assert "04 Jan · Day P&amp;L $10.00 · Cumulative P&amp;L $70.00" in html
+        assert "View trades" in html and "Starting P&amp;L" not in html
+        assert 'data-x-fraction="0"' in html and 'data-x-fraction="1"' in html
+        single = to_xml(_equity_chart(rows[:2]))
+        assert single.count("data-point-label=") == 1
+    finally:
+        workbench.close()

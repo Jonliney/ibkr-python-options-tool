@@ -24,10 +24,27 @@ rehearsal scenarios and explicit `--con-id` launches still open Management.
 - Win rate counts positive and negative **gross matched closed-trade results**.
   Flat trades are shown separately and excluded from the percentage denominator.
   Open/partially closed, unknown and unreconciled results are not wins or losses.
-- Gross realized P&L and the cumulative curve use only those closed-trade fills.
-  The equity curve is ordered by completed trades, not marked-to-market equity.
+- Gross realised P&L and the cumulative curve use only those closed-trade fills.
+  The curve groups completed trades by UTC close date, using real elapsed-day
+  spacing. Each point contains that day's gross realised P&L and the cumulative
+  total. Trades without a known close date are excluded from the curve.
+- Realised R:R compares the average losing trade's absolute loss with the
+  average winning trade's gain: `1 : (average win / average loss)`. A £200 average
+  loss and £200 average win gives 1:1. It is unavailable without both wins and
+  losses. Flat/open/unknown trades are excluded; currencies remain separate.
+  This achieved payoff ratio is distinct from planned stop risk, which is not
+  recorded in historical fills.
+- Daily points show a tooltip with day/month, day P&L and cumulative P&L.
+  Pointer movement, click/touch, keyboard arrows and Home/End inspect points.
+  “View trades” filters the history to trades closed on that date in that
+  curve's currency; “All dates” resets it. This local filter leaves summary
+  statistics unchanged. The interactive tooltip is keyboard reachable and
+  dismissible with Escape. The SVG fills available width and height beside
+  Entry timing and rescales on resize. Tooltip values are right-aligned in a
+  separate column, signed and coloured green for gains and rose for losses.
+  “View trades” uses an underlined StarUI link-style action.
 - Average adverse excursion is the arithmetic mean of `min(0, worst return)`;
-  average favorable excursion is the mean of `max(0, best return)`. Trades with
+  average favourable excursion is the mean of `max(0, best return)`. Trades with
   no usable entry/price evidence or known history gaps are excluded, and the
   included trade count is shown. Observed prices may still be incomplete.
 - Entry timing shows target reach, median dip before the first target touch,
@@ -109,7 +126,7 @@ position observation is migrated into the saved position register.
   from ordinary bars.
 
 A disappeared position establishes only an observed flat state. It does not
-establish a sell price, fill, realized P&L or win. Unknown entries remain visible
+establish a sell price, fill, realised P&L or win. Unknown entries remain visible
 in the journal. Data is isolated by account; reusing a contract ID across accounts
 does not merge their trade results.
 
@@ -139,3 +156,9 @@ closed-position persistence, account isolation, metrics, filters and navigation.
 `tests/test_journal_browser.py` renders all three views at 1500px and the 1120px
 minimum desktop width. GUI tests need Qt/WebEngine and loopback socket access.
 The existing order-management and source-safety suites remain required.
+
+## Future calculator
+
+The separate capital and position-sizing Calculator tab is recorded in the
+[position sizing calculator note](POSITION_SIZING_CALCULATOR_NOTE.md). It is a
+future feature, not part of this dashboard change.

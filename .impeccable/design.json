@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-10-16T23:18:48Z",
+  "generatedAt": "2026-10-17T07:22:26Z",
   "title": "Design System: IBKR Options Manager",
   "extensions": {
     "colorMeta": {
@@ -110,7 +110,7 @@
       }
 ,
       {"name": "StarUI Journal Navigation", "kind": "nav", "description": "Scoped to the web trade journal: flat foreground-underlined Dashboard/Positions navigation.", "html": "<nav class=\"ds-journal-nav\" aria-label=\"Main navigation\"><button aria-current=\"page\">Dashboard</button><button>Positions</button></nav>", "css": ".ds-journal-nav { display:flex; gap:1.75rem; padding:0 1.5rem; height:2.75rem; background:var(--background, oklch(14.5% 0 0)); border-top:1px solid var(--border, oklch(100% 0 0 / .1)); font-family:ui-sans-serif,system-ui,sans-serif; } .ds-journal-nav button { background:transparent; border:0; border-bottom:2px solid transparent; color:var(--muted-foreground, oklch(70.8% 0 0)); font-size:.875rem; font-weight:500; cursor:pointer; } .ds-journal-nav button:hover { color:var(--foreground, oklch(98.5% 0 0)); } .ds-journal-nav button[aria-current] { color:var(--foreground, oklch(98.5% 0 0)); border-bottom-color:var(--foreground, oklch(98.5% 0 0)); } .ds-journal-nav button:focus-visible { outline:2px solid var(--foreground, oklch(98.5% 0 0)); outline-offset:3px; } @media(prefers-reduced-motion:no-preference) { .ds-journal-nav button { transition:color 140ms ease-out,border-color 140ms ease-out; } }"},
-      {"name": "StarUI Journal Metric Register", "kind": "custom", "description": "Scoped to the web trade journal: a flat ruled metric with a signed value and visible qualification.", "html": "<div class=\"ds-journal-metric\"><p>Average observed upside</p><strong>+24.8%</strong><small>One-minute bid observations · 8 trades</small></div>", "css": ".ds-journal-metric { padding:1.4rem 0; border-top:1px solid var(--border, oklch(100% 0 0 / .1)); border-bottom:1px solid var(--border, oklch(100% 0 0 / .1)); background:var(--background, oklch(14.5% 0 0)); color:var(--muted-foreground, oklch(70.8% 0 0)); font-family:ui-sans-serif,system-ui,sans-serif; } .ds-journal-metric p { font-size:.8rem; margin:0 0 .65rem; } .ds-journal-metric strong { display:block; color:#6ee7b7; font-size:1.7rem; font-weight:550; font-variant-numeric:tabular-nums; letter-spacing:-.025em; margin-bottom:.5rem; } .ds-journal-metric small { font-size:.75rem; line-height:1.6; }"}
+      {"name": "StarUI Journal Metric Register", "kind": "custom", "description": "Scoped to the web trade journal: a Dashboard metric with a bottom rule, signed value, and direct qualification; part of the five-column opening register.", "html": "<div class=\"ds-journal-metric\"><p>Average observed upside</p><strong>+24.8%</strong><small>Includes prices after selling</small></div>", "css": ".ds-journal-metric { padding:0 0 1.4rem; border-bottom:1px solid var(--border, oklch(100% 0 0 / .1)); background:var(--background, oklch(14.5% 0 0)); color:var(--muted-foreground, oklch(70.8% 0 0)); font-family:ui-sans-serif,system-ui,sans-serif; } .ds-journal-metric p { font-size:.8rem; margin:0 0 .65rem; } .ds-journal-metric strong { display:block; color:#6ee7b7; font-size:1.7rem; font-weight:550; font-variant-numeric:tabular-nums; letter-spacing:-.025em; margin-bottom:.5rem; } .ds-journal-metric small { font-size:.75rem; line-height:1.6; }"}
     ],
     "narrative": {
       "northStar": "The Passage Plan",
@@ -123,6 +123,7 @@
         "Explicit text labels for every safety state; color is reinforcement only."
       ],
       "rules": [
+        {"name": "The Journal Inspectable-Point Rule", "body": "The chart fills both panel dimensions; daily realised P&L points expose right-aligned signed, colour-coded day and cumulative values through pointer, touch, and keyboard inspection, with View trades filtering history to that UTC date and currency. Applies only to the StarUI trade-journal extension.", "section": "components"},
         {"name": "The Journal Local-Settings Rule", "body": "Entry-timing controls belong to Entry timing; editing them refreshes its results while preserving the active input and panel. Applies only to the StarUI trade-journal extension.", "section": "components"},
         {"name": "The Journal Signed-Value Rule", "body": "Performance color reinforces the signed number and label; it never replaces them. Applies only to the StarUI trade-journal extension.", "section": "colors"},
         {"name": "The Journal Evidence-Gap Rule", "body": "Missing observations remain visible as disconnected chart segments; never interpolate a continuous observed path across a missing minute. Applies only to the StarUI trade-journal extension.", "section": "layout"},

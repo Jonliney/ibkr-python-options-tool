@@ -151,50 +151,266 @@ def _tone(value: Decimal | None) -> str:
 
 def _equity_chart(rows: tuple[JournalRow, ...]) -> Any:
     closed = sorted(
-        (r for r in rows if r.realized_pnl is not None), key=lambda r: r.exit_at or 0
+        (r for r in rows if r.realized_pnl is not None and r.exit_at is not None),
+        key=lambda r: (r.exit_at or 0, r.row_id),
     )
     if not closed:
         return Div(
             P(
-                "Your equity curve starts with the first closed trade.",
+                "Your P&L graph starts with the first dated closed trade.",
                 cls="journal-muted",
             ),
             cls="journal-chart-empty",
         )
-    values = [D(0)]
+    currency = closed[0].contract.currency
+    daily: dict[int, Decimal] = {}
     for row in closed:
-        values.append(values[-1] + (row.realized_pnl or D(0)))
-    low, high = min(values), max(values)
+        day = (row.exit_at or 0) // 86400 * 86400
+        daily[day] = daily.get(day, D(0)) + (row.realized_pnl or D(0))
+    days = list(daily)
+    values = []
+    labels = []
+    total = D(0)
+    for day, pnl in daily.items():
+        total += pnl
+        values.append(total)
+        labels.append(
+            f"{stamp(day)} · Day P&L {money(pnl, currency)} · Cumulative P&L {money(total, currency)}"
+        )
+    low, high = min(D(0), *values), max(D(0), *values)
     spread = max(high - low, D(1))
+    fractions = [(value - low) / spread for value in values]
+    x_fractions = [D(day - days[0]) / max(days[-1] - days[0], 86400) for day in days]
 
-    def y(value: Decimal) -> float:
-        return float(180 - (value - low) / spread * 145)
+    def y(fraction: Decimal) -> float:
+        return float(208 - fraction * 176)
 
     points = " ".join(
-        f"{30 + i / max(1, len(values) - 1) * 710:.1f},{y(v):.1f}"
-        for i, v in enumerate(values)
+        f"{12 + float(x) * 746:.1f},{y(f):.1f}"
+        for x, f in zip(x_fractions, fractions, strict=True)
     )
     return Div(
         Svg(
             Title(
-                "Cumulative gross realized P&L from closed trades; excludes fees and FX"
+                "Daily cumulative gross realised P&L by UTC close date; excludes fees and FX"
             ),
-            Text(f"{high:,.0f}", x=30, y=20, cls="journal-chart-label"),
-            Text(f"{low:,.0f}", x=30, y=202, cls="journal-chart-label"),
-            Line(x1=30, y1=y(D(0)), x2=740, y2=y(D(0)), cls="journal-zero-line"),
+            Text(
+                f"{high:,.0f}",
+                x=12,
+                y=18,
+                cls="journal-chart-label",
+                data_chart_high=True,
+            ),
+            Text(
+                f"{low:,.0f}",
+                x=12,
+                y=235,
+                cls="journal-chart-label",
+                data_chart_low=True,
+            ),
+            Line(
+                x1=12,
+                y1=y((D(0) - low) / spread),
+                x2=758,
+                y2=y((D(0) - low) / spread),
+                cls="journal-zero-line",
+                data_zero_fraction=str((D(0) - low) / spread),
+            ),
             Polyline(points=points, fill="none", cls="journal-equity-line"),
-            viewBox="0 0 770 210",
-            role="img",
-            aria_label="Cumulative gross realized P&L",
+            *(
+                Circle(
+                    cx=12 + float(x_fraction) * 746,
+                    cy=y(fraction),
+                    r=3.5,
+                    tabindex="0" if i == 0 else "-1",
+                    role="button",
+                    aria_label=label,
+                    aria_pressed="false",
+                    data_equity_point=True,
+                    data_x_fraction=str(x_fraction),
+                    data_day=str(days[i]),
+                    data_y_fraction=str(fraction),
+                    data_point_label=label,
+                    data_day_label=stamp(days[i]),
+                    data_day_pnl=("+" if daily[days[i]] > 0 else "")
+                    + money(daily[days[i]], currency),
+                    data_day_tone=_tone(daily[days[i]]),
+                    data_total_pnl=("+" if values[i] > 0 else "")
+                    + money(values[i], currency),
+                    data_total_tone=_tone(values[i]),
+                    cls="journal-equity-point",
+                )
+                for i, (fraction, label, x_fraction) in enumerate(
+                    zip(fractions, labels, x_fractions, strict=True)
+                )
+            ),
+            viewBox="0 0 770 240",
+            preserveAspectRatio="none",
+            role="group",
+            aria_label=f"Daily cumulative gross realised P&L in {currency}, by UTC close date. Inspect points with the pointer or keyboard.",
             cls="journal-equity-chart",
         ),
         Div(
             Span(stamp(closed[0].exit_at)),
-            Span(f"{len(closed)} closed trades"),
+            Span("Close date · UTC"),
             Span(stamp(closed[-1].exit_at)),
             cls="journal-chart-axis",
         ),
+        Div(
+            Div(
+                P(cls="journal-tooltip-date", data_equity_date=True),
+                Div(
+                    Span("Day P&L"),
+                    Span(data_equity_day_value=True),
+                    Span("Cumulative P&L"),
+                    Span(data_equity_total_value=True),
+                    cls="journal-tooltip-values",
+                ),
+                data_equity_details=True,
+            ),
+            Button(
+                "View trades",
+                type="button",
+                variant="link",
+                size="sm",
+                data_day_trades=True,
+            ),
+            cls="journal-chart-tooltip",
+            role="group",
+            aria_label="Daily P&L",
+            aria_live="polite",
+            hidden=True,
+            data_equity_tooltip=True,
+        ),
+        cls="journal-interactive-equity",
+        data_interactive_equity=True,
+        data_currency=currency,
     )
+
+
+def _equity_script() -> str:
+    return """(() => {
+      document.querySelectorAll('[data-clear-history-day]').forEach(button => {
+        button.addEventListener('click', () => {
+          const dashboard = button.closest('[data-journal-dashboard]');
+          const rows = [...dashboard.querySelectorAll('[data-history-day]')];
+          rows.forEach(row => { row.hidden = false; });
+          dashboard.querySelector('[data-history-caption]').textContent = `${rows.length} trades · all saved dates`;
+          dashboard.querySelector('[data-history-heading]').focus();
+          button.hidden = true;
+        });
+      });
+      document.querySelectorAll('[data-interactive-equity]').forEach(root => {
+        const svg = root.querySelector('svg');
+        const points = [...svg.querySelectorAll('[data-equity-point]')];
+        const tooltip = root.querySelector('[data-equity-tooltip]');
+        let selected = -1;
+        const positionTooltip = () => {
+          if (selected < 0 || tooltip.hidden) return;
+          const box = root.getBoundingClientRect();
+          const point = points[selected].getBoundingClientRect();
+          const x = point.left + point.width / 2 - box.left;
+          const y = point.top + point.height / 2 - box.top;
+          const width = tooltip.offsetWidth;
+          const height = tooltip.offsetHeight;
+          tooltip.style.left = `${Math.max(0, Math.min(box.width - width, x - width / 2))}px`;
+          tooltip.style.top = `${y >= height + 12 ? y - height - 12 : y + 12}px`;
+        };
+        const hide = () => {
+          tooltip.hidden = true;
+          points.forEach(point => {
+            point.classList.remove('is-selected');
+            point.setAttribute('aria-pressed', 'false');
+          });
+        };
+        const select = index => {
+          selected = index;
+          points.forEach((point, i) => {
+            point.classList.toggle('is-selected', i === index);
+            point.setAttribute('aria-pressed', String(i === index));
+            point.setAttribute('tabindex', i === index ? '0' : '-1');
+          });
+          const data = points[index].dataset;
+          tooltip.querySelector('[data-equity-date]').textContent = data.dayLabel;
+          const dayValue = tooltip.querySelector('[data-equity-day-value]');
+          dayValue.textContent = data.dayPnl;
+          dayValue.className = data.dayTone;
+          const totalValue = tooltip.querySelector('[data-equity-total-value]');
+          totalValue.textContent = data.totalPnl;
+          totalValue.className = data.totalTone;
+          tooltip.hidden = false;
+          positionTooltip();
+        };
+        const render = () => {
+          const width = svg.getBoundingClientRect().width;
+          const height = svg.getBoundingClientRect().height;
+          if (!width || !height) return;
+          svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+          points.forEach(point => {
+            point.setAttribute('cx', 12 + Number(point.dataset.xFraction) * (width - 24));
+            point.setAttribute('cy', height - 32 - Number(point.dataset.yFraction) * (height - 64));
+          });
+          svg.querySelector('polyline').setAttribute('points', points.map(p => `${p.getAttribute('cx')},${p.getAttribute('cy')}`).join(' '));
+          const zero = svg.querySelector('[data-zero-fraction]');
+          const baseline = height - 32 - Number(zero.dataset.zeroFraction) * (height - 64);
+          zero.setAttribute('x2', width - 12); zero.setAttribute('y1', baseline); zero.setAttribute('y2', baseline);
+          svg.querySelector('[data-chart-low]').setAttribute('y', height - 5);
+          positionTooltip();
+        };
+        points.forEach((point, index) => {
+          point.addEventListener('pointerenter', () => select(index));
+          point.addEventListener('focus', () => select(index));
+          point.addEventListener('click', () => select(index));
+          point.addEventListener('keydown', event => {
+            let next = index;
+            if (event.key === 'Escape') { event.preventDefault(); hide(); return; }
+            if (event.key === 'ArrowRight') next = Math.min(points.length - 1, index + 1);
+            else if (event.key === 'ArrowLeft') next = Math.max(0, index - 1);
+            else if (event.key === 'Home') next = 0;
+            else if (event.key === 'End') next = points.length - 1;
+            else if (!['Enter', ' '].includes(event.key)) return;
+            event.preventDefault(); points[next].focus(); select(next);
+          });
+        });
+        svg.addEventListener('pointermove', event => {
+          const box = svg.getBoundingClientRect();
+          const fraction = (event.clientX - box.left - 12) / Math.max(1, box.width - 24);
+          const nearest = points.reduce((best, point, i) =>
+            Math.abs(Number(point.dataset.xFraction) - fraction) < Math.abs(Number(points[best].dataset.xFraction) - fraction) ? i : best, 0);
+          select(nearest);
+        });
+        root.addEventListener('pointerleave', () => {
+          if (!root.contains(document.activeElement)) hide();
+        });
+        root.addEventListener('focusout', event => {
+          if (!root.contains(event.relatedTarget)) hide();
+        });
+        tooltip.addEventListener('keydown', event => {
+          if (event.key === 'Escape') { points[selected].focus(); hide(); }
+        });
+        tooltip.querySelector('[data-day-trades]').addEventListener('click', () => {
+          const dashboard = root.closest('[data-journal-dashboard]');
+          const day = points[selected].dataset.day;
+          const rows = [...dashboard.querySelectorAll('[data-history-day]')];
+          let count = 0;
+          rows.forEach(row => {
+            row.hidden = row.dataset.historyDay !== day || row.dataset.historyCurrency !== root.dataset.currency;
+            if (!row.hidden) count++;
+          });
+          dashboard.querySelector('[data-history-caption]').textContent = `${count} trades · ${points[selected].dataset.pointLabel.split(' · ')[0]} · ${root.dataset.currency} · UTC`;
+          const clear = dashboard.querySelector('[data-clear-history-day]');
+          clear.hidden = false;
+          hide();
+          clear.focus({preventScroll:true});
+          clear.scrollIntoView({behavior:'instant', block:'center'});
+        });
+        document.addEventListener('pointerdown', event => {
+          if (!root.contains(event.target)) hide();
+        });
+        const observer = new ResizeObserver(render); observer.observe(svg); render();
+        window.addEventListener('pagehide', () => observer.disconnect(), {once:true});
+      });
+    })();"""
 
 
 def insight_settings(stop: Decimal, target: Decimal) -> Any:
@@ -411,7 +627,6 @@ def dashboard(
         money(s.realized, currency) for currency, s in summaries.items()
     )
     return Div(
-        Div(H1("Dashboard"), cls="journal-title-row"),
         P(error, role="alert", cls="journal-warning") if error else None,
         Div(
             _metric(
@@ -420,7 +635,7 @@ def dashboard(
                 f"{wins} wins · {losses} losses · {flat} flat",
             ),
             _metric(
-                "Gross realized P&L",
+                "Gross realised P&L",
                 realized,
                 "Closed trades · fees excluded"
                 if len(currencies) == 1
@@ -430,24 +645,44 @@ def dashboard(
                 else "",
             ),
             _metric(
-                "Average drawdown after entry",
+                "Realised R:R",
+                " / ".join(
+                    (f"{currency} " if len(currencies) > 1 else "")
+                    + (
+                        f"1:{summary.reward_per_risk:.2f}".rstrip("0").rstrip(".")
+                        if summary.reward_per_risk is not None
+                        else "—"
+                    )
+                    for currency, summary in summaries.items()
+                ),
+                " / ".join(
+                    f"Avg loss {money(summary.average_loss, currency)} · avg win {money(summary.average_win, currency)}"
+                    for currency, summary in summaries.items()
+                ),
+            ),
+            _metric(
+                "Average biggest dip",
                 percent(adverse),
-                f"{priced} trades with observed prices",
+                f"Based on {priced} trades",
                 tone="journal-negative",
             ),
             _metric(
-                "Average best gain after entry",
+                "Average peak gain",
                 percent(favorable),
-                "Observed path · includes after exit",
+                "Includes prices after selling",
                 tone="journal-positive",
             ),
-            cls="journal-metrics",
+            cls="journal-metrics journal-dashboard-metrics",
         ),
         Div(
             Div(
-                Div(H2("Realized performance"), cls="journal-section-heading"),
+                Div(H2("Realised performance"), cls="journal-section-heading"),
                 *(
-                    Div(Span(currency, cls="journal-caption"), _equity_chart(group))
+                    Div(
+                        Span(currency, cls="journal-caption"),
+                        _equity_chart(group),
+                        cls="journal-equity-group",
+                    )
                     for currency, group in groups.items()
                 ),
                 cls="journal-equity-section",
@@ -469,18 +704,57 @@ def dashboard(
             cls="journal-chart-layout",
         ),
         Div(
-            H2("Trade history"),
-            Span(f"{len(rows)} trades · all saved dates", cls="journal-caption"),
+            H2("Trade history", tabindex="-1", data_history_heading=True),
+            Div(
+                Span(
+                    f"{len(rows)} trades · all saved dates",
+                    cls="journal-caption",
+                    data_history_caption=True,
+                    role="status",
+                ),
+                Button(
+                    "All dates",
+                    type="button",
+                    variant="outline",
+                    size="sm",
+                    hidden=True,
+                    data_clear_history_day=True,
+                ),
+                cls="journal-history-controls",
+            ),
             cls="journal-section-heading",
         ),
         _history_table(rows, path),
         P(
-            "Win rate excludes flat trades and unknown entries. Excursion averages exclude known gaps. Prices are one-minute bid observations; intraminute order and execution are not guaranteed.",
+            "Win rate excludes flat trades and unknown entries. Dips and peaks use saved bid prices, including after selling; trades with missing prices or unknown entries are excluded from these averages. Prices do not guarantee fills.",
             cls="journal-footnote",
         ),
         Script(_insight_script(path, generation)),
+        Script(_equity_script()),
         cls="journal-dashboard",
         data_journal_dashboard=True,
+    )
+
+
+def _price_sequence(sequence: str) -> Any:
+    if sequence in ("High before low", "Low before high"):
+        high_first = sequence == "High before low"
+        letters = ("H", "L") if high_first else ("L", "H")
+        content = (
+            Span(letters[0], cls="journal-positive" if high_first else "journal-negative"),
+            Icon("lucide:move-down-right" if high_first else "lucide:move-up-right", cls="size-4"),
+            Span(letters[1], cls="journal-negative" if high_first else "journal-positive"),
+        )
+    elif sequence == "Same minute · order unknown":
+        content = (Icon("lucide:clock-3", cls="size-4"), Span("H / L"))
+    else:
+        content = (Icon("lucide:circle-help", cls="size-4"), Span("—"))
+    return Span(
+        Span(*content, cls="journal-price-sequence-content", aria_hidden="true"),
+        cls="journal-price-sequence",
+        role="img",
+        aria_label=sequence,
+        title=sequence,
     )
 
 
@@ -507,7 +781,6 @@ def _history_table(rows: tuple[JournalRow, ...], path: str) -> Any:
                             "Worst",
                             "Best",
                             "Price sequence",
-                            "History",
                             "",
                         )
                     )
@@ -547,8 +820,7 @@ def _history_table(rows: tuple[JournalRow, ...], path: str) -> Any:
                             if row.analysis
                             else "",
                         ),
-                        Td(row.analysis.sequence if row.analysis else "Unknown"),
-                        Td(row.coverage, cls="journal-caption"),
+                        Td(_price_sequence(row.analysis.sequence if row.analysis else "Unknown")),
                         Td(
                             _form(
                                 path,
@@ -559,6 +831,10 @@ def _history_table(rows: tuple[JournalRow, ...], path: str) -> Any:
                                 aria_label=f"Analyse {trade_label(row)} entered {stamp(row.entry_at)}",
                             )
                         ),
+                        data_history_day=str(row.exit_at // 86400 * 86400)
+                        if row.exit_at is not None and row.realized_pnl is not None
+                        else "",
+                        data_history_currency=row.contract.currency,
                     )
                     for row in rows
                 )
@@ -894,7 +1170,7 @@ def _observation_table(row: JournalRow) -> Any:
             cls="journal-fill-table",
         ),
         P(
-            "Last 20 quantity or cost changes. A flat observation alone does not establish a sell fill or realized P&L.",
+            "Last 20 quantity or cost changes. A flat observation alone does not establish a sell fill or realised P&L.",
             cls="journal-caption",
         ),
         cls="journal-table-scroll",

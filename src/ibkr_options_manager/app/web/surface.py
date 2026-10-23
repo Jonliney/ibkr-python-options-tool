@@ -316,7 +316,7 @@ class StarUIWorkbench:
                 Link(rel="stylesheet", href="/layers.css"),
                 Link(rel="stylesheet", href="/journal.css"),
             ),
-            htmlkw={"lang": "en", "data_theme": "dark"},
+            htmlkw={"lang": "en-GB", "data_theme": "dark"},
             bodykw={"cls": "min-h-screen bg-background text-foreground"},
         )
         self.app.register(_LOCAL_POSITION_PLUGIN)
