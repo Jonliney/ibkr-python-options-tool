@@ -122,7 +122,9 @@ def test_dashboard_filters_analysis_and_management_roundtrip():
         assert "data-position-analysis" in html
         assert "Order of extremes" in html and "Average observed price" in html
         assert "Contract position observations" in html
-        assert selected.coverage in html
+        assert "Back to dashboard" not in html
+        assert selected.coverage not in html
+        assert "observed minutes · USD" not in html
         html = client.post(
             workbench.path + "action", data={"action": "show-management"}
         ).text
@@ -234,7 +236,8 @@ def test_price_chart_preserves_elapsed_time_and_breaks_missing_minutes(tmp_path)
         first_end = float(lines[0].split()[-1].split(",")[0])
         next_start = float(lines[1].split()[0].split(",")[0])
         assert next_start - first_end > 500
-        assert "Elapsed time (UTC)" in html
+        assert "Elapsed time (UTC)" not in html
+        assert "Range / close · dashed = entry · dotted = exit" not in html
     finally:
         store.close()
 
@@ -407,5 +410,35 @@ def test_equity_chart_groups_close_dates_and_sums_daily_pnl():
         assert 'data-x-fraction="0"' in html and 'data-x-fraction="1"' in html
         single = to_xml(_equity_chart(rows[:2]))
         assert single.count("data-point-label=") == 1
+    finally:
+        workbench.close()
+
+
+def test_price_path_keeps_gaps_and_handles_single_flat_observation():
+    from starhtml import to_xml
+
+    from ibkr_options_manager.app.web.journal_view import _price_chart
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    try:
+        row = next(r for r in workbench._journal_rows() if r.analysis)
+        bars = row.analysis.bars
+        gapped = replace(
+            row,
+            analysis=replace(row.analysis, bars=(bars[0], bars[1], bars[5], bars[6])),
+        )
+        html = to_xml(_price_chart(gapped))
+        assert html.count('data-price-segment="') == 2
+        assert html.count("<circle ") == 4
+        flat = replace(
+            bars[0], low=row.entry_price, high=row.entry_price, close=row.entry_price
+        )
+        html = to_xml(
+            _price_chart(replace(row, analysis=replace(row.analysis, bars=(flat,))))
+        )
+        assert html.count("<circle ") == 1
+        assert 'data-y-fraction="0"' in html
+        assert 'data-return="+0.0%"' in html
     finally:
         workbench.close()

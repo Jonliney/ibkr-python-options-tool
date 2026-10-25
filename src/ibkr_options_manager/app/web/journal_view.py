@@ -19,6 +19,7 @@ from starhtml import (
     Option,
     P,
     Polyline,
+    Rect,
     Script,
     Select,
     Span,
@@ -866,17 +867,14 @@ def _price_chart(row: JournalRow) -> Any:
     prices = [b.low for b in bars] + [b.high for b in bars] + [row.entry_price]
     low, high = min(prices), max(prices)
     spread = max(high - low, D(".01"))
+    duration = max(60, bars[-1].timestamp - bars[0].timestamp)
+    currency = row.contract.currency
 
     def x(timestamp: int) -> float:
-        return (
-            40
-            + (timestamp - bars[0].timestamp)
-            / max(60, bars[-1].timestamp - bars[0].timestamp)
-            * 690
-        )
+        return 12 + (timestamp - bars[0].timestamp) / duration * 746
 
     def y(value: Decimal) -> float:
-        return float(230 - (value - low) / spread * 190)
+        return float(208 - (value - low) / spread * 176)
 
     segments = [[bars[0]]]
     for bar in bars[1:]:
@@ -885,69 +883,249 @@ def _price_chart(row: JournalRow) -> Any:
         segments[-1].append(bar)
     ranges = []
     closes = []
-    for segment in segments:
+    points: list[Any] = []
+    for index, segment in enumerate(segments):
         upper = [(x(b.timestamp), y(b.high)) for b in segment]
         lower = [(x(b.timestamp), y(b.low)) for b in reversed(segment)]
         area = (
             "M " + " L ".join(f"{xx:.1f} {yy:.1f}" for xx, yy in upper + lower) + " Z"
         )
-        ranges.append(SvgPath(d=area, cls="journal-price-range"))
-        if len(segment) == 1:
-            closes.append(
-                Circle(
-                    cx=x(segment[0].timestamp),
-                    cy=y(segment[0].close),
-                    r=2,
-                    cls="journal-price-dot",
-                )
+        ranges.append(
+            SvgPath(d=area, cls="journal-price-range", data_price_range=index)
+        )
+        closes.append(
+            Polyline(
+                points=" ".join(
+                    f"{x(b.timestamp):.1f},{y(b.close):.1f}" for b in segment
+                ),
+                fill="none",
+                cls="journal-price-line",
+                data_price_segment=index,
             )
-        else:
-            points = " ".join(f"{x(b.timestamp):.1f},{y(b.close):.1f}" for b in segment)
-            closes.append(
-                Polyline(points=points, fill="none", cls="journal-price-line")
+        )
+        for bar in segment:
+            label = (
+                f"{stamp(bar.timestamp, full=True)} · Close bid {money(bar.close, currency)} "
+                f"{currency} · Low {money(bar.low, currency)} · High {money(bar.high, currency)}"
+            )
+            points.append(
+                Circle(
+                    cx=x(bar.timestamp),
+                    cy=y(bar.close),
+                    r=2.5,
+                    tabindex="0" if not points else "-1",
+                    role="button",
+                    aria_label=label,
+                    aria_pressed="false",
+                    data_price_point=True,
+                    data_segment=index,
+                    data_x_fraction=str(
+                        D(bar.timestamp - bars[0].timestamp) / duration
+                    ),
+                    data_y_fraction=str((bar.close - low) / spread),
+                    data_high_fraction=str((bar.high - low) / spread),
+                    data_low_fraction=str((bar.low - low) / spread),
+                    data_date_label=stamp(bar.timestamp, full=True),
+                    data_close=money(bar.close, currency),
+                    data_low=money(bar.low, currency),
+                    data_high=money(bar.high, currency),
+                    data_return=percent(row.return_at(bar.close)),
+                    data_return_tone=_tone(row.return_at(bar.close)),
+                    cls="journal-price-point",
+                )
             )
     return Div(
         Svg(
             Title("Observed minute bid range and closes, including prices after exit"),
-            Text(f"{high:.2f}", x=1, y=42, cls="journal-chart-label"),
-            Text(f"{low:.2f}", x=1, y=234, cls="journal-chart-label"),
+            Rect(
+                x=0,
+                y=0,
+                width="100%",
+                height="100%",
+                fill="transparent",
+                pointer_events="all",
+            ),
+            Text(f"{high:.2f}", x=12, y=18, cls="journal-chart-label"),
+            Text(
+                f"{low:.2f}",
+                x=12,
+                y=235,
+                cls="journal-chart-label",
+                data_price_low_label=True,
+            ),
             *ranges,
             Line(
-                x1=40,
-                x2=730,
+                x1=12,
+                x2=758,
                 y1=y(row.entry_price),
                 y2=y(row.entry_price),
                 cls="journal-zero-line",
+                data_entry_fraction=str((row.entry_price - low) / spread),
             ),
             *closes,
-            *(
-                Line(
-                    x1=x(row.exit_at),
-                    x2=x(row.exit_at),
-                    y1=25,
-                    y2=245,
-                    cls="journal-exit-line",
-                )
-                for b in bars
-                if row.exit_at is not None
-                and b.timestamp <= row.exit_at < b.timestamp + 60
-            ),
-            viewBox="0 0 770 265",
-            role="img",
-            aria_label="Bid price path after entry",
+            Line(
+                x1=x(row.exit_at),
+                x2=x(row.exit_at),
+                y1=25,
+                y2=215,
+                cls="journal-exit-line",
+                data_exit_fraction=str(D(row.exit_at - bars[0].timestamp) / duration),
+            )
+            if row.exit_at is not None
+            and any(b.timestamp <= row.exit_at < b.timestamp + 60 for b in bars)
+            else None,
+            *points,
+            viewBox="0 0 770 240",
+            preserveAspectRatio="none",
+            role="group",
+            aria_label=f"Bid price path after entry in {currency}. Inspect points with the pointer or keyboard.",
             cls="journal-price-chart",
         ),
         Div(
             Span(stamp(bars[0].timestamp, full=True)),
-            Span("Range / close · dashed = entry · dotted = exit"),
             Span(stamp(bars[-1].timestamp, full=True)),
             cls="journal-chart-axis",
         ),
-        P(
-            "Elapsed time (UTC). Gaps between observations are left unconnected.",
-            cls="journal-caption",
+        Div(
+            P(cls="journal-tooltip-date", data_price_date=True),
+            Div(
+                Span(f"Close bid · {currency}"),
+                Span(data_price_close=True),
+                Span("Low bid"),
+                Span(data_price_low=True),
+                Span("High bid"),
+                Span(data_price_high=True),
+                Span("From entry"),
+                Span(data_price_return=True),
+                cls="journal-tooltip-values",
+            ),
+            cls="journal-chart-tooltip",
+            role="group",
+            aria_label="Minute bid prices",
+            aria_live="polite",
+            hidden=True,
+            data_price_tooltip=True,
         ),
+        Script(_price_chart_script()),
+        cls="journal-interactive-price",
+        data_interactive_price=True,
     )
+
+
+def _price_chart_script() -> str:
+    return """(() => {
+      document.querySelectorAll('[data-interactive-price]').forEach(root => {
+        if (root.dataset.initialized) return;
+        root.dataset.initialized = 'true';
+        const svg = root.querySelector('svg');
+        const points = [...svg.querySelectorAll('[data-price-point]')];
+        const tooltip = root.querySelector('[data-price-tooltip]');
+        let selected = -1;
+        const positionTooltip = () => {
+          if (selected < 0 || tooltip.hidden) return;
+          const box = root.getBoundingClientRect();
+          const point = points[selected].getBoundingClientRect();
+          const x = point.left + point.width / 2 - box.left;
+          const y = point.top + point.height / 2 - box.top;
+          tooltip.style.left = `${Math.max(0, Math.min(box.width - tooltip.offsetWidth, x - tooltip.offsetWidth / 2))}px`;
+          tooltip.style.top = `${y >= tooltip.offsetHeight + 12 ? y - tooltip.offsetHeight - 12 : y + 12}px`;
+        };
+        const hide = () => {
+          tooltip.hidden = true;
+          points.forEach(point => {
+            point.classList.remove('is-selected');
+            point.setAttribute('aria-pressed', 'false');
+          });
+        };
+        const select = index => {
+          if (selected === index && !tooltip.hidden) return;
+          selected = index;
+          points.forEach((point, i) => {
+            point.classList.toggle('is-selected', i === index);
+            point.setAttribute('aria-pressed', String(i === index));
+            point.setAttribute('tabindex', i === index ? '0' : '-1');
+          });
+          const data = points[index].dataset;
+          tooltip.querySelector('[data-price-date]').textContent = data.dateLabel;
+          ['close', 'low', 'high', 'return'].forEach(key => {
+            tooltip.querySelector(`[data-price-${key}]`).textContent = data[key];
+          });
+          tooltip.querySelector('[data-price-return]').className = data.returnTone;
+          tooltip.hidden = false;
+          positionTooltip();
+        };
+        const render = () => {
+          const {width, height} = svg.getBoundingClientRect();
+          if (!width || !height) return;
+          svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+          const x = fraction => 12 + Number(fraction) * (width - 24);
+          const y = fraction => height - 32 - Number(fraction) * (height - 64);
+          points.forEach(point => {
+            point.setAttribute('cx', x(point.dataset.xFraction));
+            point.setAttribute('cy', y(point.dataset.yFraction));
+          });
+          svg.querySelectorAll('[data-price-segment]').forEach(line => {
+            const segment = points.filter(p => p.dataset.segment === line.dataset.priceSegment);
+            line.setAttribute('points', segment.map(p => `${p.getAttribute('cx')},${p.getAttribute('cy')}`).join(' '));
+            const range = svg.querySelector(`[data-price-range="${line.dataset.priceSegment}"]`);
+            const upper = segment.map(p => `${x(p.dataset.xFraction)} ${y(p.dataset.highFraction)}`);
+            const lower = [...segment].reverse().map(p => `${x(p.dataset.xFraction)} ${y(p.dataset.lowFraction)}`);
+            range.setAttribute('d', `M ${[...upper, ...lower].join(' L ')} Z`);
+          });
+          const entry = svg.querySelector('[data-entry-fraction]');
+          entry.setAttribute('x2', width - 12);
+          entry.setAttribute('y1', y(entry.dataset.entryFraction));
+          entry.setAttribute('y2', y(entry.dataset.entryFraction));
+          const exit = svg.querySelector('[data-exit-fraction]');
+          if (exit) {
+            exit.setAttribute('x1', x(exit.dataset.exitFraction));
+            exit.setAttribute('x2', x(exit.dataset.exitFraction));
+            exit.setAttribute('y2', height - 25);
+          }
+          svg.querySelector('[data-price-low-label]').setAttribute('y', height - 5);
+          positionTooltip();
+        };
+        points.forEach((point, index) => {
+          point.addEventListener('pointerenter', () => select(index));
+          point.addEventListener('focus', () => select(index));
+          point.addEventListener('click', () => select(index));
+          point.addEventListener('keydown', event => {
+            let next = index;
+            if (event.key === 'Escape') { event.preventDefault(); hide(); return; }
+            if (event.key === 'ArrowRight') next = Math.min(points.length - 1, index + 1);
+            else if (event.key === 'ArrowLeft') next = Math.max(0, index - 1);
+            else if (event.key === 'Home') next = 0;
+            else if (event.key === 'End') next = points.length - 1;
+            else if (!['Enter', ' '].includes(event.key)) return;
+            event.preventDefault(); points[next].focus(); select(next);
+          });
+        });
+        const inspectPointer = event => {
+          const box = svg.getBoundingClientRect();
+          if (event.clientX < box.left || event.clientX > box.right ||
+              event.clientY < box.top || event.clientY > box.bottom) return;
+          const fraction = (event.clientX - box.left - 12) / Math.max(1, box.width - 24);
+          const nearest = points.reduce((best, point, i) =>
+            Math.abs(Number(point.dataset.xFraction) - fraction) < Math.abs(Number(points[best].dataset.xFraction) - fraction) ? i : best, 0);
+          select(nearest);
+        };
+        root.addEventListener('pointermove', inspectPointer, true);
+        root.addEventListener('mousemove', inspectPointer, true);
+        root.addEventListener('pointerenter', inspectPointer);
+        root.addEventListener('pointerleave', () => {
+          if (!root.contains(document.activeElement)) hide();
+        });
+        root.addEventListener('focusout', event => {
+          if (!root.contains(event.relatedTarget)) hide();
+        });
+        document.addEventListener('pointerdown', event => {
+          if (!root.contains(event.target)) hide();
+        });
+        const observer = new ResizeObserver(render);
+        observer.observe(svg); render();
+        window.addEventListener('pagehide', () => observer.disconnect(), {once:true});
+      });
+    })();"""
 
 
 def _analysis_sidebar(row: JournalRow | None) -> Any:
@@ -1046,19 +1224,10 @@ def position_analysis(
         return center, _analysis_sidebar(None)
     analysis = row.analysis
     related = tuple(r for r in rows if r.contract.con_id == row.contract.con_id)
-    c = row.contract.currency
 
     center = Div(
         position_header,
         position_tabs(path, "analysis", row),
-        Div(
-            P(
-                f"{row.status} · {row.quantity.normalize():f} contracts · {row.coverage}",
-                cls="journal-muted",
-            ),
-            _form(path, "show-dashboard", "Back to dashboard", cls="journal-back"),
-            cls="journal-title-row",
-        ),
         Form(
             Label("Entry / trade", fr="journal-entry"),
             Select(
@@ -1083,10 +1252,6 @@ def position_analysis(
         else None,
         Div(
             H2("Price path after entry"),
-            Span(
-                f"{len(analysis.bars) if analysis else 0} observed minutes · {c}",
-                cls="journal-caption",
-            ),
             cls="journal-section-heading",
         ),
         _price_chart(row),

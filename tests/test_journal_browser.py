@@ -353,3 +353,222 @@ def test_equity_points_pointer_keyboard_and_resize(tmp_path):
         server.should_exit = True
         thread.join(timeout=2)
         workbench.close()
+
+
+def test_price_path_points_pointer_keyboard_and_resize(tmp_path):
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    row = next(
+        r
+        for r in workbench._journal_rows()
+        if r.contract.con_id == workbench._selected_con_id
+    )
+    client = TestClient(workbench.app)
+    client.post(
+        workbench.path + "action",
+        data={"action": "open-trade", "trade_id": row.row_id},
+    )
+    server, thread, port = _start_local_server(workbench.app)
+    view = QWebEngineView()
+    view.resize(1500, 920)
+    view.show()
+    loop = QEventLoop()
+    seen = []
+    try:
+
+        def loaded(ok):
+            assert ok
+
+            def ready(value):
+                assert value
+                view.page().runJavaScript(
+                    """(() => {
+                      const root = document.querySelector('[data-interactive-price]');
+                      const svg = root.querySelector('svg');
+                      const points = [...root.querySelectorAll('[data-price-point]')];
+                      const tooltip = root.querySelector('[data-price-tooltip]');
+                      const box = svg.getBoundingClientRect();
+                      svg.dispatchEvent(new PointerEvent('pointermove', {
+                        clientX:box.right-12, clientY:box.top+100, bubbles:true
+                      }));
+                      const last = points.at(-1);
+                      const pointer = !tooltip.hidden &&
+                        tooltip.querySelector('[data-price-close]').textContent
+                          === last.dataset.close &&
+                        tooltip.querySelector('[data-price-date]').textContent
+                          === last.dataset.dateLabel;
+                      points[0].focus();
+                      points[0].dispatchEvent(new KeyboardEvent('keydown', {
+                        key:'ArrowRight', bubbles:true
+                      }));
+                      const keyboard = document.activeElement === points[1]
+                        && points[1].getAttribute('aria-pressed') === 'true';
+                      points[1].dispatchEvent(new KeyboardEvent('keydown', {
+                        key:'End', bubbles:true
+                      }));
+                      const end = document.activeElement === last;
+                      const values = ['low', 'high', 'return'].every(key =>
+                        tooltip.querySelector(`[data-price-${key}]`).textContent
+                          === last.dataset[key]);
+                      const tipBox = tooltip.getBoundingClientRect();
+                      const rootBox = root.getBoundingClientRect();
+                      const tooltipFits = tipBox.left >= rootBox.left &&
+                        tipBox.right <= rootBox.right + 1;
+                      last.dispatchEvent(new KeyboardEvent('keydown', {
+                        key:'Escape', bubbles:true
+                      }));
+                      const dismissed = tooltip.hidden;
+                      last.dispatchEvent(new MouseEvent('click'));
+                      const reopened = !tooltip.hidden;
+                      const fullWidth = Math.abs(box.width - rootBox.width) < 1 &&
+                        Math.abs(Number(last.getAttribute('cx'))-(box.width-12)) < 1
+                        && Number(points[0].getAttribute('cx')) === 12;
+                      return JSON.stringify({pointer, keyboard, end, values,
+                        tooltipFits, dismissed, reopened, fullWidth,
+                        count:points.length});
+                    })()""",
+                    lambda result: (seen.append(json.loads(result)), loop.quit()),
+                )
+
+            wait_for_javascript(
+                view,
+                "!!document.querySelector('[data-price-point]') && "
+                "document.querySelector('[data-price-point]').getAttribute('cx')"
+                " === '12'",
+                ready,
+            )
+
+        view.loadFinished.connect(loaded)
+        view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
+        QTimer.singleShot(8000, loop.quit)
+        loop.exec()
+        assert seen and all(v for k, v in seen[0].items() if k != "count")
+        assert seen[0]["count"] == len(row.analysis.bars)
+        view.resize(1120, 920)
+        resize_loop = QEventLoop()
+        resized = []
+        wait_for_javascript(
+            view,
+            "Math.abs(Number([...document.querySelectorAll('[data-price-point]')]"
+            ".at(-1).getAttribute('cx')) - (document.querySelector("
+            "'.journal-price-chart').getBoundingClientRect().width-12)) < 1",
+            lambda value: (resized.append(value), resize_loop.quit()),
+            timeout=3,
+        )
+        QTimer.singleShot(4000, resize_loop.quit)
+        resize_loop.exec()
+        assert resized == [True]
+        QTest.qWait(150)
+        view.grab().save(str(tmp_path / "price-point-selected.png"))
+    finally:
+        view.close()
+        view.deleteLater()
+        server.should_exit = True
+        thread.join(timeout=2)
+        workbench.close()
+
+
+def test_price_path_native_hover_shows_only_inspected_dot(tmp_path):
+    from PySide6.QtCore import QPoint
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    row = next(
+        r
+        for r in workbench._journal_rows()
+        if r.contract.con_id == workbench._selected_con_id
+    )
+    TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={"action": "open-trade", "trade_id": row.row_id},
+    )
+    server, thread, port = _start_local_server(workbench.app)
+    view = QWebEngineView()
+    view.resize(1500, 920)
+    view.show()
+    loop = QEventLoop()
+    seen = []
+    try:
+
+        def loaded(ok):
+            assert ok
+
+            def ready(value):
+                assert value
+                QTest.mouseMove(view.focusProxy(), QPoint(50, 50))
+                QTest.qWait(50)
+                view.page().runJavaScript(
+                    """(() => {
+                      const svg = document.querySelector('.journal-price-chart');
+                      const box = svg.getBoundingClientRect();
+                      const visible = [...svg.querySelectorAll('[data-price-point]')]
+                        .filter(p => Number(getComputedStyle(p).opacity) > 0).length;
+                      return JSON.stringify({x:box.left+box.width*.6,
+                        y:box.top+50, visible});
+                    })()""",
+                    lambda result: (seen.append(json.loads(result)), loop.quit()),
+                )
+
+            wait_for_javascript(
+                view, "!!document.querySelector('[data-price-point]')", ready
+            )
+
+        view.loadFinished.connect(loaded)
+        view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
+        QTimer.singleShot(8000, loop.quit)
+        loop.exec()
+        assert seen and seen[0]["visible"] == 0
+        # Send actual Qt mouse moves to Chromium's input widget without clicking.
+        QTest.mouseMove(view.focusProxy(), QPoint(50, 50))
+        QTest.mouseMove(view.focusProxy(), QPoint(int(seen[0]["x"]), int(seen[0]["y"])))
+        hover_loop = QEventLoop()
+        hovered = []
+        wait_for_javascript(
+            view,
+            "!document.querySelector('[data-price-tooltip]').hidden && "
+            "[...document.querySelectorAll('[data-price-point]')]"
+            ".filter(p => Number(getComputedStyle(p).opacity) > 0).length === 1",
+            lambda value: (hovered.append(value), hover_loop.quit()),
+            timeout=3,
+        )
+        QTimer.singleShot(4000, hover_loop.quit)
+        hover_loop.exec()
+        assert hovered == [True]
+        QTest.qWait(150)
+        view.grab().save(str(tmp_path / "native-hover.png"))
+        # Also cover renderers delivering ordinary mouse events on the container.
+        mouse_loop = QEventLoop()
+        fallback = []
+        view.page().runJavaScript(
+            """(() => {
+              const root = document.querySelector('[data-interactive-price]');
+              const box = root.querySelector('svg').getBoundingClientRect();
+              root.dispatchEvent(new MouseEvent('mousemove', {
+                clientX:box.right-12, clientY:box.top+50, bubbles:true
+              }));
+              const last = root.querySelector('[data-price-point]:last-child');
+              return last.getAttribute('aria-pressed') === 'true';
+            })()""",
+            lambda value: (fallback.append(value), mouse_loop.quit()),
+        )
+        QTimer.singleShot(2000, mouse_loop.quit)
+        mouse_loop.exec()
+        assert fallback == [True]
+        QTest.mouseMove(view.focusProxy(), QPoint(50, 50))
+        leave_loop = QEventLoop()
+        left = []
+        wait_for_javascript(
+            view,
+            "document.querySelector('[data-price-tooltip]').hidden",
+            lambda value: (left.append(value), leave_loop.quit()),
+            timeout=3,
+        )
+        QTimer.singleShot(4000, leave_loop.quit)
+        leave_loop.exec()
+        assert left == [True]
+    finally:
+        view.close()
+        view.deleteLater()
+        server.should_exit = True
+        thread.join(timeout=2)
+        workbench.close()

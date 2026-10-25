@@ -128,8 +128,12 @@
 .journal-dashboard > .journal-dashboard-metrics { border-top: 0; padding-top: 0; grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .journal-interactive-equity { position: relative; display: flex; flex-direction: column; flex: 1; width: 100%; min-width: 0; min-height: 0; }
 .journal-interactive-equity .journal-equity-chart { flex: 1; width: 100%; height: 0; min-height: 15rem; }
-.journal-equity-point { fill: #6ee7b7; cursor: pointer; outline: none; }
-.journal-equity-point.is-selected, .journal-equity-point:focus-visible { fill: var(--foreground); stroke: #6ee7b7; stroke-width: 2; r: 5.5; }
+.journal-equity-point, .journal-price-point { fill: #6ee7b7; cursor: pointer; outline: none; }
+.journal-price-point { opacity: 0; pointer-events: none; }
+.journal-price-point.is-selected { opacity: 1; }
+.journal-equity-point.is-selected, .journal-equity-point:focus-visible, .journal-price-point.is-selected, .journal-price-point:focus-visible { fill: var(--foreground); stroke: #6ee7b7; stroke-width: 2; r: 5.5; }
+.journal-interactive-price { position: relative; width: 100%; min-width: 0; }
+.journal-interactive-price .journal-chart-tooltip { pointer-events: none; }
 .journal-chart-tooltip { position: absolute; z-index: 5; width: max-content; max-width: min(20rem, 100%); box-sizing: border-box; padding: .65rem .85rem; border: 1px solid var(--border); border-radius: .375rem; background: var(--popover, var(--background)); color: var(--foreground); font-size: .75rem; line-height: 1.6; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; pointer-events: auto; }
 .journal-chart-tooltip[hidden] { display: none; }
 @media (max-width: 1250px) {
