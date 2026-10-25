@@ -102,35 +102,20 @@
 }
 .journal-chart-label { fill: var(--muted-foreground); font: 11px sans-serif; font-variant-numeric: tabular-nums; }
 .journal-price-dot { fill: #6ee7b7; }
-/* Entry timing owns its settings; dashboard-wide controls are intentionally absent. */
+/* Price-path controls affect the adjacent observations, not realised P&L. */
 .journal-chart-layout { grid-template-columns: minmax(0, 1.8fr) minmax(22rem, 1fr); }
 .journal-entry-insight .journal-section-heading { margin-bottom: .75rem; }
-.journal-entry-insight .journal-section-heading > [data-slot="dropdown-menu"] { flex: 0 0 auto; }
-.journal-target-reach { display: flex; align-items: baseline; flex-wrap: wrap; gap: .5rem; }
-.journal-target-reach .journal-insight-number { font-size: 1.5rem; margin: 0; }
 .journal-entry-results .journal-caption { margin: 0; max-width: none; line-height: 1.5; }
-.journal-insight-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0 1.1rem; }
-.journal-insight-value { font-size: 1.2rem; font-weight: 550; font-variant-numeric: tabular-nums; margin: .3rem 0; }
-.journal-entry-results h3 { font-size: .8rem; font-weight: 550; line-height: 1.5; margin: 0 0 .5rem; }
-.journal-recovery-table { width: 100%; border-collapse: collapse; font-size: .75rem; font-variant-numeric: tabular-nums; margin-bottom: .75rem; }
-.journal-recovery-table th { font-weight: 500; text-align: right; color: var(--muted-foreground); line-height: 1.4; padding: .45rem .3rem; }
-.journal-recovery-table td { text-align: right; padding: .4rem .3rem; border-top: 1px solid var(--border); }
-.journal-recovery-table :is(th, td):first-child { text-align: left; }
-.journal-selected-level { background: var(--muted); }
-.journal-insight-settings { display: flex; flex-direction: column; gap: .65rem; }
-.journal-insight-settings > label:not(:first-child) { margin-top: .3rem; }
-.journal-insight-settings .journal-caption { margin: .2rem 0 0; min-height: 1.25rem; }
 .journal-entry-results[aria-busy="true"] { opacity: .65; }
 .journal-equity-section { display: flex; flex-direction: column; }
 .journal-equity-group { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 @media (max-width: 1250px) {
   .journal-chart-layout { grid-template-columns: minmax(0, 1.4fr) minmax(22rem, 1fr); }
 }
-[data-entry-timing] [data-slot="dropdown-menu-content"] { width: 16rem; padding: 1rem; }
 .journal-nav-tab, .journal-position-tab { border-radius: 0; }
 .journal-dashboard > .journal-dashboard-metrics { border-top: 0; padding-top: 0; grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .journal-interactive-equity { position: relative; display: flex; flex-direction: column; flex: 1; width: 100%; min-width: 0; min-height: 0; }
-.journal-interactive-equity .journal-equity-chart { flex: 1; width: 100%; height: 0; min-height: 15rem; }
+.journal-interactive-equity .journal-equity-chart { flex: 1; width: 100%; height: 0; min-height: 19rem; }
 .journal-equity-point, .journal-price-point { fill: #6ee7b7; cursor: pointer; outline: none; }
 .journal-price-point { opacity: 0; pointer-events: none; }
 .journal-price-point.is-selected { opacity: 1; }
@@ -173,3 +158,26 @@
 .journal-touch-stop { stroke: #fda4af; }
 .journal-touch-target { stroke: #fde68a; }
 .journal-tooltip-context { margin: 0 0 .5rem; color: var(--muted-foreground); font-size: .75rem; line-height: 1.5; }
+
+.journal-move-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .5rem .75rem; margin-top: 1rem; }
+.journal-move-controls > div { display: flex; flex-direction: column; gap: .4rem; min-width: 0; }
+.journal-move-controls label { font-size: .75rem; color: var(--muted-foreground); }
+.journal-move-status { grid-column: 1 / -1; min-height: 1.25rem; margin: 0; }
+.journal-move-scope { margin: 0 0 1.25rem; }
+.journal-move-primary { font-size: 1.1rem; line-height: 1.6; margin: 0 0 1rem; }
+.journal-move-count { font-weight: 600; font-variant-numeric: tabular-nums; }
+.journal-move-secondary { font-size: .875rem; line-height: 1.7; margin: 0 0 1.5rem; }
+.journal-move-details { font-size: .8rem; color: var(--muted-foreground); line-height: 1.6; }
+.journal-move-details summary { cursor: pointer; width: fit-content; padding: .3rem 0; }
+.journal-move-details p { margin: .75rem 0 0; }
+.journal-entry-insight [data-entry-results][aria-busy="true"] { opacity: .65; }
+
+.journal-entry-insight .journal-move-status { margin: 0; }
+.journal-entry-insight .journal-move-scope { margin: .25rem 0 1.25rem; max-width: none; }
+
+.journal-active-positions { padding: 1.5rem 0 1.5rem 1.75rem; border-left: 1px solid var(--border); }
+.journal-active-position { width: 100%; height: auto; min-height: 4.5rem; display: flex; justify-content: space-between; gap: 1rem; padding: .85rem .5rem; border-radius: 0; border-bottom: 1px solid var(--border); text-align: left; }
+.journal-active-contract { min-width: 0; flex: 1; }
+.journal-active-contract .journal-contract { white-space: normal; }
+.journal-active-quantity { font-size: .8rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.journal-active-position > svg { flex-shrink: 0; color: var(--muted-foreground); }

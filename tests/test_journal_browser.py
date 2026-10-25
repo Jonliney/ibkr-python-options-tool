@@ -123,7 +123,7 @@ def test_journal_views_render_at_desktop_and_minimum_size(tmp_path):
         workbench.close()
 
 
-def test_entry_settings_update_in_place_and_keep_input_focus(tmp_path):
+def test_active_position_opens_management(tmp_path):
     workbench = _demo_workbench()
     workbench.load_demo_data()
     client = TestClient(workbench.app)
@@ -138,64 +138,26 @@ def test_entry_settings_update_in_place_and_keep_input_focus(tmp_path):
 
         def loaded(ok):
             assert ok
-            view.page().runJavaScript("""(() => {
-              window.journalOriginalDocument = document.documentElement;
-              document.querySelector('[aria-label="Entry timing settings"]').click();
-            })()""")
-
-            def opened(value):
-                if not value:
-                    seen.append(False)
-                    loop.quit()
-                    return
-                view.page().runJavaScript("""(() => {
-                  const stop = document.querySelector('#journal-stop');
-                  const target = document.querySelector('#journal-target');
-                  stop.value='40'; target.value='35'; target.focus();
-                  stop.dispatchEvent(new Event('input',{bubbles:true}));
-                  target.dispatchEvent(new Event('input',{bubbles:true}));
-                })()""")
-
-                def updated(value):
-                    if not value:
-                        seen.append(False)
-                        loop.quit()
-                        return
-                    view.page().runJavaScript(
-                        """(() => {
-                      const input = document.querySelector('#journal-target');
-                      return window.journalOriginalDocument === document.documentElement
-                        && document.activeElement === input
-                        && input.closest('[popover]').matches(':popover-open')
-                        && document.querySelectorAll(
-                          '.journal-recovery-table tr').length > 3;
-                    })()""",
-                        lambda result: (seen.append(result), loop.quit()),
-                    )
-
+            if workbench._main_view == "dashboard":
+                view.page().runJavaScript(
+                    "document.querySelector('[data-active-positions] button').click()"
+                )
+            else:
                 wait_for_javascript(
                     view,
-                    "document.querySelector('[data-entry-results]')"
-                    ".textContent.includes('trades reached +35%')",
-                    updated,
-                    timeout=5,
+                    "!!document.querySelector('.journal-management') && "
+                    "!document.querySelector('[data-active-positions]')",
+                    lambda result: (seen.append(result), loop.quit()),
                 )
-
-            wait_for_javascript(
-                view,
-                "document.querySelector('#journal-stop').closest('[popover]').matches(':popover-open')",
-                opened,
-                timeout=5,
-            )
 
         view.loadFinished.connect(loaded)
         view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
         QTimer.singleShot(12000, loop.quit)
         loop.exec()
         assert seen == [True]
-        assert workbench._journal_stop == 40 and workbench._journal_target == 35
-        QTest.qWait(150)
-        view.grab().save(str(tmp_path / "entry-settings-open.png"))
+        assert workbench._main_view == "positions"
+        assert workbench._position_view == "management"
+        assert workbench._selected_con_id == workbench._state.positions[0].con_id
     finally:
         view.close()
         view.deleteLater()

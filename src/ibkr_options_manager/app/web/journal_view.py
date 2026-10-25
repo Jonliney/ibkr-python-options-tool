@@ -10,8 +10,8 @@ from typing import Any
 
 from starhtml import (
     H2,
-    H3,
     Circle,
+    Details,
     Div,
     Form,
     Icon,
@@ -24,6 +24,7 @@ from starhtml import (
     Script,
     Select,
     Span,
+    Summary,
     Svg,
     SvgPath,
     Table,
@@ -38,11 +39,6 @@ from starhtml import (
 
 from ...journal import JournalRow, entry_insights, summarize
 from .components.ui.button import Button
-from .components.ui.dropdown_menu import (
-    DropdownMenu,
-    DropdownMenuContent,
-    DropdownMenuTrigger,
-)
 from .components.ui.input import Input as StarInput
 from .components.ui.label import Label
 from .components.ui.tooltip import Tooltip, TooltipContent, TooltipTrigger
@@ -452,58 +448,41 @@ def _equity_script() -> str:
 
 
 def insight_settings(stop: Decimal, target: Decimal) -> Any:
-    def panel(**context: Any) -> Any:
-        element = DropdownMenuContent(
-            Div(
-                Label("Stop level %", fr="journal-stop"),
-                StarInput(
-                    type="number",
-                    name="journal_stop",
-                    id="journal-stop",
-                    value=str(stop),
-                    min="0.1",
-                    max="99.9",
-                    step="0.1",
-                    required=True,
-                    autofocus=True,
-                ),
-                Label("Target %", fr="journal-target"),
-                StarInput(
-                    type="number",
-                    name="journal_target",
-                    id="journal-target",
-                    value=str(target),
-                    min="0.1",
-                    max="10000",
-                    step="0.1",
-                    required=True,
-                ),
-                P(
-                    "",
-                    cls="journal-caption",
-                    role="status",
-                    data_entry_filter_status=True,
-                ),
-                cls="journal-insight-settings",
+    return Div(
+        Div(
+            Label("Stop (%)", fr="journal-stop"),
+            StarInput(
+                type="number",
+                name="journal_stop",
+                id="journal-stop",
+                value=str(stop),
+                min="0.1",
+                max="99.9",
+                step="0.1",
+                required=True,
             ),
-            align="end",
-            cls="w-64 p-4",
-        )(**context)
-        # Reuse StarUI positioning/dismissal with dialog semantics for form fields.
-        element.attrs["role"] = "dialog"
-        return element
-
-    def trigger(**context: Any) -> Any:
-        element = DropdownMenuTrigger(
-            Icon("lucide:funnel", cls="size-4"),
-            size="icon",
-            variant="ghost",
-            aria_label="Entry timing settings",
-        )(**context)
-        element.attrs["aria-haspopup"] = "dialog"
-        return element
-
-    return DropdownMenu(trigger, panel)
+        ),
+        Div(
+            Label("Target (%)", fr="journal-target"),
+            StarInput(
+                type="number",
+                name="journal_target",
+                id="journal-target",
+                value=str(target),
+                min="0.1",
+                max="10000",
+                step="0.1",
+                required=True,
+            ),
+        ),
+        P(
+            "",
+            cls="journal-caption journal-move-status",
+            role="status",
+            data_entry_filter_status=True,
+        ),
+        cls="journal-move-controls",
+    )
 
 
 def entry_timing_results(
@@ -511,67 +490,69 @@ def entry_timing_results(
 ) -> Any:
     insight = entry_insights(rows, stop=stop, target=target)
     target_text = f"+{target.normalize():f}%"
+    stop_text = f"-{stop.normalize():f}%"
+    level = next(r for r in insight.recovery if r.stop_percent == stop)
+    stop_first = level.touched - level.ambiguous
     definite_giveback = insight.gave_back + insight.retained
+    noun = "trade" if stop_first == 1 else "trades"
     return Div(
-        Div(
-            P(
-                f"{insight.reached_target} / {insight.eligible}",
-                cls="journal-insight-number",
+        P(
+            Span(
+                f"{insight.reached_target} of {insight.eligible}",
+                cls="journal-move-count",
             ),
-            P(f"trades reached {target_text}", cls="journal-muted"),
-            cls="journal-target-reach",
-        ),
-        Div(
-            Div(
-                P("Median dip before target", cls="journal-caption"),
-                P(percent(insight.median_dip), cls="journal-insight-value"),
-                P(f"{insight.dip_count} unambiguous paths", cls="journal-caption"),
-            ),
-            Div(
-                P("Gave the gain back", cls="journal-caption"),
-                P(
-                    f"{insight.gave_back} / {definite_giveback}"
-                    if definite_giveback
-                    else "—",
-                    cls="journal-insight-value",
-                ),
-                P("Returned to entry after target", cls="journal-caption"),
-            ),
-            cls="journal-insight-pair",
-        ),
-        H3("Recoveries after an early dip"),
-        Table(
-            Thead(
-                Tr(
-                    Th("Stop level", scope="col"),
-                    Th("Hit before target", scope="col"),
-                    Th("Later reached target", scope="col"),
-                )
-            ),
-            Tbody(
-                *(
-                    Tr(
-                        Td(f"-{r.stop_percent.normalize():f}%"),
-                        Td(str(r.touched - r.ambiguous)),
-                        Td(
-                            f"{r.recovered} / {r.touched - r.ambiguous}"
-                            if r.touched > r.ambiguous
-                            else "—"
-                        ),
-                        cls="journal-selected-level" if r.stop_percent == stop else "",
-                        aria_label=f"Selected stop -{stop.normalize():f}%"
-                        if r.stop_percent == stop
-                        else None,
-                    )
-                    for r in insight.recovery
-                )
-            ),
-            cls="journal-recovery-table",
+            f" {'trade' if insight.eligible == 1 else 'trades'} reached {target_text}.",
+            cls="journal-move-primary",
+        )
+        if insight.eligible
+        else P(
+            "No trades with complete entry and price history yet.", cls="journal-muted"
         ),
         P(
-            f"{sum(r.ambiguous for r in insight.recovery)} ambiguous stop comparisons excluded. {insight.giveback_ambiguous + insight.followup_missing} giveback paths excluded. Observed bids through last capture; gaps excluded.",
-            cls="journal-caption",
-        ),
+            Span(f"{stop_first} {noun}", cls="journal-move-count"),
+            f" fell {stop_text} first. ",
+            Span(str(level.recovered), cls="journal-move-count"),
+            f" of those later reached {target_text}.",
+            cls="journal-move-secondary",
+        )
+        if stop_first
+        else P(
+            f"No clear observations of a {stop_text} drop before {target_text}.",
+            cls="journal-muted journal-move-secondary",
+        )
+        if insight.eligible
+        else None,
+        Details(
+            Summary("More detail"),
+            P(
+                f"Among {insight.dip_count} {'trade' if insight.dip_count == 1 else 'trades'} with clear ordering, the median drop before reaching {target_text} was {percent(insight.median_dip)}."
+                if insight.median_dip is not None
+                else "There is not enough clearly ordered price history to calculate a typical pre-target dip.",
+            ),
+            P(
+                f"Of {definite_giveback} {'trade' if definite_giveback == 1 else 'trades'} with clear follow-up after {target_text}, {insight.gave_back} later returned to their entry price."
+                if definite_giveback
+                else f"No clear follow-up after {target_text} yet.",
+            ),
+            P(
+                f"{level.ambiguous} {'trade' if level.ambiguous == 1 else 'trades'} first touched both selected levels in the same minute; their order is unknown."
+            )
+            if level.ambiguous
+            else None,
+            P(
+                f"{insight.giveback_ambiguous + insight.followup_missing} {'trade' if insight.giveback_ambiguous + insight.followup_missing == 1 else 'trades'} lacked clear follow-up and are excluded from the return-to-entry count."
+            )
+            if insight.giveback_ambiguous + insight.followup_missing
+            else None,
+            P(
+                f"{len(rows) - insight.eligible} trades excluded because entry or price history is incomplete."
+            )
+            if len(rows) > insight.eligible
+            else None,
+            cls="journal-move-details",
+        )
+        if insight.eligible
+        else None,
         cls="journal-entry-results",
     )
 
@@ -604,8 +585,10 @@ def _insight_script(path: str, generation: int) -> str:
             if (!response.ok) throw Error('Update failed');
             const html = await response.text();
             if (current !== revision) return;
+            const expanded=results.querySelector('details')?.open;
             results.innerHTML = html;
-            status.textContent = 'Updated.';
+            if(expanded)results.querySelector('details').open=true;
+            status.textContent = '';
           } catch (error) {
             if (current === revision && error.name !== 'AbortError')
               status.textContent = 'Could not update. Change a value to retry.';
@@ -629,7 +612,36 @@ def dashboard(
     target: Decimal,
     generation: int,
     error: str = "",
+    active_positions: Any = None,
 ) -> Any:
+    priced = tuple(
+        row
+        for row in rows
+        if row.analysis
+        and row.analysis.bars
+        and row.coverage == "Observed minutes"
+        and row.entry_price
+    )
+    dips = tuple(
+        min(D(0), value)
+        for row in priced
+        if row.analysis and (value := row.return_at(row.analysis.low)) is not None
+    )
+    peaks = tuple(
+        max(D(0), value)
+        for row in priced
+        if row.analysis and (value := row.return_at(row.analysis.high)) is not None
+    )
+    adverse = sum(dips, D(0)) / len(dips) if dips else None
+    favorable = sum(peaks, D(0)) / len(peaks) if peaks else None
+    rows = tuple(
+        row
+        for row in rows
+        if row.trade is not None
+        and row.trade.remaining == 0
+        and row.exit_at is not None
+        and row.realized_pnl is not None
+    )
     currencies = sorted({r.contract.currency for r in rows}) or ["USD"]
     groups = {
         currency: tuple(r for r in rows if r.contract.currency == currency)
@@ -639,28 +651,6 @@ def dashboard(
     wins = sum(s.wins for s in summaries.values())
     losses = sum(s.losses for s in summaries.values())
     flat = sum(s.flat for s in summaries.values())
-    priced = sum(s.priced_count for s in summaries.values())
-    adverse = (
-        sum(
-            ((s.average_adverse or D(0)) * s.priced_count for s in summaries.values()),
-            D(0),
-        )
-        / priced
-        if priced
-        else None
-    )
-    favorable = (
-        sum(
-            (
-                (s.average_favorable or D(0)) * s.priced_count
-                for s in summaries.values()
-            ),
-            D(0),
-        )
-        / priced
-        if priced
-        else None
-    )
     realized = " / ".join(
         money(s.realized, currency) for currency, s in summaries.items()
     )
@@ -701,7 +691,7 @@ def dashboard(
             _metric(
                 "Average biggest dip",
                 percent(adverse),
-                f"Based on {priced} trades",
+                f"Based on {len(priced)} trades",
                 tone="journal-negative",
             ),
             _metric(
@@ -725,24 +715,11 @@ def dashboard(
                 ),
                 cls="journal-equity-section",
             ),
-            Div(
-                Div(
-                    H2("Entry timing"),
-                    insight_settings(stop, target),
-                    cls="journal-section-heading",
-                ),
-                Div(
-                    entry_timing_results(rows, stop=stop, target=target),
-                    data_entry_results=True,
-                    aria_live="polite",
-                ),
-                cls="journal-entry-insight",
-                data_entry_timing=True,
-            ),
+            Div(active_positions, id="position-inventory"),
             cls="journal-chart-layout",
         ),
         Div(
-            H2("Trade history", tabindex="-1", data_history_heading=True),
+            H2("Closed trades", tabindex="-1", data_history_heading=True),
             Div(
                 Span(
                     f"{len(rows)} trades · all saved dates",
@@ -764,10 +741,9 @@ def dashboard(
         ),
         _history_table(rows, path),
         P(
-            "Win rate excludes flat trades and unknown entries. Dips and peaks use saved bid prices, including after selling; trades with missing prices or unknown entries are excluded from these averages. Prices do not guarantee fills.",
+            "Win rate excludes flat trades. Realised results use matched closing fills and exclude fees. Dips and peaks include open trades and prices after selling; unknown entries and gaps in price history are excluded.",
             cls="journal-footnote",
         ),
-        Script(_insight_script(path, generation)),
         Script(_equity_script()),
         cls="journal-dashboard",
         data_journal_dashboard=True,
@@ -807,9 +783,9 @@ def _price_sequence(sequence: str) -> Any:
 def _history_table(rows: tuple[JournalRow, ...], path: str) -> Any:
     if not rows:
         return Div(
-            H2("No saved trades yet"),
+            H2("No closed trades yet"),
             P(
-                "Collect price history and entry fills to begin. Unknown entry times remain visible without an invented result.",
+                "Trades appear here after complete closing fills and a known result are recorded.",
                 cls="journal-muted",
             ),
             cls="journal-empty",

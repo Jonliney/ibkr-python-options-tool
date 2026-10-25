@@ -101,15 +101,22 @@ def test_dashboard_filters_analysis_and_management_roundtrip():
         assert ">Dashboard</h1>" not in html and "75%" in html
         assert 'lang="en-GB"' in html
         assert "Realised R:R" in html and "1:0.84" in html
+        assert "Average biggest dip" in html
         assert "Based on 11 trades" in html
+        assert "Average peak gain" in html
         assert "Illustrative history" not in html
         assert "Saved account history" not in html
         assert 'name="journal_status"' not in html
         assert 'name="journal_currency"' not in html
         assert ">Apply<" not in html
-        assert 'data-slot="dropdown-menu-trigger"' in html
+        assert "Price moves after entry" not in html
+        assert "Active positions" in html
+        assert "Closed trades" in html
+        assert 'id="journal-stop"' not in html
+        assert "Entry timing" not in html
+        assert "journal-recovery-table" not in html
         assert "Daily cumulative gross realised" in html
-        assert "Closed · entry unknown" in html
+        assert "Closed · entry unknown" not in html
         assert "Order changes" not in html
         rows = workbench._journal_rows()
         selected = next(
@@ -150,7 +157,7 @@ def test_dashboard_filters_analysis_and_management_roundtrip():
                 "journal_target": "40",
             },
         ).text
-        assert "13 trades" in html  # analysis settings never filter trade history
+        assert "8 trades" in html  # only complete matched closed trades
         assert workbench._journal_target == 40
         html = client.post(
             workbench.path + "action",
@@ -263,7 +270,7 @@ def test_live_insights_reject_stale_responses_and_invalid_inputs():
         response = client.post(workbench.path + "journal-insights", data=data)
         assert response.status_code == 200
         assert "trades reached +40%" in response.text
-        assert "Median dip before target" in response.text
+        assert "the median drop before reaching +40%" in response.text
         assert "Trade history" not in response.text
         assert workbench._journal_stop == 10
         stale = client.post(
@@ -446,5 +453,99 @@ def test_price_path_keeps_gaps_and_handles_single_flat_observation():
         assert html.count("<circle ") == 1
         assert 'data-y-fraction="0"' in html
         assert 'data-return="+0.0%"' in html
+    finally:
+        workbench.close()
+
+
+def test_price_moves_summary_is_plain_and_excludes_uncertain_stop_first_counts():
+    import re
+
+    from starhtml import to_xml
+
+    from ibkr_options_manager.app.web.journal_view import entry_timing_results
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    try:
+        rows = workbench._journal_rows()
+        html = to_xml(entry_timing_results(rows, stop=D(25), target=D(20)))
+        text = " ".join(re.sub("<[^>]+>", " ", html).split())
+        assert "10 of 11 trades reached +20%." in text
+        assert "4 trades fell -25% first. 3 of those later reached +20%." in text
+        assert "<details" in html and not re.search(r"<details[^>]*\sopen\b", html)
+        assert "journal-recovery-table" not in html
+        row = next(r for r in rows if r.analysis and r.entry_price)
+        bar = replace(
+            row.analysis.bars[0],
+            low=row.entry_price * D(".75"),
+            high=row.entry_price * D("1.2"),
+            close=row.entry_price,
+        )
+        tied = replace(row, analysis=replace(row.analysis, bars=(bar,)))
+        tied_html = to_xml(entry_timing_results((tied,), stop=D(25), target=D(20)))
+        assert "1 trade first touched both selected levels" in tied_html
+        assert "No clear observations" in tied_html
+        empty = to_xml(entry_timing_results((), stop=D(25), target=D(20)))
+        assert "No trades with complete entry and price history yet." in empty
+        assert "<details" not in empty and "0 of 0" not in empty
+    finally:
+        workbench.close()
+
+
+def test_dashboard_only_lists_completed_reconciled_trades_and_live_inventory():
+    from starhtml import to_xml
+
+    from ibkr_options_manager.app.web.journal_view import dashboard
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    client = TestClient(workbench.app)
+    try:
+        rows = workbench._journal_rows()
+        closed = tuple(
+            row
+            for row in rows
+            if row.trade is not None
+            and row.trade.remaining == 0
+            and row.realized_pnl is not None
+            and row.exit_at is not None
+        )
+        assert len(closed) == 8
+        incomplete = replace(closed[0], row_id="withheld", realized_pnl=None)
+        undated = replace(closed[0], row_id="undated", exit_at=None)
+        html = to_xml(
+            dashboard(
+                (*rows, incomplete, undated),
+                workbench.path,
+                stop=D(25),
+                target=D(20),
+                generation=1,
+            )
+        )
+        assert "8 trades · all saved dates" in html
+        assert 'value="withheld"' not in html
+        assert 'value="undated"' not in html
+        assert 'value="observed-' not in html
+        empty = to_xml(
+            dashboard(
+                (incomplete, undated),
+                workbench.path,
+                stop=D(25),
+                target=D(20),
+                generation=1,
+            )
+        )
+        assert "No closed trades yet" in empty
+
+        client.post(workbench.path + "action", data={"action": "show-dashboard"})
+        fragment = client.get(workbench.path + "inventory-fragment").text
+        assert "Active positions" in fragment
+        assert "CLOSED THIS SESSION" not in fragment
+        assert fragment.count('name="con_id"') == len(workbench._state.positions)
+        # Portfolio changes use the same fragment as the existing sidebar.
+        workbench._state = replace(workbench._state, positions=())
+        fragment = client.get(workbench.path + "inventory-fragment").text
+        assert "0 active" in fragment
+        assert "No active positions in the latest portfolio snapshot." in fragment
     finally:
         workbench.close()

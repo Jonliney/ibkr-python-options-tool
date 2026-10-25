@@ -19,6 +19,7 @@ from uuid import uuid4
 
 from starhtml import (
     H1,
+    H2,
     H3,
     Circle,
     Div,
@@ -475,7 +476,7 @@ class StarUIWorkbench:
         with self._lock:
             change = self._position_changes.selected_change
             return HTMLResponse(
-                to_xml(self._inventory()),
+                to_xml(self._inventory(compact=self._main_view == "dashboard")),
                 headers={
                     "Cache-Control": "no-store",
                     "X-Inventory-Revision": str(self._inventory_revision),
@@ -821,6 +822,7 @@ class StarUIWorkbench:
                 not in {
                     "refresh",
                     "select",
+                    "select-active",
                     "select-session-closed",
                     "verify-bracket-exists",
                     "resolve-cancelled-bracket",
@@ -835,6 +837,7 @@ class StarUIWorkbench:
             if contract_locked and action not in {
                 "refresh",
                 "select",
+                "select-active",
                 "select-session-closed",
                 "verify-management",
             }:
@@ -939,7 +942,7 @@ class StarUIWorkbench:
                 self._refresh_locked()
                 self._start_observer_locked()
                 self._submission_review_required = False
-            elif action == "select":
+            elif action in {"select", "select-active"}:
                 self._analysis_trade_id = None
                 self._protection_change_message = ""
                 self._disarm_execution_locked()
@@ -947,6 +950,8 @@ class StarUIWorkbench:
                     self._save_form_locked(values)
                 self._position_changes.clear_selected_change()
                 self._select_locked(_positive_int(values.get("con_id"), 0))
+                if action == "select-active":
+                    self._main_view, self._position_view = "positions", "management"
             elif action == "select-session-closed":
                 self._disarm_execution_locked()
                 con_id = _positive_int(values.get("con_id"), 0)
@@ -3877,6 +3882,7 @@ class StarUIWorkbench:
                 target=self._journal_target,
                 generation=self._insight_generation,
                 error=self._history_error,
+                active_positions=self._inventory(compact=True),
             )
         elif self._position_view == "analysis":
             rows = self._journal_rows()
@@ -4687,7 +4693,57 @@ class StarUIWorkbench:
         )
         return center, review
 
-    def _inventory(self) -> Any:
+    def _inventory(self, *, compact: bool = False) -> Any:
+        if compact:
+            return Div(
+                Div(
+                    H2("Active positions"),
+                    Span(f"{len(self._state.positions)} active", cls="journal-caption"),
+                    cls="journal-section-heading",
+                ),
+                *(
+                    Form(
+                        Button(
+                            Span(
+                                Span(
+                                    _position_identity(position.local_symbol)[0],
+                                    cls="journal-contract",
+                                ),
+                                Span(
+                                    _position_identity(position.local_symbol)[1],
+                                    cls="journal-caption",
+                                ),
+                                cls="journal-active-contract",
+                            ),
+                            Span(
+                                f"{position.quantity} held",
+                                cls="journal-active-quantity",
+                            ),
+                            Icon("lucide:chevron-right", cls="size-4"),
+                            type="submit",
+                            variant="ghost",
+                            disabled=not position.eligible,
+                            aria_label=f"Manage {position.local_symbol}, {position.quantity} held",
+                            cls="journal-active-position",
+                        ),
+                        HTMLInput(type="hidden", name="action", value="select-active"),
+                        HTMLInput(
+                            type="hidden", name="con_id", value=str(position.con_id)
+                        ),
+                        action=self.path + "action",
+                        method="post",
+                    )
+                    for position in self._state.positions
+                ),
+                P(
+                    "No active positions in the latest portfolio snapshot.",
+                    cls="journal-muted",
+                )
+                if not self._state.positions
+                else None,
+                cls="journal-active-positions",
+                data_active_positions=True,
+            )
         rows = []
         analysis_row = (
             self._analysis_row(self._journal_rows())

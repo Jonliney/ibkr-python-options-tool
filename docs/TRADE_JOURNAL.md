@@ -40,38 +40,26 @@ rehearsal scenarios and explicit `--con-id` launches still open Management.
   curve's currency; “All dates” resets it. This local filter leaves summary
   statistics unchanged. The interactive tooltip is keyboard reachable and
   dismissible with Escape. The SVG fills available width and height beside
-  Entry timing and rescales on resize. Tooltip values are right-aligned in a
+  the active positions overview and rescales on resize. Tooltip values are right-aligned in a
   separate column, signed and coloured green for gains and rose for losses.
   “View trades” uses an underlined StarUI link-style action.
-- Average adverse excursion is the arithmetic mean of `min(0, worst return)`;
-  average favourable excursion is the mean of `max(0, best return)`. Trades with
-  no usable entry/price evidence or known history gaps are excluded, and the
-  included trade count is shown. Observed prices may still be incomplete.
-- Entry timing shows target reach, median dip before the first target touch,
-  and how many target-reaching trades later returned to their entry price.
-  A comparison at -10%, -20%, -30%, -40% and the selected stop shows which early
-  dips subsequently recovered to the target. Trades that reached the target
-  before dipping are excluded from that early-dip cohort. Each recovery row's
-  denominator is trades hitting that level first, excluding same-minute ties.
-- The funnel button beside Entry timing opens StarUI number inputs for stop
-  and target. Results update in place after a short typing debounce, preserving
-  focus and the open dropdown. Invalid inputs retain the last valid results;
-  stale responses cannot replace a newer result. There is no Apply button.
-- The median uses only unambiguous minima before the target minute; a lower low
-  in the target minute could precede or follow the target, so that path is
-  excluded from the median. Giveback counts require later observations, with
-  same-minute ambiguities and missing follow-up excluded from its denominator.
-  Sample counts accompany the values. All comparisons use observed bid paths
-  through the last capture, not guaranteed fills or optimized strategy advice.
-- All trades are shown without trade-state or currency filters. Monetary totals
-  and equity curves remain separate per currency; percentage-only path statistics
-  can be combined across currencies without adding unlike monetary amounts.
+- Active positions uses the same broker portfolio inventory and selection as the
+  Positions sidebar. Each row shows contract identity and held quantity and opens
+  Management. It updates through the existing inventory subscription. Unsupported
+  positions remain disabled. No portfolio-wide unrealised P&L is invented from
+  the selected contract's quote.
+- Closed trades contains only fully closed fill episodes with a known close date
+  and reconciled gross result. Open, partially closed, unknown-entry and
+  unreconciled trades are excluded from this table and realised metrics/curves.
+  A position disappearing from the portfolio is not evidence of a closing fill.
+- Win rate, gross realised P&L, realised R:R, average biggest dip and average
+  peak gain remain above the chart. Dip and peak averages use all trades with
+  known entries and complete observed prices, including open trades and prices
+  after selling; missing entries and known history gaps are excluded.
+  Monetary totals and curves stay separate by currency.
 
-Dashboard controls use bundled StarUI buttons, dropdown positioning/dismissal,
-inputs and labels. Semantic layout and tables are StarHTML, with custom CSS/SVG
-charts. StarUI is the component library, not the renderer for every visual. Its
-dropdown content uses dialog semantics for editable fields. The Lucide funnel
-icon is bundled locally, with no runtime icon-network dependency.
+Dashboard controls use bundled StarUI buttons. Semantic layout and tables are
+StarHTML, with custom CSS/SVG charts.
 
 ## Position analysis
 
