@@ -33,6 +33,17 @@ def test_journal_views_render_at_desktop_and_minimum_size(tmp_path):
             ("dashboard", {"action": "show-dashboard"}),
             ("analysis", {"action": "open-trade", "trade_id": selected.row_id}),
             ("management", {"action": "show-management"}),
+            (
+                "analysis-qqq",
+                {
+                    "action": "open-trade",
+                    "trade_id": next(
+                        row.row_id
+                        for row in workbench._journal_rows()
+                        if row.contract.trading_class == "QQQ"
+                    ),
+                },
+            ),
         ):
             client.post(workbench.path + "action", data=action)
             for width in (1500, 1120, 2560):
@@ -105,10 +116,10 @@ def test_journal_views_render_at_desktop_and_minimum_size(tmp_path):
                 assert not observations[0]["overflow"]
                 assert observations[0]["chart"]
                 assert observations[0]["dashboard"] == (name == "dashboard")
-                assert observations[0]["analysis"] == (name == "analysis")
+                assert observations[0]["analysis"] == name.startswith("analysis")
                 assert observations[0]["positionHierarchy"]
-                assert observations[0]["analysisSidebar"] == (name == "analysis")
-                if name == "analysis":
+                assert observations[0]["analysisSidebar"] == name.startswith("analysis")
+                if name.startswith("analysis"):
                     analysis_widths[width] = observations[0]["workspaceWidth"]
                     assert observations[0]["analysisMetrics"] == 5
                 elif name == "management":
@@ -853,8 +864,19 @@ def test_scenario_touch_markers_use_ranges_first_touch_and_uncertainty():
             seen = []
             script = """(() => {
               const points=[...document.querySelectorAll('[data-price-point]')];
-              return JSON.stringify(
-                [...document.querySelectorAll('[data-scenario-touch]')]
+              const whiskers=[...document.querySelectorAll(
+                '[data-price-event-whisker]')];
+              const marks=[...document.querySelectorAll(
+                '.journal-price-extreme,[data-scenario-touch]')]
+                .filter(m=>m.style.display!=='none');
+              return JSON.stringify({
+                whiskerCount:whiskers.length,
+                connected:marks.every(mark=>whiskers.some(w=>
+                  Math.abs(Number(w.getAttribute('x1'))-Number(mark.getAttribute('cx')))<.01
+                  && Number(mark.getAttribute('cy'))>=Number(w.getAttribute('y1'))-.01
+                  && Number(mark.getAttribute('cy'))<=
+                    Number(w.getAttribute('y2'))+.01)),
+                touches:[...document.querySelectorAll('[data-scenario-touch]')]
                 .filter(m => m.style.display !== 'none').map(m => ({
                   kind:m.dataset.scenarioTouch,
                   index:points.findIndex(p=>p.getAttribute('cx')===m.getAttribute('cx')),
@@ -862,7 +884,7 @@ def test_scenario_touch_markers_use_ranges_first_touch_and_uncertainty():
                     '.journal-scenario-hit[data-scenario-drag="'+m.dataset.scenarioTouch+'"]')
                     .getAttribute('y1'),
                   label:m.getAttribute('aria-label')
-                })));
+                }))});
             })()"""
             view.page().runJavaScript(
                 script,
@@ -874,12 +896,13 @@ def test_scenario_touch_markers_use_ranges_first_touch_and_uncertainty():
             QTimer.singleShot(3000, result_loop.quit)
             result_loop.exec()
             assert seen
-            assert {m["kind"]: m["index"] for m in seen[0]} == expected
+            assert seen[0]["connected"] and seen[0]["whiskerCount"] > 0
+            assert {m["kind"]: m["index"] for m in seen[0]["touches"]} == expected
             assert all(
                 m["onLevel"]
                 and "not a confirmed fill" in m["label"]
                 and qualifier in m["label"]
-                for m in seen[0]
+                for m in seen[0]["touches"]
             )
     finally:
         view.close()

@@ -32,6 +32,8 @@
       Object.entries(attributes).forEach(([key,value])=>element.setAttribute(key,value));
       svg.append(element); return element;
     };
+    const events = make('g', {'aria-hidden':'true', class:'journal-price-events'});
+    svg.insertBefore(events, svg.querySelector('[data-price-segment]'));
     const lines = {}, hits = {}, leaders = {};
     ['stop','target'].forEach(kind => {
       lines[kind] = make('line', {class:`journal-scenario-line journal-scenario-${kind}`});
@@ -140,6 +142,25 @@
       touches.target.bar=bars.find(bar=>bar.high>=price('target')-epsilon)||null;
       const sameMinute=touches.stop.bar && touches.target.bar &&
         touches.stop.bar.timestamp===touches.target.bar.timestamp;
+      // A minute's close need not reach its high/low or a touched threshold.
+      // Connect those events to the observed range without inventing ordering.
+      const eventBars=new Set([
+        ...extrema.map(item=>item.bar), touches.stop.bar, touches.target.bar
+      ].filter(Boolean));
+      events.replaceChildren();
+      eventBars.forEach(bar=>{
+        const px=x(bar.point.dataset.xFraction), top=y(bar.high), bottom=y(bar.low);
+        events.append(make('line', {
+          x1:px,x2:px,y1:top,y2:bottom,'data-price-event-whisker':'',
+          class:'journal-price-whisker'
+        }));
+        [top,bottom].forEach(py=>events.append(make('line', {
+          x1:px-4,x2:px+4,y1:py,y2:py,class:'journal-price-whisker'
+        })));
+        events.append(make('circle', {
+          cx:px,cy:y(bar.close),r:2.5,class:'journal-event-close'
+        }));
+      });
       ['stop','target'].forEach(kind=>{
         const {mark,bar}=touches[kind];
         mark.style.display=bar?'':'none';

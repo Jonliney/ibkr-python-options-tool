@@ -1158,7 +1158,9 @@ def _analysis_sidebar(row: JournalRow | None) -> Any:
     analysis = row.analysis
     c = row.contract.currency
 
-    def outcome(label: str, price: Decimal | None, detail: str) -> Any:
+    def outcome(
+        label: str, price: Decimal | None, detail: str, *, help_text: str = ""
+    ) -> Any:
         value = row.return_at(price)
         return _metric(
             label,
@@ -1166,6 +1168,7 @@ def _analysis_sidebar(row: JournalRow | None) -> Any:
             f"{money(row.pnl_at(price), c)} · {detail}",
             tone=_tone(value),
             unavailable=value is None,
+            help_text=help_text,
         )
 
     return Div(
@@ -1202,16 +1205,17 @@ def _analysis_sidebar(row: JournalRow | None) -> Any:
                     money(analysis.high if analysis else None, c) + " bid",
                 ),
                 outcome(
-                    "Final-session estimate",
+                    "Hold-to-expiry estimate",
                     row.final_price,
-                    f"{money(row.final_price, c)} bid · Not settlement",
+                    f"{money(row.final_price, c)} bid",
+                    help_text="Estimated gross P&L using the last observed bid from the final trading session. This is not an actual settlement result.",
                 )
                 if row.final_kind == "expiry_bid" and row.final_price is not None
                 else _metric(
-                    "Final-session estimate",
+                    "Hold-to-expiry estimate",
                     "Unavailable",
                     unavailable=True,
-                    help_text="A final-session bid was not captured. This estimate is unavailable; it is not an expiration settlement value.",
+                    help_text="A final-session bid was not captured. This estimate is unavailable. When available, it estimates gross P&L from the last observed bid, not an actual settlement result.",
                 ),
                 cls="journal-analysis-stat-group",
             ),

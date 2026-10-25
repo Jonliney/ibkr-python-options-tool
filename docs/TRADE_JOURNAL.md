@@ -177,7 +177,11 @@ management drafts, or Dashboard settings.
 Threshold prices use the unrounded percentage-derived values and are displayed
 at currency precision. No crossing sequence or execution result is inferred
 by this chart. Missing minutes remain unconnected. Low/high markers identify
-observed extrema, not guaranteed executable prices. Price tooltips appear only
+observed extrema, not guaranteed executable prices. Capped vertical whiskers show the
+full observed minute range at extrema and first threshold touches, with a small
+mark on the closing line. Events sharing a minute use one whisker; these update
+with threshold edits and resizing and do not intercept hover or dragging.
+Price tooltips appear only
 within 10 screen pixels of a close-price point or a connected segment, with
 priority given to the stop/target drag surfaces. The corridor does not bridge
 missing observations. Keyboard inspection remains available.
