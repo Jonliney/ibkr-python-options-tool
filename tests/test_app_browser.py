@@ -20,6 +20,7 @@ from ibkr_options_manager.app.view_model import UiStatus
 from ibkr_options_manager.app.web import StarUIWorkbench
 from ibkr_options_manager.app.web.surface import (
     _live_active_script,
+    _local_feedback_script,
     _money,
 )
 from ibkr_options_manager.app.web_window import (
@@ -36,6 +37,285 @@ from support.qt import wait_for_javascript
 from support.workbench import _demo_workbench, _trailing_scenario_workbench, _WindowStub
 
 pytestmark = pytest.mark.gui
+
+
+def test_management_scroll_survives_review_creation_and_order_status_refresh(tmp_path):
+    workbench = _trailing_scenario_workbench(tmp_path, "convert")
+    workbench._select_locked(1_002_100_161)
+    workbench._build_draft_locked()
+    TestClient(workbench.app).post(
+        workbench.path + "action", data={"action": "show-management"}
+    )
+    server, thread, port = _start_local_server(workbench.app)
+    view = QWebEngineView()
+    view.resize(1120, 920)
+    view.show()
+    loop = QEventLoop()
+    observations = []
+    stage = [0]
+    desired = [0]
+    viewport = '[aria-label="OCA layers workspace"][data-slot="scroll-area-viewport"]'
+
+    def inspect():
+        view.page().runJavaScript(
+            f"""(() => {{
+              const v = document.querySelector('{viewport}');
+              return JSON.stringify({{top:v.scrollTop,
+                max:v.scrollHeight-v.clientHeight,
+                sent:!!document.querySelector('[data-order-completion="bracket-create"]'),
+                saved:!!document.querySelector('[data-completion-feedback="settings"]'),
+                refreshed:!!document.querySelector('[data-completion-feedback="refresh"]')
+              }});
+            }})()""", observed
+        )
+
+    def observed(value):
+        observations.append(json.loads(value))
+        current = stage[0]
+        stage[0] += 1
+        if current == 0:
+            view.page().runJavaScript(
+                f"""(() => {{
+                  const v = document.querySelector('{viewport}'); v.scrollTop = 200;
+                  const top = v.scrollTop;
+                  document.querySelector('button[value="execute-arm"]').click();
+                  return top;
+                }})()""", lambda top: desired.__setitem__(0, top)
+            )
+        elif current == 1:
+            view.page().runJavaScript(
+                "document.querySelector('button[value=\"execute-confirm\"]').click()"
+            )
+        elif current == 2:
+            view.grab().save(str(tmp_path / "bracket-created.png"))
+            view.page().runJavaScript(
+                "document.querySelector('[data-submission-review] button[type=submit]')"
+                ".click()"
+            )
+        elif current in {3, 4}:
+            con_id = 1_003_625_093 if current == 3 else 1_002_100_161
+            view.page().runJavaScript(
+                f"""Array.from(document.querySelectorAll('#position-inventory form'))
+                  .find(f => f.querySelector('[name="con_id"]')?.value === '{con_id}')
+                  .querySelector('button').click()"""
+            )
+        else:
+            loop.quit()
+
+    def loaded(ok):
+        assert ok
+        wait_for_javascript(
+            view, f"!!document.querySelector('{viewport}')",
+            lambda _: QTimer.singleShot(100, inspect),
+        )
+
+    try:
+        view.loadFinished.connect(loaded)
+        view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
+        QTimer.singleShot(12000, loop.quit)
+        loop.exec()
+    finally:
+        view.close()
+        server.should_exit = True
+        thread.join(timeout=2)
+
+    assert len(observations) == 6, observations
+    assert desired[0] >= 100, observations
+    for observation in [*observations[1:4], observations[5]]:
+        assert abs(observation["top"] - min(desired[0], observation["max"])) < 2
+    assert observations[4]["top"] == 0, observations
+    assert observations[2]["sent"], observations
+    assert not observations[3]["saved"], observations
+    assert observations[3]["sent"], observations
+
+
+def test_local_feedback_settles_without_hiding_errors_or_replacing_busy_controls():
+    view = QWebEngineView()
+    view.show()
+    loop = QEventLoop()
+    results = []
+
+    def loaded(ok):
+        assert ok
+
+        def inspect():
+            view.page().runJavaScript(
+                """JSON.stringify({
+                  editLabel: document.getElementById('edit').textContent,
+                  editDisabled: document.getElementById('edit').disabled,
+                  editGreen: document.getElementById('edit').classList.contains(
+                    'action-complete'),
+                  error: document.querySelector('[role=alert]').textContent,
+                  settings: document.getElementById('settings').textContent,
+                  refreshIconRestored: !document.querySelector(
+                    '[data-refresh-idle-icon]').hidden,
+                  checkRemoved: !document.querySelector('[data-completion-icon]'),
+                  busy: document.getElementById('busy').textContent
+                })""",
+                lambda value: (results.append(json.loads(value)), loop.quit()),
+            )
+
+        wait_for_javascript(
+            view,
+            "!document.querySelector('[data-order-completion]')",
+            lambda _: inspect(),
+            timeout=6,
+        )
+
+    view.loadFinished.connect(loaded)
+    view.setHtml(
+        '<button id="edit" data-order-completion="price-update" '
+        'data-restore-label="Review price changes" class="action-complete" disabled>'
+        'Successfully edited</button>'
+        '<p role="alert">Order state uncertain</p>'
+        '<button id="settings" data-completion-feedback="settings">Saved</button>'
+        '<button data-completion-feedback="refresh">'
+        '<span data-refresh-idle-icon hidden>Refresh</span>'
+        '<span data-completion-icon>Check</span></button>'
+        '<button id="busy" data-completion-feedback="settings" '
+        'aria-busy="true">Refreshing…</button>'
+        f"<script>{_local_feedback_script()}</script>"
+    )
+    QTimer.singleShot(7000, loop.quit)
+    loop.exec()
+    view.close()
+
+    assert results == [{
+        "editLabel": "Review price changes",
+        "editDisabled": True,
+        "editGreen": False,
+        "error": "Order state uncertain",
+        "settings": "Settings",
+        "refreshIconRestored": True,
+        "checkRemoved": True,
+        "busy": "Refreshing…",
+    }]
+
+
+def test_contextual_feedback_fits_management_at_desktop_sizes(tmp_path):
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    TestClient(workbench.app).post(
+        workbench.path + "action", data={"action": "show-management"}
+    )
+    workbench._build_draft_locked()
+    server, thread, port = _start_local_server(workbench.app)
+    view = QWebEngineView()
+    view.show()
+    try:
+        for scope in ("review", "action", "settings"):
+            for width in (1120, 1500):
+                workbench._feedback = None
+                if scope == "review":
+                    workbench._message = (
+                        "Price update blocked: the snapshot is stale. "
+                        "Refresh before reviewing the change again."
+                    )
+                elif scope == "action":
+                    workbench._show_order_feedback_locked(
+                        "Simulated price update acknowledged",
+                        "Demo order state refreshed; no TWS order was sent.",
+                    )
+                else:
+                    workbench._completed_action = "settings"
+                selector = (
+                    '[data-completion-feedback="settings"]'
+                    if scope == "settings"
+                    else '[data-order-completion="price-update"]'
+                    if scope == "action"
+                    else f'[data-action-feedback="{scope}"]'
+                )
+                view.resize(width, 920)
+                loop = QEventLoop()
+                observations = []
+
+                def loaded(ok, selector=selector, observations=observations, loop=loop):
+                    assert ok
+
+                    def inspect(_):
+                        view.page().runJavaScript(
+                            f"""(() => {{
+                              const e = document.querySelector('{selector}');
+                              const r = e?.getBoundingClientRect();
+                              const success = e?.hasAttribute('data-order-completion');
+                              return !!r && r.width > 0 && r.x >= 0
+                                && r.right <= innerWidth && r.bottom <= innerHeight
+                                && document.documentElement.scrollWidth <= innerWidth
+                                && (!success || (e.disabled
+                                  && getComputedStyle(e).opacity === '1'
+                                  && getComputedStyle(e).backgroundColor ===
+                                    'rgb(110, 231, 183)'));
+                            }})()""",
+                            lambda value: (observations.append(value), loop.quit()),
+                        )
+
+                    wait_for_javascript(
+                        view, f"!!document.querySelector('{selector}')", inspect
+                    )
+
+                view.loadFinished.connect(loaded)
+                view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}?{scope}-{width}"))
+                QTimer.singleShot(5000, loop.quit)
+                loop.exec()
+                view.loadFinished.disconnect(loaded)
+                assert observations == [True]
+                QTest.qWait(100)
+                view.grab().save(str(tmp_path / f"feedback-{scope}-{width}.png"))
+    finally:
+        view.close()
+        server.should_exit = True
+        thread.join(timeout=2)
+
+
+def test_new_edit_interrupts_success_without_timer_disabling_the_next_review():
+    view = QWebEngineView()
+    view.show()
+    loop = QEventLoop()
+    observations = []
+    script = _live_active_script({
+        "basis": "10", "multiplier": "100",
+        "bands": [{"low": "0", "increment": "0.1"}],
+    })
+
+    def loaded(ok):
+        assert ok
+        view.page().runJavaScript("""(() => {
+          const target = document.querySelector('[data-active-input="target"]');
+          target.value = '60';
+          target.dispatchEvent(new Event('input', {bubbles:true}));
+        })()""")
+
+        def inspect():
+            view.page().runJavaScript("""(() => {
+              const b = document.querySelector('[data-active-execute]');
+              return JSON.stringify({label:b.textContent, disabled:b.disabled,
+                success:b.hasAttribute('data-order-completion'),
+                green:b.classList.contains('action-complete')});
+            })()""", lambda v: (observations.append(json.loads(v)), loop.quit()))
+
+        QTimer.singleShot(2900, inspect)
+
+    view.loadFinished.connect(loaded)
+    view.setHtml(
+        '<form id="active-form">'
+        '<input data-active-input="target" data-active-perm-id="1" '
+        'data-live-layer="1" data-active-initial="50" '
+        'data-active-original="15" value="50">'
+        '<input data-active-input="stop" data-active-perm-id="1" '
+        'data-active-initial="-25" data-active-original="7.5" value="-25">'
+        '<input data-active-quantity="1" value="2">'
+        '</form><button data-active-execute disabled class="action-complete" '
+        'data-order-completion="price-update" '
+        'data-restore-label="Review price changes">Successfully edited</button>'
+        f"<script>{script}</script><script>{_local_feedback_script()}</script>"
+    )
+    QTimer.singleShot(5000, loop.quit)
+    loop.exec()
+    view.close()
+    assert observations == [{
+        "label": "Review price changes", "disabled": False,
+        "success": False, "green": False,
+    }]
 
 
 @pytest.mark.parametrize("with_limit", [False, True])

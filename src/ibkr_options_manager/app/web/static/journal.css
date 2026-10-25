@@ -24,7 +24,9 @@
 .journal-analysis .journal-fill-section { overflow-x: auto; }
 .journal-analysis > .journal-position-tabs { margin: .25rem 0 1.5rem; }
 .workspace-content > .journal-position-tabs { margin: .25rem 0 0; flex: 0 0 2.8rem; }
-.position-management-actions { display: flex; justify-content: flex-end; margin-top: 1rem; }
+.position-title-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .75rem 1rem; }
+.position-title-row > h1 { flex: 1 1 16rem; margin: 0; }
+.position-management-actions { display: flex; justify-content: flex-end; margin-left: auto; }
 .journal-title-row, .journal-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 1.25rem; }
 .journal-title-row { margin-bottom: 1.5rem; }
 .journal-title-row h1 { font-size: 1.65rem; font-weight: 650; letter-spacing: -.025em; line-height: 1.3; margin: 0 0 .4rem; }

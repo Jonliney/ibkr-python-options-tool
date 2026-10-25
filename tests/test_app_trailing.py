@@ -16,8 +16,8 @@ from ibkr_options_manager.app.demo import (
 )
 from ibkr_options_manager.app.web import StarUIWorkbench
 from ibkr_options_manager.app.web.surface import (
+    _action_notice,
     _money,
-    _toast_notice,
     _trailing_fill_summary,
 )
 from ibkr_options_manager.broker import SnapshotRequest
@@ -222,8 +222,8 @@ def test_named_trailing_demo_scenarios_expose_distinct_states(tmp_path: Path) ->
     )
     assert blocked_review.status_code == 200
     assert "couldn't verify a current bid" in no_bid._message
-    assert no_bid._toast is not None
-    assert "couldn't verify a current bid" in no_bid._toast.description
+    assert no_bid._feedback is not None
+    assert "couldn't verify a current bid" in no_bid._feedback.description
 
 
 def test_working_trail_limit_review_update_and_delete(tmp_path: Path) -> None:
@@ -528,8 +528,8 @@ def test_closed_trailing_demo_moves_position_to_session_history_on_refresh(
     assert "Average fill" not in closed_row
 
 
-def test_trailing_review_failure_uses_trailing_toast_title() -> None:
-    notice = _toast_notice("Trailing exit blocked: the quote is unavailable")
+def test_trailing_review_failure_uses_trailing_feedback_title() -> None:
+    notice = _action_notice("Trailing exit blocked: the quote is unavailable")
     assert notice is not None
     assert notice.title == "Couldn't review trailing exit"
 

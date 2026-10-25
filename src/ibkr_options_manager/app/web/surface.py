@@ -121,7 +121,6 @@ from .components.ui.input import Input
 from .components.ui.label import Label
 from .components.ui.scroll_area import ScrollArea
 from .components.ui.separator import Separator
-from .components.ui.toast import Toaster
 from .components.ui.toggle_group import ToggleGroup, ToggleGroupItem
 from .components.ui.tooltip import Tooltip, TooltipContent, TooltipTrigger
 from .journal_view import (
@@ -152,7 +151,7 @@ _LOCAL_POSITION_PLUGIN = Plugin(  # type: ignore[no-untyped-call]
 
 
 @dataclass(frozen=True, slots=True)
-class _ToastNotice:
+class _ActionNotice:
     title: str
     description: str
     variant: str
@@ -290,10 +289,15 @@ class StarUIWorkbench:
         self._stop_presets = "25"
         self._last_refreshed_at = "—"
         self._notifications_enabled = False
-        self._suppress_toasts = False
-        self._toast: _ToastNotice | None = None
-        self._toast_revision = 0
-        self._toast_rendered_revision = 0
+        self._suppress_feedback = False
+        self._feedback: _ActionNotice | None = None
+        self._feedback_revision = 0
+        self._feedback_rendered_revision = 0
+        self._feedback_scope = "review"
+        self._order_feedback_action = "price-update"
+        self._action_feedback_scope = "review"
+        self._completed_action = ""
+        self._draft_feedback_index: int | None = None
         self._status_message = ""
         self._message = "Refresh and select a position to build a draft."
         self._launch_connection = "idle"
@@ -333,16 +337,17 @@ class StarUIWorkbench:
 
     @property
     def _message(self) -> str:
-        """Retain a diagnostic status internally while exposing outcomes as toasts."""
+        """Keep diagnostics while placing actionable feedback beside its source."""
         return self._status_message
 
     @_message.setter
     def _message(self, message: str) -> None:
         self._status_message = message
-        if self._notifications_enabled and not self._suppress_toasts:
-            self._toast = _toast_notice(message)
-            if self._toast is not None:
-                self._toast_revision += 1
+        if self._notifications_enabled and not self._suppress_feedback:
+            self._feedback = _action_notice(message)
+            if self._feedback is not None:
+                self._feedback_scope = self._action_feedback_scope
+                self._feedback_revision += 1
 
     @property
     def path(self) -> str:
@@ -375,7 +380,7 @@ class StarUIWorkbench:
                 return
             self._launch_connection = "connecting"
             self._launch_account_error = ""
-            self._suppress_toasts = True
+            self._suppress_feedback = True
             self._message = "Connecting to TWS…"
         try:
             state = self._view_model.refresh_portfolio(settings)
@@ -383,20 +388,20 @@ class StarUIWorkbench:
             with self._lock:
                 self._launch_connection = "failed"
                 self._message = f"TWS connection failed: {error}"
-                self._suppress_toasts = False
+                self._suppress_feedback = False
             return
         with self._lock:
             # A user cannot alter launch settings until the page is rendered,
             # but still reject a stale completion rather than overwriting a
             # newer state in a future launch-flow change.
             if settings != self._settings:
-                self._suppress_toasts = False
+                self._suppress_feedback = False
                 return
             self._apply_refreshed_portfolio_locked(state)
             self._launch_connection = (
                 "success" if state.status is UiStatus.READY else "failed"
             )
-            self._suppress_toasts = False
+            self._suppress_feedback = False
             if state.status is UiStatus.READY:
                 self._start_observer_locked()
 
@@ -639,7 +644,7 @@ class StarUIWorkbench:
                 if order_hint:
                     self._disarm_execution_locked()
                 previous_selected = self._selected_con_id
-                self._suppress_toasts = True
+                self._suppress_feedback = True
                 try:
                     self._refresh_locked(
                         auto_select=False, preserve_invalid_drafts=True
@@ -683,7 +688,7 @@ class StarUIWorkbench:
                     )
                     self._observation_requires_reload = True
                 finally:
-                    self._suppress_toasts = False
+                    self._suppress_feedback = False
                     self._inventory_revision += 1
 
     async def _journal_insights(self, request: Request) -> HTMLResponse:
@@ -724,7 +729,7 @@ class StarUIWorkbench:
         }:
             with self._lock:
                 self._disarm_execution_locked()
-                self._toast = None
+                self._feedback = None
                 if action == "journal-filter":
                     try:
                         stop, target = _journal_thresholds(values)
@@ -813,8 +818,14 @@ class StarUIWorkbench:
                 and action in {"active-action-execute", "trailing-convert-confirm"}
             ):
                 self._disarm_execution_locked()
-            # Each response carries only feedback produced by this action.
-            self._toast = None
+            # Feedback stays visible across page reloads, until another action
+            # replaces it. Broker uncertainty also retains its existing locks.
+            self._feedback = None
+            self._completed_action = ""
+            self._draft_feedback_index = None
+            self._action_feedback_scope = (
+                "connection" if action == "refresh" else "review"
+            )
             unresolved_brackets = self._unresolved_bracket_submissions()
             if (
                 unresolved_brackets
@@ -942,6 +953,20 @@ class StarUIWorkbench:
                 self._refresh_locked()
                 self._start_observer_locked()
                 self._submission_review_required = False
+                if self._feedback is None:
+                    if (
+                        values.get("feedback") == "order-status"
+                        and not self._unresolved_bracket_submissions()
+                    ):
+                        self._show_order_feedback_locked(
+                            "Bracket orders sent",
+                            "Bracket orders acknowledged; verify their current status in TWS.",
+                            action="bracket-create",
+                        )
+                    else:
+                        self._completed_action = (
+                            "settings" if values.get("feedback") == "settings" else "refresh"
+                        )
             elif action in {"select", "select-active"}:
                 self._analysis_trade_id = None
                 self._protection_change_message = ""
@@ -1071,9 +1096,13 @@ class StarUIWorkbench:
                 if not self._save_form_locked(values, removing_index=removing_index):
                     return self._page()
                 if action == "add-layer":
+                    previous_count = len(self._current_layers())
                     self._add_layer_locked()
+                    if len(self._current_layers()) > previous_count:
+                        self._draft_feedback_index = len(self._current_layers())
                 elif action == "build-draft":
                     self._build_draft_locked()
+                    self._draft_feedback_index = len(self._current_layers())
                 elif action in {"equal-split", "equal-split-available"}:
                     self._equal_split_locked(use_available_quantity=True)
                 elif action == "equal-split-assigned":
@@ -1440,11 +1469,22 @@ class StarUIWorkbench:
     def _set_review_status_locked(self, message: str) -> None:
         """Keep routine review transitions out of the notification queue."""
         self._status_message = message
-        self._toast = None
+        self._feedback = None
 
-    def _show_success_toast_locked(self, title: str, description: str) -> None:
-        self._toast_revision += 1
-        self._toast = _ToastNotice(title, description, "success")
+    def _show_order_feedback_locked(
+        self,
+        title: str,
+        description: str,
+        *,
+        verified: bool = True,
+        action: str = "price-update",
+    ) -> None:
+        self._feedback_revision += 1
+        self._feedback = _ActionNotice(
+            title, description, "success" if verified else "warning"
+        )
+        self._feedback_scope = "action" if verified else "review"
+        self._order_feedback_action = action
 
     def _arm_execution_locked(self) -> None:
         drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
@@ -1542,7 +1582,7 @@ class StarUIWorkbench:
                 "bracket, approve it there if required, then Refresh to reconcile it "
                 "into Active layers. Do not retry this draft."
             )
-            self._toast = None
+            self._feedback = None
             self._submission_review_required = True
         except ExecutionBlocked as error:
             self._message = f"Execution blocked: {error}"
@@ -1557,7 +1597,11 @@ class StarUIWorkbench:
             )
             self._submission_review_required = True
             if refreshed:
-                self._toast = None
+                self._show_order_feedback_locked(
+                    "Bracket orders sent",
+                    "Bracket orders acknowledged; verify their current status in TWS.",
+                    action="bracket-create",
+                )
         finally:
             self._disarm_execution_locked()
 
@@ -2947,9 +2991,10 @@ class StarUIWorkbench:
                 include_quote=False,
             )
             if refreshed:
-                self._show_success_toast_locked(
+                self._show_order_feedback_locked(
                     "Market sell sent to TWS",
                     "Selected bracket orders were cancelled. Check TWS for the fill.",
+                    action="market-exit",
                 )
         finally:
             self._disarm_execution_locked()
@@ -3366,7 +3411,7 @@ class StarUIWorkbench:
                     if order.order_id in receipt.entry.order_ids
                 ],
             )
-            self._show_success_toast_locked(
+            self._show_order_feedback_locked(
                 "Simulated price update acknowledged"
                 if self._demo_mode
                 else "Price update acknowledged by TWS",
@@ -3375,6 +3420,7 @@ class StarUIWorkbench:
                 else "Latest TWS state loaded. Check TWS for any required Transmit."
                 if refresh_succeeded
                 else "The automatic refresh could not verify broker state. Refresh before another order change.",
+                verified=refresh_succeeded,
             )
         finally:
             self._disarm_execution_locked()
@@ -3407,9 +3453,9 @@ class StarUIWorkbench:
             }
             if blocking_codes == {"POSITION_FULLY_ALLOCATED"}:
                 # This is an expected inventory state, not a failed position
-                # selection. Keep the planner blocked without an error toast.
+                # selection. Keep the planner blocked without an error notice.
                 self._status_message = message
-                self._toast = None
+                self._feedback = None
             else:
                 self._message = message
 
@@ -4057,12 +4103,14 @@ class StarUIWorkbench:
             if self._observe_positions
             else None,
             self._header(),
+            self._feedback_component("connection"),
             app_navigation(self.path, self._main_view),
             content,
-            self._toast_component(),
             self._launch_connection_dialog(),
             self._submission_review_dialog(),
             recovery_dialog,
+            Script(_management_scroll_script()),
+            Script(_local_feedback_script()),
             Script(_busy_submit_script()),
             Script(_paper_confirmation_countdown_script()),
             cls="journal-shell h-screen overflow-hidden bg-background text-foreground selection:bg-primary selection:text-primary-foreground",
@@ -4146,6 +4194,7 @@ class StarUIWorkbench:
                                 data_busy_text="Checking…",
                             ),
                             HTMLInput(type="hidden", name="action", value="refresh"),
+                            HTMLInput(type="hidden", name="feedback", value="order-status"),
                             action=f"/{self.session_token}/action",
                             method="post",
                         )
@@ -4189,39 +4238,30 @@ class StarUIWorkbench:
             cls="flex h-[calc(100vh-3.5rem)] items-center justify-center border-t border-border px-6",
         )
 
-    def _toast_component(self) -> Any:
-        notice = (
-            self._toast
-            if self._toast_revision > self._toast_rendered_revision
-            else None
-        )
-        if notice is not None:
-            self._toast_rendered_revision = self._toast_revision
-        # Keep the official Toaster mounted on every response so the embedded
-        # Datastar runtime always has its signal and close button. A normal
-        # Toaster uses an ``ifmissing`` signal, which is right for initial
-        # hydration but intentionally does not replace a pre-existing signal
-        # after an action rerender. The explicit non-ifmissing signal below is
-        # the documented server-side update path for each new notice.
-        initial_toasts = (
-            [
-                {
-                    "id": self._toast_revision,
-                    "title": notice.title,
-                    "description": notice.description,
-                    "variant": notice.variant,
-                    "timestamp": self._toast_revision,
-                    "order": 0,
-                },
-                None,
-                None,
-            ]
-            if notice is not None
-            else [None, None, None]
-        )
+    def _feedback_component(self, scope: str) -> Any:
+        notice = self._feedback
+        if (
+            notice is None
+            or self._feedback_scope != scope
+            or notice.variant == "success"
+        ):
+            return None
         return Div(
-            Signal("toasts", initial_toasts, ifmissing=False),
-            Toaster(position="top-right"),
+            Icon(
+                "lucide:circle-alert",
+                cls="size-4 shrink-0 mt-0.5",
+                aria_hidden="true",
+            ),
+            Div(
+                P(notice.title, cls="text-sm font-medium"),
+                P(notice.description, cls="mt-1 text-xs leading-5"),
+                cls="min-w-0",
+            ),
+            role="alert",
+            aria_live="assertive",
+            data_action_feedback=scope,
+            data_feedback_tone=notice.variant,
+            cls="action-feedback",
         )
 
     def _launch_connection_dialog(self) -> Any:
@@ -4506,7 +4546,7 @@ class StarUIWorkbench:
                 data_header_status=initial_label,
                 title="TWS position observer and window event stream; a fresh broker snapshot is still required for order review",
             )
-        return Div(
+        header = Div(
             connection,
             plan_status,
             account_mode,
@@ -4522,11 +4562,37 @@ class StarUIWorkbench:
             Form(
                 _button_tooltip(
                     Button(
+                        Span(
+                            Icon(
+                                "lucide:refresh-ccw",
+                                cls="size-3.5",
+                                aria_hidden="true",
+                            ),
+                            data_refresh_idle_icon=True,
+                            hidden=self._completed_action == "refresh",
+                        ),
+                        Icon(
+                            "lucide:check",
+                            cls="size-3.5",
+                            aria_hidden="true",
+                            data_completion_icon=True,
+                        )
+                        if self._completed_action == "refresh"
+                        else None,
                         "Refresh",
                         variant="outline",
                         size="sm",
                         type="submit",
                         data_busy_text="Refreshing…",
+                        data_completion_feedback="refresh"
+                        if self._completed_action == "refresh"
+                        else None,
+                        aria_label="Positions refreshed"
+                        if self._completed_action == "refresh"
+                        else "Refresh positions",
+                        cls="completion-button action-complete"
+                        if self._completed_action == "refresh"
+                        else "completion-button",
                     ),
                     "Get the latest positions and orders from TWS",
                 ),
@@ -4547,6 +4613,8 @@ class StarUIWorkbench:
             self._settings_dialog(),
             cls="flex h-14 items-center gap-3 px-4",
         )
+        self._completed_action = ""
+        return header
 
     def _closed_session_workspace(self, con_id: int) -> Any:
         position = self._session_closed_positions[con_id]
@@ -4631,7 +4699,16 @@ class StarUIWorkbench:
             _header_pnl(realized, "USD") if pnl_verified and has_recorded_fill else "—"
         )
         header = (
-            H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
+            Div(
+                H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
+                Div(
+                    self._add_layer_control(disabled=True),
+                    cls="position-management-actions",
+                    role="toolbar",
+                    aria_label="Position management actions",
+                ),
+                cls="position-title-row",
+            ),
             Div(
                 _contract_header_metric("Held / total", "0 / 0"),
                 _contract_header_metric("Available", "0"),
@@ -4644,12 +4721,6 @@ class StarUIWorkbench:
             position_tabs(self.path, "management"),
         )
         center = self._workspace_content(
-            Div(
-                self._add_layer_control(disabled=True),
-                cls="position-management-actions",
-                role="toolbar",
-                aria_label="Position management actions",
-            ),
             Div(
                 ScrollArea(
                     ScrollArea(
@@ -4665,6 +4736,10 @@ class StarUIWorkbench:
                     ),
                     aria_label="OCA layers workspace",
                     orientation="vertical",
+                    data_management_scroll_key=(
+                        f"{self.session_token}:{self._settings.account}:"
+                        f"{self._selected_closed_con_id or self._selected_con_id}"
+                    ),
                     cls="h-full",
                 ),
                 cls="mt-5 min-h-0 flex-1 overflow-hidden",
@@ -4688,7 +4763,9 @@ class StarUIWorkbench:
                 ),
                 cls="flex min-h-0 flex-1 flex-col items-center justify-center px-6",
             ),
-            Div(Button("Review order", disabled=True, cls="w-full"), cls="mx-4 mb-4"),
+            self._order_completion_control()
+            or Div(Button("Review order", disabled=True, cls="w-full"), cls="mx-4 mb-4"),
+            data_management_review=True,
             cls="flex min-h-0 flex-col overflow-hidden border-l border-border bg-card/30",
         )
         return center, review
@@ -4888,7 +4965,23 @@ class StarUIWorkbench:
         return Tooltip(
             TooltipTrigger(
                 Dialog(
-                    DialogTrigger("Settings", variant="outline", size="sm"),
+                    DialogTrigger(
+                        Icon("lucide:check", cls="size-3.5", aria_hidden="true")
+                        if self._completed_action == "settings"
+                        else None,
+                        "Saved" if self._completed_action == "settings" else "Settings",
+                        variant="outline",
+                        size="sm",
+                        cls="completion-button action-complete"
+                        if self._completed_action == "settings"
+                        else "completion-button",
+                        aria_label="Settings saved"
+                        if self._completed_action == "settings"
+                        else "Settings",
+                        data_completion_feedback="settings"
+                        if self._completed_action == "settings"
+                        else None,
+                    ),
                     DialogContent(
                         DialogHeader(
                             DialogTitle("Connection & layer defaults"),
@@ -5034,6 +5127,7 @@ class StarUIWorkbench:
                                 cls="mt-6",
                             ),
                             HTMLInput(type="hidden", name="action", value="refresh"),
+                            HTMLInput(type="hidden", name="feedback", value="settings"),
                             action=f"/{self.session_token}/action",
                             method="post",
                         ),
@@ -5276,153 +5370,162 @@ class StarUIWorkbench:
         heading = H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight")
         if header_only:
             return Div(heading, facts, cls="position-analysis-header")
-        return self._workspace_content(
+        actions = Div(
             Div(
                 Div(
-                    Div(
-                        self._set_stops_dialog(
-                            active_pairs,
-                            basis,
-                            quote,
-                            selected_snapshot.fresh
-                            if selected_snapshot is not None
-                            else False,
-                        )
-                        if basis is not None
-                        else None,
-                        Tooltip(
-                            TooltipTrigger(
-                                Button(
-                                    Icon(
-                                        "lucide:equal", cls="size-4", aria_hidden="true"
-                                    ),
-                                    variant="outline",
-                                    size="icon",
-                                    type="button",
-                                    data_move_stops_to_be=True,
-                                    aria_label="Raise stops to B/E",
-                                    disabled=self._paper_execution is None
-                                    or bool(self._armed_price_updates)
-                                    or self._armed_position_exit is not None
-                                    or self._armed_trailing_change is not None
-                                    or not self._active_stop_limits_editable(
-                                        active_pairs
-                                    ),
-                                ),
-                                delay_duration=250,
-                            ),
-                            TooltipContent(
-                                "Raise stops below entry to B/E; keep higher stops unchanged"
-                            ),
-                        ),
-                        Separator(orientation="vertical", cls="h-5 self-center"),
-                        Tooltip(
-                            TooltipTrigger(
-                                Button(
-                                    Icon(
-                                        "lucide:trash-2",
-                                        cls="size-4",
-                                        aria_hidden="true",
-                                    ),
-                                    variant="outline",
-                                    size="icon",
-                                    type="submit",
-                                    form="active-form",
-                                    name="action",
-                                    value="cancel-all-active",
-                                    aria_label="Cancel all exits",
-                                    disabled=self._paper_execution is None
-                                    or bool(self._armed_price_updates)
-                                    or self._armed_position_exit is not None
-                                    or self._armed_trailing_change is not None,
-                                ),
-                                delay_duration=250,
-                            ),
-                            TooltipContent("Cancel all exits and keep the contracts"),
-                        ),
-                        Tooltip(
-                            TooltipTrigger(
-                                Button(
-                                    Icon(
-                                        "lucide:log-out",
-                                        cls="size-4",
-                                        aria_hidden="true",
-                                    ),
-                                    variant="outline",
-                                    size="icon",
-                                    type="submit",
-                                    form="active-form",
-                                    name="action",
-                                    value="market-exit-selected",
-                                    aria_label="Sell all brackets now",
-                                    disabled=self._paper_execution is None
-                                    or bool(self._armed_price_updates)
-                                    or self._armed_position_exit is not None
-                                    or self._armed_trailing_change is not None,
-                                ),
-                                delay_duration=250,
-                            ),
-                            TooltipContent("Sell all brackets now"),
-                        ),
-                        self._trailing_conversion_dialog() if active_pairs else None,
-                        cls="flex items-center gap-2",
+                    self._set_stops_dialog(
+                        active_pairs,
+                        basis,
+                        quote,
+                        selected_snapshot.fresh
+                        if selected_snapshot is not None
+                        else False,
                     )
-                    if active_pairs or working_trails
+                    if basis is not None
                     else None,
-                    self._trailing_conversion_dialog()
-                    if not active_pairs
-                    and not working_trails
-                    and selected_snapshot is not None
-                    and selected_snapshot.position.quantity > 0
-                    else None,
-                    Separator(orientation="vertical", cls="h-5 self-center")
-                    if (active_pairs or working_trails) and draft_allowed
-                    else None,
-                    Div(
-                        Tooltip(
-                            TooltipTrigger(
-                                DropdownMenu(
-                                    DropdownMenuTrigger(
-                                        Icon(
-                                            "lucide:split",
-                                            cls="size-4",
-                                            aria_hidden="true",
-                                        ),
-                                        size="icon",
-                                        aria_label="Split draft layer quantities",
-                                        disabled=not draft_allowed
-                                        or planning_available <= 0
-                                        or len(self._current_layers()) < 2,
-                                    ),
-                                    DropdownMenuContent(
-                                        DropdownMenuItem(
-                                            "Split all available",
-                                            data_on_click="document.getElementById('split-all-submit').click()",
-                                        ),
-                                        DropdownMenuItem(
-                                            "Split assigned",
-                                            data_on_click="document.getElementById('split-assigned-submit').click()",
-                                        ),
-                                        align="end",
-                                    ),
+                    Tooltip(
+                        TooltipTrigger(
+                            Button(
+                                Icon(
+                                    "lucide:equal", cls="size-4", aria_hidden="true"
                                 ),
-                                delay_duration=250,
+                                variant="outline",
+                                size="icon",
+                                type="button",
+                                data_move_stops_to_be=True,
+                                aria_label="Raise stops to B/E",
+                                disabled=self._paper_execution is None
+                                or bool(self._armed_price_updates)
+                                or self._armed_position_exit is not None
+                                or self._armed_trailing_change is not None
+                                or not self._active_stop_limits_editable(
+                                    active_pairs
+                                ),
                             ),
-                            TooltipContent("Split contracts across draft layers"),
+                            delay_duration=250,
                         ),
-                        self._add_layer_control(
-                            disabled=not draft_allowed
-                            or planning_available <= 0
-                            or len(self._current_layers()) >= planning_available,
+                        TooltipContent(
+                            "Raise stops below entry to B/E; keep higher stops unchanged"
                         ),
-                        cls="flex items-center gap-2",
                     ),
-                    cls="ml-auto flex flex-wrap items-center justify-end gap-2",
+                    Separator(orientation="vertical", cls="h-5 self-center"),
+                    Tooltip(
+                        TooltipTrigger(
+                            Button(
+                                Icon(
+                                    "lucide:trash-2",
+                                    cls="size-4",
+                                    aria_hidden="true",
+                                ),
+                                variant="outline",
+                                size="icon",
+                                type="submit",
+                                form="active-form",
+                                name="action",
+                                value="cancel-all-active",
+                                aria_label="Cancel all exits",
+                                disabled=self._paper_execution is None
+                                or bool(self._armed_price_updates)
+                                or self._armed_position_exit is not None
+                                or self._armed_trailing_change is not None,
+                            ),
+                            delay_duration=250,
+                        ),
+                        TooltipContent("Cancel all exits and keep the contracts"),
+                    ),
+                    Tooltip(
+                        TooltipTrigger(
+                            Button(
+                                Icon(
+                                    "lucide:log-out",
+                                    cls="size-4",
+                                    aria_hidden="true",
+                                ),
+                                variant="outline",
+                                size="icon",
+                                type="submit",
+                                form="active-form",
+                                name="action",
+                                value="market-exit-selected",
+                                aria_label="Sell all brackets now",
+                                disabled=self._paper_execution is None
+                                or bool(self._armed_price_updates)
+                                or self._armed_position_exit is not None
+                                or self._armed_trailing_change is not None,
+                            ),
+                            delay_duration=250,
+                        ),
+                        TooltipContent("Sell all brackets now"),
+                    ),
+                    self._trailing_conversion_dialog() if active_pairs else None,
+                    cls="flex items-center gap-2",
+                )
+                if active_pairs or working_trails
+                else None,
+                self._trailing_conversion_dialog()
+                if not active_pairs
+                and not working_trails
+                and selected_snapshot is not None
+                and selected_snapshot.position.quantity > 0
+                else None,
+                Separator(
+                    orientation="vertical",
+                    data_trail_split_separator=True,
+                    cls="h-5 self-center",
+                )
+                if active_pairs
+                or working_trails
+                or (
+                    selected_snapshot is not None
+                    and selected_snapshot.position.quantity > 0
+                )
+                else None,
+                Div(
+                    Tooltip(
+                        TooltipTrigger(
+                            DropdownMenu(
+                                DropdownMenuTrigger(
+                                    Icon(
+                                        "lucide:split",
+                                        cls="size-4",
+                                        aria_hidden="true",
+                                    ),
+                                    size="icon",
+                                    aria_label="Split draft layer quantities",
+                                    disabled=not draft_allowed
+                                    or planning_available <= 0
+                                    or len(self._current_layers()) < 2,
+                                ),
+                                DropdownMenuContent(
+                                    DropdownMenuItem(
+                                        "Split all available",
+                                        data_on_click="document.getElementById('split-all-submit').click()",
+                                    ),
+                                    DropdownMenuItem(
+                                        "Split assigned",
+                                        data_on_click="document.getElementById('split-assigned-submit').click()",
+                                    ),
+                                    align="end",
+                                ),
+                            ),
+                            delay_duration=250,
+                        ),
+                        TooltipContent("Split contracts across draft layers"),
+                    ),
+                    self._add_layer_control(
+                        disabled=not draft_allowed
+                        or planning_available <= 0
+                        or len(self._current_layers()) >= planning_available,
+                    ),
+                    cls="flex items-center gap-2",
                 ),
-                cls="position-management-actions flex flex-wrap items-center gap-4",
-                role="toolbar",
-                aria_label="Position management actions",
+                cls="ml-auto flex flex-wrap items-center justify-end gap-2",
             ),
+            cls="position-management-actions flex flex-wrap items-center gap-4",
+            role="toolbar",
+            aria_label="Position management actions",
+        )
+        return self._workspace_content(
             self._selected_quantity_notice(),
             self._submission_attention(outcomes),
             Div(
@@ -5457,11 +5560,27 @@ class StarUIWorkbench:
                     else None,
                     aria_label="OCA layers workspace",
                     orientation="vertical",
+                    data_management_scroll_key=(
+                        f"{self.session_token}:{self._settings.account}:"
+                        f"{self._selected_closed_con_id or self._selected_con_id}"
+                    ),
                     cls="h-full",
                 ),
                 cls="mt-5 min-h-0 flex-1 overflow-hidden",
             ),
-            header=(heading, facts, position_tabs(self.path, "management")),
+            header=(
+                Div(
+                    heading,
+                    Fieldset(
+                        actions,
+                        disabled=bool(self._unresolved_management_entries()),
+                        cls="contents",
+                    ),
+                    cls="position-title-row",
+                ),
+                facts,
+                position_tabs(self.path, "management"),
+            ),
         )
 
     def _bracket_identity_card(self, entry: JournalEntry, index: int) -> Any:
@@ -7842,9 +7961,13 @@ class StarUIWorkbench:
 
     def _draft_layer_row(self, index: int, layer: DraftLayerForm) -> Any:
         gain, loss = self._layer_projection(layer)
+        newly_added = index == self._draft_feedback_index
+        if newly_added:
+            self._draft_feedback_index = None
         return _layer_row_layout(
             index=index,
             state="draft",
+            newly_added=newly_added,
             target_field=_percentage_price_field(
                 _LAYER_TARGET_LABEL,
                 Input(
@@ -8697,6 +8820,9 @@ class StarUIWorkbench:
                 cls="flex min-h-0 flex-1 items-center justify-center px-6",
             ),
             Div(
+                Div(self._feedback_component("review"), cls="mx-4")
+                if self._feedback is not None and self._feedback_scope == "review"
+                else None,
                 Div(outcome_projection, cls="mx-4 mb-3")
                 if outcome_projection is not None
                 else None,
@@ -8704,6 +8830,7 @@ class StarUIWorkbench:
                 self._execution_control(),
                 cls="border-t border-border pt-4",
             ),
+            data_management_review=True,
             cls="flex min-h-0 flex-col overflow-hidden border-l border-border bg-card/30",
         )
 
@@ -8711,44 +8838,62 @@ class StarUIWorkbench:
         available = self._planning_available_quantity()
         drafted = sum(_int_or_zero(layer.quantity) for layer in self._current_layers())
         over = drafted > available
-        stop_limit = self._stop_configuration()[0] == "STP LMT"
-        stop_description = (
-            "If the stop price is reached, the order will only sell at "
-            "your limit price or higher. If the market drops below that "
-            "price, you may still own the option and lose more than shown above. "
-            "If your offset reaches $0 or less, the limit uses the lowest positive "
-            "price allowed by this option's price increments."
-        )
         quantity_description = (
             f"{drafted} contracts drafted; {available} available. "
             "Reduce a layer's quantity."
         )
         return Alert(
             AlertTitle(
-                "Draft exceeds available contracts"
-                if over
-                else "Your stop may not sell the option",
+                "Draft exceeds available contracts",
                 data_review_alert_title=True,
             ),
             AlertDescription(
-                quantity_description if over else stop_description,
+                quantity_description,
                 data_review_alert_description=True,
             ),
             data_review_alert=True,
             data_quantity_over="true" if over else "false",
             data_quantity_description=quantity_description,
-            data_stop_description=stop_description,
-            data_stop_limit_warning=True,
             live=True,
             cls=(
                 "mx-4 mb-3 w-[calc(100%-2rem)] min-w-0 break-words "
-                + (
-                    "border-destructive/70 bg-red-950 text-red-50 [&_p]:text-red-100/90"
-                    if over
-                    else "border-amber-500/40 bg-amber-500/10 text-amber-100"
-                )
-                + ("" if over or stop_limit else " hidden")
+                "border-destructive/70 bg-red-950 text-red-50 [&_p]:text-red-100/90"
+                + ("" if over else " hidden")
             ),
+        )
+
+    def _order_completion_control(self, *, embedded: bool = False) -> Any:
+        if (
+            self._feedback is None
+            or self._feedback.variant != "success"
+            or self._feedback_scope != "action"
+            or self._feedback_revision <= self._feedback_rendered_revision
+        ):
+            return None
+        self._feedback_rendered_revision = self._feedback_revision
+        price_update = self._order_feedback_action == "price-update"
+        return Div(
+            Button(
+                Icon("lucide:check", cls="size-4", aria_hidden="true"),
+                "Successfully edited"
+                if price_update
+                else "Bracket orders sent"
+                if self._order_feedback_action == "bracket-create"
+                else "Sell order sent",
+                type="submit" if price_update else "button",
+                name="action" if price_update else None,
+                value="active-update-arm" if price_update else None,
+                form="active-form" if price_update else None,
+                data_active_execute=True if price_update else None,
+                data_order_completion=self._order_feedback_action,
+                data_restore_label="Review price changes" if price_update else "Review order",
+                data_busy_text="Checking…",
+                disabled=True,
+                aria_live="polite",
+                cls="completion-button action-complete w-full",
+            ),
+            data_active_execute_control=True if price_update else None,
+            cls="w-full" if embedded else "mx-4 mb-4 flex flex-col",
         )
 
     def _execution_control(self) -> Any:
@@ -8759,6 +8904,10 @@ class StarUIWorkbench:
                 ),
                 cls="mx-4 mb-4 w-[calc(100%-2rem)]",
             )
+        if self._order_feedback_action in {"market-exit", "bracket-create"}:
+            completion = self._order_completion_control()
+            if completion is not None:
+                return completion
         if self._pending_submissions():
             return Div(
                 Button(
@@ -8898,6 +9047,7 @@ class StarUIWorkbench:
         can_execute_draft = (
             self._paper_execution is not None and available > 0 and has_draft_layers
         )
+        completion = self._order_completion_control(embedded=True)
         return Div(
             self._cancel_changes_control(staged=False) if has_active_layers else None,
             Div(
@@ -8916,11 +9066,12 @@ class StarUIWorkbench:
                 data_draft_execute=True,
                 cls=(
                     "hidden w-full"
-                    if has_active_layers and not has_draft_layers
+                    if completion is not None
+                    or (has_active_layers and not has_draft_layers)
                     else "w-full"
                 ),
             ),
-            Div(
+            completion or Div(
                 Button(
                     "Review price changes",
                     variant="default",
@@ -8936,7 +9087,7 @@ class StarUIWorkbench:
                 data_active_execute_control=True,
                 cls="hidden w-full" if has_draft_layers else "w-full",
             )
-            if has_active_layers
+            if has_active_layers or completion is not None
             else None,
             cls="mx-4 mb-4 flex w-[calc(100%-2rem)] flex-col",
         )
@@ -9824,19 +9975,11 @@ def _stop_type_visual_script() -> str:
     const refreshAlert = () => {
       if (!reviewAlert) return;
       const over = reviewAlert.dataset.quantityOver === 'true';
-      const stopLimit = mode.value === 'STP LMT';
-      reviewAlert.classList.toggle('hidden', !over && !stopLimit);
-      reviewAlert.classList.toggle('border-destructive/70', over);
-      reviewAlert.classList.toggle('bg-red-950', over);
-      reviewAlert.classList.toggle('text-red-50', over);
-      reviewAlert.classList.toggle('[&_p]:text-red-100/90', over);
-      reviewAlert.classList.toggle('border-amber-500/40', !over);
-      reviewAlert.classList.toggle('bg-amber-500/10', !over);
-      reviewAlert.classList.toggle('text-amber-100', !over);
-      reviewAlert.querySelector('[data-review-alert-title]').textContent = over
-        ? 'Draft exceeds available contracts' : 'Your stop may not sell the option';
-      reviewAlert.querySelector('[data-review-alert-description]').textContent = over
-        ? reviewAlert.dataset.quantityDescription : reviewAlert.dataset.stopDescription;
+      reviewAlert.classList.toggle('hidden', !over);
+      reviewAlert.querySelector('[data-review-alert-title]').textContent =
+        'Draft exceeds available contracts';
+      reviewAlert.querySelector('[data-review-alert-description]').textContent =
+        reviewAlert.dataset.quantityDescription;
     };
     document.addEventListener('draft-quantity-change', refreshAlert);
     refreshAlert();
@@ -10111,14 +10254,23 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       return NaN;
     }};
     const minimumPositivePrice = Math.min(...bands.map((band) => roundUp(Math.max(band.low, band.increment))));
+    let reviewInitialized = false;
     const setHidden = (node, hidden, display = 'flex') => {{
       if (!node) return;
+      const wasHidden = node.classList.contains('hidden');
       node.classList.toggle('hidden', hidden);
       node.classList.toggle(display, !hidden);
+      // Only a newly revealed edit earns an entrance, never initial hydration
+      // or each subsequent keystroke. Hidden rows cancel their CSS animation.
+      if (node.matches('[data-active-review-row], [data-trailing-review-row]')) {{
+        if (hidden) node.dataset.reviewEntering = 'false';
+        else if (reviewInitialized && wasHidden) node.dataset.reviewEntering = 'true';
+      }}
     }};
     const setReviewMode = (active) => {{
       const hasDraftRows = document.querySelector('[data-draft-review]')?.dataset.hasDraftRows === 'true';
-      const showActive = active || !hasDraftRows;
+      const showActive = active || !hasDraftRows ||
+        Boolean(document.querySelector('[data-order-completion="price-update"]'));
       document.querySelectorAll('[data-draft-review], [data-draft-review-badge], [data-draft-execute]').forEach((node) => {{
         node.classList.toggle('hidden', showActive);
       }});
@@ -10267,7 +10419,14 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       }});
       const empty = document.querySelector('[data-active-review-empty]');
       if (empty) empty.classList.toggle('hidden', changed || invalid);
-      document.querySelectorAll('[data-active-execute]').forEach((button) => {{ button.disabled = !changed || invalid; }});
+      document.querySelectorAll('[data-active-execute]').forEach((button) => {{
+        if ((changed || invalid) && button.hasAttribute('data-order-completion')) {{
+          button.textContent = button.dataset.restoreLabel;
+          button.classList.remove('action-complete');
+          delete button.dataset.orderCompletion;
+        }}
+        button.disabled = !changed || invalid;
+      }});
       const resetVisible = edited && !form.querySelector('[data-active-input]:disabled');
       document.querySelectorAll('[data-reset-active-prices]').forEach((button) => {{
         button.disabled = !resetVisible;
@@ -10465,7 +10624,9 @@ def _live_active_script(configuration: dict[str, Any] | None) -> str:
       form.querySelectorAll('input[type="hidden"][data-active-stop-limit-offset], input[type="hidden"][data-active-stop-limit-unit]').forEach((input) => {{ input.value = ''; }});
       update();
     }}));
+    form.addEventListener('completion-settled', update);
     update();
+    reviewInitialized = true;
   }};
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, {{ once: true }});
   else start();
@@ -10711,6 +10872,7 @@ def _layer_row_layout(
     quantity_field: Any,
     action_field: Any,
     oca_group: str | None = None,
+    newly_added: bool = False,
 ) -> Any:
     """Keep draft and active OCA rows structurally identical."""
     return Div(
@@ -10728,6 +10890,7 @@ def _layer_row_layout(
         quantity_field,
         action_field,
         data_layer_state=state,
+        data_draft_created=True if newly_added else None,
         cls="layer-row-grid items-start gap-3 border-t border-border py-4 first:border-t-0",
     )
 
@@ -11493,26 +11656,26 @@ def _projection_script(configuration: dict[str, Any]) -> str:
 """
 
 
-def _toast_notice(message: str) -> _ToastNotice | None:
+def _action_notice(message: str) -> _ActionNotice | None:
     """Notify only when a problem needs attention; successes are explicit."""
     normalized = " ".join(message.split())
     lowered = normalized.lower()
     if lowered.startswith("trailing exit stopped:"):
-        return _ToastNotice(
+        return _ActionNotice(
             "Trailing exit stopped", normalized.partition(":")[2].strip(), "error"
         )
     if lowered.startswith("position exit stopped:"):
-        return _ToastNotice(
+        return _ActionNotice(
             "Market exit stopped", normalized.partition(":")[2].strip(), "error"
         )
     if "paper bracket confirmation expired" in lowered:
-        return _ToastNotice(
+        return _ActionNotice(
             "Review expired",
             "Review the action again with current prices and quantities.",
             "warning",
         )
     if "portfolio state is not ready" in lowered or "tws connection failed" in lowered:
-        return _ToastNotice(
+        return _ActionNotice(
             title="Couldn't connect to TWS",
             description="Check that TWS is open, then try again.",
             variant="error",
@@ -11545,7 +11708,7 @@ def _toast_notice(message: str) -> _ToastNotice | None:
     ):
         return None
     if "automatic tws refresh failed" in lowered or "tws refresh could not" in lowered:
-        return _ToastNotice(
+        return _ActionNotice(
             "Action acknowledged by TWS",
             "Refresh to verify the latest orders and position before another change.",
             "warning",
@@ -11556,27 +11719,27 @@ def _toast_notice(message: str) -> _ToastNotice | None:
             if lowered.startswith("submission outcome is unknown")
             else "Check TWS and refresh. Do not retry until the outcome is clear."
         )
-        return _ToastNotice("Order status is uncertain", description, "error")
+        return _ActionNotice("Order status is uncertain", description, "error")
     if "journal reconciliation blocked" in lowered:
-        return _ToastNotice(
+        return _ActionNotice(
             "Couldn't reconcile orders",
             "Refresh and check the app's orders in TWS.",
             "error",
         )
     if "targets must" in lowered:
-        return _ToastNotice(
+        return _ActionNotice(
             "Fix the layer prices",
             "Target must be above 0%; stop must be below its target.",
             "error",
         )
     if "quote changes" in lowered:
-        return _ToastNotice(
+        return _ActionNotice(
             "Check the changed quote",
             "The price warning changed. Review it before confirming again.",
             "error",
         )
     if "earlier price amendment" in lowered:
-        return _ToastNotice(
+        return _ActionNotice(
             "Check the earlier price change",
             "Inspect the order in TWS before retrying.",
             "error",
@@ -11593,9 +11756,74 @@ def _toast_notice(message: str) -> _ToastNotice | None:
     }
     title = titles.get(prefix, "Couldn't complete this action")
     body = detail.strip() if separator else normalized
-    if len(body) > 160:
-        body = body[:157].rstrip() + "…"
-    return _ToastNotice(title, body, "error")
+    return _ActionNotice(title, body, "error")
+
+
+def _management_scroll_script() -> str:
+    """Retain each position's main viewport through full-document responses."""
+    return """
+    (() => {
+      const area = document.querySelector('[data-management-scroll-key]');
+      const viewport = area?.querySelector(':scope > [data-slot="scroll-area-viewport"]');
+      if (!viewport) return;
+      const key = 'management-scroll:' + area.dataset.managementScrollKey;
+      let top = 0;
+      try {
+        const stored = Number(sessionStorage.getItem(key));
+        if (Number.isFinite(stored) && stored >= 0) top = stored;
+      } catch (_) { /* Storage is optional; broker actions do not depend on it. */ }
+      let restoring = true;
+      const restore = () => { viewport.scrollTop = top; };
+      const save = () => {
+        if (restoring) return;
+        try { sessionStorage.setItem(key, String(viewport.scrollTop)); } catch (_) {}
+      };
+      restore();
+      requestAnimationFrame(() => {
+        restore();
+        requestAnimationFrame(() => { restore(); restoring = false; });
+      });
+      viewport.addEventListener('scroll', save, {passive: true});
+      document.addEventListener('submit', save, true);
+      window.addEventListener('pagehide', save);
+    })();
+    """
+
+
+def _local_feedback_script() -> str:
+    """Settle routine acknowledgements without timers on warnings or errors."""
+    return """
+    (() => {
+      document.querySelectorAll('[data-order-completion]').forEach(button => {
+        const completion = button.dataset.orderCompletion;
+        window.setTimeout(() => {
+          if (!button.isConnected || button.dataset.orderCompletion !== completion
+              || button.getAttribute('aria-busy') === 'true') return;
+          button.textContent = button.dataset.restoreLabel;
+          button.classList.remove('action-complete');
+          delete button.dataset.orderCompletion;
+          document.getElementById('active-form')?.dispatchEvent(
+            new Event('completion-settled'));
+        }, 2500);
+      });
+      document.querySelectorAll('[data-completion-feedback]').forEach(button => {
+        window.setTimeout(() => {
+          if (!button.isConnected || button.getAttribute('aria-busy') === 'true') return;
+          if (button.dataset.completionFeedback === 'settings') {
+            button.textContent = 'Settings';
+            button.setAttribute('aria-label', 'Settings');
+          } else {
+            button.querySelector('[data-completion-icon]')?.remove();
+            const idle = button.querySelector('[data-refresh-idle-icon]');
+            if (idle) idle.hidden = false;
+            button.setAttribute('aria-label', 'Refresh positions');
+          }
+          button.classList.remove('action-complete');
+          delete button.dataset.completionFeedback;
+        }, 2200);
+      });
+    })();
+    """
 
 
 def _paper_confirmation_countdown_script() -> str:

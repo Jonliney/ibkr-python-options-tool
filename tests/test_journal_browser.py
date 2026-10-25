@@ -83,11 +83,18 @@ def test_journal_views_render_at_desktop_and_minimum_size(tmp_path):
                                 '.journal-position-tabs');
                               const actions = scope.querySelector(
                                 '.position-management-actions');
+                              const titleRow = title?.closest('.position-title-row');
+                              const analysis = !!document.querySelector(
+                                '[data-position-analysis]');
                               const box = element => element.getBoundingClientRect();
                               return !!(title && facts && tabs)
                                 && box(title).bottom <= box(facts).top
                                 && box(facts).bottom <= box(tabs).top
-                                && (!actions || box(tabs).bottom <= box(actions).top);
+                                && (analysis ? !actions :
+                                    titleRow?.contains(actions)
+                                    && box(actions).bottom <= box(facts).top
+                                    && Math.abs(box(actions).right
+                                      - box(facts).right) < 2);
                             })()
                         })""",
                             lambda result: (

@@ -340,8 +340,13 @@ session remains necessary; simulation is not evidence of identical live
 behavior.
 
 After a submission receives complete API acknowledgements, the workbench shows
-an **Orders sent to TWS** toast and journal-backed **Pending TWS verification**
-rows until a fresh snapshot verifies the orders as working.
+a focused review dialog and journal-backed **Pending TWS verification** rows
+until a fresh snapshot verifies the orders as working.
+Complete acknowledgements show **Bracket orders sent** in the disabled action
+button for 2.5 seconds. A successful **Refresh order status** returns that
+confirmation to the same action button, rather than reporting a Settings save.
+This acknowledgement does not claim that either order has filled or that an
+unresolved tranche is verified; existing recovery dialogs and locks remain.
 Every unresolved row offers **Verify**. **Refresh layers** requests a fresh
 broker read and updates the row only when the exact app-owned OCA pair or a
 matching completed fill is observed. **Clear unverified bracket** stays disabled
@@ -748,7 +753,23 @@ capture counter alone does not invalidate sell-all review or its bid estimate.
 Every read must still be connected, complete and fresh, with unchanged account,
 contract, quantity, basis, cost and fills. The exit-order set must also match
 before cancellation or submission. Material baseline differences name the
-changed fields, and a blocked market-exit review uses its own toast title.
+changed fields, and a blocked market-exit review shows its specific failure
+beside the review controls. Errors and warnings persist across page reloads;
+verified price changes turn the review button green with **Successfully edited**
+for 2.5 seconds, then restore its disabled **Review price changes** state.
+Starting another edit interrupts that confirmation immediately. Market-sell
+acknowledgements use **Sell order sent** in the action button; this does not
+claim that a fill has occurred.
+An acknowledged write with an unverified follow-up snapshot remains a persistent
+warning, never a transient success. Refresh and settings completion appear in
+their header buttons. These visual changes do not alter confirmation gates,
+broker reconciliation, or order transmission.
+
+The main Management viewport retains its scroll offset through review,
+confirmation, refresh and position switching. Offsets are isolated by app
+session, account and contract and stored only in browser session storage.
+If the new content is shorter, the browser clamps the offset to its new range.
+Unavailable browser storage does not block order review or broker operations.
 
 Verify with `.venv/bin/python -m pytest -q`. These demo and automated checks do
 not establish paper-TWS or live execution success. Paper-TWS verification is

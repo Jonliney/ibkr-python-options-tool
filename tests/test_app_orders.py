@@ -193,21 +193,22 @@ def test_lost_position_observer_blocks_paper_order_review() -> None:
     assert workbench._armed_execution is None
     assert "TWS observation is unavailable" in workbench._status_message
 
-    assert workbench._toast is not None
-    assert "Dismiss toast" in response.text
+    assert workbench._feedback is not None
+    assert 'data-action-feedback="review"' in response.text
+    assert "Dismiss toast" not in response.text
     reloaded = TestClient(workbench.app).get(workbench.path)
-    assert "TWS observation is unavailable" not in reloaded.text
+    assert "TWS observation is unavailable" in reloaded.text
     second_reload = TestClient(workbench.app).get(workbench.path)
-    assert "TWS observation is unavailable" not in second_reload.text
+    assert "TWS observation is unavailable" in second_reload.text
 
-    first_revision = workbench._toast_revision
+    first_revision = workbench._feedback_revision
     repeated = TestClient(workbench.app).post(
         workbench.path + "action", data={"action": "execute-arm"}
     )
     assert repeated.status_code == 200
-    assert workbench._toast is not None
-    assert workbench._toast_revision == first_revision + 1
-    assert "Dismiss toast" in repeated.text
+    assert workbench._feedback is not None
+    assert workbench._feedback_revision == first_revision + 1
+    assert 'data-action-feedback="review"' in repeated.text
 
 
 def test_unverified_projection_shows_layer_estimate_without_enabling_review() -> None:
@@ -385,9 +386,9 @@ def test_immediate_price_update_fill_records_edited_values(monkeypatch) -> None:
 
     assert recorded == [((update,), {201: ("2", "-25")})], (
         workbench._message,
-        workbench._toast,
+        workbench._feedback,
     )
-    assert workbench._toast is None
+    assert workbench._feedback is None
 
 
 def test_position_identity_preserves_the_inventory_scan_order() -> None:
@@ -702,8 +703,8 @@ def test_stale_paper_bracket_confirmation_expires_before_any_send(monkeypatch) -
 
     assert workbench._armed_execution is None
     assert "expired" in workbench._message.lower()
-    assert workbench._toast is not None
-    assert workbench._toast.variant == "warning"
+    assert workbench._feedback is not None
+    assert workbench._feedback.variant == "warning"
 
 
 def test_paper_bracket_confirm_button_counts_down_to_server_deadline(
@@ -1054,12 +1055,15 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
     assert 'aria-label="Cancel all exits"' in header
     assert 'aria-label="Sell all brackets now"' in header
     assert 'data-orientation="vertical"' in header
+    assert "data-trail-split-separator" in header
     assert 'form="active-form" name="action" value="market-exit-selected"' in header
     assert 'form="active-form" name="action" value="cancel-all-active"' in header
     assert (
         header.index('aria-label="Raise stops to B/E"')
         < header.index('aria-label="Cancel all exits"')
         < header.index('aria-label="Sell all brackets now"')
+        < header.index('aria-label="Set a trailing exit for this position"')
+        < header.index("data-trail-split-separator")
         < header.index('aria-label="Split draft layer quantities"')
     )
     assert header.index('aria-label="Set all stops…"') < header.index(
@@ -1176,9 +1180,9 @@ def test_active_layers_show_complete_reconciled_lmt_stop_pairs() -> None:
 
     workbench._armed_cancellation = None
     workbench._message = "Execution blocked: previous action failed"
-    assert workbench._toast is not None
+    assert workbench._feedback is not None
     added_page = client.post(workbench.path + "action", data={"action": "add-layer"})
-    assert workbench._toast is None
+    assert workbench._feedback is None
     before_add, after_add, _config = workbench._projection_state()
     assert before_add.expected_gain is not None
     assert after_add.expected_gain is not None
@@ -1275,7 +1279,7 @@ def test_cancelled_review_with_no_draft_prioritises_unprotected_contracts(
         assert "data-edit-active-prices" in page
     assert "firstPrice.scrollIntoView" in page
     assert re.search(r'data-active-review-empty class="absolute inset-0 flex', page)
-    assert "const showActive = active || !hasDraftRows;" in _live_active_script(
+    assert "const showActive = active || !hasDraftRows ||" in _live_active_script(
         {"basis": "1", "multiplier": "100", "bands": []}
     )
     assert "badge.textContent = active ? 'PRICE UPDATE' : 'NEXT STEP';" in (
@@ -2280,7 +2284,7 @@ def test_arming_price_update_preserves_edited_percentage_in_active_input(
     assert target_input is not None
     assert 'value="30"' in target_input.group()
     assert ('name="ack_unknown_price_update"' in page.text) is prior_unknown
-    arm_toast_revision = workbench._toast_revision
+    arm_feedback_revision = workbench._feedback_revision
 
     if prior_unknown:
         blocked = TestClient(workbench.app).post(
@@ -2302,8 +2306,8 @@ def test_arming_price_update_preserves_edited_percentage_in_active_input(
     assert workbench._status_message.startswith(
         "Simulated broker acknowledged 2 app-owned OCA price amendment"
     ), workbench._status_message
-    assert workbench._toast_revision > arm_toast_revision
-    assert "Simulated price update acknowledged" in confirmed.text
+    assert workbench._feedback_revision > arm_feedback_revision
+    assert "Successfully edited" in confirmed.text
     source = journal.find(fingerprint)
     assert source is not None
     assert source.layers[0].target_percentage == "30"
@@ -2393,7 +2397,7 @@ def test_close_all_review_lists_pair_cancellations_then_one_market_order() -> No
         workbench._status_message
         == "Staged action cancelled. No orders were sent to TWS."
     )
-    assert workbench._toast is None
+    assert workbench._feedback is None
 
 
 def test_delete_active_layer_review_cancels_only_that_oca_bracket() -> None:
@@ -2706,7 +2710,7 @@ def test_active_action_reviews_before_refresh_and_requires_execute(
 
     review = client.post(workbench.path + "action", data={"action": review_action})
     assert refreshes == []
-    assert workbench._toast is None
+    assert workbench._feedback is None
     assert (
         "Review cancellation"
         if review_action.startswith("cancel-")
@@ -2882,7 +2886,7 @@ def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
     assert armed.status_code == 200
     assert "Confirm (" in armed.text
     assert workbench._status_message.startswith("Fresh paper snapshot verified")
-    assert workbench._toast is None
+    assert workbench._feedback is None
 
     submitted = client.post(
         workbench.path + "action",
@@ -2897,7 +2901,10 @@ def test_demo_execution_brackets_unreserved_contracts_beside_external_order(
     assert "Refresh order status" in submitted.text
     assert "data-submission-review" in submitted.text
     assert "data-cancelled-bracket-recovery-dialog" not in submitted.text
-    assert workbench._toast is None
+    assert workbench._feedback is not None
+    assert workbench._feedback.variant == "success"
+    assert 'data-order-completion="bracket-create"' in submitted.text
+    assert 'data-completion-feedback="settings"' not in submitted.text
     assert "Awaiting TWS verification" in submitted.text
     assert "VERIFY IN TWS" in submitted.text
     assert 'data-layer-state="verify"' in submitted.text
@@ -2976,20 +2983,8 @@ def test_demo_stop_limit_draft_reviews_and_journals_the_paper_pair(tmp_path) -> 
     assert pair.stop.limit_price is not None
     assert pair.stop.limit_price < pair.stop.rounded_price
     assert f'data-reviewed-limit-price="{pair.stop.limit_price}"' in armed.text
-    assert "Your stop may not sell the option" in armed.text
-    assert "you may still own the option and lose more than shown above" in armed.text
-    warning_match = re.search(
-        r'<div[^>]*data-stop-limit-warning[^>]*>.*?data-slot="alert-description"',
-        armed.text,
-        re.S,
-    )
-    assert warning_match is not None
-    warning = warning_match.group()
-    assert "border-amber-500/40 bg-amber-500/10 text-amber-100" in warning
-    assert "<svg" not in warning
-    assert armed.text.index("Your stop may not sell the option") < armed.text.index(
-        "Confirm ("
-    )
+    assert "Your stop may not sell the option" not in armed.text
+    assert "you may still own the option and lose more than shown above" not in armed.text
     assert "Confirm (" in armed.text
 
     submitted = client.post(
@@ -3074,10 +3069,10 @@ def test_demo_weekend_stop_to_break_even_uses_acknowledged_price_update(
             "action": "price-update-confirm",
         },
     )
-    assert "Simulated price update acknowledged" in confirmed.text, (
+    assert "Successfully edited" in confirmed.text, (
         workbench._message,
         workbench._status_message,
-        workbench._toast,
+        workbench._feedback,
     )
     assert "Order status is uncertain" not in confirmed.text
     assert workbench._active_oca_pairs()[0][2].stop_price == Decimal("1.85")
@@ -3106,8 +3101,8 @@ def test_demo_weekend_stop_to_break_even_uses_acknowledged_price_update(
         },
     )
     assert unsupported.status_code == 200
-    assert workbench._toast is not None
-    assert workbench._toast.title == "Couldn't change prices"
+    assert workbench._feedback is not None
+    assert workbench._feedback.title == "Couldn't change prices"
     assert "Price update blocked" in workbench._message
     assert not journal.unresolved_management_entries(
         account=DEMO_ACCOUNT,
@@ -3138,8 +3133,8 @@ def test_demo_weekend_stop_to_break_even_uses_acknowledged_price_update(
             "action": "price-update-confirm",
         },
     )
-    assert workbench._toast is not None
-    assert workbench._toast.title == "Order status is uncertain"
+    assert workbench._feedback is not None
+    assert workbench._feedback.title == "Order status is uncertain"
     assert "data-contract-lockdown" in uncertain.text
     assert journal.unresolved_management_entries(
         account=DEMO_ACCOUNT,
@@ -3497,7 +3492,7 @@ def test_pending_bracket_verify_button_stays_available_and_requires_broker_evide
     assert workbench._recovery_requested_fingerprint is None
 
 
-def test_unknown_submission_uses_guided_refresh_without_error_toast(
+def test_unknown_submission_uses_guided_refresh_without_error_feedback(
     tmp_path, monkeypatch
 ) -> None:
     def clock() -> Decimal:
@@ -3547,7 +3542,7 @@ def test_unknown_submission_uses_guided_refresh_without_error_toast(
     assert workbench._submission_review_error == "TWS did not acknowledge every order"
     assert "data-submission-review" in response.text
     assert "data-cancelled-bracket-recovery-dialog" not in response.text
-    assert workbench._toast is None
+    assert workbench._feedback is None
 
 
 def test_order_status_check_closes_dialog_even_when_planning_stays_blocked(
@@ -3878,7 +3873,7 @@ def test_sell_all_review_and_confirm_accept_new_capture_counters(
         assert not workbench._active_action_verified
         assert writes == []
         assert "position quantity changed after review" in workbench._message
-        assert workbench._toast.title == "Couldn't review market sell"
+        assert workbench._feedback.title == "Couldn't review market sell"
         return
     assert workbench._active_action_verified, workbench._message
     assert workbench._position_exit_bid() is not None
@@ -4014,7 +4009,7 @@ def test_multi_bracket_exit_keeps_lease_and_reports_partial_failure(
         ) in workbench._message
         assert f"{expected_count} of 3" in workbench._message
         assert f"{label} was not submitted" in workbench._protection_change_message
-        assert workbench._toast.title == (
+        assert workbench._feedback.title == (
             "Market exit stopped" if exit_kind == "market" else "Trailing exit stopped"
         )
         assert DEMO_ACCOUNT not in workbench._message

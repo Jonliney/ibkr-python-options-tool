@@ -24,13 +24,13 @@ from ibkr_options_manager.app.main import build_parser
 from ibkr_options_manager.app.view_model import PlanForm, UiStatus, ValidationLine
 from ibkr_options_manager.app.web import StarUIWorkbench
 from ibkr_options_manager.app.web.surface import (
+    _action_notice,
     _busy_submit_script,
     _contract_display_name,
     _next_target_preset_above,
     _price_update_impact,
     _projection_gain_value,
     _projection_loss_value,
-    _toast_notice,
 )
 from ibkr_options_manager.app.web_window import (
     StarUIPlannerWindow,
@@ -823,7 +823,7 @@ def test_launch_refresh_never_blocks_the_initial_workbench_page() -> None:
     assert "Connecting to TWS" in responses[0].text
 
 
-def test_launch_connection_failure_stays_in_the_retry_dialog_without_a_toast() -> None:
+def test_launch_connection_failure_stays_in_retry_dialog() -> None:
     workbench = _demo_workbench()
     workbench._demo_mode = False
     blocked = replace(
@@ -954,24 +954,134 @@ def test_retry_connection_waits_for_one_terminal_refresh_response() -> None:
     assert "TWS unavailable" not in page.text
 
 
-def test_status_updates_render_as_short_toasts_not_workspace_copy() -> None:
+def test_errors_stay_beside_review_controls_across_reloads() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
     workbench._message = "Execution blocked: TWS must be open"
 
     page = TestClient(workbench.app).get(workbench.path)
 
-    assert workbench._toast is not None
-    assert workbench._toast.title == "Couldn't send bracket orders"
+    assert workbench._feedback is not None
+    assert workbench._feedback.title == "Couldn't send bracket orders"
     assert "Average price" in page.text
-    assert "Dismiss toast" in page.text
-    # Action rerenders must replace an already-hydrated empty toast signal.
-    assert "data-signals='{toasts:" in page.text
-    assert "data-signals:toasts__ifmissing" in page.text
+    assert 'data-action-feedback="review"' in page.text
+    assert 'role="alert"' in page.text
+    assert "Dismiss toast" not in page.text
+    assert "toasts__ifmissing" not in page.text
+    reloaded = TestClient(workbench.app).get(workbench.path)
+    assert "TWS must be open" in reloaded.text
+    assert 'data-action-feedback="review"' in reloaded.text
     assert "document.startViewTransition" not in page.text
 
 
-def test_selecting_fully_allocated_position_does_not_raise_error_toast() -> None:
+@pytest.mark.parametrize("feedback", ["refresh", "settings"])
+def test_refresh_completion_stays_in_its_control_and_does_not_replay(feedback) -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    client = TestClient(workbench.app)
+
+    response = client.post(
+        workbench.path + "action",
+        data={"action": "refresh", "feedback": feedback},
+    )
+
+    assert f'data-completion-feedback="{feedback}"' in response.text
+    assert "Dismiss toast" not in response.text
+    reloaded = client.get(workbench.path)
+    assert f'data-completion-feedback="{feedback}"' not in reloaded.text
+
+
+def test_order_acknowledgement_is_local_and_unverified_state_stays_visible() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._show_order_feedback_locked("Acknowledged", "Orders refreshed")
+
+    assert workbench._feedback_component("action") is None
+    success = str(to_xml(workbench._order_completion_control()))
+    assert 'data-order-completion="price-update"' in success
+    assert "Successfully edited" in success
+    assert "disabled" in success
+    assert "action-complete" in success
+    assert workbench._order_completion_control() is None
+
+    workbench._show_order_feedback_locked(
+        "Acknowledged", "Refresh required", verified=False
+    )
+    for _ in range(2):
+        warning = str(to_xml(workbench._feedback_component("review")))
+        assert 'data-feedback-tone="warning"' in warning
+        assert 'role="alert"' in warning
+        assert "data-transient-feedback" not in warning
+
+
+def test_market_acknowledgement_uses_action_button_without_claiming_a_fill() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._show_order_feedback_locked(
+        "Market sell sent to TWS", "Check TWS for the fill", action="market-exit"
+    )
+
+    control = str(to_xml(workbench._order_completion_control()))
+
+    assert 'data-order-completion="market-exit"' in control
+    assert "Sell order sent" in control
+    assert "Successfully sold" not in control
+    assert "disabled" in control
+
+
+def test_edit_success_keeps_draft_review_controls_available_for_later_use() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._build_draft_locked()
+    workbench._show_order_feedback_locked("Acknowledged", "Orders refreshed")
+
+    controls = str(to_xml(workbench._execution_control()))
+
+    assert "data-draft-execute" in controls
+    assert 'data-order-completion="price-update"' in controls
+    assert "Successfully edited" in controls
+
+
+def test_adding_a_draft_highlights_the_new_layer_without_replaying_on_reload() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    client = TestClient(workbench.app)
+
+    response = client.post(workbench.path + "action", data={"action": "add-layer"})
+
+    assert "data-draft-created" in response.text
+    assert "data-draft-created" not in client.get(workbench.path).text
+
+
+def test_refresh_failure_stays_in_connection_strip_without_success_feedback() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+
+    def failed_refresh(**_kwargs):
+        workbench._message = "TWS connection failed"
+
+    workbench._refresh_locked = failed_refresh  # type: ignore[method-assign]
+    client = TestClient(workbench.app)
+    response = client.post(workbench.path + "action", data={"action": "refresh"})
+
+    assert 'data-action-feedback="connection"' in response.text
+    assert 'data-completion-feedback="refresh"' not in response.text
+    assert 'data-action-feedback="connection"' in client.get(workbench.path).text
+
+
+def test_only_settings_form_marks_refresh_as_a_settings_save() -> None:
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    workbench._submission_review_required = True
+
+    settings = str(to_xml(workbench._settings_dialog()))
+    submission = str(to_xml(workbench._submission_review_dialog()))
+
+    assert 'name="feedback" value="settings"' in settings
+    assert 'name="feedback" value="settings"' not in submission
+
+
+def test_selecting_fully_allocated_position_does_not_raise_error_feedback() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
     con_id = workbench._selected_con_id
@@ -995,16 +1105,16 @@ def test_selecting_fully_allocated_position_does_not_raise_error_toast() -> None
 
     assert workbench._state.status is UiStatus.BLOCKED
     assert workbench._state.available_quantity == 0
-    assert workbench._toast is None
+    assert workbench._feedback is None
     assert workbench._status_message.endswith(
         "existing closing exposure already covers the whole position"
     )
     page = TestClient(workbench.app).get(workbench.path).text
-    assert "data-signals:toasts__ifmissing" in page
-    assert 'data-signals="{toasts: [null, null, null]}"' in page
+    assert "toasts__ifmissing" not in page
+    assert "data-action-feedback=" not in page
 
 
-def test_overallocated_position_still_raises_error_toast() -> None:
+def test_overallocated_position_still_raises_error_feedback() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
     con_id = workbench._selected_con_id
@@ -1024,12 +1134,12 @@ def test_overallocated_position_still_raises_error_toast() -> None:
 
     workbench._select_locked(con_id)
 
-    assert workbench._toast is not None
-    assert workbench._toast.variant == "error"
+    assert workbench._feedback is not None
+    assert workbench._feedback.variant == "error"
 
 
-def test_tws_connection_toast_has_a_short_recovery_message() -> None:
-    notice = _toast_notice(
+def test_tws_connection_feedback_has_a_short_recovery_message() -> None:
+    notice = _action_notice(
         "Portfolio state is not ready: missing completion barriers: positions"
     )
 
@@ -1048,8 +1158,8 @@ def test_tws_connection_toast_has_a_short_recovery_message() -> None:
         "Paper submission acknowledged for 2 orders. TWS state refreshed.",
     ),
 )
-def test_routine_statuses_do_not_create_toasts(message: str) -> None:
-    assert _toast_notice(message) is None
+def test_routine_statuses_do_not_create_feedback(message: str) -> None:
+    assert _action_notice(message) is None
 
 
 @pytest.mark.parametrize(
@@ -1062,7 +1172,7 @@ def test_routine_statuses_do_not_create_toasts(message: str) -> None:
     ],
 )
 def test_acknowledged_action_with_unverified_refresh_is_a_warning(message: str) -> None:
-    notice = _toast_notice(message)
+    notice = _action_notice(message)
 
     assert notice is not None
     assert notice.title == "Action acknowledged by TWS"
@@ -1248,11 +1358,11 @@ def test_quote_movement_without_new_sell_risk_still_sends_amendment(
     workbench._confirm_price_updates_locked({})
 
     assert sent == [update]
-    assert workbench._toast is not None
-    assert workbench._toast.variant == "success"
-    assert workbench._toast.title == "Simulated price update acknowledged"
+    assert workbench._feedback is not None
+    assert workbench._feedback.variant == ("success" if refreshed else "warning")
+    assert workbench._feedback.title == "Simulated price update acknowledged"
     assert (
-        "Refresh before another order change" in workbench._toast.description
+        "Refresh before another order change" in workbench._feedback.description
     ) is not refreshed
 
 
@@ -1291,16 +1401,16 @@ def test_quote_movement_without_new_sell_risk_still_sends_amendment(
         ),
     ),
 )
-def test_problem_toasts_use_short_specific_copy(
+def test_problem_feedback_use_short_specific_copy(
     message: str, title: str, body: str
 ) -> None:
-    notice = _toast_notice(message)
+    notice = _action_notice(message)
 
     assert notice is not None
     assert (notice.title, notice.description, notice.variant) == (title, body, "error")
 
 
-def test_failed_post_write_refresh_does_not_show_a_success_toast() -> None:
+def test_failed_post_write_refresh_does_not_show_a_success_feedback() -> None:
     workbench = _demo_workbench()
     workbench.load_demo_data()
 
@@ -1312,9 +1422,9 @@ def test_failed_post_write_refresh_does_not_show_a_success_toast() -> None:
     assert not workbench._refresh_after_acknowledged_write_locked(
         "Paper submission acknowledged."
     )
-    assert workbench._toast is not None
-    assert workbench._toast.title == "Action acknowledged by TWS"
-    assert workbench._toast.variant == "warning"
+    assert workbench._feedback is not None
+    assert workbench._feedback.title == "Action acknowledged by TWS"
+    assert workbench._feedback.variant == "warning"
 
 
 def test_post_write_snapshot_is_verified_even_if_draft_plan_is_blocked() -> None:
@@ -1332,7 +1442,7 @@ def test_post_write_snapshot_is_verified_even_if_draft_plan_is_blocked() -> None
         "TWS acknowledged the price amendment."
     )
     assert workbench._status_message.endswith("TWS state refreshed.")
-    assert workbench._toast is None
+    assert workbench._feedback is None
 
 
 def test_busy_submit_only_applies_to_explicitly_async_controls() -> None:
@@ -1473,11 +1583,11 @@ def test_manual_tws_confirmation_clears_unknown_only_after_fresh_api_check(
     )
     workbench._view_model._latest_snapshot = snapshot
     workbench._message = "Journal reconciliation blocked: incomplete TWS read"
-    assert workbench._toast is not None and workbench._toast.variant == "error"
+    assert workbench._feedback is not None and workbench._feedback.variant == "error"
     assert (
         "data-cancelled-bracket-recovery-dialog" not in client.get(workbench.path).text
     )
-    workbench._toast = None
+    workbench._feedback = None
     assert (
         "data-cancelled-bracket-recovery-dialog" not in client.get(workbench.path).text
     )

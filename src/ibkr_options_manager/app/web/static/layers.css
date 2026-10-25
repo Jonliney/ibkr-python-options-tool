@@ -413,3 +413,115 @@
   display: flex;
   align-items: center;
 }
+
+/* Small, local feedback follows the existing Cancel changes reveal. */
+.layer-row-grid:is([data-layer-state="draft"], [data-layer-state="working"]) {
+  transition: background-color 140ms ease-out;
+}
+
+.layer-row-grid:is([data-layer-state="draft"], [data-layer-state="working"]):focus-within {
+  background-color: color-mix(in srgb, var(--foreground) 3%, transparent);
+}
+
+/* Keep safety states immediate: never inherit transition-all for disabled
+   opacity, and never tween numbers or field geometry. */
+:is(.journal-management, [data-management-review]) button {
+  transition-property: background-color, border-color, box-shadow, transform;
+  transition-duration: 120ms;
+  transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+:is(.journal-management, [data-management-review]) button:enabled:active:not(.journal-position-tab):not(.oca-layer-trigger) {
+  transform: translateY(1px);
+  transition-duration: 60ms;
+}
+
+:is(.journal-management, [data-management-review]) button:disabled {
+  transform: none;
+  transition: none;
+}
+
+.layer-row-grid input[type="number"] {
+  font-variant-numeric: tabular-nums;
+}
+
+/* One entrance per newly revealed bracket edit, rather than per keystroke.
+   No fill mode: resting content stays visible even if animation is removed. */
+[data-review-entering="true"] {
+  animation: bracket-review-in 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes bracket-review-in {
+  from { opacity: .65; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.action-feedback {
+  display: flex;
+  align-items: flex-start;
+  gap: .5rem;
+  margin-bottom: .75rem;
+  padding: .75rem;
+  border: 1px solid var(--border);
+  border-radius: .375rem;
+  overflow-wrap: anywhere;
+}
+.action-feedback[data-feedback-tone="error"] {
+  color: #fecdd3;
+  background: rgb(251 113 133 / 8%);
+  border-color: rgb(251 113 133 / 30%);
+}
+.action-feedback[data-feedback-tone="warning"] {
+  color: #fde68a;
+  background: rgb(252 211 77 / 8%);
+  border-color: rgb(252 211 77 / 30%);
+}
+.journal-shell > .action-feedback {
+  flex-shrink: 0;
+  margin: 0;
+  border-radius: 0;
+  padding-inline: 1rem;
+}
+button.completion-button,
+[data-management-review] button.completion-button:disabled {
+  transition: background-color 180ms ease-out, color 180ms ease-out,
+    opacity 180ms ease-out;
+}
+button.action-complete,
+button.action-complete:disabled {
+  background: #6ee7b7;
+  color: #052e21;
+  opacity: 1;
+  cursor: default;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  [data-draft-created] {
+    animation: draft-layer-added 650ms ease-out;
+  }
+  :is([data-completion-feedback], [data-order-completion]) [data-icon-sh] {
+    animation: feedback-check-in 160ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+}
+@keyframes draft-layer-added {
+  from { background-color: color-mix(in srgb, var(--foreground) 8%, transparent); }
+  to { background-color: transparent; }
+}
+@keyframes feedback-check-in {
+  from { opacity: .5; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :is(.journal-management, [data-management-review]) button {
+    transition-property: background-color, border-color, box-shadow;
+  }
+
+  :is(.journal-management, [data-management-review]) button:enabled:active:not(.journal-position-tab):not(.oca-layer-trigger) {
+    transform: none;
+  }
+
+  [data-review-entering="true"] {
+    animation: none;
+  }
+}
