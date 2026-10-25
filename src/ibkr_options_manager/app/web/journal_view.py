@@ -38,6 +38,7 @@ from starhtml import (
 )
 
 from ...journal import JournalRow, entry_insights, summarize
+from ...journal_trends import MetricTrend, weekly_metric_trends
 from .components.ui.button import Button
 from .components.ui.input import Input as StarInput
 from .components.ui.label import Label
@@ -145,6 +146,70 @@ def _metric_help(label: str, *content: Any) -> Any:
     )
 
 
+def _metric_sparkline(series: tuple[MetricTrend, ...]) -> Any:
+    charts = []
+    for trend in series:
+        known = [value for value in trend.values if value is not None]
+        if len(known) < 2:
+            continue
+        # Trim empty edges so short histories still read as a tile background.
+        # Internal missing weeks retain their actual spacing and breaks.
+        first = next(i for i, value in enumerate(trend.values) if value is not None)
+        last = max(i for i, value in enumerate(trend.values) if value is not None)
+        low, high = min(known), max(known)
+        spread = high - low or max(abs(high) * D(".1"), D(1))
+        segments: list[list[tuple[float, float]]] = []
+        segment: list[tuple[float, float]] = []
+        for index, value in enumerate(trend.values):
+            if value is None:
+                if len(segment) >= 2:
+                    segments.append(segment)
+                segment = []
+                continue
+            y = 38.0 if high == low else 68 - float((value - low) / spread) * 60
+            segment.append(((index - first) * 220 / (last - first), y))
+        if len(segment) >= 2:
+            segments.append(segment)
+        if not segments:
+            continue
+        charts.append(
+            Div(
+                Svg(
+                    *(
+                        SvgPath(
+                            d="M "
+                            + " L ".join(f"{x:.2f} {y:.2f}" for x, y in points)
+                            + f" L {points[-1][0]:.2f} 76 L {points[0][0]:.2f} 76 Z",
+                            cls="journal-spark-fill",
+                        )
+                        for points in segments
+                    ),
+                    *(
+                        Polyline(
+                            points=" ".join(f"{x:.2f},{y:.2f}" for x, y in points),
+                            fill="none",
+                            cls="journal-spark-line",
+                        )
+                        for points in segments
+                    ),
+                    viewBox="0 0 220 76",
+                    preserveAspectRatio="none",
+                    aria_hidden="true",
+                    focusable="false",
+                ),
+                Span(trend.currency, cls="journal-spark-currency")
+                if len(series) > 1
+                else None,
+                cls="journal-spark-lane",
+            )
+        )
+    return (
+        Div(*charts, cls="journal-metric-sparkline", aria_hidden="true")
+        if charts
+        else None
+    )
+
+
 def _metric(
     label: str,
     value: str,
@@ -153,8 +218,10 @@ def _metric(
     tone: str = "",
     help_text: str = "",
     unavailable: bool = False,
+    trend: tuple[MetricTrend, ...] = (),
 ) -> Any:
     return Div(
+        _metric_sparkline(trend) if trend else None,
         Div(
             Span(label),
             _metric_help(label, help_text) if help_text else None,
@@ -614,6 +681,7 @@ def dashboard(
     error: str = "",
     active_positions: Any = None,
 ) -> Any:
+    trends = weekly_metric_trends(rows, as_of=int(datetime.now(UTC).timestamp()))
     priced = tuple(
         row
         for row in rows
@@ -661,6 +729,7 @@ def dashboard(
                 "Win rate",
                 f"{D(wins) / (wins + losses) * 100:.0f}%" if wins + losses else "—",
                 f"{wins} wins · {losses} losses · {flat} flat",
+                trend=trends["win"],
             ),
             _metric(
                 "Gross realised P&L",
@@ -668,6 +737,7 @@ def dashboard(
                 "Closed trades · fees excluded"
                 if len(currencies) == 1
                 else "Separate totals by currency · no conversion",
+                trend=trends["pnl"],
                 tone=_tone(next(iter(summaries.values())).realized)
                 if len(currencies) == 1
                 else "",
@@ -687,17 +757,20 @@ def dashboard(
                     f"Avg loss {money(summary.average_loss, currency)} · avg win {money(summary.average_win, currency)}"
                     for currency, summary in summaries.items()
                 ),
+                trend=trends["rr"],
             ),
             _metric(
                 "Average biggest dip",
                 percent(adverse),
                 f"Based on {len(priced)} trades",
+                trend=trends["dip"],
                 tone="journal-negative",
             ),
             _metric(
                 "Average peak gain",
                 percent(favorable),
                 "Includes prices after selling",
+                trend=trends["peak"],
                 tone="journal-positive",
             ),
             cls="journal-metrics journal-dashboard-metrics",
@@ -740,10 +813,6 @@ def dashboard(
             cls="journal-section-heading",
         ),
         _history_table(rows, path),
-        P(
-            "Win rate excludes flat trades. Realised results use matched closing fills and exclude fees. Dips and peaks include open trades and prices after selling; unknown entries and gaps in price history are excluded.",
-            cls="journal-footnote",
-        ),
         Script(_equity_script()),
         cls="journal-dashboard",
         data_journal_dashboard=True,

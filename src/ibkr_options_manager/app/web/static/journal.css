@@ -181,3 +181,13 @@
 .journal-active-contract .journal-contract { white-space: normal; }
 .journal-active-quantity { font-size: .8rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .journal-active-position > svg { flex-shrink: 0; color: var(--muted-foreground); }
+
+/* Decorative weekly history stays behind readable, all-history metrics. */
+.journal-dashboard-metrics .journal-metric { position: relative; isolation: isolate; min-height: 9.25rem; padding-bottom: 2rem; overflow: hidden; }
+.journal-dashboard-metrics .journal-metric > :not(.journal-metric-sparkline) { position: relative; z-index: 1; }
+.journal-metric-sparkline { position: absolute; inset: 35% .5rem 0; display: flex; flex-direction: column; pointer-events: none; user-select: none; color: var(--muted-foreground); }
+.journal-spark-lane { position: relative; flex: 1; min-height: 0; }
+.journal-spark-lane svg { display: block; width: 100%; height: 100%; overflow: hidden; }
+.journal-spark-line { stroke: currentColor; stroke-opacity: .36; stroke-width: 1.4; vector-effect: non-scaling-stroke; }
+.journal-spark-fill { fill: currentColor; fill-opacity: .065; }
+.journal-spark-currency { position: absolute; right: .25rem; bottom: .15rem; color: var(--muted-foreground); font-size: .6rem; }

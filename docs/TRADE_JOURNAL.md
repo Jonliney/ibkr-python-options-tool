@@ -57,6 +57,20 @@ rehearsal scenarios and explicit `--con-id` launches still open Management.
   known entries and complete observed prices, including open trades and prices
   after selling; missing entries and known history gaps are excluded.
   Monetary totals and curves stay separate by currency.
+- Faint, non-interactive background sparklines show twelve UTC weekly samples,
+  including the current partial week. The headline numbers retain their
+  all-history scope. Gross P&L accumulates closes inside the twelve-week window;
+  win rate and R:R use the most recent four calendar weeks at each sample.
+  Dip and peak averages use entries in those four weeks and only prices observed
+  before that sample's cutoff, including observations after selling.
+- Rolling samples require at least two eligible trades; R:R additionally needs
+  both a win and a loss. Missing samples remain gaps, with no interpolated data
+  or isolated dots. Cumulative P&L begins at the first recorded close in the
+  window. Monetary and R:R series use separate labelled lanes per currency.
+  Empty leading and trailing weeks are trimmed so available history fills each
+  tile width; internal gaps remain unconnected.
+  Each sparkline scales independently and is decorative, so magnitudes should
+  not be compared between tiles. There are no hover, click or keyboard controls.
 
 Dashboard controls use bundled StarUI buttons. Semantic layout and tables are
 StarHTML, with custom CSS/SVG charts.
