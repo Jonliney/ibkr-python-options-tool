@@ -110,7 +110,7 @@ def test_journal_views_render_at_desktop_and_minimum_size(tmp_path):
                 assert observations[0]["analysisSidebar"] == (name == "analysis")
                 if name == "analysis":
                     analysis_widths[width] = observations[0]["workspaceWidth"]
-                    assert observations[0]["analysisMetrics"] == 6
+                    assert observations[0]["analysisMetrics"] == 5
                 elif name == "management":
                     assert observations[0]["workspaceWidth"] == analysis_widths[width]
                 QTest.qWait(150)  # allow the rendered compositor frame to reach grab()
@@ -546,7 +546,7 @@ def test_price_path_native_hover_shows_only_inspected_dot(tmp_path):
               root.dispatchEvent(new MouseEvent('mousemove', {
                 clientX:box.right-12, clientY:box.top+50, bubbles:true
               }));
-              const last = root.querySelector('[data-price-point]:last-child');
+              const last = [...root.querySelectorAll('[data-price-point]')].at(-1);
               return last.getAttribute('aria-pressed') === 'true';
             })()""",
             lambda value: (fallback.append(value), mouse_loop.quit()),
@@ -571,4 +571,223 @@ def test_price_path_native_hover_shows_only_inspected_dot(tmp_path):
         view.deleteLater()
         server.should_exit = True
         thread.join(timeout=2)
+        workbench.close()
+
+
+def test_analysis_scenario_edit_drag_cancel_and_close_labels(tmp_path):
+    from PySide6.QtCore import QPoint, Qt
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    original_layers = workbench._current_layers()
+    row = next(
+        r
+        for r in workbench._journal_rows()
+        if r.contract.con_id == workbench._selected_con_id
+    )
+    TestClient(workbench.app).post(
+        workbench.path + "action",
+        data={
+            "action": "open-trade",
+            "trade_id": row.row_id,
+        },
+    )
+    server, thread, port = _start_local_server(workbench.app)
+    view = QWebEngineView()
+    view.resize(1120, 920)
+    view.show()
+
+    def js(source):
+        loop = QEventLoop()
+        values = []
+        view.page().runJavaScript(
+            source, lambda value: (values.append(value), loop.quit())
+        )
+        QTimer.singleShot(3000, loop.quit)
+        loop.exec()
+        assert values
+        return values[0]
+
+    try:
+        loaded = QEventLoop()
+        view.loadFinished.connect(loaded.quit)
+        view.setUrl(QUrl(f"http://127.0.0.1:{port}{workbench.path}"))
+        QTimer.singleShot(8000, loaded.quit)
+        loaded.exec()
+        assert js("!!document.querySelector('[data-scenario-input]')")
+        result = json.loads(
+            js("""(() => {
+          const root=document.querySelector('[data-interactive-price]');
+          const input=root.querySelector('[data-scenario-input="stop"]');
+          input.focus(); input.value='50'; input.dispatchEvent(new Event('input'));
+          input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
+          const changed=root.querySelector('[data-scenario-result]').textContent;
+          input.focus(); input.value='10'; input.dispatchEvent(new Event('input'));
+          input.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+          const cancelled=input.value==='50';
+          input.focus(); input.value='100'; input.dispatchEvent(new Event('input'));
+          const invalid=input.getAttribute('aria-invalid')==='true'
+            && !root.querySelector('[data-scenario-error]').hidden;
+          input.blur();
+          const restored=input.value==='50' &&
+            root.querySelector('[data-scenario-error]').hidden;
+          const local=!input.name && !input.closest('form');
+          return JSON.stringify({changed,cancelled,invalid,restored,local});
+        })()""")
+        )
+        assert "Target reached first" in result.pop("changed")
+        assert all(result.values())
+        coordinates = json.loads(
+            js("""(() => {
+          const line=document.querySelector(
+            '.journal-scenario-hit[data-scenario-drag="stop"]');
+          const svg=line.ownerSVGElement.getBoundingClientRect();
+          return JSON.stringify({x:svg.left+70,
+            y:svg.top+Number(line.getAttribute('y1'))});
+        })()""")
+        )
+        js("document.querySelector('[data-scenario-input=stop]').focus()")
+        start = QPoint(round(coordinates["x"]), round(coordinates["y"]))
+        end = start - QPoint(0, 28)
+        QTest.mouseMove(view.focusProxy(), start)
+        QTest.mousePress(view.focusProxy(), Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(view.focusProxy(), end)
+        QTest.qWait(60)
+        QTest.mouseRelease(view.focusProxy(), Qt.MouseButton.LeftButton, pos=end)
+        QTest.qWait(60)
+        assert js(
+            "Number(document.querySelector('[data-scenario-input=stop]').value) < 50"
+        )
+        assert js(
+            "!document.querySelector('[data-interactive-price]').classList.contains('is-dragging')"
+        )
+        # A cancelled drag restores the original level, with no server action.
+        before = js(
+            "Number(document.querySelector('[data-scenario-input=stop]').value)"
+        )
+        coordinates = json.loads(
+            js("""(() => {
+          const line=document.querySelector(
+            '.journal-scenario-hit[data-scenario-drag="stop"]');
+          const svg=line.ownerSVGElement.getBoundingClientRect();
+          return JSON.stringify({x:svg.left+70,
+            y:svg.top+Number(line.getAttribute('y1'))});
+        })()""")
+        )
+        start = QPoint(round(coordinates["x"]), round(coordinates["y"]))
+        QTest.mousePress(view.focusProxy(), Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(view.focusProxy(), start - QPoint(0, 20))
+        QTest.qWait(60)
+        QTest.keyClick(view.focusProxy(), Qt.Key.Key_Escape)
+        QTest.qWait(50)
+        QTest.mouseRelease(
+            view.focusProxy(), Qt.MouseButton.LeftButton, pos=start - QPoint(0, 20)
+        )
+        assert (
+            js("Number(document.querySelector('[data-scenario-input=stop]').value)")
+            == before
+        )
+        assert js("""(() => {
+          const grip=document.querySelector('[data-scenario-grip=stop]');
+          const input=document.querySelector('[data-scenario-input=stop]');
+          const before=Number(input.value);
+          grip.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowUp',bubbles:true}));
+          return Number(input.value)<before;
+        })()""")
+        assert js("""(() => {
+          ['stop','target'].forEach(kind=>{
+            const input=document.querySelector(`[data-scenario-input=${kind}]`);
+            input.value='.1'; input.dispatchEvent(new Event('input'));
+          });
+          const a=document.querySelector('[data-scenario-drag=stop]')
+            .getBoundingClientRect();
+          const b=document.querySelector('[data-scenario-drag=target]')
+            .getBoundingClientRect();
+          return b.bottom<=a.top && a.right<=innerWidth && b.right<=innerWidth;
+        })()""")
+        QTest.qWait(100)
+        view.grab().save(str(tmp_path / "nearby-levels.png"))
+        assert workbench._journal_stop == 25 and workbench._journal_target == 20
+        assert workbench._current_layers() == original_layers
+    finally:
+        view.close()
+        view.deleteLater()
+        server.should_exit = True
+        thread.join(timeout=2)
+        workbench.close()
+
+
+def test_scenario_crossings_same_minute_exact_touch_and_incomplete_history():
+    from dataclasses import replace
+    from decimal import Decimal
+
+    from starhtml import to_xml
+
+    from ibkr_options_manager.app.web.journal_view import _price_chart
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    row = next(r for r in workbench._journal_rows() if r.analysis and r.entry_price)
+    first = row.analysis.bars[0]
+    entry = row.entry_price
+    view = QWebEngineView()
+    view.resize(900, 600)
+    view.show()
+    try:
+        cases = (
+            (entry, entry, "Observed minutes", "Neither level observed"),
+            (
+                entry * Decimal("0.75"),
+                entry,
+                "Observed minutes",
+                "Stop reached first",
+            ),
+            (
+                entry,
+                entry * Decimal("1.2"),
+                "Observed minutes",
+                "Target reached first",
+            ),
+            (
+                entry * Decimal("0.75"),
+                entry * Decimal("1.2"),
+                "Observed minutes",
+                "same minute · order unknown",
+            ),
+            (
+                entry * Decimal("0.75"),
+                entry * Decimal("1.2"),
+                "Gaps in history",
+                "sequence unknown",
+            ),
+        )
+        for low, high, coverage, expected in cases:
+            bar = replace(first, low=low, high=high, close=entry)
+            sample = replace(
+                row, coverage=coverage, analysis=replace(row.analysis, bars=(bar,))
+            )
+            loop = QEventLoop()
+            view.loadFinished.connect(loop.quit)
+            view.setHtml(to_xml(_price_chart(sample)))
+            QTimer.singleShot(5000, loop.quit)
+            loop.exec()
+            view.loadFinished.disconnect(loop.quit)
+            result_loop = QEventLoop()
+            seen = []
+            wait_for_javascript(
+                view,
+                "document.querySelector('[data-scenario-result]')"
+                f".textContent.includes({json.dumps(expected)})",
+                lambda value, seen=seen, result_loop=result_loop: (
+                    seen.append(value),
+                    result_loop.quit(),
+                ),
+                timeout=3,
+            )
+            QTimer.singleShot(4000, result_loop.quit)
+            result_loop.exec()
+            assert seen == [True], expected
+    finally:
+        view.close()
+        view.deleteLater()
         workbench.close()

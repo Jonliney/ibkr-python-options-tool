@@ -43,7 +43,10 @@
 .journal-metric:first-child { padding-left: 0; }
 .journal-metric:last-child { border: 0; }
 .journal-metric-label { color: var(--muted-foreground); font-size: .8rem; margin: 0 0 .65rem; }
+.journal-metric-label-with-help { display: flex; align-items: center; gap: .4rem; }
+.journal-metric-help-content { max-width: 16rem; }
 .journal-metric-value { font-size: 1.7rem; line-height: 1.2; font-weight: 550; letter-spacing: -.025em; font-variant-numeric: tabular-nums; margin: 0 0 .5rem; }
+.journal-metric-placeholder { color: var(--muted-foreground); font-size: .8rem; font-weight: 400; line-height: 1.6; margin: 0 0 .5rem; }
 .journal-metric .journal-caption { margin: 0; }
 .journal-positive { color: #6ee7b7; }
 .journal-negative { color: #fda4af; }
@@ -149,3 +152,23 @@
 .journal-tooltip-values { display: grid; grid-template-columns: auto minmax(5.5rem, auto); column-gap: 2rem; row-gap: .25rem; align-items: baseline; }
 .journal-tooltip-values > :nth-child(odd) { color: var(--muted-foreground); }
 .journal-tooltip-values > :nth-child(even) { text-align: right; white-space: nowrap; }
+
+.journal-scenario-heading { margin: .25rem 0; }
+.journal-scenario-line { stroke-width: 1; pointer-events: none; }
+.journal-scenario-stop { stroke: #fda4af; stroke-dasharray: 5 4; }
+.journal-scenario-target { stroke: #fde68a; stroke-dasharray: 2 4; }
+.journal-scenario-hit { stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: ns-resize; touch-action: none; }
+.journal-scenario-label { position: absolute; right: 12px; z-index: 2; display: flex; align-items: center; gap: .2rem; padding: .15rem .3rem; border-radius: .25rem; background: var(--background); color: var(--foreground); font-size: .75rem; line-height: 1.5; cursor: ns-resize; touch-action: none; font-variant-numeric: tabular-nums; }
+.journal-scenario-label input { width: 4.8ch; min-width: 0; padding: 0; border: 0; border-bottom: 1px dotted var(--muted-foreground); border-radius: 0; background: transparent; color: inherit; font: inherit; text-align: center; appearance: textfield; touch-action: auto; }
+.journal-scenario-label input::-webkit-inner-spin-button, .journal-scenario-label input::-webkit-outer-spin-button { appearance: none; margin: 0; }
+.journal-scenario-label input[aria-invalid="true"] { border-color: #fda4af; }
+.journal-scenario-label [data-scenario-grip] { cursor: ns-resize; }
+.journal-scenario-result { border-top: 1px solid var(--border); padding-top: .85rem; margin-top: 1.25rem; font-size: .8rem; }
+.journal-scenario-result p { margin: 0 0 .4rem; }
+.journal-scenario-result [role="alert"] { color: #fda4af; }
+.journal-price-extreme { fill: var(--background); stroke: #6ee7b7; stroke-width: 2; cursor: help; }
+.journal-extreme-label { fill: var(--foreground); font-weight: 600; pointer-events: none; }
+.journal-interactive-price.is-dragging { cursor: ns-resize; user-select: none; }
+@media (pointer: coarse) { .journal-scenario-hit { stroke-width: 24; } .journal-scenario-label { min-height: 2.5rem; } }
+
+.journal-scenario-percent { display: inline-flex; align-items: baseline; }

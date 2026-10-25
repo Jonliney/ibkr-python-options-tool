@@ -120,8 +120,10 @@ def test_dashboard_filters_analysis_and_management_roundtrip():
             data={"action": "open-trade", "trade_id": selected.row_id},
         ).text
         assert "data-position-analysis" in html
-        assert "Order of extremes" in html and "Average observed price" in html
-        assert "Contract position observations" in html
+        assert "What-if exit" in html and "Average observed bid" in html
+        assert "Order of extremes" not in html
+        assert "Contract position observations" not in html
+        assert "Trade fills" in html
         assert "Back to dashboard" not in html
         assert selected.coverage not in html
         assert "observed minutes · USD" not in html
@@ -186,7 +188,7 @@ def test_saved_closed_trade_reopens_after_workbench_restart(tmp_path):
                 .text
             )
             assert "data-position-analysis" in html
-            assert "Actual gross P&amp;L" in html
+            assert "Realised gross P&amp;L" in html
             assert "disabled" in html  # no management for a saved closed trade
         finally:
             reopened.close()

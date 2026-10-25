@@ -162,3 +162,20 @@ The existing order-management and source-safety suites remain required.
 The separate capital and position-sizing Calculator tab is recorded in the
 [position sizing calculator note](POSITION_SIZING_CALCULATOR_NOTE.md). It is a
 future feature, not part of this dashboard change.
+
+## Analysis what-if levels
+
+The Analysis chart always shows hypothetical stop and target levels derived
+from the selected trade's quantity-weighted average entry price. Drag a level
+or edit its percentage inline; Enter commits an edit and Escape restores it.
+Up/Down on a level handle moves its price. These controls are local to the
+current page, do not persist, and neither submit nor modify broker orders,
+management drafts, or Dashboard settings.
+
+Results report observed bid threshold crossings, including observations after
+a sale. They are not simulated executions. Prices are displayed at currency
+precision, while comparisons use the unrounded percentage-derived thresholds.
+Same-minute stop/target touches have unknown ordering; incomplete history
+withholds the sequence. Tiny floating-point representation errors at exact
+touches are tolerated at machine precision. Missing minutes remain unconnected.
+Low/high markers identify observed extrema, not guaranteed executable prices.

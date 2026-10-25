@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from starhtml import (
@@ -44,6 +45,7 @@ from .components.ui.dropdown_menu import (
 )
 from .components.ui.input import Input as StarInput
 from .components.ui.label import Label
+from .components.ui.tooltip import Tooltip, TooltipContent, TooltipTrigger
 
 D = Decimal
 
@@ -130,11 +132,47 @@ def position_tabs(path: str, active: str, row: JournalRow | None = None) -> Any:
     )
 
 
-def _metric(label: str, value: str, detail: str, *, tone: str = "") -> Any:
+def _metric_help(label: str, *content: Any) -> Any:
+    return Tooltip(
+        TooltipTrigger(
+            Button(
+                Icon("lucide:info", cls="size-3.5", aria_hidden="true"),
+                type="button",
+                variant="ghost",
+                size="icon",
+                cls="size-4",
+                aria_label=f"About {label}",
+            ),
+            delay_duration=250,
+        ),
+        TooltipContent(*content, align="end", cls="journal-metric-help-content"),
+    )
+
+
+def _metric(
+    label: str,
+    value: str,
+    detail: str = "",
+    *,
+    tone: str = "",
+    help_text: str = "",
+    unavailable: bool = False,
+) -> Any:
     return Div(
-        P(label, cls="journal-metric-label"),
-        P(value, cls=f"journal-metric-value {tone}"),
-        P(detail, cls="journal-caption"),
+        Div(
+            Span(label),
+            _metric_help(label, help_text) if help_text else None,
+            cls="journal-metric-label journal-metric-label-with-help"
+            if help_text
+            else "journal-metric-label",
+        ),
+        P(
+            value,
+            cls="journal-metric-placeholder"
+            if unavailable
+            else f"journal-metric-value {tone}",
+        ),
+        P(detail, cls="journal-caption") if detail else None,
         cls="journal-metric",
     )
 
@@ -857,13 +895,22 @@ def _history_table(rows: tuple[JournalRow, ...], path: str) -> Any:
     )
 
 
-def _price_chart(row: JournalRow) -> Any:
-    if row.analysis is None or not row.analysis.bars or row.entry_price is None:
+def _price_chart(
+    row: JournalRow, *, stop: Decimal | None = None, target: Decimal | None = None
+) -> Any:
+    if (
+        row.analysis is None
+        or not row.analysis.bars
+        or row.entry_price is None
+        or row.entry_price <= 0
+    ):
         return Div(
             P("Price history is not available for this entry.", cls="journal-muted"),
             cls="journal-chart-empty",
         )
     bars = row.analysis.bars
+    stop = stop if stop is not None else D(25)
+    target = target if target is not None else D(20)
     prices = [b.low for b in bars] + [b.high for b in bars] + [row.entry_price]
     low, high = min(prices), max(prices)
     spread = max(high - low, D(".01"))
@@ -925,6 +972,7 @@ def _price_chart(row: JournalRow) -> Any:
                     data_y_fraction=str((bar.close - low) / spread),
                     data_high_fraction=str((bar.high - low) / spread),
                     data_low_fraction=str((bar.low - low) / spread),
+                    data_timestamp=bar.timestamp,
                     data_date_label=stamp(bar.timestamp, full=True),
                     data_close=money(bar.close, currency),
                     data_low=money(bar.low, currency),
@@ -945,7 +993,13 @@ def _price_chart(row: JournalRow) -> Any:
                 fill="transparent",
                 pointer_events="all",
             ),
-            Text(f"{high:.2f}", x=12, y=18, cls="journal-chart-label"),
+            Text(
+                f"{high:.2f}",
+                x=12,
+                y=18,
+                cls="journal-chart-label",
+                data_price_high_label=True,
+            ),
             Text(
                 f"{low:.2f}",
                 x=12,
@@ -981,6 +1035,39 @@ def _price_chart(row: JournalRow) -> Any:
             aria_label=f"Bid price path after entry in {currency}. Inspect points with the pointer or keyboard.",
             cls="journal-price-chart",
         ),
+        *(
+            Div(
+                Button(
+                    Icon("lucide:equal", cls="size-3.5", aria_hidden="true"),
+                    type="button",
+                    variant="ghost",
+                    size="icon",
+                    cls="size-5",
+                    aria_label=f"Move hypothetical {kind} price with Up and Down arrows",
+                    data_scenario_grip=kind,
+                ),
+                Span(kind.capitalize()),
+                Span(data_scenario_price=kind),
+                Span(
+                    Span("(-" if kind == "stop" else "(+"),
+                    Input(
+                        type="number",
+                        inputmode="decimal",
+                        value=str(value),
+                        min="0.1",
+                        max="99.9" if kind == "stop" else "10000",
+                        step="0.1",
+                        aria_label=f"Hypothetical {kind} percentage",
+                        data_scenario_input=kind,
+                    ),
+                    Span("%)"),
+                    cls="journal-scenario-percent",
+                ),
+                cls="journal-scenario-label",
+                data_scenario_drag=kind,
+            )
+            for kind, value in (("stop", stop), ("target", target))
+        ),
         Div(
             Span(stamp(bars[0].timestamp, full=True)),
             Span(stamp(bars[-1].timestamp, full=True)),
@@ -1006,126 +1093,28 @@ def _price_chart(row: JournalRow) -> Any:
             hidden=True,
             data_price_tooltip=True,
         ),
+        Div(
+            P(data_scenario_result=True, role="status", aria_live="polite"),
+            P(
+                "Observed bid crossings, including prices after sale · not simulated fills",
+                cls="journal-caption",
+            ),
+            P("", data_scenario_error=True, role="alert", hidden=True),
+            cls="journal-scenario-result",
+        ),
         Script(_price_chart_script()),
         cls="journal-interactive-price",
         data_interactive_price=True,
+        data_scenario_entry=str(row.entry_price),
+        data_scenario_low=str(low),
+        data_scenario_spread=str(spread),
+        data_scenario_currency=currency,
+        data_scenario_incomplete=row.coverage != "Observed minutes",
     )
 
 
 def _price_chart_script() -> str:
-    return """(() => {
-      document.querySelectorAll('[data-interactive-price]').forEach(root => {
-        if (root.dataset.initialized) return;
-        root.dataset.initialized = 'true';
-        const svg = root.querySelector('svg');
-        const points = [...svg.querySelectorAll('[data-price-point]')];
-        const tooltip = root.querySelector('[data-price-tooltip]');
-        let selected = -1;
-        const positionTooltip = () => {
-          if (selected < 0 || tooltip.hidden) return;
-          const box = root.getBoundingClientRect();
-          const point = points[selected].getBoundingClientRect();
-          const x = point.left + point.width / 2 - box.left;
-          const y = point.top + point.height / 2 - box.top;
-          tooltip.style.left = `${Math.max(0, Math.min(box.width - tooltip.offsetWidth, x - tooltip.offsetWidth / 2))}px`;
-          tooltip.style.top = `${y >= tooltip.offsetHeight + 12 ? y - tooltip.offsetHeight - 12 : y + 12}px`;
-        };
-        const hide = () => {
-          tooltip.hidden = true;
-          points.forEach(point => {
-            point.classList.remove('is-selected');
-            point.setAttribute('aria-pressed', 'false');
-          });
-        };
-        const select = index => {
-          if (selected === index && !tooltip.hidden) return;
-          selected = index;
-          points.forEach((point, i) => {
-            point.classList.toggle('is-selected', i === index);
-            point.setAttribute('aria-pressed', String(i === index));
-            point.setAttribute('tabindex', i === index ? '0' : '-1');
-          });
-          const data = points[index].dataset;
-          tooltip.querySelector('[data-price-date]').textContent = data.dateLabel;
-          ['close', 'low', 'high', 'return'].forEach(key => {
-            tooltip.querySelector(`[data-price-${key}]`).textContent = data[key];
-          });
-          tooltip.querySelector('[data-price-return]').className = data.returnTone;
-          tooltip.hidden = false;
-          positionTooltip();
-        };
-        const render = () => {
-          const {width, height} = svg.getBoundingClientRect();
-          if (!width || !height) return;
-          svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-          const x = fraction => 12 + Number(fraction) * (width - 24);
-          const y = fraction => height - 32 - Number(fraction) * (height - 64);
-          points.forEach(point => {
-            point.setAttribute('cx', x(point.dataset.xFraction));
-            point.setAttribute('cy', y(point.dataset.yFraction));
-          });
-          svg.querySelectorAll('[data-price-segment]').forEach(line => {
-            const segment = points.filter(p => p.dataset.segment === line.dataset.priceSegment);
-            line.setAttribute('points', segment.map(p => `${p.getAttribute('cx')},${p.getAttribute('cy')}`).join(' '));
-            const range = svg.querySelector(`[data-price-range="${line.dataset.priceSegment}"]`);
-            const upper = segment.map(p => `${x(p.dataset.xFraction)} ${y(p.dataset.highFraction)}`);
-            const lower = [...segment].reverse().map(p => `${x(p.dataset.xFraction)} ${y(p.dataset.lowFraction)}`);
-            range.setAttribute('d', `M ${[...upper, ...lower].join(' L ')} Z`);
-          });
-          const entry = svg.querySelector('[data-entry-fraction]');
-          entry.setAttribute('x2', width - 12);
-          entry.setAttribute('y1', y(entry.dataset.entryFraction));
-          entry.setAttribute('y2', y(entry.dataset.entryFraction));
-          const exit = svg.querySelector('[data-exit-fraction]');
-          if (exit) {
-            exit.setAttribute('x1', x(exit.dataset.exitFraction));
-            exit.setAttribute('x2', x(exit.dataset.exitFraction));
-            exit.setAttribute('y2', height - 25);
-          }
-          svg.querySelector('[data-price-low-label]').setAttribute('y', height - 5);
-          positionTooltip();
-        };
-        points.forEach((point, index) => {
-          point.addEventListener('pointerenter', () => select(index));
-          point.addEventListener('focus', () => select(index));
-          point.addEventListener('click', () => select(index));
-          point.addEventListener('keydown', event => {
-            let next = index;
-            if (event.key === 'Escape') { event.preventDefault(); hide(); return; }
-            if (event.key === 'ArrowRight') next = Math.min(points.length - 1, index + 1);
-            else if (event.key === 'ArrowLeft') next = Math.max(0, index - 1);
-            else if (event.key === 'Home') next = 0;
-            else if (event.key === 'End') next = points.length - 1;
-            else if (!['Enter', ' '].includes(event.key)) return;
-            event.preventDefault(); points[next].focus(); select(next);
-          });
-        });
-        const inspectPointer = event => {
-          const box = svg.getBoundingClientRect();
-          if (event.clientX < box.left || event.clientX > box.right ||
-              event.clientY < box.top || event.clientY > box.bottom) return;
-          const fraction = (event.clientX - box.left - 12) / Math.max(1, box.width - 24);
-          const nearest = points.reduce((best, point, i) =>
-            Math.abs(Number(point.dataset.xFraction) - fraction) < Math.abs(Number(points[best].dataset.xFraction) - fraction) ? i : best, 0);
-          select(nearest);
-        };
-        root.addEventListener('pointermove', inspectPointer, true);
-        root.addEventListener('mousemove', inspectPointer, true);
-        root.addEventListener('pointerenter', inspectPointer);
-        root.addEventListener('pointerleave', () => {
-          if (!root.contains(document.activeElement)) hide();
-        });
-        root.addEventListener('focusout', event => {
-          if (!root.contains(event.relatedTarget)) hide();
-        });
-        document.addEventListener('pointerdown', event => {
-          if (!root.contains(event.target)) hide();
-        });
-        const observer = new ResizeObserver(render);
-        observer.observe(svg); render();
-        window.addEventListener('pagehide', () => observer.disconnect(), {once:true});
-      });
-    })();"""
+    return (Path(__file__).parent / "static" / "journal-price-chart.js").read_text()
 
 
 def _analysis_sidebar(row: JournalRow | None) -> Any:
@@ -1146,6 +1135,7 @@ def _analysis_sidebar(row: JournalRow | None) -> Any:
             percent(value),
             f"{money(row.pnl_at(price), c)} · {detail}",
             tone=_tone(value),
+            unavailable=value is None,
         )
 
     return Div(
@@ -1153,22 +1143,20 @@ def _analysis_sidebar(row: JournalRow | None) -> Any:
         Div(
             Div(
                 _metric(
-                    "Entry price",
+                    "Average entry price",
                     money(row.entry_price, c),
-                    stamp(row.entry_at, full=True),
+                    unavailable=row.entry_price is None,
+                    help_text="Quantity-weighted average of buy fills for this trade. See Trade fills for entry dates and times.",
                 ),
                 _metric(
-                    "Actual gross P&L",
-                    money(row.realized_pnl, c),
-                    percent(row.actual_return)
+                    "Realised gross P&L",
+                    money(row.realized_pnl, c)
                     if row.realized_pnl is not None
-                    else "Available after a fully matched close",
+                    else "Not yet available",
+                    percent(row.actual_return) if row.realized_pnl is not None else "",
                     tone=_tone(row.realized_pnl),
-                ),
-                _metric(
-                    "Average observed price",
-                    money(analysis.average if analysis else None, c),
-                    "Arithmetic mean of minute closes",
+                    unavailable=row.realized_pnl is None,
+                    help_text="Calculated from matched opening and closing fills once the trade has fully closed and quantities agree. Excludes fees and FX.",
                 ),
                 cls="journal-analysis-stat-group",
             ),
@@ -1184,13 +1172,16 @@ def _analysis_sidebar(row: JournalRow | None) -> Any:
                     money(analysis.high if analysis else None, c) + " bid",
                 ),
                 outcome(
-                    "Hold to final session",
+                    "Final-session estimate",
                     row.final_price,
-                    "Final bid estimate · not settlement",
+                    f"{money(row.final_price, c)} bid · Not settlement",
                 )
-                if row.final_kind == "expiry_bid"
+                if row.final_kind == "expiry_bid" and row.final_price is not None
                 else _metric(
-                    "Hold to expiration", "—", "Final-session value not captured"
+                    "Final-session estimate",
+                    "Unavailable",
+                    unavailable=True,
+                    help_text="A final-session bid was not captured. This estimate is unavailable; it is not an expiration settlement value.",
                 ),
                 cls="journal-analysis-stat-group",
             ),
@@ -1252,43 +1243,19 @@ def position_analysis(
         else None,
         Div(
             H2("Price path after entry"),
+            _metric_help(
+                "the price path",
+                P(
+                    f"Average observed bid: {money(analysis.average if analysis else None, row.contract.currency)}"
+                ),
+                P("Arithmetic mean of observed minute closing bids."),
+            ),
             cls="journal-section-heading",
         ),
-        _price_chart(row),
-        Div(
-            Div(
-                H2("Order of extremes"),
-                P(
-                    analysis.sequence if analysis else "Unknown",
-                    cls="journal-insight-label",
-                ),
-                P(
-                    f"Low: {stamp(analysis.low_at, full=True)} · High: {stamp(analysis.high_at, full=True)}"
-                    if analysis
-                    else "Entry timing is needed to calculate the path.",
-                    cls="journal-caption",
-                ),
-            ),
-            Div(
-                H2(f"-{stop.normalize():f}% stop / +{target.normalize():f}% target"),
-                P(
-                    analysis.threshold_sequence if analysis else "Unknown",
-                    cls="journal-insight-label",
-                ),
-                P(
-                    "Hypothetical bid levels, including prices after sale. Same-minute ordering remains unknown.",
-                    cls="journal-caption",
-                ),
-            ),
-            cls="journal-sequence-layout",
-        ),
+        P("What-if exit", cls="journal-caption journal-scenario-heading"),
+        _price_chart(row, stop=stop, target=target),
         P(row.warning, cls="journal-warning") if row.warning else None,
         Div(H2("Trade fills"), _fill_table(row), cls="journal-fill-section"),
-        Div(
-            H2("Contract position observations"),
-            _observation_table(row),
-            cls="journal-fill-section",
-        ),
         P(
             "Gross estimates use original entry quantity and contract multiplier. Entry minute excluded; scale-ins start after the final buy. Actual results come only from matched fills. Fees, FX, exercise and assignment are excluded.",
             cls="journal-footnote",
@@ -1333,48 +1300,4 @@ def _fill_table(row: JournalRow) -> Any:
             )
         ),
         cls="journal-fill-table",
-    )
-
-
-def _observation_table(row: JournalRow) -> Any:
-    if not row.observations:
-        return P("No position snapshots saved for this contract.", cls="journal-muted")
-    return Div(
-        Table(
-            Thead(
-                Tr(
-                    *(
-                        Th(label, scope="col")
-                        for label in (
-                            "Observed (UTC)",
-                            "Held quantity",
-                            "Average premium",
-                            "State",
-                        )
-                    )
-                )
-            ),
-            Tbody(
-                *(
-                    Tr(
-                        Td(stamp(o.timestamp, full=True)),
-                        Td(f"{o.quantity.normalize():f}"),
-                        Td(
-                            money(
-                                o.average_cost / row.contract.multiplier,
-                                row.contract.currency,
-                            )
-                        ),
-                        Td("Flat observed" if o.quantity == 0 else "Holding observed"),
-                    )
-                    for o in row.observations[-20:]
-                )
-            ),
-            cls="journal-fill-table",
-        ),
-        P(
-            "Last 20 quantity or cost changes. A flat observation alone does not establish a sell fill or realised P&L.",
-            cls="journal-caption",
-        ),
-        cls="journal-table-scroll",
     )
