@@ -1060,6 +1060,7 @@ def _price_chart(
             cls="journal-chart-axis",
         ),
         Div(
+            P("", data_price_context=True, cls="journal-tooltip-context", hidden=True),
             P(cls="journal-tooltip-date", data_price_date=True),
             Div(
                 Span(f"Close bid · {currency}"),
@@ -1093,6 +1094,7 @@ def _price_chart(
         data_scenario_low=str(low),
         data_scenario_spread=str(spread),
         data_scenario_currency=currency,
+        data_scenario_incomplete=row.coverage != "Observed minutes",
     )
 
 
@@ -1235,16 +1237,15 @@ def position_analysis(
                 P(
                     "Stop and target are hypothetical levels. Dragging or editing them changes this chart only."
                 ),
+                P(
+                    "Touch markers show each level's first observed minute independently, not confirmed fills."
+                ),
             ),
             cls="journal-section-heading",
         ),
         _price_chart(row, stop=stop, target=target),
         P(row.warning, cls="journal-warning") if row.warning else None,
         Div(H2("Trade fills"), _fill_table(row), cls="journal-fill-section"),
-        P(
-            "Gross estimates use original entry quantity and contract multiplier. Entry minute excluded; scale-ins start after the final buy. Actual results come only from matched fills. Fees, FX, exercise and assignment are excluded.",
-            cls="journal-footnote",
-        ),
         cls="journal-analysis",
         data_position_analysis=True,
     )

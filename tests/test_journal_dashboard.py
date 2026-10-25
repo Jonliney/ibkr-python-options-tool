@@ -126,6 +126,7 @@ def test_dashboard_filters_analysis_and_management_roundtrip():
         assert "data-price-high-label" not in html
         assert "Order of extremes" not in html
         assert "Contract position observations" not in html
+        assert "Gross estimates use original entry quantity" not in html
         assert "Trade fills" in html
         assert "Back to dashboard" not in html
         assert selected.coverage not in html

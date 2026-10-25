@@ -169,3 +169,7 @@
 
 .journal-scenario-percent { display: inline-flex; align-items: baseline; }
 .journal-scenario-error { margin: .75rem 0; color: #fda4af; font-size: .8rem; }
+.journal-scenario-touch { fill: var(--background); stroke-width: 2; cursor: help; }
+.journal-touch-stop { stroke: #fda4af; }
+.journal-touch-target { stroke: #fde68a; }
+.journal-tooltip-context { margin: 0 0 .5rem; color: var(--muted-foreground); font-size: .75rem; line-height: 1.5; }

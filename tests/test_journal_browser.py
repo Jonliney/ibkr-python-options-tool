@@ -645,9 +645,17 @@ def test_analysis_scenario_edit_drag_cancel_and_close_labels(tmp_path):
             js("""(() => {
           const root=document.querySelector('[data-interactive-price]');
           const input=root.querySelector('[data-scenario-input="stop"]');
+          const visibleTouches=[...root.querySelectorAll('[data-scenario-touch]')]
+            .filter(m=>m.style.display!=='none').every(mark=>{
+              const box=mark.getBoundingClientRect();
+              return document.elementFromPoint(box.left+box.width/2,
+                box.top+box.height/2)?.closest('[data-scenario-touch]')===mark;
+            });
           input.focus(); input.value='50'; input.dispatchEvent(new Event('input'));
           input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
           const changed=root.querySelector('[data-scenario-price=stop]').textContent;
+          const hiddenTouch=root.querySelector('[data-scenario-touch=stop]')
+            .style.display==='none';
           input.focus(); input.value='10'; input.dispatchEvent(new Event('input'));
           input.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
           const cancelled=input.value==='50';
@@ -658,7 +666,14 @@ def test_analysis_scenario_edit_drag_cancel_and_close_labels(tmp_path):
           const restored=input.value==='50' &&
             root.querySelector('[data-scenario-error]').hidden;
           const local=!input.name && !input.closest('form');
-          return JSON.stringify({changed,cancelled,invalid,restored,local});
+          const touch=root.querySelector('[data-scenario-touch=target]');
+          touch.focus();
+          const markerContext=!root.querySelector('[data-price-tooltip]').hidden &&
+            root.querySelector('[data-price-context]').textContent
+              .includes('not a confirmed fill');
+          touch.blur();
+          return JSON.stringify({changed,visibleTouches,hiddenTouch,cancelled,invalid,
+            restored,local,markerContext});
         })()""")
         )
         assert result.pop("changed") == f"${row.entry_price / 2:.2f}"
@@ -800,6 +815,110 @@ def test_price_tooltip_does_not_bridge_missing_minutes():
         QTimer.singleShot(6000, loop.quit)
         loop.exec()
         assert seen == [True]
+    finally:
+        view.close()
+        view.deleteLater()
+        workbench.close()
+
+
+def test_scenario_touch_markers_use_ranges_first_touch_and_uncertainty():
+    from dataclasses import replace
+    from decimal import Decimal
+
+    from starhtml import to_xml
+
+    from ibkr_options_manager.app.web.journal_view import _price_chart
+
+    workbench = _demo_workbench()
+    workbench.load_demo_data()
+    row = next(r for r in workbench._journal_rows() if r.analysis and r.entry_price)
+    entry = row.entry_price
+    base = row.analysis.bars[0]
+    flat = replace(base, low=entry, high=entry, close=entry)
+    stop = replace(flat, low=entry * Decimal(".75"))
+    target = replace(flat, high=entry * Decimal("1.2"))
+    both = replace(stop, high=target.high)
+    view = QWebEngineView()
+    view.resize(900, 600)
+    view.show()
+    cases = (
+        ((flat,), "Observed minutes", {}, ""),
+        ((stop,), "Observed minutes", {"stop": 0}, ""),
+        ((target,), "Observed minutes", {"target": 0}, ""),
+        ((both,), "Observed minutes", {"stop": 0, "target": 0}, "order unknown"),
+        ((both,), "Gaps in history", {"stop": 0, "target": 0}, "History incomplete"),
+        (
+            (
+                flat,
+                replace(stop, timestamp=base.timestamp + 60),
+                replace(both, timestamp=base.timestamp + 120),
+            ),
+            "Observed minutes",
+            {"stop": 1, "target": 2},
+            "",
+        ),
+    )
+    try:
+        for bars, coverage, expected, qualifier in cases:
+            sample = replace(
+                row, coverage=coverage, analysis=replace(row.analysis, bars=bars)
+            )
+            loop = QEventLoop()
+            view.loadFinished.connect(loop.quit)
+            view.setHtml(
+                "<style>.journal-price-chart{width:100%;height:300px}</style>"
+                + to_xml(_price_chart(sample))
+            )
+            QTimer.singleShot(5000, loop.quit)
+            loop.exec()
+            view.loadFinished.disconnect(loop.quit)
+            ready_loop = QEventLoop()
+            ready = []
+            wait_for_javascript(
+                view,
+                "[...document.querySelectorAll('[data-scenario-touch]')]"
+                ".every(m => m.style.display === 'none' || m.hasAttribute('cx'))",
+                lambda value, ready=ready, ready_loop=ready_loop: (
+                    ready.append(value),
+                    ready_loop.quit(),
+                ),
+                timeout=3,
+            )
+            QTimer.singleShot(4000, ready_loop.quit)
+            ready_loop.exec()
+            assert ready == [True]
+            result_loop = QEventLoop()
+            seen = []
+            script = """(() => {
+              const points=[...document.querySelectorAll('[data-price-point]')];
+              return JSON.stringify(
+                [...document.querySelectorAll('[data-scenario-touch]')]
+                .filter(m => m.style.display !== 'none').map(m => ({
+                  kind:m.dataset.scenarioTouch,
+                  index:points.findIndex(p=>p.getAttribute('cx')===m.getAttribute('cx')),
+                  onLevel:m.getAttribute('cy')===document.querySelector(
+                    '.journal-scenario-hit[data-scenario-drag="'+m.dataset.scenarioTouch+'"]')
+                    .getAttribute('y1'),
+                  label:m.getAttribute('aria-label')
+                })));
+            })()"""
+            view.page().runJavaScript(
+                script,
+                lambda value, seen=seen, result_loop=result_loop: (
+                    seen.append(json.loads(value)),
+                    result_loop.quit(),
+                ),
+            )
+            QTimer.singleShot(3000, result_loop.quit)
+            result_loop.exec()
+            assert seen
+            assert {m["kind"]: m["index"] for m in seen[0]} == expected
+            assert all(
+                m["onLevel"]
+                and "not a confirmed fill" in m["label"]
+                and qualifier in m["label"]
+                for m in seen[0]
+            )
     finally:
         view.close()
         view.deleteLater()

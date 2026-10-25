@@ -6,6 +6,7 @@
     const points = [...svg.querySelectorAll('[data-price-point]')];
     const tooltip = root.querySelector('[data-price-tooltip]');
     const error = root.querySelector('[data-scenario-error]');
+    const context = root.querySelector('[data-price-context]');
     const basis = Number(root.dataset.scenarioEntry);
     const baseLow = Number(root.dataset.scenarioLow);
     const baseSpread = Number(root.dataset.scenarioSpread);
@@ -24,7 +25,7 @@
     const committed = {...levels};
     const labels = Object.fromEntries(['stop','target'].map(kind =>
       [kind, root.querySelector(`[data-scenario-drag="${kind}"]`)]));
-    let selected = -1, drag = null, scale = null;
+    let selected = -1, drag = null, scale = null, inspectionAnchor = null;
     const ns = 'http://www.w3.org/2000/svg';
     const make = (tag, attributes) => {
       const element = document.createElementNS(ns, tag);
@@ -54,19 +55,38 @@
       });
       return {kind,bar,mark,label};
     });
+    const touches = Object.fromEntries(['stop','target'].map(kind => {
+      const mark=make('circle',{r:5,class:`journal-scenario-touch journal-touch-${kind}`,
+        'data-scenario-touch':kind, tabindex:0,role:'button'});
+      const show=()=>{
+        const touch=touches[kind];
+        if(drag || !touch.bar)return;
+        select(bars.indexOf(touch.bar));
+        inspectionAnchor=mark;context.textContent=touch.detail;
+        context.hidden=false;positionTooltip();
+      };
+      mark.addEventListener('pointerenter',show);mark.addEventListener('focus',show);
+      mark.addEventListener('click',show);
+      mark.addEventListener('keydown',event=>{
+        if(event.key==='Escape'){event.preventDefault();hide();}
+        if(event.key==='Enter'||event.key===' '){event.preventDefault();show();}
+      });
+      return [kind,{mark,bar:null,detail:"",show}];
+    }));
     function positionTooltip() {
       if (selected<0 || tooltip.hidden) return;
-      const box=root.getBoundingClientRect(), point=points[selected].getBoundingClientRect();
+      const box=root.getBoundingClientRect(), point=(inspectionAnchor||points[selected]).getBoundingClientRect();
       const x=point.left+point.width/2-box.left, y=point.top+point.height/2-box.top;
       tooltip.style.left=`${Math.max(0,Math.min(box.width-tooltip.offsetWidth,x-tooltip.offsetWidth/2))}px`;
       tooltip.style.top=`${y>=tooltip.offsetHeight+12?y-tooltip.offsetHeight-12:y+12}px`;
     }
     function hide() {
-      tooltip.hidden=true;
+      tooltip.hidden=true;inspectionAnchor=null;context.hidden=true;
       points.forEach(point=>{point.classList.remove('is-selected');point.setAttribute('aria-pressed','false');});
     }
     function select(index) {
-      if(drag || (selected===index && !tooltip.hidden))return;
+      if(drag || (selected===index && !tooltip.hidden && !inspectionAnchor))return;
+      inspectionAnchor=null;context.hidden=true;
       selected=index;
       points.forEach((point,i)=>{
         point.classList.toggle('is-selected',i===index);
@@ -115,11 +135,32 @@
         label.setAttribute('x',Math.min(width-22,Math.max(12,px+8)));
         label.setAttribute('y',py+(kind==='low'?18:-10));
       });
+      const epsilon=Number.EPSILON*Math.max(1,basis,price('target'))*8;
+      touches.stop.bar=bars.find(bar=>bar.low<=price('stop')+epsilon)||null;
+      touches.target.bar=bars.find(bar=>bar.high>=price('target')-epsilon)||null;
+      const sameMinute=touches.stop.bar && touches.target.bar &&
+        touches.stop.bar.timestamp===touches.target.bar.timestamp;
+      ['stop','target'].forEach(kind=>{
+        const {mark,bar}=touches[kind];
+        mark.style.display=bar?'':'none';
+        if(!bar)return;
+        mark.setAttribute('cx',x(bar.point.dataset.xFraction));
+        mark.setAttribute('cy',y(price(kind)));
+        const detail=`First observed ${kind} touch at ${money(price(kind))} · ${bar.date}. `+
+          (sameMinute?'Both levels observed in this minute; order unknown. ':'')+
+          (root.hasAttribute('data-scenario-incomplete')?'History incomplete; an earlier touch may be missing. ':'')+
+          'Independent hypothetical level, not a confirmed fill.';
+        mark.setAttribute('aria-label',detail);touches[kind].detail=detail;
+      });
       // Move nearby labels apart while the leader retains the exact level.
       const labelHeight=Math.max(labels.stop.offsetHeight,labels.target.offsetHeight,26);
       const gap=labelHeight+5;
       let targetY=Math.max(16,y(price('target')));
       let stopY=Math.max(y(price('stop')),targetY+gap);
+      const covered=kind=>touches[kind].bar &&
+        x(touches[kind].bar.point.dataset.xFraction)>=width-12-labels[kind].offsetWidth-8;
+      if(covered('target'))targetY=Math.max(16,targetY-gap);
+      if(covered('stop'))stopY=Math.min(height-18,stopY+gap);
       if(stopY>height-18){targetY-=stopY-(height-18);stopY=height-18;}
       const offset=svg.getBoundingClientRect().top-root.getBoundingClientRect().top;
       ['stop','target'].forEach(kind=>{
@@ -138,6 +179,7 @@
       positionTooltip();
     }
     function update(kind,value) {
+      hide();
       levels[kind]=Math.round(value*10)/10;
       if(drag || document.activeElement!==fields[kind])fields[kind].value=String(levels[kind]);
       render();
@@ -220,6 +262,8 @@
     });
     const inspectPointer=event=>{
       if(drag || event.target.closest('[data-scenario-drag]')){hide();return;}
+      const touch=event.target.closest('[data-scenario-touch]');
+      if(touch){touches[touch.dataset.scenarioTouch].show();return;}
       if(event.target.closest('.journal-price-extreme'))return;
       const box=svg.getBoundingClientRect();
       const px=event.clientX-box.left,py=event.clientY-box.top;

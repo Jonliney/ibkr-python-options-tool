@@ -179,3 +179,12 @@ observed extrema, not guaranteed executable prices. Price tooltips appear only
 within 10 screen pixels of a close-price point or a connected segment, with
 priority given to the stop/target drag surfaces. The corridor does not bridge
 missing observations. Keyboard inspection remains available.
+
+Stop/target dots identify each level's first observed minute independently,
+using minute lows for the stop and minute highs for the target. A dot is plotted
+on the hypothetical level at that minute; no sub-minute time or fill price is
+interpolated. The two dots do not simulate a paired exit or assume that both
+orders execute. Hover/focus identifies same-minute ordering uncertainty and
+incomplete history. Dots disappear when a level was not observed and update
+while editing or dragging. Exact touches tolerate machine-precision numeric
+representation differences.
