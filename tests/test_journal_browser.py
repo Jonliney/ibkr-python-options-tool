@@ -388,15 +388,37 @@ def test_price_path_points_pointer_keyboard_and_resize(tmp_path):
                       const points = [...root.querySelectorAll('[data-price-point]')];
                       const tooltip = root.querySelector('[data-price-tooltip]');
                       const box = svg.getBoundingClientRect();
-                      svg.dispatchEvent(new PointerEvent('pointermove', {
-                        clientX:box.right-12, clientY:box.top+100, bubbles:true
-                      }));
                       const last = points.at(-1);
+                      svg.dispatchEvent(new PointerEvent('pointermove', {
+                        clientX:box.left+Number(last.getAttribute('cx')),
+                        clientY:box.top+Number(last.getAttribute('cy')), bubbles:true
+                      }));
                       const pointer = !tooltip.hidden &&
                         tooltip.querySelector('[data-price-close]').textContent
                           === last.dataset.close &&
                         tooltip.querySelector('[data-price-date]').textContent
                           === last.dataset.dateLabel;
+                      svg.dispatchEvent(new PointerEvent('pointermove', {
+                        clientX:box.right-12,
+                        clientY:box.top+Number(last.getAttribute('cy'))+35,
+                        bubbles:true
+                      }));
+                      const outside=tooltip.hidden;
+                      const a=points[60], b=points[61];
+                      svg.dispatchEvent(new PointerEvent('pointermove', {
+                        clientX:box.left+(Number(a.getAttribute('cx'))+
+                          Number(b.getAttribute('cx')))/2,
+                        clientY:box.top+(Number(a.getAttribute('cy'))+
+                          Number(b.getAttribute('cy')))/2+6, bubbles:true
+                      }));
+                      const corridor=!tooltip.hidden;
+                      const drag=root.querySelector('.journal-scenario-hit');
+                      drag.dispatchEvent(new PointerEvent('pointermove', {
+                        clientX:box.left+100,
+                        clientY:box.top+Number(drag.getAttribute('y1')),
+                        bubbles:true
+                      }));
+                      const dragPriority=tooltip.hidden;
                       points[0].focus();
                       points[0].dispatchEvent(new KeyboardEvent('keydown', {
                         key:'ArrowRight', bubbles:true
@@ -423,7 +445,8 @@ def test_price_path_points_pointer_keyboard_and_resize(tmp_path):
                       const fullWidth = Math.abs(box.width - rootBox.width) < 1 &&
                         Math.abs(Number(last.getAttribute('cx'))-(box.width-12)) < 1
                         && Number(points[0].getAttribute('cx')) === 12;
-                      return JSON.stringify({pointer, keyboard, end, values,
+                      return JSON.stringify({pointer, outside, corridor, dragPriority,
+                        keyboard, end, values,
                         tooltipFits, dismissed, reopened, fullWidth,
                         count:points.length});
                     })()""",
@@ -503,8 +526,10 @@ def test_price_path_native_hover_shows_only_inspected_dot(tmp_path):
                       const box = svg.getBoundingClientRect();
                       const visible = [...svg.querySelectorAll('[data-price-point]')]
                         .filter(p => Number(getComputedStyle(p).opacity) > 0).length;
-                      return JSON.stringify({x:box.left+box.width*.6,
-                        y:box.top+50, visible});
+                      const point=svg.querySelectorAll('[data-price-point]')[60];
+                      return JSON.stringify({
+                        x:box.left+Number(point.getAttribute('cx')),
+                        y:box.top+Number(point.getAttribute('cy')), visible});
                     })()""",
                     lambda result: (seen.append(json.loads(result)), loop.quit()),
                 )
@@ -543,10 +568,11 @@ def test_price_path_native_hover_shows_only_inspected_dot(tmp_path):
             """(() => {
               const root = document.querySelector('[data-interactive-price]');
               const box = root.querySelector('svg').getBoundingClientRect();
-              root.dispatchEvent(new MouseEvent('mousemove', {
-                clientX:box.right-12, clientY:box.top+50, bubbles:true
-              }));
               const last = [...root.querySelectorAll('[data-price-point]')].at(-1);
+              root.dispatchEvent(new MouseEvent('mousemove', {
+                clientX:box.left+Number(last.getAttribute('cx')),
+                clientY:box.top+Number(last.getAttribute('cy')), bubbles:true
+              }));
               return last.getAttribute('aria-pressed') === 'true';
             })()""",
             lambda value: (fallback.append(value), mouse_loop.quit()),
@@ -621,7 +647,7 @@ def test_analysis_scenario_edit_drag_cancel_and_close_labels(tmp_path):
           const input=root.querySelector('[data-scenario-input="stop"]');
           input.focus(); input.value='50'; input.dispatchEvent(new Event('input'));
           input.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
-          const changed=root.querySelector('[data-scenario-result]').textContent;
+          const changed=root.querySelector('[data-scenario-price=stop]').textContent;
           input.focus(); input.value='10'; input.dispatchEvent(new Event('input'));
           input.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
           const cancelled=input.value==='50';
@@ -635,7 +661,7 @@ def test_analysis_scenario_edit_drag_cancel_and_close_labels(tmp_path):
           return JSON.stringify({changed,cancelled,invalid,restored,local});
         })()""")
         )
-        assert "Target reached first" in result.pop("changed")
+        assert result.pop("changed") == f"${row.entry_price / 2:.2f}"
         assert all(result.values())
         coordinates = json.loads(
             js("""(() => {
@@ -717,9 +743,8 @@ def test_analysis_scenario_edit_drag_cancel_and_close_labels(tmp_path):
         workbench.close()
 
 
-def test_scenario_crossings_same_minute_exact_touch_and_incomplete_history():
+def test_price_tooltip_does_not_bridge_missing_minutes():
     from dataclasses import replace
-    from decimal import Decimal
 
     from starhtml import to_xml
 
@@ -727,66 +752,54 @@ def test_scenario_crossings_same_minute_exact_touch_and_incomplete_history():
 
     workbench = _demo_workbench()
     workbench.load_demo_data()
-    row = next(r for r in workbench._journal_rows() if r.analysis and r.entry_price)
-    first = row.analysis.bars[0]
-    entry = row.entry_price
+    row = next(r for r in workbench._journal_rows() if r.analysis)
+    bars = row.analysis.bars
+    row = replace(
+        row, analysis=replace(row.analysis, bars=(bars[0], bars[1], bars[-2], bars[-1]))
+    )
     view = QWebEngineView()
     view.resize(900, 600)
     view.show()
+    loop = QEventLoop()
+    seen = []
     try:
-        cases = (
-            (entry, entry, "Observed minutes", "Neither level observed"),
-            (
-                entry * Decimal("0.75"),
-                entry,
-                "Observed minutes",
-                "Stop reached first",
-            ),
-            (
-                entry,
-                entry * Decimal("1.2"),
-                "Observed minutes",
-                "Target reached first",
-            ),
-            (
-                entry * Decimal("0.75"),
-                entry * Decimal("1.2"),
-                "Observed minutes",
-                "same minute · order unknown",
-            ),
-            (
-                entry * Decimal("0.75"),
-                entry * Decimal("1.2"),
-                "Gaps in history",
-                "sequence unknown",
-            ),
-        )
-        for low, high, coverage, expected in cases:
-            bar = replace(first, low=low, high=high, close=entry)
-            sample = replace(
-                row, coverage=coverage, analysis=replace(row.analysis, bars=(bar,))
-            )
-            loop = QEventLoop()
-            view.loadFinished.connect(loop.quit)
-            view.setHtml(to_xml(_price_chart(sample)))
-            QTimer.singleShot(5000, loop.quit)
-            loop.exec()
-            view.loadFinished.disconnect(loop.quit)
-            result_loop = QEventLoop()
-            seen = []
+
+        def loaded(ok):
+            assert ok
+
+            def ready(value):
+                assert value
+                view.page().runJavaScript(
+                    """(() => {
+                      const root=document.querySelector('[data-interactive-price]');
+                      const svg=root.querySelector('svg');
+                      const points=[...svg.querySelectorAll('[data-price-point]')];
+                      const tooltip=root.querySelector('[data-price-tooltip]');
+                      const box=svg.getBoundingClientRect();
+                      const a=points[1],b=points[2];
+                      svg.dispatchEvent(new PointerEvent('pointermove', {
+                        clientX:box.left+(Number(a.getAttribute('cx'))+
+                          Number(b.getAttribute('cx')))/2,
+                        clientY:box.top+(Number(a.getAttribute('cy'))+
+                          Number(b.getAttribute('cy')))/2, bubbles:true
+                      }));
+                      return tooltip.hidden;
+                    })()""",
+                    lambda result: (seen.append(result), loop.quit()),
+                )
+
             wait_for_javascript(
-                view,
-                "document.querySelector('[data-scenario-result]')"
-                f".textContent.includes({json.dumps(expected)})",
-                lambda value, seen=seen, result_loop=result_loop: (
-                    seen.append(value),
-                    result_loop.quit(),
-                ),
-                timeout=3,
+                view, "!!document.querySelector('[data-price-point]')", ready
             )
-            QTimer.singleShot(4000, result_loop.quit)
-            result_loop.exec()
-            assert seen == [True], expected
+
+        view.loadFinished.connect(loaded)
+        view.setHtml(
+            "<style>.journal-price-chart{width:100%;height:300px}</style>"
+            + to_xml(_price_chart(row))
+        )
+        QTimer.singleShot(6000, loop.quit)
+        loop.exec()
+        assert seen == [True]
     finally:
         view.close()
         view.deleteLater()

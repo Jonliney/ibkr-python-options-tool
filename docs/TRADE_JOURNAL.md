@@ -172,10 +172,10 @@ Up/Down on a level handle moves its price. These controls are local to the
 current page, do not persist, and neither submit nor modify broker orders,
 management drafts, or Dashboard settings.
 
-Results report observed bid threshold crossings, including observations after
-a sale. They are not simulated executions. Prices are displayed at currency
-precision, while comparisons use the unrounded percentage-derived thresholds.
-Same-minute stop/target touches have unknown ordering; incomplete history
-withholds the sequence. Tiny floating-point representation errors at exact
-touches are tolerated at machine precision. Missing minutes remain unconnected.
-Low/high markers identify observed extrema, not guaranteed executable prices.
+Threshold prices use the unrounded percentage-derived values and are displayed
+at currency precision. No crossing sequence or execution result is inferred
+by this chart. Missing minutes remain unconnected. Low/high markers identify
+observed extrema, not guaranteed executable prices. Price tooltips appear only
+within 10 screen pixels of a close-price point or a connected segment, with
+priority given to the stop/target drag surfaces. The corridor does not bridge
+missing observations. Keyboard inspection remains available.

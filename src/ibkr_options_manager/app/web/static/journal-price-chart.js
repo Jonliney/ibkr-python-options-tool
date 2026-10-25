@@ -5,7 +5,6 @@
     const svg = root.querySelector('svg');
     const points = [...svg.querySelectorAll('[data-price-point]')];
     const tooltip = root.querySelector('[data-price-tooltip]');
-    const result = root.querySelector('[data-scenario-result]');
     const error = root.querySelector('[data-scenario-error]');
     const basis = Number(root.dataset.scenarioEntry);
     const baseLow = Number(root.dataset.scenarioLow);
@@ -84,21 +83,6 @@
     }
     const price = kind => basis*(1+(kind==='stop'?-1:1)*levels[kind]/100);
     const valid = (kind,value) => Number.isFinite(value) && value>=.1 && value<=(kind==='stop'?99.9:10000);
-    function outcome() {
-      const epsilon=Number.EPSILON*Math.max(1,basis,price('target'))*8;
-      const stop=bars.find(bar=>bar.low<=price('stop')+epsilon);
-      const target=bars.find(bar=>bar.high>=price('target')-epsilon);
-      if(root.hasAttribute('data-scenario-incomplete')) {
-        result.textContent='Incomplete price history · sequence unknown'; return;
-      }
-      if(stop && target && stop.timestamp===target.timestamp) {
-        result.textContent=`Both levels observed in the same minute · order unknown · ${stop.date}`;
-      } else if(stop && (!target || stop.timestamp<target.timestamp)) {
-        result.textContent=`Stop reached first · ${stop.date}`+(target?' · target reached later':' · target not observed');
-      } else if(target) {
-        result.textContent=`Target reached first · ${target.date}`+(stop?' · stop reached later':' · stop not observed');
-      } else result.textContent='Neither level observed';
-    }
     function render() {
       const {width,height}=svg.getBoundingClientRect(); if(!width||!height)return;
       const low=Math.min(baseLow,price('stop'));
@@ -125,7 +109,6 @@
       entry.setAttribute('x2',width-12);entry.setAttribute('y1',y(basis));entry.setAttribute('y2',y(basis));
       const exit=svg.querySelector('[data-exit-fraction]');
       if(exit){exit.setAttribute('x1',x(exit.dataset.exitFraction));exit.setAttribute('x2',x(exit.dataset.exitFraction));exit.setAttribute('y2',height-25);}
-      svg.querySelector('[data-price-low-label]').setAttribute('y',height-5);
       extrema.forEach(({kind,bar,mark,label})=>{
         const px=x(bar.point.dataset.xFraction),py=y(bar[kind]);
         mark.setAttribute('cx',px);mark.setAttribute('cy',py);
@@ -152,7 +135,7 @@
         const grip=root.querySelector(`[data-scenario-grip="${kind}"]`);
         grip.setAttribute('aria-label',`Hypothetical ${kind} ${money(price(kind))}, ${levels[kind]} percent. Use Up and Down arrows to move the price.`);
       });
-      outcome();positionTooltip();
+      positionTooltip();
     }
     function update(kind,value) {
       levels[kind]=Math.round(value*10)/10;
@@ -236,12 +219,28 @@
       });
     });
     const inspectPointer=event=>{
-      if(drag || event.target.closest('[data-scenario-drag]'))return;
+      if(drag || event.target.closest('[data-scenario-drag]')){hide();return;}
+      if(event.target.closest('.journal-price-extreme'))return;
       const box=svg.getBoundingClientRect();
-      if(event.clientX<box.left||event.clientX>box.right||event.clientY<box.top||event.clientY>box.bottom)return;
-      const fraction=(event.clientX-box.left-12)/Math.max(1,box.width-24);
+      const px=event.clientX-box.left,py=event.clientY-box.top;
+      if(px<0||px>box.width||py<0||py>box.height){hide();return;}
+      const fraction=(px-12)/Math.max(1,box.width-24);
       const nearest=points.reduce((best,point,i)=>Math.abs(Number(point.dataset.xFraction)-fraction)<Math.abs(Number(points[best].dataset.xFraction)-fraction)?i:best,0);
-      select(nearest);
+      // Inspect only a 10px corridor around an observed close or its connected
+      // line segment. Never project a hover corridor across missing minutes.
+      let distance=Math.hypot(px-Number(points[nearest].getAttribute('cx')),
+        py-Number(points[nearest].getAttribute('cy')));
+      const right=points.findIndex(point=>Number(point.getAttribute('cx'))>=px);
+      if(right>0){
+        const a=points[right-1],b=points[right];
+        if(a.dataset.segment===b.dataset.segment){
+          const ax=Number(a.getAttribute('cx')),bx=Number(b.getAttribute('cx'));
+          const ay=Number(a.getAttribute('cy')),by=Number(b.getAttribute('cy'));
+          const t=Math.max(0,Math.min(1,((px-ax)*(bx-ax)+(py-ay)*(by-ay))/((bx-ax)**2+(by-ay)**2)));
+          distance=Math.min(distance,Math.hypot(px-(ax+t*(bx-ax)),py-(ay+t*(by-ay))));
+        }
+      }
+      if(distance<=10)select(nearest);else hide();
     };
     root.addEventListener('pointermove',inspectPointer,true);root.addEventListener('mousemove',inspectPointer,true);root.addEventListener('pointerenter',inspectPointer);
     root.addEventListener('pointerleave',()=>{if(!root.contains(document.activeElement))hide();});

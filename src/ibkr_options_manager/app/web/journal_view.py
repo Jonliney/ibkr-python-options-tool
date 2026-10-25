@@ -993,20 +993,6 @@ def _price_chart(
                 fill="transparent",
                 pointer_events="all",
             ),
-            Text(
-                f"{high:.2f}",
-                x=12,
-                y=18,
-                cls="journal-chart-label",
-                data_price_high_label=True,
-            ),
-            Text(
-                f"{low:.2f}",
-                x=12,
-                y=235,
-                cls="journal-chart-label",
-                data_price_low_label=True,
-            ),
             *ranges,
             Line(
                 x1=12,
@@ -1093,14 +1079,12 @@ def _price_chart(
             hidden=True,
             data_price_tooltip=True,
         ),
-        Div(
-            P(data_scenario_result=True, role="status", aria_live="polite"),
-            P(
-                "Observed bid crossings, including prices after sale · not simulated fills",
-                cls="journal-caption",
-            ),
-            P("", data_scenario_error=True, role="alert", hidden=True),
-            cls="journal-scenario-result",
+        P(
+            "",
+            data_scenario_error=True,
+            role="alert",
+            hidden=True,
+            cls="journal-scenario-error",
         ),
         Script(_price_chart_script()),
         cls="journal-interactive-price",
@@ -1109,7 +1093,6 @@ def _price_chart(
         data_scenario_low=str(low),
         data_scenario_spread=str(spread),
         data_scenario_currency=currency,
-        data_scenario_incomplete=row.coverage != "Observed minutes",
     )
 
 
@@ -1249,10 +1232,12 @@ def position_analysis(
                     f"Average observed bid: {money(analysis.average if analysis else None, row.contract.currency)}"
                 ),
                 P("Arithmetic mean of observed minute closing bids."),
+                P(
+                    "Stop and target are hypothetical levels. Dragging or editing them changes this chart only."
+                ),
             ),
             cls="journal-section-heading",
         ),
-        P("What-if exit", cls="journal-caption journal-scenario-heading"),
         _price_chart(row, stop=stop, target=target),
         P(row.warning, cls="journal-warning") if row.warning else None,
         Div(H2("Trade fills"), _fill_table(row), cls="journal-fill-section"),

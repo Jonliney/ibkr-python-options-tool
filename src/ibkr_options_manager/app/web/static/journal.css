@@ -153,7 +153,6 @@
 .journal-tooltip-values > :nth-child(odd) { color: var(--muted-foreground); }
 .journal-tooltip-values > :nth-child(even) { text-align: right; white-space: nowrap; }
 
-.journal-scenario-heading { margin: .25rem 0; }
 .journal-scenario-line { stroke-width: 1; pointer-events: none; }
 .journal-scenario-stop { stroke: #fda4af; stroke-dasharray: 5 4; }
 .journal-scenario-target { stroke: #fde68a; stroke-dasharray: 2 4; }
@@ -163,12 +162,10 @@
 .journal-scenario-label input::-webkit-inner-spin-button, .journal-scenario-label input::-webkit-outer-spin-button { appearance: none; margin: 0; }
 .journal-scenario-label input[aria-invalid="true"] { border-color: #fda4af; }
 .journal-scenario-label [data-scenario-grip] { cursor: ns-resize; }
-.journal-scenario-result { border-top: 1px solid var(--border); padding-top: .85rem; margin-top: 1.25rem; font-size: .8rem; }
-.journal-scenario-result p { margin: 0 0 .4rem; }
-.journal-scenario-result [role="alert"] { color: #fda4af; }
 .journal-price-extreme { fill: var(--background); stroke: #6ee7b7; stroke-width: 2; cursor: help; }
 .journal-extreme-label { fill: var(--foreground); font-weight: 600; pointer-events: none; }
 .journal-interactive-price.is-dragging { cursor: ns-resize; user-select: none; }
 @media (pointer: coarse) { .journal-scenario-hit { stroke-width: 24; } .journal-scenario-label { min-height: 2.5rem; } }
 
 .journal-scenario-percent { display: inline-flex; align-items: baseline; }
+.journal-scenario-error { margin: .75rem 0; color: #fda4af; font-size: .8rem; }

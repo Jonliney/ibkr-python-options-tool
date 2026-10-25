@@ -120,7 +120,10 @@ def test_dashboard_filters_analysis_and_management_roundtrip():
             data={"action": "open-trade", "trade_id": selected.row_id},
         ).text
         assert "data-position-analysis" in html
-        assert "What-if exit" in html and "Average observed bid" in html
+        assert "What-if exit" not in html and "Average observed bid" in html
+        assert "data-scenario-result" not in html
+        assert "data-price-low-label" not in html
+        assert "data-price-high-label" not in html
         assert "Order of extremes" not in html
         assert "Contract position observations" not in html
         assert "Trade fills" in html
