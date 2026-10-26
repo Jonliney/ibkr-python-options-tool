@@ -28,6 +28,8 @@ def test_journal_views_render_at_desktop_and_minimum_size(tmp_path):
         if r.contract.con_id == workbench._selected_con_id
     )
     analysis_widths = {}
+    analysis_header_bounds = {}
+    management_header_bounds = {}
     try:
         for name, action in (
             ("dashboard", {"action": "show-dashboard"}),
@@ -72,6 +74,15 @@ def test_journal_views_render_at_desktop_and_minimum_size(tmp_path):
                               ?.getBoundingClientRect().width,
                             analysisMetrics: document.querySelectorAll(
                               '.journal-analysis-sidebar .journal-metric').length,
+                            headerBounds: Array.from(document.querySelectorAll(
+                              '.journal-analysis .contract-header-facts, '
+                              + '.journal-management .contract-header-facts, '
+                              + '.journal-analysis .journal-position-tabs, '
+                              + '.journal-management .journal-position-tabs'
+                            )).map(e => {
+                              const {x, y, width, height} = e.getBoundingClientRect();
+                              return {x, y, width, height};
+                            }),
                             positionHierarchy: (() => {
                               const scope = document.querySelector(
                                 '.journal-analysis,.journal-management');
@@ -128,11 +139,16 @@ def test_journal_views_render_at_desktop_and_minimum_size(tmp_path):
                 assert observations[0]["analysisSidebar"] == name.startswith("analysis")
                 if name.startswith("analysis"):
                     analysis_widths[width] = observations[0]["workspaceWidth"]
+                    if name == "analysis":
+                        analysis_header_bounds[width] = observations[0]["headerBounds"]
                     assert observations[0]["analysisMetrics"] == 5
                 elif name == "management":
                     assert observations[0]["workspaceWidth"] == analysis_widths[width]
+                    management_header_bounds[width] = observations[0]["headerBounds"]
                 QTest.qWait(150)  # allow the rendered compositor frame to reach grab()
                 view.grab().save(str(screenshots / f"{name}-{width}.png"))
+        # Compare the same open position before the later closed-trade capture.
+        assert management_header_bounds == analysis_header_bounds
     finally:
         view.close()
         view.deleteLater()

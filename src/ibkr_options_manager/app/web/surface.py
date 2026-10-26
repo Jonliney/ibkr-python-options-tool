@@ -4416,7 +4416,10 @@ class StarUIWorkbench:
         currency = contract.currency if contract else "USD"
         quantity = f"{'0' if closed else '—'} / {row.quantity:g}" if row else "— / —"
         return Div(
-            H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
+            Div(
+                H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight"),
+                cls="position-title-row",
+            ),
             Div(
                 _contract_header_metric("Held / total", quantity),
                 _contract_header_metric(
@@ -5369,7 +5372,11 @@ class StarUIWorkbench:
         )
         heading = H1(title, cls="min-w-0 text-2xl font-semibold tracking-tight")
         if header_only:
-            return Div(heading, facts, cls="position-analysis-header")
+            return Div(
+                Div(heading, cls="position-title-row"),
+                facts,
+                cls="position-analysis-header",
+            )
         actions = Div(
             Div(
                 Div(
